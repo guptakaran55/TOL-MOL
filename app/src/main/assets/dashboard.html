@@ -343,6 +343,88 @@ window.onOcoGttResult=function(resultJson){
 //   8. Dry-run preview modal listing every proposed trigger — nothing goes out until the user confirms.
 // Global holder for the in-flight plan so checkbox clicks can mutate it.
 var BULK_PLAN=null;
+// ── GTT Audit modal ────────────────────────────────────────────────────────
+// Renders the most recent N entries of the append-only audit log written by
+// ZerodhaClient (create / modify / bump / delete) and DailyPortfolioManager
+// (decide / skip / error). One row per event, newest first, with action-coded
+// colour pills so the user can scan for a specific kind of decision.
+//
+// All filtering happens client-side on a single fetch — the bridge returns
+// up to 500 events, the modal lets the user filter by symbol or action without
+// hitting the bridge again. Rebuild from scratch on every filter change since
+// the dataset is small.
+var GTT_AUDIT={rows:[],filter:{sym:'',action:''}};
+function openGttAudit(){
+  try{
+    var raw=Android.getGttActivityLog(500);
+    var arr=JSON.parse(raw||'[]');
+    GTT_AUDIT.rows=arr;
+    GTT_AUDIT.filter={sym:'',action:''};
+    renderGttAuditModal();
+  }catch(e){uiAlert('Audit log error',e.message)}
+}
+function setGttAuditFilter(kind,val){
+  GTT_AUDIT.filter[kind]=val;
+  renderGttAuditModal();
+}
+function clearGttAuditLog(){
+  uiConfirm('Clear audit log?','Wipe the entire GTT activity log? This cannot be undone — events already sent to Kite are unaffected, only the local audit trail is cleared.',function(ok){
+    if(!ok)return;
+    try{Android.clearGttActivityLog();GTT_AUDIT.rows=[];renderGttAuditModal()}
+    catch(e){uiAlert('Clear failed',e.message)}
+  });
+}
+function renderGttAuditModal(){
+  var rows=GTT_AUDIT.rows||[];
+  var f=GTT_AUDIT.filter;
+  // Build symbol & action option lists from full dataset (not filtered)
+  var symSet={},actSet={};
+  rows.forEach(function(r){if(r.sym)symSet[r.sym]=1;if(r.action)actSet[r.action]=1});
+  var symOpts='<option value="">All symbols</option>'+Object.keys(symSet).sort().map(function(s){return '<option value="'+s+'"'+(f.sym===s?' selected':'')+'>'+s+'</option>'}).join('');
+  var actOpts='<option value="">All actions</option>'+Object.keys(actSet).sort().map(function(a){return '<option value="'+a+'"'+(f.action===a?' selected':'')+'>'+a+'</option>'}).join('');
+  // Apply filter
+  var filtered=rows.filter(function(r){
+    if(f.sym && r.sym!==f.sym)return false;
+    if(f.action && r.action!==f.action)return false;
+    return true;
+  });
+  var actionColor={
+    create:'#22c55e', modify:'#60a5fa', modify_sl:'#60a5fa', modify_tgt:'#60a5fa',
+    bump:'#a78bfa', delete:'#ef4444', decide:'#fbbf24', skip:'#9ca3af', error:'#ef4444'
+  };
+  var html='<div style="font-size:10px;color:var(--t3);font-weight:500;margin-bottom:8px">'+rows.length+' events stored · '+filtered.length+' shown · newest first</div>';
+  html+='<div style="display:flex;gap:6px;margin-bottom:8px;align-items:center">';
+  html+='<select onchange="setGttAuditFilter(\'sym\',this.value)" style="flex:1;padding:4px;font-size:11px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:4px">'+symOpts+'</select>';
+  html+='<select onchange="setGttAuditFilter(\'action\',this.value)" style="flex:1;padding:4px;font-size:11px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:4px">'+actOpts+'</select>';
+  html+='<span onclick="clearGttAuditLog()" style="cursor:pointer;color:var(--rd);font-size:10px;font-weight:700;padding:4px 8px;border:1px solid var(--rd);border-radius:4px" title="Wipe local audit log (Kite-side state untouched)">Clear</span>';
+  html+='</div>';
+  if(!filtered.length){
+    html+='<div style="text-align:center;padding:24px;color:var(--t3);font-size:11px">No events match the current filter.<br/>The log fills up as the engine creates / modifies / skips GTTs.</div>';
+  }else{
+    html+='<div style="max-height:60vh;overflow-y:auto;font-family:monospace;font-size:10px;line-height:1.5">';
+    filtered.forEach(function(r){
+      var col=actionColor[r.action]||'var(--t2)';
+      var ts=(r.ts||'').replace('T',' ');
+      // Build the "extra fields" string from everything except ts/epoch/action/sym
+      var extras=[];
+      Object.keys(r).forEach(function(k){
+        if(k==='ts'||k==='epoch'||k==='action'||k==='sym')return;
+        var v=r[k];
+        if(typeof v==='number')v=Math.round(v*100)/100;
+        extras.push('<span style="color:var(--t3)">'+k+'</span>=<span style="color:var(--t1)">'+v+'</span>');
+      });
+      html+='<div style="padding:4px 6px;border-bottom:1px dashed var(--bd)">'+
+        '<span style="color:var(--t3)">'+ts+'</span> '+
+        '<span style="display:inline-block;min-width:62px;padding:0 6px;background:'+col+';color:#000;border-radius:3px;font-weight:700;font-size:9px;text-align:center">'+r.action.toUpperCase()+'</span> '+
+        (r.sym?'<span style="color:var(--t1);font-weight:700"> '+r.sym+'</span> ':'')+
+        '<span style="color:var(--t2)">'+extras.join(' · ')+'</span>'+
+        '</div>';
+    });
+    html+='</div>';
+  }
+  uiAlert('📜 GTT Audit Log',html);
+}
+
 function planBulkOco(){
   if(!PORTFOLIO.holdings||!PORTFOLIO.holdings.length){uiAlert('No holdings','Portfolio is empty.');return}
   var gttCount=0;
@@ -386,10 +468,31 @@ function planBulkOco(){
     if(!row.hasAnalysis||!row.support||!row.resistance||row.resistance<=row.support){
       row.reason='no S/R — run a scan';row.plan=null;row.sel=false;return row;
     }
-    var rawTgt=(row.projectedCeiling!=null&&row.projectedCeiling>row.ltp)?row.projectedCeiling:row.resistance;
-    // SL = support level directly. No 5% floor — user wants tight SL.
-    // planOcoTriggers() will still clamp to ltp*0.75 (Kite -25% hard limit).
-    var rawSl=row.support;
+    // TARGET = max(waveCeiling || resistance, LTP + 2×ATR) — mirrors the daily
+    // trailing ratchet in DailyPortfolioManager so day-1 target is already pushed
+    // out and winners aren't capped at the projected ceiling. planOcoTriggers()
+    // then clamps by Kite +25% hard limit (which acts as the ONLY ceiling).
+    // ATR multiple 2.0 mirrors ConfigManager.targetAtrMultiple default.
+    var tgtCandWave = (row.projectedCeiling!=null&&row.projectedCeiling>row.ltp)?row.projectedCeiling:row.resistance;
+    var tgtCandAtr  = row.ltp + 2.0 * (row.atr || Math.max(0.01, row.ltp*0.02));
+    var rawTgt = Math.max(tgtCandWave, tgtCandAtr);
+    // SL = max(support, chandelier) — mirrors TrailingStopCalculator.kt line 104.
+    // Tighter (higher) of the two = smaller worst-case loss. Chandelier dominates
+    // when support is far below LTP; support dominates when stock is climbing
+    // through swing-low cluster. planOcoTriggers() then clamps to Kite ±25%.
+    var atrLocal = row.atr || Math.max(0.01, row.ltp*0.02);
+    var avgLocal = row.avgPrice || 0;
+    var peakLocal = row.ltp;                              // fresh create: no peak history
+    var gainLocal = avgLocal>0 ? (peakLocal-avgLocal)/avgLocal : 0;
+    var atrMultLocal = gainLocal<=0.05?3.0 : gainLocal<=0.10?2.5 : gainLocal<=0.20?2.0 : gainLocal<=0.30?1.5 : 1.0;
+    var chandelierLocal = peakLocal - atrMultLocal*atrLocal;
+    var supportFloorLocal = (row.support>0 && row.support<row.ltp) ? row.support : 0;
+    // Pathway D: Hard −10% floor from entry — mirrors DailyPortfolioManager.HARD_SL_FRAC=0.90.
+    // Anchor to avgPrice (entry cost) when available; otherwise fall back to LTP-based floor.
+    // This matches what autoCreateOcoGtt + daily trail enforce, so Bulk OCO no longer
+    // bypasses the policy text shown right above this modal.
+    var hardFloorLocal = (avgLocal>0 ? avgLocal : row.ltp) * 0.90;
+    var rawSl = Math.max(supportFloorLocal, chandelierLocal, hardFloorLocal);
     var plan=planOcoTriggers(row.ltp,rawSl,rawTgt);
     row.plan=plan;
     row.tgtSource=(row.projectedCeiling!=null&&row.projectedCeiling>row.ltp)?'wave':'resistance';
@@ -422,16 +525,23 @@ function computePathwayTrace(r){
   var slCandidateA = supportFloor;              // Pathway A
   var slCandidateB = chandelier;                 // Pathway B
   var slCandidateC = null;                       // Pathway C (monotonic prev-SL) — none on fresh create
-  var preClamp = Math.max(slCandidateA, slCandidateB);
-  var slWinner = preClamp===slCandidateA && slCandidateA>0 ? 'A (Support)' : 'B (Chandelier)';
+  // Pathway D: Hard −10% floor from entry (avg cost). Mirrors DailyPortfolioManager.HARD_SL_FRAC.
+  var slCandidateD = (avg>0 ? avg : ltp) * 0.90;
+  var preClamp = Math.max(slCandidateA, slCandidateB, slCandidateD);
+  var slWinner = preClamp===slCandidateD ? 'D (Hard −10% floor from entry)'
+                : preClamp===slCandidateA && slCandidateA>0 ? 'A (Support)'
+                : 'B (Chandelier)';
   var slClamped = (r.plan.sl !== preClamp);
 
   var gainNowPct = avg>0?(ltp-avg)/avg*100:0;
   var atrPct = ltp>0?atr/ltp*100:0;
   var tgtSrcLabel = (r.tgtSource==='wave')?'Wave projection ceiling':'Resistance level';
   var tgtSrcValue = (r.tgtSource==='wave')?(r.projectedCeiling||0):resistance;
-  var kiteCap = ltp*1.25;
-  var tgtClamped = (r.plan.tg !== tgtSrcValue);
+  var tgtAtrCand  = ltp + 2.0 * atr;                          // Pathway C: ATR ratchet candidate
+  var tgtPreClamp = Math.max(tgtSrcValue, tgtAtrCand);        // max(A, C) — pick whichever is further out
+  var kiteCap = ltp*1.25;                                      // Pathway B: hard Kite ceiling
+  var tgtWinnerLabel = tgtPreClamp===tgtSrcValue ? 'A ('+tgtSrcLabel+')' : 'C (LTP + 2×ATR)';
+  var tgtClamped = (r.plan.tg !== tgtPreClamp);                // true iff Kite ceiling overrode our pick
   var threeAtrThreshold = 3*atrPct;
   var wouldAutoDelete = gainNowPct > threeAtrThreshold;  // daily tick's 3×ATR rule
 
@@ -447,9 +557,10 @@ function computePathwayTrace(r){
 
   return {
     gain:gain, atrMult:atrMult, atrPct:atrPct,
-    slPathA:slCandidateA, slPathB:slCandidateB, slPathC:slCandidateC,
-    slWinner:slWinner, slClamped:slClamped,
-    tgtSrcLabel:tgtSrcLabel, tgtSrcValue:tgtSrcValue, kiteCap:kiteCap,
+    slPathA:slCandidateA, slPathB:slCandidateB, slPathC:slCandidateC, slPathD:slCandidateD,
+    slWinner:slWinner, slClamped:slClamped, slPreClamp:preClamp,
+    tgtSrcLabel:tgtSrcLabel, tgtSrcValue:tgtSrcValue, tgtAtrCand:tgtAtrCand,
+    tgtPreClamp:tgtPreClamp, tgtWinnerLabel:tgtWinnerLabel, kiteCap:kiteCap,
     tgtClamped:tgtClamped, wouldAutoDelete:wouldAutoDelete, threeAtrThreshold:threeAtrThreshold,
     gainNowPct:gainNowPct,
     slLimit:slLimit, tgLimit:tgLimit,
@@ -481,14 +592,16 @@ function renderPathwayTrace(r){
   html+='<div>&nbsp;&nbsp;&nbsp;&nbsp;daysSincePeak = 0 → no time-decay</div>';
   html+='<div>&nbsp;&nbsp;&nbsp;&nbsp;chandelier = peak − '+f2(t.atrMult)+' × ATR = <b>₹'+f2(t.slPathB)+'</b></div>';
   html+='<div>&nbsp;&nbsp;<b>Pathway C · Monotonic floor (prev SL)</b> → (none — fresh create)</div>';
-  html+='<div style="margin-top:3px">&nbsp;&nbsp;<b>WINNER:</b> Pathway '+t.slWinner+' → pre-clamp ₹'+f2(Math.max(t.slPathA,t.slPathB))+'</div>';
+  html+='<div>&nbsp;&nbsp;<b>Pathway D · Hard −10% floor from entry</b> → ₹'+f2(t.slPathD)+(r.avgPrice?'':' <span style="color:var(--t3)">(avg unknown — anchored to LTP)</span>')+'</div>';
+  html+='<div style="margin-top:3px">&nbsp;&nbsp;<b>WINNER:</b> Pathway '+t.slWinner+' → pre-clamp ₹'+f2(t.slPreClamp)+'</div>';
   html+='<div>&nbsp;&nbsp;Kite clamp [LTP×0.75, LTP×0.999] → '+(t.slClamped?'<b style="color:#d97706">clamped</b>':mark(true))+'</div>';
   html+='<div style="margin-top:3px;color:#f87171">&nbsp;&nbsp;<b>▼ SL trigger = ₹'+f2(r.plan.sl)+'</b> ('+f1((r.plan.sl/r.ltp-1)*100)+'%)  ·  limit ₹'+f2(t.slLimit)+' (−2% pad)</div>';
   // Target trace
   html+='<div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--bd);color:#4ade80;font-weight:700">▲ TARGET DECISION TRACE</div>';
   html+='<div>&nbsp;&nbsp;<b>Pathway A · '+t.tgtSrcLabel+'</b> → candidate = <b>₹'+f2(t.tgtSrcValue)+'</b></div>';
-  html+='<div>&nbsp;&nbsp;<b>Pathway B · Kite +25% cap</b> → ₹'+f2(t.kiteCap)+'</div>';
-  html+='<div>&nbsp;&nbsp;<b>WINNER:</b> min(A, B) = ₹'+f2(Math.min(t.tgtSrcValue,t.kiteCap))+(t.tgtClamped?' <b style="color:#d97706">(clamped)</b>':'')+'</div>';
+  html+='<div>&nbsp;&nbsp;<b>Pathway C · LTP + 2×ATR (trailing ratchet)</b> → candidate = <b>₹'+f2(t.tgtAtrCand)+'</b></div>';
+  html+='<div>&nbsp;&nbsp;<b>Pathway B · Kite +25% cap (ceiling)</b> → ₹'+f2(t.kiteCap)+'</div>';
+  html+='<div style="margin-top:3px">&nbsp;&nbsp;<b>WINNER:</b> max(A, C) = ₹'+f2(t.tgtPreClamp)+' · pathway '+t.tgtWinnerLabel+(t.tgtClamped?' → <b style="color:#d97706">clamped to Kite ceiling ₹'+f2(t.kiteCap)+'</b>':' · within Kite ceiling ✓')+'</div>';
   html+='<div>&nbsp;&nbsp;3× ATR auto-delete rule: gain '+f1(t.gainNowPct)+'% '+(t.wouldAutoDelete?'&gt;':'≤')+' '+f1(t.threeAtrThreshold)+'% (3×ATR) → '+(t.wouldAutoDelete?'<b style="color:#d97706">upper target WILL be removed on tomorrow\'s daily tick</b>':mark(true)+' kept')+'</div>';
   html+='<div style="margin-top:3px;color:#4ade80">&nbsp;&nbsp;<b>▲ Target trigger = ₹'+f2(r.plan.tg)+'</b> (+'+f1((r.plan.tg/r.ltp-1)*100)+'%)  ·  limit ₹'+f2(t.tgLimit)+' (−1% pad)</div>';
   // Risk/Reward
@@ -1138,6 +1251,7 @@ function render(){
   if(STATE.tab==='portfolio')return renderPortfolio();
   if(STATE.tab==='value')return renderValue();
   if(STATE.tab==='sectors')return renderSectors();
+  if(STATE.tab==='gttcal')return renderGttCal();
 
   var stocks=STATE.data,tab=STATE.tab,cur=STATE.currency;
   var f;
@@ -1773,6 +1887,7 @@ function renderPortfolio(){
 
   // Bulk OCO action — creates SL+Target for every eligible holding in one click
   h+='<div style="margin:0 8px 6px;text-align:right">'+
+     '<span onclick="openGttAudit()" style="display:inline-block;padding:5px 10px;background:rgba(168,85,247,0.12);border:1px solid rgba(168,85,247,0.45);border-radius:6px;color:#c084fc;cursor:pointer;font-weight:700;font-size:10px;margin-right:6px" title="View append-only audit log of every GTT decision the engine has made">📜 GTT Audit</span>'+
      '<span onclick="planBulkOco()" style="display:inline-block;padding:5px 10px;background:rgba(37,99,235,0.12);border:1px solid rgba(37,99,235,0.45);border-radius:6px;color:#60a5fa;cursor:pointer;font-weight:700;font-size:10px" title="Create SL+Target OCO GTT for every portfolio stock that doesn\'t already have one">\uD83C\uDFAF Bulk OCO GTT</span>'+
      '</div>';
 
@@ -2086,6 +2201,76 @@ function renderValue(){
   }
 
   document.getElementById('app').innerHTML=h;
+}
+
+// GTT Calibration — execution metrics to improve trigger weights
+function renderGttCal(){
+  var h=topBar();
+  h+='<div style="padding:8px;font-size:11px;color:var(--t2);line-height:1.5;text-align:center">';
+  h+='<div class="sp" style="width:20px;height:20px;margin:20px auto;border-width:2px"></div>';
+  h+='<div>Fetching GTT execution history...</div>';
+  h+='</div>';
+  h+='<div id="gtt-result" style="padding:8px"></div>';
+  document.getElementById('app').innerHTML=h;
+
+  // Fetch GTT data from Kotlin
+  if(typeof Android!=='undefined'&&Android.fetchGttExecutionData){
+    try{
+      var dataJson=Android.fetchGttExecutionData();
+      var data=JSON.parse(dataJson);
+      if(data.error){
+        document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">'+data.error+'</div>';
+        return;
+      }
+
+      var h2='<div style="padding:8px">';
+      // Overall stats
+      h2+='<div style="background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:12px">';
+      h2+='<div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:8px">GTT EXECUTION SUMMARY</div>';
+      h2+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">';
+      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Total GTTs</div><div style="font-size:16px;font-weight:800;color:var(--t1)">'+data.totalGtts+'</div></div>';
+      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Executed</div><div style="font-size:16px;font-weight:800;color:var(--gn)">'+data.totalExecuted+'</div></div>';
+      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Success Rate</div><div style="font-size:16px;font-weight:800;color:var(--bl)">'+data.overallExecutionRate+'%</div></div>';
+      h2+='</div></div>';
+
+      // Per-symbol breakdown
+      if(data.bySymbol.length>0){
+        h2+='<div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:6px">BY SYMBOL (sorted by execution rate)</div>';
+        h2+='<div style="overflow-x:auto;-webkit-overflow-scrolling:touch">';
+        h2+='<table style="width:100%;font-size:10px">';
+        h2+='<thead><tr style="background:var(--bg2);font-weight:700">';
+        h2+='<th style="padding:6px 4px;text-align:left;color:var(--t3)">Symbol</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--t3)">Total</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--gn)">Executed</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--t3)">Active</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--rd)">Cancelled</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--bl)">Rate</th>';
+        h2+='<th style="padding:6px 4px;text-align:center;color:var(--am)">Avg Dev %</th>';
+        h2+='</tr></thead><tbody>';
+
+        data.bySymbol.forEach(function(stat){
+          h2+='<tr style="border-bottom:1px solid var(--bd)">';
+          h2+='<td style="padding:6px 4px;font-weight:700;color:var(--t1)">'+stat.symbol+'</td>';
+          h2+='<td style="padding:6px 4px;text-align:center">'+stat.totalGtts+'</td>';
+          h2+='<td style="padding:6px 4px;text-align:center;color:var(--gn);font-weight:700">'+stat.executedCount+'</td>';
+          h2+='<td style="padding:6px 4px;text-align:center">'+stat.activeCount+'</td>';
+          h2+='<td style="padding:6px 4px;text-align:center;color:var(--rd)">'+stat.cancelledCount+'</td>';
+          h2+='<td style="padding:6px 4px;text-align:center;color:var(--bl);font-weight:700">'+stat.executionRate+'%</td>';
+          h2+='<td style="padding:6px 4px;text-align:center;color:var(--am)">'+stat.avgTriggerDeviation+'</td>';
+          h2+='</tr>';
+        });
+        h2+='</tbody></table></div>';
+      }else{
+        h2+='<div style="text-align:center;color:var(--t3);padding:20px;font-size:11px">No GTT history available yet. GTTs will appear here once you place them in Zerodha.</div>';
+      }
+      h2+='</div>';
+      document.getElementById('gtt-result').innerHTML=h2;
+    }catch(e){
+      document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Error: '+e.message+'</div>';
+    }
+  }else{
+    document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Android bridge not available</div>';
+  }
 }
 
 // ===== DETAIL MODAL =====

@@ -25,6 +25,12 @@ import java.security.KeyStore
  */
 class ConfigManager(context: Context) {
 
+    /** Application context — exposed so collaborators (e.g. ZerodhaClient,
+     *  GttActivityLog hooks) that already hold a ConfigManager don't need a
+     *  parallel Context plumbing. We hold the application context only,
+     *  never the activity, to avoid leaks. */
+    val appContext: Context = context.applicationContext
+
     companion object {
         private const val TAG = "ConfigManager"
         private const val ENCRYPTED_PREFS_FILE = "signalscope_secure_prefs"

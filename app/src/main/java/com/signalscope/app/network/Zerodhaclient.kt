@@ -510,6 +510,10 @@ class ZerodhaClient(private val config: ConfigManager) {
                 }
                 val outId = j.getAsJsonObject("data")?.get("trigger_id")?.asLong ?: id
                 Log.i(TAG, "GTT $outId bumped to $newTriggerPrice")
+                com.signalscope.app.data.GttActivityLog.append(
+                    config.appContext, "bump",
+                    fields = mapOf("id" to outId, "new" to newTriggerPrice, "oldHint" to oldTriggerHint)
+                )
                 GttModifyResult.Success(outId, newTriggerPrice)
             }
         } catch (e: Exception) {
@@ -597,6 +601,14 @@ class ZerodhaClient(private val config: ConfigManager) {
                 }
                 val outId = j.getAsJsonObject("data")?.get("trigger_id")?.asLong ?: id
                 Log.i(TAG, "GTT $outId set to triggers=$newTriggerValues limits=$newLimitPrices")
+                com.signalscope.app.data.GttActivityLog.append(
+                    config.appContext, "modify",
+                    fields = mapOf(
+                        "id" to outId,
+                        "trigs" to newTriggerValues.joinToString(","),
+                        "limits" to newLimitPrices.joinToString(",")
+                    )
+                )
                 GttModifyResult.Success(outId, newTriggerValues.first())
             }
         } catch (e: Exception) {
@@ -621,6 +633,10 @@ class ZerodhaClient(private val config: ConfigManager) {
                     return GttDeleteResult.Failure(j.get("message")?.asString ?: "Delete failed")
                 }
                 Log.i(TAG, "GTT $id deleted")
+                com.signalscope.app.data.GttActivityLog.append(
+                    config.appContext, "delete",
+                    fields = mapOf("id" to id)
+                )
                 GttDeleteResult.Success(id)
             }
         } catch (e: Exception) {
@@ -710,6 +726,15 @@ class ZerodhaClient(private val config: ConfigManager) {
                 }
                 val id = j.getAsJsonObject("data")?.get("trigger_id")?.asLong ?: 0L
                 Log.i(TAG, "GTT created id=$id type=$type $tradingsymbol trigs=$triggerValues")
+                com.signalscope.app.data.GttActivityLog.append(
+                    config.appContext, "create", symbol = tradingsymbol,
+                    fields = mapOf(
+                        "id" to id,
+                        "type" to type,
+                        "trigs" to triggerValues.joinToString(","),
+                        "lastPrice" to lastPrice
+                    )
+                )
                 GttCreateResult.Success(id)
             }
         } catch (e: Exception) {

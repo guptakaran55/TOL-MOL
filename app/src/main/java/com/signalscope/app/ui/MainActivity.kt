@@ -496,11 +496,35 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun hasAiEnabled(): Boolean = config.hasLlmCredentials
 
+        /** Read the most recent [limit] entries from the GTT activity audit log
+         *  (newest first). Returns a JSON array of {ts, action, sym, …} objects. */
+        @JavascriptInterface
+        fun getGttActivityLog(limit: Int = 500): String {
+            return try {
+                com.signalscope.app.data.GttActivityLog.readRecent(applicationContext, limit).toString()
+            } catch (e: Exception) {
+                Log.e(TAG, "getGttActivityLog failed", e)
+                "[]"
+            }
+        }
+
+        /** Total event count in the activity log (for the audit modal header). */
+        @JavascriptInterface
+        fun getGttActivityCount(): Int =
+            com.signalscope.app.data.GttActivityLog.count(applicationContext)
+
+        /** Wipe the activity log — exposed in case the user wants a clean slate
+         *  before a fresh trading session. */
+        @JavascriptInterface
+        fun clearGttActivityLog() {
+            com.signalscope.app.data.GttActivityLog.clear(applicationContext)
+        }
+
         /** Fetch GTT execution history for calibration insights */
         @JavascriptInterface
         fun fetchGttExecutionData(): String {
             return try {
-                val summary = zerodhaClient.analyzeGttExecutionHistory()
+                val summary = com.signalscope.app.network.ZerodhaClient(config).analyzeGttExecutionHistory()
                 if (summary == null) {
                     "{\"error\": \"Failed to fetch GTT data\"}"
                 } else {
