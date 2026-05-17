@@ -172,6 +172,76 @@ class ConfigManager(context: Context) {
         else ""
 
     // ═══════════════════════════════════════════════════════
+    // TRADING 212 CREDENTIALS  (US-space broker, Phase 2A scaffolding)
+    // ═══════════════════════════════════════════════════════
+    //
+    // NOTE on auth model:
+    //   T212's public REST API uses a single bearer token (just the API key).
+    //   We store both `t212ApiKey` and `t212ApiSecret` for forward-compat —
+    //   the user's account dashboard exposed both, and storing both costs
+    //   nothing. Trading212Client uses only `t212ApiKey` in the Authorization
+    //   header for now. If T212 ever introduces signed requests requiring a
+    //   secret, the field is already plumbed.
+    //
+    // Base URL: T212 has separate live + demo environments.
+    //   live → https://live.trading212.com/api/v0
+    //   demo → https://demo.trading212.com/api/v0
+    // The "useLive" flag picks one — defaults to demo so an API-key typo
+    // can't accidentally hit a real account.
+
+    var t212ApiKey: String
+        get() = encrypted.getString("T212_API_KEY", "") ?: ""
+        set(v) = encrypted.edit().putString("T212_API_KEY", v).apply()
+
+    var t212ApiSecret: String
+        get() = encrypted.getString("T212_API_SECRET", "") ?: ""
+        set(v) = encrypted.edit().putString("T212_API_SECRET", v).apply()
+
+    /** Always live — demo endpoint removed. The user only ever uses the live
+     *  T212 account (read+order); demo endpoint was only ever a footgun (it
+     *  rejected live keys with confusing 401s). Field still exists for any
+     *  future code that reads it; always returns true. */
+    val t212UseLive: Boolean get() = true
+
+    val t212BaseUrl: String
+        get() = "https://live.trading212.com/api/v0"
+
+    /** Simulate-only mode for T212 orders. When TRUE (default), order-placement
+     *  bridges write to the GTT audit log with action="simulate" and return a
+     *  fake order id WITHOUT calling the real T212 API. Lets the user watch
+     *  the engine's decisions for a week before any real money is at stake.
+     *  Flip OFF in Settings → "Trading 212 — go live" once you trust the
+     *  decisions you see in the audit log. */
+    var t212SimulateOnly: Boolean
+        get() = prefs.getBoolean("t212_simulate_only", true)
+        set(v) = prefs.edit().putBoolean("t212_simulate_only", v).apply()
+
+    /** T212 uses HTTP Basic auth — Authorization: Basic base64(key:secret).
+     *  Both fields are required; the API rejects empty-secret basic auth
+     *  with 401. Verified against working Python reference script. */
+    val hasT212Credentials: Boolean
+        get() = t212ApiKey.isNotBlank() && t212ApiSecret.isNotBlank()
+
+    // ═══════════════════════════════════════════════════════
+    // SPACE / WORKSPACE  (which broker space the UI is currently in)
+    // ═══════════════════════════════════════════════════════
+
+    /** Current workspace: "IN" (Zerodha / NSE), "US" (Trading 212 / NASDAQ),
+     *  or "DE" (Trading 212 / Xetra).
+     *  Persisted across app restarts so the user lands back where they left. */
+    var currentSpace: String
+        get() {
+            val s = (prefs.getString("current_space", "IN") ?: "IN").uppercase()
+            return if (s == "IN" || s == "US" || s == "DE") s else "IN"
+        }
+        set(v) {
+            val s = v.uppercase()
+            if (s == "IN" || s == "US" || s == "DE") {
+                prefs.edit().putString("current_space", s).apply()
+            }
+        }
+
+    // ═══════════════════════════════════════════════════════
     // LLM / AI CREDENTIALS (for stock analysis via news)
     // ═══════════════════════════════════════════════════════
 
@@ -236,7 +306,23 @@ class ConfigManager(context: Context) {
         get() {
             val json = prefs.getString("scoring_weights", null) ?: return ScoringWeights()
             return try {
-                gson.fromJson(json, ScoringWeights::class.java)
+                val parsed = gson.fromJson(json, ScoringWeights::class.java)
+                val obj = com.google.gson.JsonParser.parseString(json).asJsonObject
+                val d = ScoringWeights()
+                var fixed = parsed
+                if (!obj.has("setupMacdLowPctMin")) {
+                    fixed = fixed.copy(setupMacdLowPctMin = d.setupMacdLowPctMin)
+                }
+                if (!obj.has("setupMacdPctlMax")) {
+                    fixed = fixed.copy(setupMacdPctlMax = d.setupMacdPctlMax)
+                }
+                if (kotlin.math.abs(fixed.minSlopeMagnitude) <= 5.0 && kotlin.math.abs(fixed.goldenBuyMaxSlope) <= 5.0) {
+                    fixed = fixed.copy(
+                        minSlopeMagnitude = d.minSlopeMagnitude,
+                        goldenBuyMaxSlope = d.goldenBuyMaxSlope
+                    )
+                }
+                fixed
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to parse scoring weights, using defaults", e)
                 ScoringWeights()
@@ -249,7 +335,12 @@ class ConfigManager(context: Context) {
     // read. SessionWeights.override is cleared on every process start (session-only).
     var scoringWeights: ScoringWeights
         get() = SessionWeights.override ?: persistedScoringWeights
-        set(v) = prefs.edit().putString("scoring_weights", gson.toJson(v)).apply()
+        set(v) {
+            prefs.edit().putString("scoring_weights", gson.toJson(v)).apply()
+            // Saving new Settings defaults should take effect immediately rather than
+            // leaving an older Setups-tab session override in control until restart.
+            SessionWeights.override = null
+        }
 
     fun resetScoringWeights() {
         prefs.edit().remove("scoring_weights").apply()
@@ -291,6 +382,65 @@ class ConfigManager(context: Context) {
     var slLimitPct: Double
         get() = prefs.getFloat("sl_limit_pct", 0.02f).toDouble()
         set(v) = prefs.edit().putFloat("sl_limit_pct", v.toFloat()).apply()
+
+    /**
+     * Emergency hard stop for newly detected Zerodha holdings.
+     *
+     * 0.05 means the first protective SELL GTT is placed around entry * 0.95.
+     * The same floor is reused by later OCO creation/trailing so the app has one
+     * consistent "never leave me less protected than this" baseline.
+     */
+    var newPositionHardStopPct: Double
+        get() = prefs.getFloat("new_position_hard_stop_pct", 0.05f).toDouble()
+        set(v) = prefs.edit().putFloat("new_position_hard_stop_pct", v.toFloat()).apply()
+
+    val newPositionHardStopFraction: Double
+        get() = (1.0 - newPositionHardStopPct.coerceIn(0.01, 0.25)).coerceIn(0.75, 0.99)
+
+    /**
+     * Optional fixed chandelier ATR multiple for stop-loss placement/trailing.
+     *
+     * 0.0 keeps the existing automatic gain-tiered formula:
+     *   <=5%: 3.0, <=10%: 2.5, <=20%: 2.0, <=30%: 1.5, else: 1.0.
+     *
+     * Any positive value overrides the tiers. Example: 1.2 gives a tighter,
+     * more conservative stop.
+     */
+    var slChandelierFixedAtrMultiple: Double
+        get() = prefs.getFloat("sl_chandelier_fixed_atr_multiple", 0.0f).toDouble()
+        set(v) = prefs.edit().putFloat("sl_chandelier_fixed_atr_multiple", v.toFloat()).apply()
+
+    /** Time-decay factor after a position has gone >=10 days without a fresh peak. */
+    var slTimeDecay10dFactor: Double
+        get() = prefs.getFloat("sl_time_decay_10d_factor", 0.80f).toDouble()
+        set(v) = prefs.edit().putFloat("sl_time_decay_10d_factor", v.toFloat()).apply()
+
+    /** Time-decay factor after a position has gone >=20 days without a fresh peak. */
+    var slTimeDecay20dFactor: Double
+        get() = prefs.getFloat("sl_time_decay_20d_factor", 0.60f).toDouble()
+        set(v) = prefs.edit().putFloat("sl_time_decay_20d_factor", v.toFloat()).apply()
+
+    /** Shared stop-loss chandelier multiplier used by Settings, India, US, and Germany flows. */
+    fun slChandelierAtrMultiple(gainFraction: Double, daysSincePeak: Long = 0L): Double {
+        var mult = if (slChandelierFixedAtrMultiple > 0.0) {
+            slChandelierFixedAtrMultiple
+        } else {
+            when {
+                gainFraction <= 0.05 -> 3.0
+                gainFraction <= 0.10 -> 2.5
+                gainFraction <= 0.20 -> 2.0
+                gainFraction <= 0.30 -> 1.5
+                else -> 1.0
+            }
+        }
+
+        mult *= when {
+            daysSincePeak >= 20 -> slTimeDecay20dFactor.coerceIn(0.10, 1.00)
+            daysSincePeak >= 10 -> slTimeDecay10dFactor.coerceIn(0.10, 1.00)
+            else -> 1.0
+        }
+        return mult.coerceIn(0.20, 8.00)
+    }
 
     /** Epoch ms of last successful daily tick — prevents double-runs within one trading day. */
     var lastDailyTickEpoch: Long

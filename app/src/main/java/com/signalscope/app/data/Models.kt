@@ -65,12 +65,33 @@ data class StockAnalysis(
     val macdSignal: Double,
     val macdHist: Double,
     val macdSlope: Double,
+    /** Signed absolute angle derived from raw d(MACD)/dt via atan(slope). */
+    val macdSlopeAngle: Double = 0.0,
     val macdAccel: Double,
     val macdPctl: Double,
     val macdLowPct: Double,
     val macd1yLow: Double,
     val macdPhase: String,
     val macdCurve: List<Double> = emptyList(),
+    val smoothMacdCurve: List<Double> = emptyList(),
+    val smoothMacdSlope: Double = 0.0,
+    val smoothMacdPrevSlope: Double = 0.0,
+    val smoothMacdAccel: Double = 0.0,
+    val smoothMacdLowDistPct: Double = 0.0,
+    val smoothMacdHook: Boolean = false,
+    val smoothMacdPrevSavedSlope: Double? = null,
+    val smoothMacdTurnedPositiveToday: Boolean = false,
+    val smoothMacdTurnSourceTimestamp: Long = 0L,
+
+    // 252-session price trend strip for the detail/discovery UI. Raw price is
+    // kept alongside a local-linear Kalman smooth so the chart can show both
+    // actual movement and the filtered trajectory without recomputing on JS.
+    val priceCurve: List<Double> = emptyList(),
+    val kalmanCurve: List<Double> = emptyList(),
+    val kalmanSlope: Double = 0.0,        // smoothed daily percent slope
+    val kalmanTrendPct: Double = 0.0,     // smoothed horizon return
+    val kalmanRegime: String = "UNKNOWN",
+    val kalmanHorizonDays: Int = 0,
 
     // Adaptive MACD-watchdog time filter (days). Derived from each stock's
     // 6-month histogram oscillation period. Fast midcaps → 3; slow large-caps → 15+.
@@ -84,6 +105,8 @@ data class StockAnalysis(
 
     val ema21: Double?,
     val ema21PctDiff: Double,
+    val ema200: Double? = null,
+    val ema200Slope: Double = 0.0,
     val avgVol20: Double,
 
     // Today's (most-recent candle) raw volume — needed by the dynamic Soft Sniper
@@ -132,18 +155,54 @@ data class StockAnalysis(
     val obvDivergence: Boolean = false,
     val obvWeakness: Boolean = false,
 
+    /** Pre-formatted per-bucket trace for the "Why this score?" detail panel
+     *  in the dashboard. Pipe-delimited rows (bucket|status|points|max|reason),
+     *  newline-separated. Empty string when not built (older cached analysis). */
+    val buyScoreReport: String = "",
+
+    /** Read-only qualified MACD setup checklist for the detail modal.
+     *  Pipe rows: label|pass|value|required. Empty for older cached analysis. */
+    val goldenBuyReport: String = "",
+
+    /** Lightweight first-pass style fit:
+     *  swingScore = suitability for repeated support/resistance wave riding.
+     *  longTermScore = suitability for slower trend-hold behaviour.
+     *  These are heuristic scan-time scores, not a full spectral/Hurst study. */
+    val swingScore: Int = 0,
+    val longTermScore: Int = 0,
+    val styleLabel: String = "MIXED",      // "RIDE" / "HOLD" / "MIXED" / "WEAK"
+    val styleReason: String = "",
+    val macdCycleDays: Double = 0.0,       // estimated MACD histogram cycle period, days
+    val returnAutocorr1: Double = 0.0,     // lag-1 daily-return autocorrelation
+    val styleScoreReport: String = "",
+
     // ── Value Analysis (fundamental) ──
     val trailingPe: Double? = null,
+    val forwardPe: Double? = null,
     val priceToBook: Double? = null,
     val evToEbitda: Double? = null,
     val debtToEquity: Double? = null,
-    val roce: Double? = null,             // Return on Capital Employed
+    val roce: Double? = null,             // Yahoo ROE proxy, as percentage
+    val revenueGrowth: Double? = null,    // as percentage
+    val earningsGrowth: Double? = null,   // as percentage
+    val grossMargins: Double? = null,     // as percentage
+    val operatingMargins: Double? = null, // as percentage
+    val profitMargins: Double? = null,    // as percentage
     val dividendYield: Double? = null,    // as percentage
     val operatingCashflow: Double? = null,
+    val freeCashflow: Double? = null,
     val netIncome: Double? = null,
+    val totalRevenue: Double? = null,
+    val totalCash: Double? = null,
+    val totalDebt: Double? = null,
+    val currentRatio: Double? = null,
+    val annualRevenueGrowth: Double? = null,
+    val annualNetIncomeGrowth: Double? = null,
     val fiftyTwoWeekLow: Double? = null,
     val fiftyTwoWeekHigh: Double? = null,
     val sharesOutstanding: Long? = null,
+    val sector: String? = null,
+    val industry: String? = null,
     val sectorMedianPe: Double? = null,   // populated per-scan from sector grouping
     val hasBuyback: Boolean = false,
 
@@ -155,7 +214,8 @@ data class StockAnalysis(
     val projectedMidpoint: Double? = null,
 
     val valueScore: Int = 0,              // 0–100 fundamental value score
-    val valueRating: String = "N/A"       // "DEEP VALUE" / "MODERATE VALUE" / "MILD VALUE" / "NOT ATTRACTIVE" / "N/A"
+    val valueRating: String = "N/A",      // "DEEP VALUE" / "MODERATE VALUE" / "MILD VALUE" / "NOT ATTRACTIVE" / "N/A"
+    val valueScoreReport: String = ""     // bucket|max|reason rows for audit
 )
 
 // ═══════════════════════════════════════════════════════
@@ -238,7 +298,7 @@ data class DiscoveryScanResult(
     /** Stocks with buyScore ≥ 75 */
     val strongBuys: List<StockAnalysis>,
 
-    /** Stocks matching Golden Buy criteria */
+    /** Stocks matching qualified MACD setup criteria */
     val goldenBuys: List<StockAnalysis>,
 
     /** Setups: SMA pass + BUY FLIP or EARLY BUY phase */

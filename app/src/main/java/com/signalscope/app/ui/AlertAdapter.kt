@@ -48,10 +48,10 @@ class AlertAdapter : ListAdapter<StockAlert, AlertAdapter.VH>(DIFF) {
         val (stripColor, badgeText, badgeTextColor) = when (alert.alertType) {
             AlertType.STRONG_EXIT     -> Triple(0xFFdc2626.toInt(), "STRONG EXIT", 0xFFdc2626.toInt())
             AlertType.BOOK_PROFIT     -> Triple(0xFFf97316.toInt(), "BOOK PROFIT", 0xFFf97316.toInt())
-            AlertType.PROTECT_CAPITAL -> Triple(0xFFeab308.toInt(), "PROTECT", 0xFFeab308.toInt())
+            AlertType.PROTECT_CAPITAL -> Triple(0xFFeab308.toInt(), "TREND BROKEN", 0xFFeab308.toInt())
             AlertType.PEAK_WARNING    -> Triple(0xFF8b5cf6.toInt(), "PEAK WARNING", 0xFF8b5cf6.toInt())
+            AlertType.GOLDEN_BUY      -> Triple(0xFF0891b2.toInt(), "MACD SETUP", 0xFF0891b2.toInt())
             AlertType.MACD_FLIP       -> Triple(0xFFb91c1c.toInt(), "🚨 MACD FLIP", 0xFFb91c1c.toInt())
-            AlertType.GOLDEN_BUY      -> Triple(0xFFd97706.toInt(), "★ GOLDEN", 0xFFd97706.toInt())
             AlertType.STRONG_BUY      -> Triple(0xFF059669.toInt(), "BUY", 0xFF059669.toInt())
             // Legacy types (deprecated but kept for existing alerts in memory)
             else -> Triple(0xFF64748b.toInt(), alert.alertType.name, 0xFF64748b.toInt())

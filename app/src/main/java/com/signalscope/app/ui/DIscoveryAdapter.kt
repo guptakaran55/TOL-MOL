@@ -47,13 +47,13 @@ class DiscoveryAdapter : ListAdapter<StockAnalysis, DiscoveryAdapter.VH>(DIFF) {
             (row1.getChildAt(0) as? TextView)?.text = s.symbol
             (row1.getChildAt(1) as? TextView)?.apply {
                 text = when {
-                    s.goldenBuy -> "★ GOLDEN"
+                    s.goldenBuy -> "MACD SETUP"
                     s.buyScore >= 75 -> "STRONG BUY"
                     s.buyScore >= 60 -> "MOD BUY"
                     else -> "—"
                 }
                 setTextColor(when {
-                    s.goldenBuy -> 0xFFd97706.toInt()
+                    s.goldenBuy -> 0xFF0891b2.toInt()
                     s.buyScore >= 75 -> 0xFF059669.toInt()
                     s.buyScore >= 60 -> 0xFF0891b2.toInt()
                     else -> 0xFF94a3b8.toInt()

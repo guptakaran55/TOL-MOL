@@ -325,27 +325,15 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
         else
             "HOLD is NOT a valid verdict — the user does NOT own this stock, so you must commit to a directional call (BUY / WATCH / AVOID). Do not output HOLD under any circumstances."
 
-        val trendDesc = if (sma200 != null) {
-            val aboveBelow = if (price > sma200) "ABOVE" else "BELOW"
-            val pctFromSma = ((price - sma200) / sma200 * 100)
-            "Price is $aboveBelow SMA(200) by ${String.format("%.1f", kotlin.math.abs(pctFromSma))}% (SMA200 = ₹${String.format("%.2f", sma200)})"
-        } else "SMA(200) not available (short history)"
-
-        // MACD slope sign encodes momentum direction; macdPhase gives the qualitative phase.
-        val macdSlopeDir = when {
-            macdSlope > 0.01 -> "rising"
-            macdSlope < -0.01 -> "falling"
-            else -> "flat"
-        }
-
         val system = """You are a stock market analyst providing outlook summaries for Indian NSE stocks.
 Form your own independent opinion based PRIMARILY on recent news and publicly known fundamentals.
 Headlines are listed in chronological order (most recent first) — prioritize those heavily over older news.
-Do NOT assume any prior bullish or bearish bias — you are only given trend (price vs SMA200), MACD phase, and headlines.
+Do NOT assume any prior bullish or bearish bias — you are given current price, ownership status, and headlines only. Critically assess both risks and opportunities.
+Do not infer or mention app technical indicators unless they are explicitly present in the news headlines.
 
 Give a structured response:
-1. SHORT TERM (1-4 weeks): News-driven outlook combined with the given MACD phase
-2. LONG TERM (3-12 months): Trend (price vs SMA200) + fundamental narrative from news
+1. SHORT TERM (1-4 weeks): News-driven outlook
+2. LONG TERM (3-12 months): Fundamental narrative from recent news and publicly known context
 3. KEY RISKS: 1-2 bullet points from recent developments
 4. VERDICT: One of: $allowedVerdicts
 
@@ -357,9 +345,11 @@ Keep each section to 2-3 sentences max. Be specific about price levels when poss
             append("Stock: $symbol (NSE India)\n")
             append("Current Price: ₹${String.format("%.2f", price)}\n")
             append("User currently owns this: ${if (isInPortfolio) "YES" else "NO"}\n\n")
-            append("── Minimal Technical Context ──\n")
-            append("Trend: $trendDesc\n")
-            append("MACD Phase: $macdPhase (slope $macdSlopeDir)\n\n")
+            // Technical context intentionally withheld here to keep the LLM
+            // outlook independent from app-generated SMA/MACD bias.
+            // append("── Minimal Technical Context ──\n")
+            // append("Trend: ...\n")
+            // append("MACD Phase: ...\n\n")
             if (headlines.isNotEmpty()) {
                 append("── Recent News Headlines (prioritize items from the last 30 days) ──\n")
                 headlines.forEachIndexed { i, h -> append("[${i + 1}] $h\n") }
@@ -374,8 +364,8 @@ Keep each section to 2-3 sentences max. Be specific about price levels when poss
             append("Do not reference any app-generated scoring.")
         }
         // NOTE: buyScore / profitScore / protectScore / sellIntent / rrRatio / rsi / ema21PctDiff /
-        // priceVel parameters are deliberately NOT passed to the LLM — per the LLM-outlook rework:
-        // keep context minimal (trend + MACD phase + news), drop RSI/EMA21/velocity/ADX/OBV/BB.
+        // priceVel / SMA200 / MACD parameters are deliberately NOT passed to the LLM — per the
+        // LLM-outlook rework: keep context minimal (price + ownership + news), drop technicals.
         // The params remain in the signature for backward compat with the JS bridge in MainActivity.
 
         return callLlm(config, system, user)

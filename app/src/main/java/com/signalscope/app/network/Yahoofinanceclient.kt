@@ -3,6 +3,7 @@ package com.signalscope.app.network
 
 import android.util.Log
 import com.signalscope.app.data.CandleData
+import com.google.gson.JsonParser
 import okhttp3.*
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -236,7 +237,7 @@ object YahooFinanceClient {
      * For US stocks (NASDAQ): uses symbol as-is.
      *
      * @param symbol  Trading symbol e.g. "RELIANCE" or "AAPL"
-     * @param exchange "NSE", "BSE", or "NASDAQ" — determines Yahoo suffix
+     * @param exchange "NSE", "BSE", "NASDAQ", or "DE"/"XETRA" — determines Yahoo suffix
      */
     fun fetchCandles(symbol: String, exchange: String = "NSE"): CandleResult {
         val yahooSymbol = toYahooSymbol(symbol, exchange)
@@ -432,16 +433,96 @@ object YahooFinanceClient {
         val debtToEquity: Double? = null,
         val returnOnEquity: Double? = null,    // ROE as decimal (0.15 = 15%)
         val returnOnAssets: Double? = null,
-        val dividendYield: Double? = null,      // as decimal (0.03 = 3%)
+        val revenueGrowth: Double? = null,      // as percentage
+        val earningsGrowth: Double? = null,     // as percentage
+        val grossMargins: Double? = null,       // as percentage
+        val operatingMargins: Double? = null,   // as percentage
+        val profitMargins: Double? = null,      // as percentage
+        val dividendYield: Double? = null,      // as percentage
         val operatingCashflow: Double? = null,
+        val freeCashflow: Double? = null,
         val totalRevenue: Double? = null,
         val netIncome: Double? = null,          // from incomeStatementHistory
+        val totalCash: Double? = null,
+        val totalDebt: Double? = null,
+        val currentRatio: Double? = null,
+        val annualRevenueGrowth: Double? = null,
+        val annualNetIncomeGrowth: Double? = null,
         val fiftyTwoWeekLow: Double? = null,
         val fiftyTwoWeekHigh: Double? = null,
         val sharesOutstanding: Long? = null,
         val sector: String? = null,
         val industry: String? = null
     )
+
+    // ── Symbol autocomplete (Yahoo's `/v1/finance/search` endpoint) ──────────
+    // Used by the Discovery search box so the user can type a partial name
+    // ("TATA") and pick from a dropdown of matches, instead of having to
+    // know the exact ticker. Endpoint is unauthenticated but lightly rate-
+    // limited; we cap quotesCount=10 to keep responses small.
+    data class SearchHit(
+        val symbol: String,         // raw Yahoo symbol incl. .NS / .BO suffix
+        val name: String,           // shortname → longname fallback
+        val exchange: String,       // exchDisp ("NSI", "NMS", "NYQ", …)
+        val quoteType: String       // "EQUITY", "ETF", "MUTUALFUND", …
+    )
+
+    sealed class SearchResult {
+        data class Success(val hits: List<SearchHit>) : SearchResult()
+        object RateLimited : SearchResult()
+        data class Error(val message: String) : SearchResult()
+    }
+
+    fun searchSymbols(query: String, region: String = "IN"): SearchResult {
+        val q = query.trim()
+        if (q.length < 2) return SearchResult.Success(emptyList())
+        return try {
+            val url = HttpUrl.Builder()
+                .scheme("https")
+                .host("query1.finance.yahoo.com")
+                .addPathSegments("v1/finance/search")
+                .addQueryParameter("q", q)
+                .addQueryParameter("lang", "en-US")
+                .addQueryParameter("region", region)
+                .addQueryParameter("quotesCount", "10")
+                .addQueryParameter("newsCount", "0")
+                .addQueryParameter("enableFuzzyQuery", "true")
+                .build()
+            val request = Request.Builder()
+                .url(url)
+                .addHeader(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0"
+                )
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (resp.code == 429) return SearchResult.RateLimited
+                if (!resp.isSuccessful) return SearchResult.Error("HTTP ${resp.code}")
+                val body = resp.body?.string() ?: return SearchResult.Error("empty response")
+                val root = JsonParser.parseString(body).asJsonObject
+                val arr = root.getAsJsonArray("quotes") ?: return SearchResult.Success(emptyList())
+                val hits = arr.mapNotNull { el ->
+                    try {
+                        val o = el.asJsonObject
+                        // Filter junk: only keep equities / ETFs (skip currencies, futures, indices)
+                        val qt = o.get("quoteType")?.asString ?: return@mapNotNull null
+                        if (qt !in setOf("EQUITY", "ETF", "MUTUALFUND")) return@mapNotNull null
+                        val sym = o.get("symbol")?.asString ?: return@mapNotNull null
+                        val name = o.get("shortname")?.asString
+                            ?: o.get("longname")?.asString ?: sym
+                        val ex = o.get("exchDisp")?.asString
+                            ?: o.get("exchange")?.asString ?: ""
+                        SearchHit(sym, name, ex, qt)
+                    } catch (e: Exception) { null }
+                }
+                SearchResult.Success(hits)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "searchSymbols failed for '$q'", e)
+            SearchResult.Error(e.message ?: "unknown")
+        }
+    }
 
     sealed class FundamentalResult {
         data class Success(val data: FundamentalData) : FundamentalResult()
@@ -452,7 +533,8 @@ object YahooFinanceClient {
 
     /**
      * Fetch fundamental data from Yahoo Finance quoteSummary API.
-     * Modules: defaultKeyStatistics, financialData, summaryDetail, assetProfile
+     * Modules include snapshot valuation, balance-sheet quality, and annual
+     * income/cash-flow history for the Value Score.
      */
     fun fetchFundamentals(symbol: String, exchange: String = "NSE"): FundamentalResult {
         val yahooSymbol = toYahooSymbol(symbol, exchange)
@@ -468,7 +550,11 @@ object YahooFinanceClient {
                 .scheme("https")
                 .host("query2.finance.yahoo.com")
                 .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
-                .addQueryParameter("modules", "defaultKeyStatistics,financialData,summaryDetail,assetProfile")
+                .addQueryParameter(
+                    "modules",
+                    "defaultKeyStatistics,financialData,summaryDetail,assetProfile," +
+                            "incomeStatementHistory,cashflowStatementHistory,balanceSheetHistory,earningsTrend"
+                )
                 .addQueryParameter("crumb", crumb)
                 .build()
 
@@ -532,6 +618,8 @@ object YahooFinanceClient {
             val finData = r.optJSONObject("financialData")
             val summaryDetail = r.optJSONObject("summaryDetail")
             val profile = r.optJSONObject("assetProfile")
+            val incomeHistory = r.optJSONObject("incomeStatementHistory")
+            val balanceHistory = r.optJSONObject("balanceSheetHistory")
 
             fun JSONObject?.rawVal(key: String): Double? {
                 val obj = this?.optJSONObject(key) ?: return null
@@ -545,6 +633,28 @@ object YahooFinanceClient {
                 return if (v == -1L) null else v
             }
 
+            fun statementValues(module: JSONObject?, arrayName: String, key: String): List<Double> {
+                val arr = module?.optJSONArray(arrayName) ?: return emptyList()
+                val values = mutableListOf<Double>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i)
+                    val v = item.rawVal(key)
+                    if (v != null && !v.isNaN() && !v.isInfinite()) values += v
+                }
+                return values
+            }
+
+            fun longGrowthPct(values: List<Double>): Double? {
+                if (values.size < 2) return null
+                val latest = values.first()
+                val oldest = values.last()
+                if (oldest == 0.0) return null
+                return ((latest - oldest) / kotlin.math.abs(oldest)) * 100.0
+            }
+
+            val annualRevenues = statementValues(incomeHistory, "incomeStatementHistory", "totalRevenue")
+            val annualNetIncomes = statementValues(incomeHistory, "incomeStatementHistory", "netIncome")
+
             val data = FundamentalData(
                 trailingPe = summaryDetail.rawVal("trailingPE") ?: keyStats.rawVal("trailingPE"),
                 forwardPe = summaryDetail.rawVal("forwardPE") ?: keyStats.rawVal("forwardPE"),
@@ -553,10 +663,27 @@ object YahooFinanceClient {
                 debtToEquity = finData.rawVal("debtToEquity")?.let { it / 100.0 }, // Yahoo returns as %, normalize
                 returnOnEquity = finData.rawVal("returnOnEquity"),
                 returnOnAssets = finData.rawVal("returnOnAssets"),
+                revenueGrowth = finData.rawVal("revenueGrowth")?.let { it * 100.0 },
+                earningsGrowth = finData.rawVal("earningsGrowth")?.let { it * 100.0 },
+                grossMargins = finData.rawVal("grossMargins")?.let { it * 100.0 },
+                operatingMargins = finData.rawVal("operatingMargins")?.let { it * 100.0 },
+                profitMargins = finData.rawVal("profitMargins")?.let { it * 100.0 },
                 dividendYield = summaryDetail.rawVal("dividendYield")?.let { it * 100.0 }, // convert decimal → %
                 operatingCashflow = finData.rawVal("operatingCashflow"),
+                freeCashflow = finData.rawVal("freeCashflow"),
                 totalRevenue = finData.rawVal("totalRevenue"),
                 netIncome = finData.rawVal("netIncome") ?: keyStats.rawVal("netIncomeToCommon"),
+                totalCash = finData.rawVal("totalCash") ?: balanceHistory
+                    ?.optJSONArray("balanceSheetStatements")
+                    ?.optJSONObject(0)
+                    .rawVal("cash"),
+                totalDebt = finData.rawVal("totalDebt") ?: balanceHistory
+                    ?.optJSONArray("balanceSheetStatements")
+                    ?.optJSONObject(0)
+                    .rawVal("totalDebt"),
+                currentRatio = finData.rawVal("currentRatio"),
+                annualRevenueGrowth = longGrowthPct(annualRevenues),
+                annualNetIncomeGrowth = longGrowthPct(annualNetIncomes),
                 fiftyTwoWeekLow = summaryDetail.rawVal("fiftyTwoWeekLow"),
                 fiftyTwoWeekHigh = summaryDetail.rawVal("fiftyTwoWeekHigh"),
                 sharesOutstanding = keyStats.rawLong("sharesOutstanding"),
@@ -578,6 +705,7 @@ object YahooFinanceClient {
      * NSE stocks: RELIANCE -> RELIANCE.NS
      * BSE stocks: RELIANCE -> RELIANCE.BO
      * US stocks: AAPL -> AAPL (no suffix)
+     * German stocks: SAP -> SAP.DE
      *
      * Some Indian stocks have special characters that Yahoo handles differently.
      */
@@ -588,6 +716,7 @@ object YahooFinanceClient {
         return when (exchange.uppercase()) {
             "BSE" -> "$symbol.BO"
             "NASDAQ", "NYSE", "US" -> symbol
+            "DE", "XETRA", "GERMANY" -> "$symbol.DE"
             else -> "$symbol.NS" // default to NSE
         }
     }

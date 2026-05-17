@@ -33,6 +33,13 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var tvZerodhaStatus: TextView
     private lateinit var layoutZerodhaToken: View
 
+    // ── Trading 212 fields (US space) ──
+    private lateinit var etT212ApiKey: EditText
+    private lateinit var etT212ApiSecret: EditText
+    private lateinit var switchT212SimulateOnly: Switch
+    private lateinit var btnT212Test: Button
+    private lateinit var tvT212Status: TextView
+
     // ── Config fields ──
     private lateinit var spinnerInterval: Spinner
     private lateinit var switchMarketHours: Switch
@@ -49,6 +56,11 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etSoftSniperLooseBufferPct: EditText
     private lateinit var etSoftSniperVolSpikeMult: EditText
     private lateinit var etSoftSniperVolWeakMult: EditText
+    private lateinit var etSlLimitPct: EditText
+    private lateinit var etNewPositionHardStopPct: EditText
+    private lateinit var etSlChandelierFixedAtrMultiple: EditText
+    private lateinit var etSlTimeDecay10dFactor: EditText
+    private lateinit var etSlTimeDecay20dFactor: EditText
     private lateinit var switchAutoTrailingTarget: android.widget.Switch
     private lateinit var etTargetAtrMultiple: EditText
     private lateinit var etTargetMaxDailyStepPct: EditText
@@ -89,14 +101,28 @@ class SettingsActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 48)
         }
 
+        // Section headers track their position in `inner` so we can wire
+        // collapsibility AFTER the whole layout is built. Each header becomes
+        // clickable: tap to hide every view between it and the next header
+        // (exclusive). Connections sections (Zerodha / T212 / LLM) start
+        // expanded; the rest start expanded for now too — flipping a section
+        // to start-collapsed is a one-line change in the loop below if the
+        // user later wants the menu pre-collapsed.
+        val sectionHeaders = mutableListOf<TextView>()
+        val sectionStartIdx = mutableListOf<Int>()
         fun addSection(title: String) {
-            inner.addView(TextView(this).apply {
-                text = title
+            sectionStartIdx.add(inner.childCount)
+            val header = TextView(this).apply {
+                text = "▼ $title"
                 textSize = 16f
                 setTypeface(null, android.graphics.Typeface.BOLD)
                 setPadding(0, 32, 0, 8)
                 setTextColor(android.graphics.Color.parseColor("#059669"))
-            })
+                isClickable = true
+                isFocusable = true
+            }
+            inner.addView(header)
+            sectionHeaders.add(header)
         }
 
         fun addLabel(text: String) {
@@ -176,6 +202,39 @@ class SettingsActivity : AppCompatActivity() {
         btnZerodhaToken = addButton("✓ Submit Token")
         inner.addView(layoutZerodhaToken)
 
+        // ── Trading 212 section (US space) ──
+        addSection("🇺🇸 Trading 212 Credentials  (US space)")
+        inner.addView(TextView(this).apply {
+            text = "Paste your Trading 212 API key from the live or demo dashboard.\n" +
+                   "T212 docs: settings → API → generate token.\n" +
+                   "Phase 2A: read-only access (account balance, portfolio).\n" +
+                   "Order placement (Phase 2B) is not enabled yet."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("API Key (T212_API_KEY)")
+        etT212ApiKey = addField("Paste Trading 212 API key", isPassword = true)
+        addLabel("API Secret (T212_API_SECRET)  —  REQUIRED.  T212 uses HTTP Basic auth = base64(key:secret).")
+        etT212ApiSecret = addField("Paste Trading 212 API secret", isPassword = true)
+
+        switchT212SimulateOnly = Switch(this).apply {
+            text = "🎭 Simulate-only mode  (recommended ON until trust is built)"
+            setPadding(0, 12, 0, 0)
+        }
+        inner.addView(switchT212SimulateOnly)
+        inner.addView(TextView(this).apply {
+            text = "When ON: SL / target / buy orders are LOGGED to the GTT audit but NEVER actually sent to T212.\n" +
+                   "Watch the audit log for ~1 week. Once the decisions look sane, flip this OFF — then orders go live.\n" +
+                   "⚠ Live mode places real orders on your real T212 account. There is no demo fallback."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
+        btnT212Test = addButton("🔌 Test connection")
+        tvT212Status = addStatus()
+
         // ── Scan config section ──
         addSection("Scan Configuration")
 
@@ -217,13 +276,26 @@ class SettingsActivity : AppCompatActivity() {
         inner.addView(switchAutoCreateGtt)
         inner.addView(TextView(this).apply {
             text = "If you buy a stock and it has NO GTT by 15:20, the system creates one:\n" +
-                   "  • SL  = support level  (floored at −10% from your avg price)\n" +
+                   "  • SL  = support level  (floored by your hard-SL setting)\n" +
                    "  • TGT = resistance  (or wave projection ceiling if available)\n" +
                    "Protects gap-down overnight risk for same-day buys automatically."
             textSize = 10f
             setPadding(32, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#64748b"))
         })
+
+        inner.addView(TextView(this).apply {
+            text = "New-position hard SL (%) - default 5.0"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etNewPositionHardStopPct = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "5.0"
+            textSize = 13f
+        }
+        inner.addView(etNewPositionHardStopPct)
 
         switchAutoTrailing = Switch(this).apply {
             text = "Auto-trail SL upward as stock rises"
@@ -236,6 +308,73 @@ class SettingsActivity : AppCompatActivity() {
             textSize = 10f
             setPadding(32, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#64748b"))
+        })
+
+        inner.addView(TextView(this).apply {
+            text = "Stop-loss Chandelier Settings"
+            textSize = 12f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(16, 16, 0, 4)
+            setTextColor(android.graphics.Color.parseColor("#1f2937"))
+        })
+
+        inner.addView(TextView(this).apply {
+            text = "SL limit pad (%) - default 2.0"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etSlLimitPct = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "2.0"
+            textSize = 13f
+        }
+        inner.addView(etSlLimitPct)
+
+        inner.addView(TextView(this).apply {
+            text = "Fixed chandelier ATR multiple (0 = automatic tiers; 1.2 = tighter/conservative)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etSlChandelierFixedAtrMultiple = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.0"
+            textSize = 13f
+        }
+        inner.addView(etSlChandelierFixedAtrMultiple)
+
+        inner.addView(TextView(this).apply {
+            text = "10-day plateau decay factor (default 0.80)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etSlTimeDecay10dFactor = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.80"
+            textSize = 13f
+        }
+        inner.addView(etSlTimeDecay10dFactor)
+
+        inner.addView(TextView(this).apply {
+            text = "20-day plateau decay factor (default 0.60)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etSlTimeDecay20dFactor = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.60"
+            textSize = 13f
+        }
+        inner.addView(etSlTimeDecay20dFactor)
+
+        inner.addView(TextView(this).apply {
+            text = "Automatic tiers are 3.0 / 2.5 / 2.0 / 1.5 / 1.0 ATR as gains grow. Set a fixed ATR multiple only when you want one style across all holdings and all spaces."
+            textSize = 10f
+            setPadding(32, 4, 0, 12)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
         })
 
         switchAutoExit = Switch(this).apply {
@@ -545,10 +684,12 @@ class SettingsActivity : AppCompatActivity() {
             }
 
             val et = EditText(this).apply {
-                inputType = if (default is Double)
-                    InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-                else
+                inputType = if (default is Double) {
+                    val signed = if (key == "minSlopeMagnitude" || key == "setupSma200MinSlope") InputType.TYPE_NUMBER_FLAG_SIGNED else 0
+                    InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or signed
+                } else {
                     InputType.TYPE_CLASS_NUMBER
+                }
                 setTextColor(Color.BLACK)
                 textSize = 13f
                 setPadding(16, 8, 16, 8)
@@ -715,28 +856,32 @@ class SettingsActivity : AppCompatActivity() {
         addSubHeader(buySection, "2. MACD Inflection (mutually exclusive)")
         addSchemaNote(buySection,
             "Only the HIGHEST matching signal scores. Never summed.\n" +
-            "Golden Buy: MACD near 1Y low + slope flat + SMA200 rising → strongest\n" +
+            "Qualified MACD setup: MACD acceleration + angle inside setup band + MACD %ile not stretched + SMA200 slope above setup minimum → strongest\n" +
             "Zero-cross up: MACD crosses above zero with positive acceleration\n" +
             "Slope cross up: MACD slope flips from negative to positive\n" +
             "Early buy: MACD decelerating downward (bottom approaching)\n" +
             "Pctl bonus: added when MACD is in bottom 25% of its 1Y range")
-        addWeightRow(buySection, "buyGoldenBuyPts", "Golden Buy", defaults.buyGoldenBuyPts)
-        addWeightRow(buySection, "buyGoldenBonus", "Golden bonus", defaults.buyGoldenBonus)
+        addWeightRow(buySection, "buyGoldenBuyPts", "Qualified MACD setup", defaults.buyGoldenBuyPts)
+        addWeightRow(buySection, "buyGoldenBonus", "Setup bonus", defaults.buyGoldenBonus)
         addWeightRow(buySection, "buyMacdZeroCrossUpPts", "MACD zero-cross up", defaults.buyMacdZeroCrossUpPts)
         addWeightRow(buySection, "buySlopeCrossUpPts", "Slope cross up", defaults.buySlopeCrossUpPts)
         addWeightRow(buySection, "buyEarlyBuyPts", "Early buy", defaults.buyEarlyBuyPts)
         addWeightRow(buySection, "buyMacdPctlBonus", "MACD pctl bonus", defaults.buyMacdPctlBonus)
         addWeightRow(buySection, "buyMacdPctlThreshold", "Pctl threshold ≤", defaults.buyMacdPctlThreshold)
 
-        // -- MACD Slope Tunables (kept as plain editable defaults here; live sliders are in the Setups tab) --
-        addSubHeader(buySection, "MACD Slope Thresholds (defaults for Setups tab)")
+        // -- MACD Angle Tunables (kept as plain editable defaults here; live sliders are in the Setups tab) --
+        addSubHeader(buySection, "Setup Thresholds (defaults for Setups tab)")
         addSchemaNote(buySection,
             "These values act as the DEFAULTS for the Setups-tab sliders.\n" +
-            "d(MACD)/dt MIN: below this magnitude slope is considered flat — affects BUY FLIP / SELL FLIP detection.\n" +
-            "d(MACD)/dt MAX for Golden Buy: MACD slope must be at or below this (near-flat near a 1Y low) to qualify.\n" +
+            "MACD angle MIN: signed lower bound for atan(d(MACD)/dt). Negative catches MACD still falling but curving upward.\n" +
+            "MACD angle MAX for qualified setup: positive cap in degrees. High caps allow sudden-news surges without raw-slope clipping.\n" +
+            "d(SMA200)/dt MIN: default long-term-trend floor for Setups and qualified setup.\n" +
+            "MACD %ile max: default upper bound for the current MACD's position in its 1Y range.\n" +
             "Live adjustments happen on the Setups tab; those reset to these defaults on app reopen.")
-        addWeightRow(buySection, "minSlopeMagnitude", "d(MACD)/dt minimum", defaults.minSlopeMagnitude)
-        addWeightRow(buySection, "goldenBuyMaxSlope", "d(MACD)/dt max (Golden Buy)", defaults.goldenBuyMaxSlope)
+        addWeightRow(buySection, "minSlopeMagnitude", "MACD angle minimum (°)", defaults.minSlopeMagnitude)
+        addWeightRow(buySection, "goldenBuyMaxSlope", "MACD angle max (setup °)", defaults.goldenBuyMaxSlope)
+        addWeightRow(buySection, "setupSma200MinSlope", "d(SMA200)/dt minimum", defaults.setupSma200MinSlope)
+        addWeightRow(buySection, "setupMacdPctlMax", "MACD %ile ≤", defaults.setupMacdPctlMax)
 
         // -- RSI --
         addSubHeader(buySection, "3. RSI Oversold + Momentum Flip")
@@ -978,18 +1123,54 @@ class SettingsActivity : AppCompatActivity() {
         inner.addView(btnResetWeights)
 
         // ── Save button ──
+        // Pinned OUTSIDE the scroll/collapsible region so it stays visible
+        // even when the user collapses every section. Previously btnSave was
+        // a child of `inner`, which meant the LAST section's collapsibility
+        // range swallowed it (sectionEnd defaulted to inner.childCount).
         btnSave = Button(this).apply {
             text = "💾 Save Settings"
             val lp = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-            lp.topMargin = 32
+            lp.topMargin = 12
             layoutParams = lp
             setBackgroundColor(Color.parseColor("#059669"))
             setTextColor(Color.WHITE)
         }
-        inner.addView(btnSave)
 
+        // Make the scroll view fill remaining space so btnSave can pin below it.
+        scroll.layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
         scroll.addView(inner)
         layout.addView(scroll)
+        layout.addView(btnSave)   // pinned below the scroll — always visible
+
+        // ── Wire section collapsibility ──────────────────────────────────────
+        // Walk the captured (header, startIndex) pairs and bind a click handler
+        // that toggles visibility on every view between this header and the
+        // NEXT header (exclusive) — or to inner.childCount if this is the last.
+        // Capturing start indices at addSection time avoids the O(n²) cost of
+        // searching headers in inner.children on every click.
+        sectionHeaders.forEachIndexed { i, header ->
+            val title = header.text.toString().removePrefix("▼ ").removePrefix("▶ ")
+            val sectionStart = sectionStartIdx[i] + 1
+            val sectionEnd = if (i + 1 < sectionStartIdx.size) sectionStartIdx[i + 1]
+                             else inner.childCount
+            val children = (sectionStart until sectionEnd).map { inner.getChildAt(it) }
+            // Connections (first section = Zerodha) starts expanded.
+            // Trading 212 (second) and Scan Config (third) start expanded too.
+            // Heavier weight sections (4+) start COLLAPSED so the menu is short
+            // by default — user taps to expand the one they want to tune.
+            val startCollapsed = i >= 3
+            if (startCollapsed) {
+                children.forEach { it.visibility = View.GONE }
+                header.text = "▶ $title"
+            }
+            header.setOnClickListener {
+                val firstVisibleChild = children.firstOrNull()
+                val isExpanded = firstVisibleChild != null && firstVisibleChild.visibility != View.GONE
+                val newVis = if (isExpanded) View.GONE else View.VISIBLE
+                children.forEach { it.visibility = newVis }
+                header.text = (if (isExpanded) "▶ " else "▼ ") + title
+            }
+        }
 
         setupListeners()
         return layout
@@ -1028,11 +1209,63 @@ class SettingsActivity : AppCompatActivity() {
         }
 
         btnZerodhaToken.setOnClickListener { submitZerodhaToken() }
+
+        // ── Trading 212 connection test ──────────────────────────────────────
+        // Saves the API key first (so the test reflects what's typed, not what
+        // was saved last time), then ping /equity/account/cash on a background
+        // thread. Status TextView shows the result so the user knows whether
+        // their key + endpoint combo works before relying on it elsewhere.
+        btnT212Test.setOnClickListener {
+            config.t212ApiKey = etT212ApiKey.text.toString().trim()
+            config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
+            config.t212SimulateOnly = switchT212SimulateOnly.isChecked
+            if (!config.hasT212Credentials) {
+                tvT212Status.text = "❌ Both API key AND secret are required (Basic auth)"
+                tvT212Status.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                tvT212Status.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+            tvT212Status.text = "⏳ Testing LIVE endpoint…"
+            tvT212Status.setTextColor(android.graphics.Color.parseColor("#475569"))
+            tvT212Status.visibility = View.VISIBLE
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    try {
+                        com.signalscope.app.network.Trading212Client(config).fetchAccountSummary()
+                    } catch (e: Exception) {
+                        com.signalscope.app.network.Trading212Client.T212Result.Failure(
+                            e.message ?: "exception"
+                        )
+                    }
+                }
+                when (result) {
+                    is com.signalscope.app.network.Trading212Client.T212Result.Success -> {
+                        tvT212Status.text =
+                            "✅ Connected — cash $${"%.2f".format(result.data.cash)} · " +
+                            "free $${"%.2f".format(result.data.freeFunds)}"
+                        tvT212Status.setTextColor(android.graphics.Color.parseColor("#059669"))
+                    }
+                    is com.signalscope.app.network.Trading212Client.T212Result.Failure -> {
+                        tvT212Status.text = "❌ ${result.message}"
+                        tvT212Status.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                    }
+                    is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured -> {
+                        tvT212Status.text = "❌ API key missing"
+                        tvT212Status.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                    }
+                }
+            }
+        }
     }
 
     private fun loadCurrentValues() {
         etZerodhaApiKey.setText(config.zerodhaApiKey)
         etZerodhaApiSecret.setText(config.zerodhaApiSecret)
+
+        // T212 credentials (US space)
+        etT212ApiKey.setText(config.t212ApiKey)
+        etT212ApiSecret.setText(config.t212ApiSecret)
+        switchT212SimulateOnly.isChecked = config.t212SimulateOnly
 
         // Interval spinner
         spinnerInterval.setSelection(when (config.portfolioScanIntervalMin) {
@@ -1059,6 +1292,11 @@ class SettingsActivity : AppCompatActivity() {
         etSoftSniperLooseBufferPct.setText("%.2f".format(config.softSniperLooseBufferPct * 100.0))
         etSoftSniperVolSpikeMult.setText("%.2f".format(config.softSniperVolumeSpikeMultiple))
         etSoftSniperVolWeakMult.setText("%.2f".format(config.softSniperVolumeWeakMultiple))
+        etSlLimitPct.setText("%.2f".format(config.slLimitPct * 100.0))
+        etNewPositionHardStopPct.setText("%.2f".format(config.newPositionHardStopPct * 100.0))
+        etSlChandelierFixedAtrMultiple.setText("%.2f".format(config.slChandelierFixedAtrMultiple))
+        etSlTimeDecay10dFactor.setText("%.2f".format(config.slTimeDecay10dFactor))
+        etSlTimeDecay20dFactor.setText("%.2f".format(config.slTimeDecay20dFactor))
         switchAutoTrailingTarget.isChecked = config.autoTrailingTargetEnabled
         etTargetAtrMultiple.setText("%.2f".format(config.targetAtrMultiple))
         etTargetMaxDailyStepPct.setText("%.2f".format(config.targetMaxDailyStepPct * 100.0))
@@ -1080,8 +1318,8 @@ class SettingsActivity : AppCompatActivity() {
             tvZerodhaStatus.visibility = View.VISIBLE
         }
 
-        // Load scoring weights
-        loadWeightValues(config.scoringWeights)
+        // Load persisted scoring defaults, not the live Setups-tab session override.
+        loadWeightValues(config.persistedScoringWeights)
     }
 
     private fun loadWeightValues(w: ScoringWeights) {
@@ -1101,6 +1339,9 @@ class SettingsActivity : AppCompatActivity() {
             "buyObvPts" to w.buyObvPts, "buyEmaMaxPts" to w.buyEmaMaxPts,
             "buyStrongThreshold" to w.buyStrongThreshold, "buyModerateThreshold" to w.buyModerateThreshold,
             "minSlopeMagnitude" to w.minSlopeMagnitude, "goldenBuyMaxSlope" to w.goldenBuyMaxSlope,
+            "setupSma200MinSlope" to w.setupSma200MinSlope,
+            "setupMacdLowPctMin" to w.setupMacdLowPctMin,
+            "setupMacdPctlMax" to w.setupMacdPctlMax,
             // Profit Booking
             "profitSlopeCrossDnPts" to w.profitSlopeCrossDnPts, "profitEarlySellPts" to w.profitEarlySellPts,
             "profitMacdZeroCrossDnPts" to w.profitMacdZeroCrossDnPts, "profitMacdPctlBonus" to w.profitMacdPctlBonus,
@@ -1183,8 +1424,11 @@ class SettingsActivity : AppCompatActivity() {
             buyEmaMaxPts = readInt("buyEmaMaxPts", d.buyEmaMaxPts),
             buyStrongThreshold = readInt("buyStrongThreshold", d.buyStrongThreshold),
             buyModerateThreshold = readInt("buyModerateThreshold", d.buyModerateThreshold),
-            minSlopeMagnitude = readDouble("minSlopeMagnitude", d.minSlopeMagnitude),
-            goldenBuyMaxSlope = readDouble("goldenBuyMaxSlope", d.goldenBuyMaxSlope),
+            minSlopeMagnitude = readDouble("minSlopeMagnitude", d.minSlopeMagnitude).coerceIn(-89.0, 89.0),
+            goldenBuyMaxSlope = kotlin.math.abs(readDouble("goldenBuyMaxSlope", d.goldenBuyMaxSlope)).coerceIn(0.0, 89.0),
+            setupSma200MinSlope = readDouble("setupSma200MinSlope", d.setupSma200MinSlope),
+            setupMacdLowPctMin = readDouble("setupMacdLowPctMin", d.setupMacdLowPctMin).coerceIn(0.0, 100.0),
+            setupMacdPctlMax = readDouble("setupMacdPctlMax", d.setupMacdPctlMax).coerceIn(0.0, 100.0),
             profitSlopeCrossDnPts = readInt("profitSlopeCrossDnPts", d.profitSlopeCrossDnPts),
             profitEarlySellPts = readInt("profitEarlySellPts", d.profitEarlySellPts),
             profitMacdZeroCrossDnPts = readInt("profitMacdZeroCrossDnPts", d.profitMacdZeroCrossDnPts),
@@ -1254,6 +1498,11 @@ class SettingsActivity : AppCompatActivity() {
         config.zerodhaApiKey = etZerodhaApiKey.text.toString().trim()
         config.zerodhaApiSecret = etZerodhaApiSecret.text.toString().trim()
 
+        // Trading 212 (US space)
+        config.t212ApiKey = etT212ApiKey.text.toString().trim()
+        config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
+        config.t212SimulateOnly = switchT212SimulateOnly.isChecked
+
         // Scan config
         config.portfolioScanIntervalMin = when (spinnerInterval.selectedItemPosition) {
             0    -> 5
@@ -1296,6 +1545,18 @@ class SettingsActivity : AppCompatActivity() {
         // Trailing OCO target — defaults: ATR mult 2.0 (range 0.5–5.0),
         // max daily step 8% (range 1–25%). Tighter than 1% would block almost
         // every bump; wider than 25% defeats the anti-spike protection.
+        // Stop-loss / chandelier settings. 0 fixed ATR means "use automatic tiers".
+        val slLimitPadPct = etSlLimitPct.text.toString().toDoubleOrNull() ?: 2.0
+        val newHardStopPct = etNewPositionHardStopPct.text.toString().toDoubleOrNull() ?: 5.0
+        val fixedSlAtr = etSlChandelierFixedAtrMultiple.text.toString().toDoubleOrNull() ?: 0.0
+        val slDecay10 = etSlTimeDecay10dFactor.text.toString().toDoubleOrNull() ?: 0.80
+        val slDecay20 = etSlTimeDecay20dFactor.text.toString().toDoubleOrNull() ?: 0.60
+        config.slLimitPct = (slLimitPadPct / 100.0).coerceIn(0.0, 0.05)
+        config.newPositionHardStopPct = (newHardStopPct / 100.0).coerceIn(0.01, 0.25)
+        config.slChandelierFixedAtrMultiple = fixedSlAtr.coerceIn(0.0, 8.0)
+        config.slTimeDecay10dFactor = slDecay10.coerceIn(0.10, 1.00)
+        config.slTimeDecay20dFactor = slDecay20.coerceIn(0.10, 1.00)
+
         config.autoTrailingTargetEnabled = switchAutoTrailingTarget.isChecked
         val tgtAtrMult = etTargetAtrMultiple.text.toString().toDoubleOrNull() ?: 2.0
         val tgtMaxStep = etTargetMaxDailyStepPct.text.toString().toDoubleOrNull() ?: 8.0

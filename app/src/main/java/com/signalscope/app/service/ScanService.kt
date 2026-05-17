@@ -58,8 +58,10 @@ class ScanService : Service() {
         // _AUTO variants run in ROBUST mode (background, must not fail midway).
         const val ACTION_DISCOVERY_NIFTY500       = "com.signalscope.DISCOVERY_NIFTY500"
         const val ACTION_DISCOVERY_NASDAQ100      = "com.signalscope.DISCOVERY_NASDAQ100"
+        const val ACTION_DISCOVERY_DAX            = "com.signalscope.DISCOVERY_DAX"
         const val ACTION_DISCOVERY_NIFTY500_AUTO  = "com.signalscope.DISCOVERY_NIFTY500_AUTO"
         const val ACTION_DISCOVERY_NASDAQ100_AUTO = "com.signalscope.DISCOVERY_NASDAQ100_AUTO"
+        const val ACTION_DISCOVERY_DAX_AUTO       = "com.signalscope.DISCOVERY_DAX_AUTO"
         const val ACTION_DISCOVERY_STOP           = "com.signalscope.DISCOVERY_STOP"
 
         // Broadcast events
@@ -156,8 +158,10 @@ class ScanService : Service() {
             ACTION_SCAN_NOW                -> triggerImmediatePortfolioScan()
             ACTION_DISCOVERY_NIFTY500      -> startDiscoveryScan("nifty500", robust = false)
             ACTION_DISCOVERY_NASDAQ100     -> startDiscoveryScan("nasdaq100", robust = false)
+            ACTION_DISCOVERY_DAX           -> startDiscoveryScan("dax", robust = false)
             ACTION_DISCOVERY_NIFTY500_AUTO -> startDiscoveryScan("nifty500", robust = true)
             ACTION_DISCOVERY_NASDAQ100_AUTO-> startDiscoveryScan("nasdaq100", robust = true)
+            ACTION_DISCOVERY_DAX_AUTO      -> startDiscoveryScan("dax", robust = true)
             ACTION_DISCOVERY_STOP          -> stopDiscoveryScan()
             else                           -> startPortfolioMonitoring()
         }
@@ -324,7 +328,12 @@ class ScanService : Service() {
         isDiscoveryRunning = true
         discoveryAbort = false
         ScanServiceResultHolder.isDiscoveryRunning = true
-        ScanServiceResultHolder.discoveryMarket = if (market == "nifty500") "NIFTY 500" else "NASDAQ 100"
+        ScanServiceResultHolder.discoveryMarket = when (market) {
+            "nifty500" -> "NIFTY 500"
+            "nasdaq100" -> "NASDAQ 100"
+            "dax" -> "DAX 100"
+            else -> market.uppercase()
+        }
 
         discoveryJob?.cancel()
         discoveryJob = serviceScope.launch {
@@ -343,8 +352,14 @@ class ScanService : Service() {
                     //   (a) it's recent (< 45 min old) so the data is still valid
                     //   (b) it has at least some stocks scanned (not a fresh abort)
                     //   (c) it wasn't already complete
-                    val marketName = if (market == "nifty500") "NIFTY 500" else "NASDAQ 100"
+                    val marketName = when (market) {
+                        "nifty500" -> "NIFTY 500"
+                        "nasdaq100" -> "NASDAQ 100"
+                        "dax" -> "DAX 100"
+                        else -> market.uppercase()
+                    }
                     val prior = DiscoveryResultStore.load(this@ScanService, marketName)
+                    val previousComplete = DiscoveryResultStore.loadLatestComplete(this@ScanService, marketName)
                     val ageMs = if (prior != null) System.currentTimeMillis() - prior.timestamp else Long.MAX_VALUE
                     val resumeFrom = if (prior != null
                             && !prior.isComplete
@@ -354,10 +369,11 @@ class ScanService : Service() {
                         updateScanNotification("Resuming $marketName: ${prior.allStocks.size} cached, continuing...")
                         prior
                     } else null
-                    if (market == "nifty500") {
-                        runYahooDiscovery(NIFTY_500_YAHOO_SYMBOLS, "NIFTY 500", "₹", robust = robust, resumeFrom = resumeFrom)
-                    } else {
-                        runYahooDiscovery(NASDAQ_100_SYMBOLS, "NASDAQ 100", "$", robust = robust, resumeFrom = resumeFrom)
+                    when (market) {
+                        "nifty500"  -> runYahooDiscovery(NIFTY_500_YAHOO_SYMBOLS, "NIFTY 500", "₹", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
+                        "nasdaq100" -> runYahooDiscovery(NASDAQ_100_SYMBOLS, "NASDAQ 100", "$", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
+                        "dax"       -> runYahooDiscovery(DAX_SYMBOLS, "DAX 100", "€", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
+                        else        -> Log.w(TAG, "Unknown market '$market' — skipping discovery")
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -385,6 +401,24 @@ class ScanService : Service() {
         updateScanNotification("Discovery scan stopped")
     }
 
+    private fun discoverySymbolKey(symbol: String): String =
+        symbol.trim().uppercase(Locale.US).removeSuffix(".NS")
+
+    private fun annotateSmoothMacdTurn(
+        analysis: StockAnalysis,
+        previousSmoothBySymbol: Map<String, StockAnalysis>,
+        previousSmoothTimestamp: Long
+    ): StockAnalysis {
+        val previous = previousSmoothBySymbol[discoverySymbolKey(analysis.symbol)]
+            ?: return analysis
+        val turnedPositive = previous.smoothMacdSlope < 0.0 && analysis.smoothMacdSlope >= 0.0
+        return analysis.copy(
+            smoothMacdPrevSavedSlope = previous.smoothMacdSlope,
+            smoothMacdTurnedPositiveToday = turnedPositive,
+            smoothMacdTurnSourceTimestamp = if (turnedPositive) previousSmoothTimestamp else 0L
+        )
+    }
+
     /**
      * Scan a list of symbols via Yahoo Finance with adaptive pacing & retry queue.
      *
@@ -410,7 +444,8 @@ class ScanService : Service() {
         marketName: String,
         currency: String,
         robust: Boolean = false,
-        resumeFrom: DiscoveryScanResult? = null
+        resumeFrom: DiscoveryScanResult? = null,
+        previousComplete: DiscoveryScanResult? = null
     ) = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         val total = symbols.size
@@ -423,6 +458,11 @@ class ScanService : Service() {
             allStocks.addAll(resumeFrom.allStocks)
             resumeFrom.allStocks.forEach { alreadyScannedSymbols.add(it.symbol) }
         }
+        val previousSmoothBySymbol = previousComplete
+            ?.allStocks
+            ?.associateBy { discoverySymbolKey(it.symbol) }
+            ?: emptyMap()
+        val previousSmoothTimestamp = previousComplete?.timestamp ?: 0L
         var errors = 0
         var skipped = 0
         var lastError = ""
@@ -511,19 +551,36 @@ class ScanService : Service() {
                                         Log.d(TAG, "Value score for $symbol: ${vr.valueScore} (${vr.valueRating}) PE=${vr.trailingPe} PB=${vr.priceToBook}")
                                         analysis = analysis.copy(
                                             trailingPe = vr.trailingPe,
+                                            forwardPe = vr.forwardPe,
                                             priceToBook = vr.priceToBook,
                                             evToEbitda = vr.evToEbitda,
                                             debtToEquity = vr.debtToEquity,
                                             roce = vr.roce,
+                                            revenueGrowth = vr.revenueGrowth,
+                                            earningsGrowth = vr.earningsGrowth,
+                                            grossMargins = vr.grossMargins,
+                                            operatingMargins = vr.operatingMargins,
+                                            profitMargins = vr.profitMargins,
                                             dividendYield = vr.dividendYield,
                                             operatingCashflow = vr.operatingCashflow,
+                                            freeCashflow = vr.freeCashflow,
                                             netIncome = vr.netIncome,
+                                            totalRevenue = vr.totalRevenue,
+                                            totalCash = vr.totalCash,
+                                            totalDebt = vr.totalDebt,
+                                            currentRatio = vr.currentRatio,
+                                            annualRevenueGrowth = vr.annualRevenueGrowth,
+                                            annualNetIncomeGrowth = vr.annualNetIncomeGrowth,
                                             fiftyTwoWeekLow = vr.fiftyTwoWeekLow,
                                             fiftyTwoWeekHigh = vr.fiftyTwoWeekHigh,
                                             sharesOutstanding = vr.sharesOutstanding,
+                                            sector = vr.sector,
+                                            industry = vr.industry,
+                                            sectorMedianPe = vr.sectorMedianPe,
                                             hasBuyback = vr.hasBuyback,
                                             valueScore = vr.valueScore,
-                                            valueRating = vr.valueRating
+                                            valueRating = vr.valueRating,
+                                            valueScoreReport = vr.valueScoreReport
                                         )
                                     }
                                     is YahooFinanceClient.FundamentalResult.RateLimited -> {
@@ -543,7 +600,7 @@ class ScanService : Service() {
                             } catch (e: Exception) {
                                 Log.w(TAG, "Fundamentals fetch failed for $symbol — technical data kept", e)
                             }
-                            allStocks.add(analysis)
+                            allStocks.add(annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp))
                         } else {
                             skipped++
                         }
@@ -670,17 +727,28 @@ class ScanService : Service() {
                                     if (fundResult is YahooFinanceClient.FundamentalResult.Success) {
                                         val vr = ValueAnalyzer.analyze(fundResult.data, analysis.price, w = weights)
                                         analysis = analysis.copy(
-                                            trailingPe = vr.trailingPe, priceToBook = vr.priceToBook,
-                                            evToEbitda = vr.evToEbitda, debtToEquity = vr.debtToEquity,
-                                            roce = vr.roce, dividendYield = vr.dividendYield,
-                                            operatingCashflow = vr.operatingCashflow, netIncome = vr.netIncome,
+                                            trailingPe = vr.trailingPe, forwardPe = vr.forwardPe,
+                                            priceToBook = vr.priceToBook, evToEbitda = vr.evToEbitda,
+                                            debtToEquity = vr.debtToEquity, roce = vr.roce,
+                                            revenueGrowth = vr.revenueGrowth, earningsGrowth = vr.earningsGrowth,
+                                            grossMargins = vr.grossMargins, operatingMargins = vr.operatingMargins,
+                                            profitMargins = vr.profitMargins, dividendYield = vr.dividendYield,
+                                            operatingCashflow = vr.operatingCashflow, freeCashflow = vr.freeCashflow,
+                                            netIncome = vr.netIncome, totalRevenue = vr.totalRevenue,
+                                            totalCash = vr.totalCash, totalDebt = vr.totalDebt,
+                                            currentRatio = vr.currentRatio,
+                                            annualRevenueGrowth = vr.annualRevenueGrowth,
+                                            annualNetIncomeGrowth = vr.annualNetIncomeGrowth,
                                             fiftyTwoWeekLow = vr.fiftyTwoWeekLow, fiftyTwoWeekHigh = vr.fiftyTwoWeekHigh,
-                                            sharesOutstanding = vr.sharesOutstanding, hasBuyback = vr.hasBuyback,
-                                            valueScore = vr.valueScore, valueRating = vr.valueRating
+                                            sharesOutstanding = vr.sharesOutstanding,
+                                            sector = vr.sector, industry = vr.industry,
+                                            sectorMedianPe = vr.sectorMedianPe, hasBuyback = vr.hasBuyback,
+                                            valueScore = vr.valueScore, valueRating = vr.valueRating,
+                                            valueScoreReport = vr.valueScoreReport
                                         )
                                     }
                                 } catch (_: Exception) {}
-                                allStocks.add(analysis)
+                                allStocks.add(annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp))
                             } else {
                                 skipped++
                             }
@@ -737,6 +805,7 @@ class ScanService : Service() {
         }
 
         // ── Final result ──
+        applySectorPeMedians(allStocks, weights)
         val sorted = allStocks.sortedByDescending { it.buyScore }
         val elapsed = System.currentTimeMillis() - startTime
         lastDiscoveryResult = DiscoveryScanResult(
@@ -770,8 +839,36 @@ class ScanService : Service() {
         updateScanNotification(statusMsg)
         ScanServiceResultHolder.discoveryStatusText = statusMsg
         Log.i(TAG, "$statusMsg — ${sorted.count { it.buyScore >= 60 }} buy signals, " +
-                "${sorted.count { it.goldenBuy }} golden buys" +
+                "${sorted.count { it.goldenBuy }} qualified MACD setups" +
                 if (retryQueue.isNotEmpty()) " (retried ${retryQueue.size})" else "")
+    }
+
+    private fun applySectorPeMedians(stocks: MutableList<StockAnalysis>, weights: ScoringWeights) {
+        val medians = stocks
+            .filter { !it.sector.isNullOrBlank() && it.trailingPe != null && it.trailingPe > 0.0 }
+            .groupBy { it.sector!!.trim().uppercase(Locale.US) }
+            .mapValues { (_, rows) -> median(rows.mapNotNull { it.trailingPe }.filter { it > 0.0 }) }
+
+        if (medians.isEmpty()) return
+        for (i in stocks.indices) {
+            val stock = stocks[i]
+            val medianPe = stock.sector?.trim()?.uppercase(Locale.US)?.let { medians[it] } ?: continue
+            if (stock.valueRating == "N/A" && stock.valueScore == 0) continue
+            val vr = ValueAnalyzer.analyzeSnapshot(stock, sectorMedianPe = medianPe, w = weights)
+            stocks[i] = stock.copy(
+                sectorMedianPe = medianPe,
+                valueScore = vr.valueScore,
+                valueRating = vr.valueRating,
+                valueScoreReport = vr.valueScoreReport
+            )
+        }
+    }
+
+    private fun median(values: List<Double>): Double? {
+        if (values.isEmpty()) return null
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2.0
     }
 
     // ═══════════════════════════════════════════════════════
@@ -887,6 +984,129 @@ class ScanService : Service() {
         }
     }
 
+    /**
+     * Fast protection pass for newly detected Zerodha holdings.
+     *
+     * The daily 15:20 OCO builder waits for cleaner support/resistance data. This
+     * pass is deliberately simpler: every portfolio scan checks whether a holding
+     * already has an active SELL stop below LTP. If not, it places a single-leg
+     * emergency SL around entry * (1 - configured hard-stop %).
+     */
+    private suspend fun ensureEmergencyStopGtts(holdings: List<PortfolioHolding>) {
+        if (!config.autoCreateGtt || holdings.isEmpty()) return
+
+        val gttList = when (val r = zerodhaClient.fetchGttTriggers()) {
+            is ZerodhaClient.GttListResult.Success -> r.triggers
+            is ZerodhaClient.GttListResult.Expired -> {
+                config.zerodhaAccessToken = ""
+                sendZerodhaExpiredNotification()
+                return
+            }
+            is ZerodhaClient.GttListResult.Failure -> {
+                Log.w(TAG, "Emergency SL skipped: could not fetch GTTs (${r.message})")
+                return
+            }
+        }
+
+        val activeSellGttsBySymbol = gttList
+            .filter { it.status.equals("active", ignoreCase = true) && it.transactionType.equals("SELL", ignoreCase = true) }
+            .groupBy { it.tradingsymbol.uppercase(Locale.US) }
+
+        for (h in holdings) {
+            val ltp = h.ltp
+            val entry = if (h.avgPrice > 0.0) h.avgPrice else ltp
+            if (h.quantity <= 0 || ltp <= 0.0 || entry <= 0.0) continue
+
+            val symbolKey = h.symbol.uppercase(Locale.US)
+            val existing = activeSellGttsBySymbol[symbolKey].orEmpty()
+            val existingStop = existing
+                .filter { it.triggerPrice > 0.0 && it.triggerPrice < ltp }
+                .maxByOrNull { it.triggerPrice }
+
+            val rawTrigger = entry * config.newPositionHardStopFraction
+            val trigger = roundToTick(rawTrigger.coerceIn(ltp * 0.75, ltp * 0.999))
+            val limit = roundToTick(trigger * (1.0 - config.slLimitPct))
+            val stopPct = (trigger / entry - 1.0) * 100.0
+
+            if (existingStop == null) {
+                val result = zerodhaClient.createGttTrigger(
+                    type = "single",
+                    exchange = h.exchange,
+                    tradingsymbol = h.symbol,
+                    triggerValues = listOf(trigger),
+                    lastPrice = ltp,
+                    orders = listOf(
+                        ZerodhaClient.GttOrderSpec(
+                            transactionType = "SELL",
+                            quantity = h.quantity,
+                            price = limit,
+                            product = "CNC",
+                            orderType = "LIMIT"
+                        )
+                    )
+                )
+                when (result) {
+                    is ZerodhaClient.GttCreateResult.Success -> {
+                        Log.i(TAG, "Emergency SL GTT #${result.id} created for ${h.symbol} at $trigger")
+                        com.signalscope.app.data.GttActivityLog.append(
+                            config.appContext,
+                            "emergency_sl_create",
+                            symbol = h.symbol,
+                            fields = mapOf(
+                                "id" to result.id,
+                                "entry" to entry,
+                                "ltp" to ltp,
+                                "trigger" to trigger,
+                                "limit" to limit,
+                                "pctFromEntry" to stopPct
+                            )
+                        )
+                    }
+                    is ZerodhaClient.GttCreateResult.Failure ->
+                        Log.w(TAG, "Emergency SL create failed for ${h.symbol}: ${result.message}")
+                }
+                delay(1000L)
+            } else if (existingStop.triggerType == "single" && trigger > existingStop.triggerPrice + 0.05) {
+                val result = zerodhaClient.setGttTriggerPrices(
+                    existingStop.id,
+                    newTriggerValues = listOf(trigger),
+                    newLimitPrices = listOf(limit)
+                )
+                if (result is ZerodhaClient.GttModifyResult.Success) {
+                    Log.i(TAG, "Emergency SL raised for ${h.symbol}: ${existingStop.triggerPrice} -> $trigger")
+                    com.signalscope.app.data.GttActivityLog.append(
+                        config.appContext,
+                        "emergency_sl_raise",
+                        symbol = h.symbol,
+                        fields = mapOf(
+                            "id" to existingStop.id,
+                            "old" to existingStop.triggerPrice,
+                            "new" to trigger,
+                            "limit" to limit,
+                            "reason" to "configured hard floor"
+                        )
+                    )
+                    delay(1000L)
+                }
+            } else {
+                com.signalscope.app.data.GttActivityLog.append(
+                    config.appContext,
+                    "skip",
+                    symbol = h.symbol,
+                    fields = mapOf(
+                        "path" to "emergencySl",
+                        "existing" to (existingStop?.triggerPrice ?: 0.0),
+                        "candidate" to trigger,
+                        "reason" to "existing SL is already equal/better or OCO-managed"
+                    )
+                )
+            }
+        }
+    }
+
+    private fun roundToTick(value: Double): Double =
+        Math.round(value * 20.0) / 20.0
+
     private suspend fun scanZerodhaPortfolio(): ScanResult = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         val alerts = mutableListOf<StockAlert>()
@@ -905,6 +1125,8 @@ class ScanService : Service() {
                 return@withContext emptyScanResult(startTime)
             }
         }
+
+        ensureEmergencyStopGtts(rawHoldings)
 
         for (holding in rawHoldings) {
             try {
@@ -1349,10 +1571,10 @@ class ScanService : Service() {
         val title = when (alert.alertType) {
             AlertType.STRONG_EXIT     -> "🔴 STRONG EXIT: ${alert.symbol}"
             AlertType.BOOK_PROFIT     -> "💰 BOOK PROFIT: ${alert.symbol}"
-            AlertType.PROTECT_CAPITAL -> "🛡️ PROTECT CAPITAL: ${alert.symbol}"
+            AlertType.PROTECT_CAPITAL -> "TREND BROKEN: ${alert.symbol}"
             AlertType.PEAK_WARNING    -> "⚡ Peak Approaching: ${alert.symbol}"
             AlertType.MACD_FLIP       -> "🚨 MACD FLIP: ${alert.symbol}"
-            AlertType.GOLDEN_BUY      -> "⭐ Golden Buy: ${alert.symbol}"
+            AlertType.GOLDEN_BUY      -> "MACD Setup: ${alert.symbol}"
             AlertType.STRONG_BUY      -> "🟢 Buy: ${alert.symbol}"
             else -> "📊 ${alert.alertType}: ${alert.symbol}"
         }
@@ -1372,7 +1594,7 @@ class ScanService : Service() {
             AlertType.PROTECT_CAPITAL -> 0xFFEAB308.toInt()  // Yellow
             AlertType.PEAK_WARNING    -> 0xFF8B5CF6.toInt()  // Purple
             AlertType.MACD_FLIP       -> 0xFFB91C1C.toInt()  // Deep red — watchdog confirmed
-            AlertType.GOLDEN_BUY      -> 0xFFD97706.toInt()  // Gold
+            AlertType.GOLDEN_BUY      -> 0xFFD97706.toInt()  // Setup amber
             AlertType.STRONG_BUY      -> 0xFF059669.toInt()  // Green
             else -> 0xFF64748B.toInt()
         }
@@ -1673,3 +1895,28 @@ val NASDAQ_100_SYMBOLS = listOf(
     "TEAM","TMUS","TSLA","TTD","TTWO","TXN","VRSK","VRTX","WBD","WDAY",
     "XEL","ZS"
 )
+
+// ── DAX 40 + selected MDAX components (German equity universe) ──
+// Yahoo uses the `.DE` suffix for Deutsche Börse Xetra listings. Includes
+// the 40 DAX blue chips (Adidas, SAP, Allianz, …) plus a handful of liquid
+// MDAX names that round out the German large-cap landscape — same ~50-stock
+// shape as Nifty 50 / NASDAQ 100, fast enough to scan in one pass.
+val DAX_SYMBOLS = listOf(
+    // DAX 40
+    "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BEI.DE","BMW.DE","BNR.DE",
+    "CBK.DE","CON.DE","1COV.DE","DBK.DE","DB1.DE","DHL.DE","DTE.DE","DTG.DE",
+    "ENR.DE","EOAN.DE","FRE.DE","HEI.DE","HEN3.DE","HFG.DE","HNR1.DE","IFX.DE",
+    "MBG.DE","MRK.DE","MTX.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE",
+    "RWE.DE","SAP.DE","SHL.DE","SIE.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE",
+    // MDAX additions
+    "AIXA.DE","AT1.DE","NDA.DE","AG1.DE","BC8.DE","GBF.DE","EVD.DE","DHER.DE",
+    "DEZ.DE","DWS.DE","EVK.DE","FTK.DE","FRA.DE","FNTN.DE","FPE3.DE","HAG.DE",
+    "HOT.DE","BOSS.DE","IOS.DE","JEN.DE","JUN3.DE","SDF.DE","KGX.DE","KBX.DE",
+    "KRN.DE","LXS.DE","LEG.DE","LHA.DE","NEM.DE","NDX1.DE","PUM.DE","RAA.DE",
+    "RDC.DE","R3NK.DE","RRTL.DE","SZG.DE","SRT3.DE","SHA.DE","SAX.DE","TEG.DE",
+    "TLX.DE","TKA.DE","8TRA.DE","TUI1.DE","UTDI.DE","WCH.DE",
+    // TecDAX / additional liquid German tech names
+    "1U1.DE","AOF.DE","COK.DE","COP.DE","DRW3.DE","ELG.DE","EKT.DE","EVT.DE",
+    "KTN.DE","NA9.DE","PNE3.DE","F3C.DE","WAF.DE","S92.DE","TMV.DE","VBK.DE",
+    "EUZ.DE"
+).distinct()
