@@ -172,22 +172,15 @@ class ConfigManager(context: Context) {
         else ""
 
     // ═══════════════════════════════════════════════════════
-    // TRADING 212 CREDENTIALS  (US-space broker, Phase 2A scaffolding)
+    // TRADING 212 CREDENTIALS  (live US/DE broker)
     // ═══════════════════════════════════════════════════════
     //
     // NOTE on auth model:
-    //   T212's public REST API uses a single bearer token (just the API key).
-    //   We store both `t212ApiKey` and `t212ApiSecret` for forward-compat —
-    //   the user's account dashboard exposed both, and storing both costs
-    //   nothing. Trading212Client uses only `t212ApiKey` in the Authorization
-    //   header for now. If T212 ever introduces signed requests requiring a
-    //   secret, the field is already plumbed.
+    //   T212 uses HTTP Basic auth with key + secret:
+    //   Authorization: Basic base64(key:secret)
     //
-    // Base URL: T212 has separate live + demo environments.
-    //   live → https://live.trading212.com/api/v0
-    //   demo → https://demo.trading212.com/api/v0
-    // The "useLive" flag picks one — defaults to demo so an API-key typo
-    // can't accidentally hit a real account.
+    // Base URL is always the live endpoint:
+    //   https://live.trading212.com/api/v0
 
     var t212ApiKey: String
         get() = encrypted.getString("T212_API_KEY", "") ?: ""
@@ -206,15 +199,11 @@ class ConfigManager(context: Context) {
     val t212BaseUrl: String
         get() = "https://live.trading212.com/api/v0"
 
-    /** Simulate-only mode for T212 orders. When TRUE (default), order-placement
-     *  bridges write to the GTT audit log with action="simulate" and return a
-     *  fake order id WITHOUT calling the real T212 API. Lets the user watch
-     *  the engine's decisions for a week before any real money is at stake.
-     *  Flip OFF in Settings → "Trading 212 — go live" once you trust the
-     *  decisions you see in the audit log. */
+    /** Legacy compatibility setting. Trading 212 order flows are always live;
+     *  older stored values are ignored and cleared when written. */
     var t212SimulateOnly: Boolean
-        get() = prefs.getBoolean("t212_simulate_only", true)
-        set(v) = prefs.edit().putBoolean("t212_simulate_only", v).apply()
+        get() = false
+        set(v) = prefs.edit().putBoolean("t212_simulate_only", false).apply()
 
     /** T212 uses HTTP Basic auth — Authorization: Basic base64(key:secret).
      *  Both fields are required; the API rejects empty-secret basic auth
@@ -290,6 +279,11 @@ class ConfigManager(context: Context) {
         get() = prefs.getBoolean("notifications_enabled", true)
         set(v) = prefs.edit().putBoolean("notifications_enabled", v).apply()
 
+    /** Universal master switch for the Yahoo live-price WebSocket overlay. */
+    var livePriceStreamingEnabled: Boolean
+        get() = prefs.getBoolean("live_price_streaming_enabled", false)
+        set(v) = prefs.edit().putBoolean("live_price_streaming_enabled", v).apply()
+
     var vibrateOnAlerts: Boolean
         get() = prefs.getBoolean("vibrate_alerts", true)
         set(v) = prefs.edit().putBoolean("vibrate_alerts", v).apply()
@@ -315,6 +309,46 @@ class ConfigManager(context: Context) {
                 }
                 if (!obj.has("setupMacdPctlMax")) {
                     fixed = fixed.copy(setupMacdPctlMax = d.setupMacdPctlMax)
+                }
+                if (!obj.has("pullbackStrongThreshold")) {
+                    fixed = fixed.copy(
+                        pullbackStrongThreshold = fixed.buyStrongThreshold,
+                        pullbackModerateThreshold = fixed.buyModerateThreshold
+                    )
+                }
+                if (!obj.has("momentumTrendStackPts")) {
+                    fixed = fixed.copy(
+                        momentumTrendStackPts = d.momentumTrendStackPts,
+                        momentumMacdPts = d.momentumMacdPts,
+                        momentumEma21SlopePts = d.momentumEma21SlopePts,
+                        momentumNotOverextendedPts = d.momentumNotOverextendedPts,
+                        momentumRsiRoomPts = d.momentumRsiRoomPts,
+                        momentumObvPts = d.momentumObvPts,
+                        momentumStrongThreshold = d.momentumStrongThreshold,
+                        momentumModerateThreshold = d.momentumModerateThreshold
+                    )
+                }
+                if (!obj.has("valueRevenueGrowthHighPts")) {
+                    fixed = fixed.copy(
+                        valueRevenueGrowthHighPts = d.valueRevenueGrowthHighPts,
+                        valueRevenueGrowthMidPts = d.valueRevenueGrowthMidPts,
+                        valueRevenueGrowthPositivePts = d.valueRevenueGrowthPositivePts,
+                        valueRevenueGrowthHighThreshold = d.valueRevenueGrowthHighThreshold,
+                        valueRevenueGrowthMidThreshold = d.valueRevenueGrowthMidThreshold,
+                        valueEarningsGrowthHighPts = d.valueEarningsGrowthHighPts,
+                        valueEarningsGrowthMidPts = d.valueEarningsGrowthMidPts,
+                        valueEarningsGrowthPositivePts = d.valueEarningsGrowthPositivePts,
+                        valueEarningsGrowthHighThreshold = d.valueEarningsGrowthHighThreshold,
+                        valueEarningsGrowthMidThreshold = d.valueEarningsGrowthMidThreshold,
+                        valueGrossMarginPts = d.valueGrossMarginPts,
+                        valueGrossMarginThreshold = d.valueGrossMarginThreshold,
+                        valueProfitMarginGrowthPts = d.valueProfitMarginGrowthPts,
+                        valueProfitMarginGrowthThreshold = d.valueProfitMarginGrowthThreshold,
+                        valueRevenueGrowthPenaltyThreshold = d.valueRevenueGrowthPenaltyThreshold,
+                        valueRevenueGrowthPenaltyPts = d.valueRevenueGrowthPenaltyPts,
+                        valueEarningsGrowthPenaltyThreshold = d.valueEarningsGrowthPenaltyThreshold,
+                        valueEarningsGrowthPenaltyPts = d.valueEarningsGrowthPenaltyPts
+                    )
                 }
                 if (kotlin.math.abs(fixed.minSlopeMagnitude) <= 5.0 && kotlin.math.abs(fixed.goldenBuyMaxSlope) <= 5.0) {
                     fixed = fixed.copy(

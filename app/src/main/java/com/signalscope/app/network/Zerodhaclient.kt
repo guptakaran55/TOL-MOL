@@ -7,6 +7,7 @@ import com.google.gson.JsonParser
 import com.signalscope.app.data.ConfigManager
 import com.signalscope.app.data.PortfolioHolding
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.security.MessageDigest
@@ -168,6 +169,12 @@ class ZerodhaClient(private val config: ConfigManager) {
         data class Failure(val message: String) : HoldingsResult()
     }
 
+    sealed class LtpResult {
+        data class Success(val lastPrice: Double) : LtpResult()
+        data class Expired(val message: String) : LtpResult()
+        data class Failure(val message: String) : LtpResult()
+    }
+
     /**
      * Fetch Zerodha portfolio holdings.
      * Returns holdings with quantity > 0, mapped to PortfolioHolding.
@@ -231,6 +238,43 @@ class ZerodhaClient(private val config: ConfigManager) {
         } catch (e: Exception) {
             Log.e(TAG, "Zerodha holdings fetch error", e)
             HoldingsResult.Failure(e.message ?: "Unknown error")
+        }
+    }
+
+    /** Fetch one fresh Kite LTP. Used just before GTT creation so stale
+     * portfolio snapshots don't make Kite reject trigger placement. */
+    fun fetchLtp(exchange: String, tradingsymbol: String): LtpResult {
+        if (!isConnected) return LtpResult.Failure("Not connected to Zerodha")
+        return try {
+            val instrument = "${exchange.uppercase()}:${tradingsymbol.uppercase()}"
+            val url = "$BASE_URL/quote/ltp".toHttpUrl().newBuilder()
+                .addQueryParameter("i", instrument)
+                .build()
+            val req = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return LtpResult.Failure("Empty response")
+                val json = JsonParser.parseString(body).asJsonObject
+                if (json.get("status")?.asString != "success") {
+                    val msg = json.get("message")?.asString ?: "LTP fetch failed"
+                    if (msg.lowercase().contains("token") || resp.code == 403) {
+                        return LtpResult.Failure("LTP unavailable: $msg")
+                    }
+                    return LtpResult.Failure(msg)
+                }
+                val data = json.getAsJsonObject("data") ?: return LtpResult.Failure("No LTP data")
+                val obj = data.get(instrument)?.asJsonObject
+                    ?: data.entrySet().firstOrNull()?.value?.asJsonObject
+                    ?: return LtpResult.Failure("No LTP for $instrument")
+                val ltp = obj.get("last_price")?.asDouble ?: 0.0
+                if (ltp > 0.0) LtpResult.Success(ltp) else LtpResult.Failure("Invalid LTP for $instrument")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Zerodha LTP fetch error", e)
+            LtpResult.Failure(e.message ?: "Unknown error")
         }
     }
 
@@ -309,7 +353,6 @@ class ZerodhaClient(private val config: ConfigManager) {
                 if (json.get("status")?.asString != "success") {
                     val msg = json.get("message")?.asString ?: "Unknown error"
                     if (msg.lowercase().contains("token") || response.code == 403) {
-                        config.zerodhaAccessToken = ""
                         return GttListResult.Expired("Zerodha session expired. Please reconnect.")
                     }
                     return GttListResult.Failure(msg)
@@ -449,8 +492,13 @@ class ZerodhaClient(private val config: ConfigManager) {
             val orders = existing.getAsJsonArray("orders")
             val tradingsymbol = cond.get("tradingsymbol").asString
             val exchange = cond.get("exchange").asString
-            val lastPrice = cond.get("last_price")?.asDouble ?: newTriggerPrice
+            var lastPrice = cond.get("last_price")?.asDouble ?: newTriggerPrice
             val triggerType = existing.get("type")?.asString ?: "single"
+            lastPrice = when (val fresh = fetchLtp(exchange, tradingsymbol)) {
+                is LtpResult.Success -> fresh.lastPrice
+                is LtpResult.Expired -> return GttModifyResult.Failure(fresh.message)
+                is LtpResult.Failure -> lastPrice
+            }
 
             // Existing trigger values — MUST be preserved (Kite rejects two-leg PUTs that drop one).
             val oldTriggerValues = cond.getAsJsonArray("trigger_values")
@@ -468,6 +516,16 @@ class ZerodhaClient(private val config: ConfigManager) {
                 oldTriggerValues.indices.minByOrNull { kotlin.math.abs(oldTriggerValues[it] - oldTriggerHint) } ?: 0
             } else 0
             oldTriggerValues[bumpIdx] = newTriggerPrice
+            if (oldTriggerValues.size > 1) {
+                val sl = oldTriggerValues[0]
+                val target = oldTriggerValues[1]
+                if (sl >= lastPrice) {
+                    return GttModifyResult.Failure("SL must be below latest LTP $lastPrice")
+                }
+                if (target <= lastPrice) {
+                    return GttModifyResult.Failure("Target must be above latest LTP $lastPrice")
+                }
+            }
 
             // Build orders JSON — only orders[bumpIdx] gets the new limit price;
             // the other leg's price stays exactly as it was on the broker side.
@@ -557,11 +615,26 @@ class ZerodhaClient(private val config: ConfigManager) {
             val orders = existing.getAsJsonArray("orders")
             val tradingsymbol = cond.get("tradingsymbol").asString
             val exchange = cond.get("exchange").asString
-            val lastPrice = cond.get("last_price")?.asDouble ?: newTriggerValues.first()
+            var lastPrice = cond.get("last_price")?.asDouble ?: newTriggerValues.first()
             val triggerType = existing.get("type")?.asString ?: "single"
+            lastPrice = when (val fresh = fetchLtp(exchange, tradingsymbol)) {
+                is LtpResult.Success -> fresh.lastPrice
+                is LtpResult.Expired -> return GttModifyResult.Failure(fresh.message)
+                is LtpResult.Failure -> lastPrice
+            }
 
             if (orders.size() != newTriggerValues.size) {
                 return GttModifyResult.Failure("GTT has ${orders.size()} legs, got ${newTriggerValues.size} new values")
+            }
+            if (newTriggerValues.size > 1) {
+                val sl = newTriggerValues[0]
+                val target = newTriggerValues[1]
+                if (sl >= lastPrice) {
+                    return GttModifyResult.Failure("SL must be below latest LTP $lastPrice")
+                }
+                if (target <= lastPrice) {
+                    return GttModifyResult.Failure("Target must be above latest LTP $lastPrice")
+                }
             }
 
             val ordersJson = StringBuilder("[")
@@ -722,7 +795,22 @@ class ZerodhaClient(private val config: ConfigManager) {
                 val body = resp.body?.string() ?: return GttCreateResult.Failure("Empty response")
                 val j = JsonParser.parseString(body).asJsonObject
                 if (j.get("status")?.asString != "success") {
-                    return GttCreateResult.Failure(j.get("message")?.asString ?: "Create failed")
+                    val msg = j.get("message")?.asString ?: "Create failed"
+                    com.signalscope.app.data.GttActivityLog.append(
+                        config.appContext, "error_create", symbol = tradingsymbol,
+                        fields = mapOf(
+                            "type" to type,
+                            "exchange" to exchange,
+                            "trigs" to triggerValues.joinToString(","),
+                            "limits" to orders.joinToString(",") { it.price.toString() },
+                            "qty" to orders.joinToString(",") { it.quantity.toString() },
+                            "side" to orders.joinToString(",") { it.transactionType },
+                            "lastPrice" to lastPrice,
+                            "http" to resp.code,
+                            "error" to msg
+                        )
+                    )
+                    return GttCreateResult.Failure("Kite create failed HTTP ${resp.code}: $msg")
                 }
                 val id = j.getAsJsonObject("data")?.get("trigger_id")?.asLong ?: 0L
                 Log.i(TAG, "GTT created id=$id type=$type $tradingsymbol trigs=$triggerValues")
@@ -731,7 +819,13 @@ class ZerodhaClient(private val config: ConfigManager) {
                     fields = mapOf(
                         "id" to id,
                         "type" to type,
+                        "exchange" to exchange,
                         "trigs" to triggerValues.joinToString(","),
+                        "limits" to orders.joinToString(",") { it.price.toString() },
+                        "qty" to orders.joinToString(",") { it.quantity.toString() },
+                        "side" to orders.joinToString(",") { it.transactionType },
+                        "product" to orders.joinToString(",") { it.product },
+                        "orderType" to orders.joinToString(",") { it.orderType },
                         "lastPrice" to lastPrice
                     )
                 )
@@ -739,6 +833,19 @@ class ZerodhaClient(private val config: ConfigManager) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "GTT create error", e)
+            com.signalscope.app.data.GttActivityLog.append(
+                config.appContext, "error_create", symbol = tradingsymbol,
+                fields = mapOf(
+                    "type" to type,
+                    "exchange" to exchange,
+                    "trigs" to triggerValues.joinToString(","),
+                    "limits" to orders.joinToString(",") { it.price.toString() },
+                    "qty" to orders.joinToString(",") { it.quantity.toString() },
+                    "side" to orders.joinToString(",") { it.transactionType },
+                    "lastPrice" to lastPrice,
+                    "error" to (e.message ?: "Unknown error")
+                )
+            )
             GttCreateResult.Failure(e.message ?: "Unknown error")
         }
     }

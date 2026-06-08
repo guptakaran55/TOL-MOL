@@ -6,6 +6,7 @@ import com.signalscope.app.data.CandleData
 import com.google.gson.JsonParser
 import okhttp3.*
 import org.json.JSONObject
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -24,6 +25,10 @@ object YahooFinanceClient {
 
     private const val TAG = "YahooFinanceClient"
     private const val BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+    private val NIFTY_500_URLS = listOf(
+        "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+    )
 
     // Cookie jar with proper domain matching (cookies from .yahoo.com apply to all subdomains)
     private val cookieJar = object : CookieJar {
@@ -128,10 +133,106 @@ object YahooFinanceClient {
     }
 
     sealed class CandleResult {
-        data class Success(val candles: List<CandleData>) : CandleResult()
+        data class Success(val candles: List<CandleData>, val name: String? = null) : CandleResult()
         object RateLimited : CandleResult()
         object NoData : CandleResult()
         data class Error(val message: String) : CandleResult()
+    }
+
+    sealed class NiftyUniverseResult {
+        data class Success(val symbols: List<String>, val sourceUrl: String) : NiftyUniverseResult()
+        data class Failure(val message: String) : NiftyUniverseResult()
+    }
+
+    /**
+     * Download the current NIFTY 500 constituents from the same official CSV
+     * endpoints used by the earlier browser project. A result is accepted only
+     * when it looks like a real NIFTY 500 universe (>400 symbols); otherwise the
+     * caller should fall back to the embedded static list.
+     */
+    fun fetchNifty500Symbols(minAcceptedSymbols: Int = 400): NiftyUniverseResult {
+        var lastError = ""
+        for (url in NIFTY_500_URLS) {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0"
+                    )
+                    .addHeader("Accept", "text/csv,text/plain,*/*")
+                    .addHeader("Accept-Language", "en-US,en;q=0.9")
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        lastError = "$url returned HTTP ${response.code}"
+                        Log.w(TAG, lastError)
+                        return@use
+                    }
+                    val text = response.body?.string().orEmpty()
+                    val symbols = parseNifty500Csv(text)
+                    if (symbols.size > minAcceptedSymbols) {
+                        Log.i(TAG, "NIFTY 500 universe: ${symbols.size} symbols from $url")
+                        return NiftyUniverseResult.Success(symbols, url)
+                    }
+                    lastError = "$url had only ${symbols.size} symbols"
+                    Log.w(TAG, lastError)
+                }
+            } catch (e: Exception) {
+                lastError = "$url failed: ${e.message ?: e.javaClass.simpleName}"
+                Log.w(TAG, lastError)
+            }
+        }
+        return NiftyUniverseResult.Failure(lastError.ifBlank { "No NIFTY 500 source returned enough symbols" })
+    }
+
+    private fun parseNifty500Csv(text: String): List<String> {
+        val lines = text
+            .replace("\uFEFF", "")
+            .lines()
+            .filter { it.isNotBlank() }
+        if (lines.isEmpty()) return emptyList()
+
+        val header = parseCsvLine(lines.first()).map { it.trim() }
+        val symbolIdx = header.indexOfFirst { it.equals("Symbol", ignoreCase = true) }
+        if (symbolIdx < 0) return emptyList()
+
+        val validSymbol = Regex("^[A-Z0-9&-]+$")
+        return lines.drop(1)
+            .mapNotNull { line ->
+                val cols = parseCsvLine(line)
+                val raw = cols.getOrNull(symbolIdx)?.trim().orEmpty()
+                val sym = raw.removeSuffix("-EQ").uppercase(Locale.US)
+                sym.takeIf { it.isNotBlank() && validSymbol.matches(it) }
+            }
+            .distinct()
+            .sorted()
+    }
+
+    private fun parseCsvLine(line: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        var inQuotes = false
+        var i = 0
+        while (i < line.length) {
+            val c = line[i]
+            when {
+                c == '"' && inQuotes && i + 1 < line.length && line[i + 1] == '"' -> {
+                    cur.append('"')
+                    i++
+                }
+                c == '"' -> inQuotes = !inQuotes
+                c == ',' && !inQuotes -> {
+                    out.add(cur.toString())
+                    cur.clear()
+                }
+                else -> cur.append(c)
+            }
+            i++
+        }
+        out.add(cur.toString())
+        return out
     }
 
     // ── Candle cache ──
@@ -372,6 +473,13 @@ object YahooFinanceClient {
             if (resultArray.length() == 0) return CandleResult.NoData
 
             val result = resultArray.getJSONObject(0)
+            val meta = result.optJSONObject("meta")
+            fun metaName(key: String): String? {
+                val value = meta?.optString(key, "")?.trim().orEmpty()
+                return value.takeIf { it.isNotBlank() && !it.equals(symbol, ignoreCase = true) }
+            }
+            val displayName = metaName("longName") ?: metaName("shortName")
+
             val timestamps = result.getJSONArray("timestamp")
             val indicators = result.getJSONObject("indicators")
             val quoteArray = indicators.getJSONArray("quote")
@@ -409,7 +517,7 @@ object YahooFinanceClient {
             }
 
             Log.d(TAG, "Yahoo Finance: $symbol — ${candles.size} candles")
-            CandleResult.Success(candles)
+            CandleResult.Success(candles, displayName)
 
         } catch (e: Exception) {
             Log.e(TAG, "Yahoo Finance parse error for $symbol", e)
@@ -452,7 +560,8 @@ object YahooFinanceClient {
         val fiftyTwoWeekHigh: Double? = null,
         val sharesOutstanding: Long? = null,
         val sector: String? = null,
-        val industry: String? = null
+        val industry: String? = null,
+        val name: String? = null
     )
 
     // ── Symbol autocomplete (Yahoo's `/v1/finance/search` endpoint) ──────────
@@ -552,7 +661,7 @@ object YahooFinanceClient {
                 .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
                 .addQueryParameter(
                     "modules",
-                    "defaultKeyStatistics,financialData,summaryDetail,assetProfile," +
+                    "price,defaultKeyStatistics,financialData,summaryDetail,assetProfile," +
                             "incomeStatementHistory,cashflowStatementHistory,balanceSheetHistory,earningsTrend"
                 )
                 .addQueryParameter("crumb", crumb)
@@ -618,6 +727,7 @@ object YahooFinanceClient {
             val finData = r.optJSONObject("financialData")
             val summaryDetail = r.optJSONObject("summaryDetail")
             val profile = r.optJSONObject("assetProfile")
+            val price = r.optJSONObject("price")
             val incomeHistory = r.optJSONObject("incomeStatementHistory")
             val balanceHistory = r.optJSONObject("balanceSheetHistory")
 
@@ -652,8 +762,14 @@ object YahooFinanceClient {
                 return ((latest - oldest) / kotlin.math.abs(oldest)) * 100.0
             }
 
+            fun JSONObject?.cleanName(key: String): String? {
+                val value = this?.optString(key, "")?.trim().orEmpty()
+                return value.takeIf { it.isNotBlank() && !it.equals(symbol, ignoreCase = true) }
+            }
+
             val annualRevenues = statementValues(incomeHistory, "incomeStatementHistory", "totalRevenue")
             val annualNetIncomes = statementValues(incomeHistory, "incomeStatementHistory", "netIncome")
+            val displayName = price.cleanName("longName") ?: price.cleanName("shortName")
 
             val data = FundamentalData(
                 trailingPe = summaryDetail.rawVal("trailingPE") ?: keyStats.rawVal("trailingPE"),
@@ -687,8 +803,9 @@ object YahooFinanceClient {
                 fiftyTwoWeekLow = summaryDetail.rawVal("fiftyTwoWeekLow"),
                 fiftyTwoWeekHigh = summaryDetail.rawVal("fiftyTwoWeekHigh"),
                 sharesOutstanding = keyStats.rawLong("sharesOutstanding"),
-                sector = profile?.optString("sector", null),
-                industry = profile?.optString("industry", null)
+                sector = profile?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() },
+                industry = profile?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() },
+                name = displayName
             )
 
             Log.d(TAG, "Fundamentals: $symbol — PE=${data.trailingPe} PB=${data.priceToBook} D/E=${data.debtToEquity}")

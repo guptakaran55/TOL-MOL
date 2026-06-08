@@ -65,7 +65,7 @@
                 android:fontFamily="monospace" />
         </LinearLayout>
 
-        <!-- Buy / Profit Booking / Capital Protection scores -->
+        <!-- Pullback / Momentum / Profit Booking / Capital Protection scores -->
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -81,7 +81,7 @@
                 android:paddingEnd="5dp"
                 android:paddingTop="2dp"
                 android:paddingBottom="2dp"
-                android:text="72"
+                android:text="Pb72/Mo68"
                 android:textColor="#059669"
                 android:textSize="10sp"
                 android:textStyle="bold"

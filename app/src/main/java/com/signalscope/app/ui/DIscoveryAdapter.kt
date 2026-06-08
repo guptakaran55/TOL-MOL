@@ -13,7 +13,7 @@ import com.signalscope.app.data.StockAnalysis
  * Displays discovery scan results with full indicator data,
  * mirroring the Python web dashboard's stock table.
  *
- * Each row shows: Symbol, Price, Buy Score, Sell Score, MACD phase + slope,
+ * Each row shows: Symbol, Price, Pullback/Momentum points, MACD phase + slope,
  * RSI, R:R ratio, ATR risk, signal label.
  */
 class DiscoveryAdapter : ListAdapter<StockAnalysis, DiscoveryAdapter.VH>(DIFF) {
@@ -48,14 +48,16 @@ class DiscoveryAdapter : ListAdapter<StockAnalysis, DiscoveryAdapter.VH>(DIFF) {
             (row1.getChildAt(1) as? TextView)?.apply {
                 text = when {
                     s.goldenBuy -> "MACD SETUP"
-                    s.buyScore >= 75 -> "STRONG BUY"
-                    s.buyScore >= 60 -> "MOD BUY"
+                    s.momentumScore >= 75 -> "STRONG MOMO"
+                    s.pullbackScore >= 75 -> "STRONG PULL"
+                    maxOf(s.pullbackScore, s.momentumScore) >= 60 -> "ENTRY"
                     else -> "—"
                 }
                 setTextColor(when {
                     s.goldenBuy -> 0xFF0891b2.toInt()
-                    s.buyScore >= 75 -> 0xFF059669.toInt()
-                    s.buyScore >= 60 -> 0xFF0891b2.toInt()
+                    s.momentumScore >= 75 -> 0xFF059669.toInt()
+                    s.pullbackScore >= 75 -> 0xFF2563eb.toInt()
+                    maxOf(s.pullbackScore, s.momentumScore) >= 60 -> 0xFF0891b2.toInt()
                     else -> 0xFF94a3b8.toInt()
                 })
             }
@@ -67,8 +69,8 @@ class DiscoveryAdapter : ListAdapter<StockAnalysis, DiscoveryAdapter.VH>(DIFF) {
         // Scores row (buy-only for discovery — sell scores not relevant for unowned stocks)
         (layout.getChildAt(2) as? LinearLayout)?.let { row2 ->
             (row2.getChildAt(0) as? TextView)?.apply {
-                text = "Buy ${s.buyScore}"
-                setTextColor(if (s.buyScore >= 60) 0xFF059669.toInt() else 0xFF64748b.toInt())
+                text = "Pb ${s.pullbackScore} · Mo ${s.momentumScore}"
+                setTextColor(if (maxOf(s.pullbackScore, s.momentumScore) >= 60) 0xFF059669.toInt() else 0xFF64748b.toInt())
             }
             (row2.getChildAt(1) as? TextView)?.apply {
                 text = s.macdPhase
@@ -134,7 +136,7 @@ class DiscoveryAdapter : ListAdapter<StockAnalysis, DiscoveryAdapter.VH>(DIFF) {
                 setPadding(0, dp(2), 0, dp(4))
             })
 
-            // Row 2: Buy score, Sell score, MACD phase
+            // Row 2: Pullback/Momentum points and MACD phase
             addView(LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = android.view.Gravity.CENTER_VERTICAL

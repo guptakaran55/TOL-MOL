@@ -24,9 +24,15 @@ import com.signalscope.app.data.ConfigManager
 import com.signalscope.app.data.DiscoveryResultStore
 import com.signalscope.app.data.DiscoveryScanResult
 import com.signalscope.app.data.PortfolioResultStore
+import com.signalscope.app.data.LiveBuyTrackerStore
+import com.signalscope.app.data.WatchlistStore
 import com.signalscope.app.service.ScanService
 import com.signalscope.app.network.YahooFinanceClient
+import com.signalscope.app.network.YahooFinanceStreamClient
 import com.signalscope.app.network.StockAiClient
+import com.signalscope.app.trading.LivePortfolioBars
+import com.signalscope.app.trading.LiveBuyTrackerEngine
+import com.signalscope.app.trading.LiveSoftSniperEngine
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.concurrent.thread
@@ -58,9 +64,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnStop: MaterialButton
     private lateinit var txtStatus: TextView
     private lateinit var controlBar: LinearLayout
+    private lateinit var liveStreamClient: YahooFinanceStreamClient
 
     private val gson = Gson()
     private var isServiceRunning = false
+    private var liveStreamStatus = YahooFinanceStreamClient.StreamStatus(
+        enabled = false,
+        connected = false,
+        message = "Live stream off",
+        symbolCount = 0
+    )
+    @Volatile private var t212LiveSymbols: Set<String> = emptySet()
 
     // ── Polling-based UI refresh (replaces unreliable broadcasts on MIUI) ──
     private val pollHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -68,6 +82,12 @@ class MainActivity : AppCompatActivity() {
     private var lastSeenPortfolioVersion = 0L
     private var wasDiscoveryRunning = false
     private val POLL_INTERVAL_MS = 500L // 500ms — keeps UI in sync with notification progress
+    private val DISCOVERY_PUSH_MIN_INTERVAL_MS = 2_000L
+    private val DISCOVERY_PUSH_MIN_STOCK_DELTA = 10
+    private var lastDiscoveryPayloadPushAt = 0L
+    private var lastDiscoveryPayloadStockCount = -1
+    private var lastDiscoveryPayloadMarket = ""
+    private var lastDiscoveryPayloadComplete = false
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -97,7 +117,7 @@ class MainActivity : AppCompatActivity() {
             } else if (wasDiscoveryRunning) {
                 // Scan just finished
                 wasDiscoveryRunning = false
-                pushDiscoveryResultsToWebView()
+                pushDiscoveryResultsToWebView(force = true)
                 webView.evaluateJavascript("window.scanComplete()", null)
                 // btnStop kept permanently hidden — replaced by the pulsing
                 // ⏹ Stop pill in the dashboard topBar (saves vertical space).
@@ -135,6 +155,28 @@ class MainActivity : AppCompatActivity() {
         buildLayout()
 
         config = ConfigManager(this)
+        liveStreamClient = YahooFinanceStreamClient(
+            onQuote = { quote ->
+                val liveSignal = LivePortfolioBars.recordQuote(quote)
+                if (liveSignal != null) {
+                    LiveSoftSniperEngine.onSignal(applicationContext, config, liveSignal)
+                    LiveBuyTrackerEngine.onSignal(applicationContext, config, liveSignal)
+                }
+                runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+            },
+            onStatus = { status ->
+                LivePortfolioBars.updateStreamState(
+                    enabled = status.enabled,
+                    connected = status.connected,
+                    symbolCount = status.symbolCount,
+                    message = status.message
+                )
+                runOnUiThread {
+                    liveStreamStatus = status
+                    pushLiveStreamStateToWebView()
+                }
+            }
+        )
 
         // Setups-tab sliders are session-only by design. Clear any lingering
         // session override on a fresh MainActivity launch so reopening the app
@@ -183,9 +225,11 @@ class MainActivity : AppCompatActivity() {
         refreshStatusBar()
 
         // Push whatever results we have (live or cached) to WebView
-        pushCachedDiscoveryResultsToWebView()
-        pushDiscoveryResultsToWebView()
+        pushDiscoveryResultsToWebView(force = true)
         pushPortfolioResultsToWebView()
+        updateLiveStreamSubscriptions()
+        pushLiveStreamStateToWebView()
+        pollHandler.postDelayed({ pushCachedDiscoveryResultsToWebViewAsync() }, 250L)
 
         // Start polling for live updates (reliable even on MIUI)
         pollHandler.removeCallbacks(pollRunnable)
@@ -195,7 +239,19 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         pollHandler.removeCallbacks(pollRunnable)
+        if (::liveStreamClient.isInitialized) {
+            LivePortfolioBars.updateStreamState(false, false, 0, "Paused")
+            liveStreamClient.stop("Paused")
+        }
         try { unregisterReceiver(scanReceiver) } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        if (::liveStreamClient.isInitialized) {
+            LivePortfolioBars.updateStreamState(false, false, 0, "Activity destroyed")
+            liveStreamClient.stop("Activity destroyed")
+        }
+        super.onDestroy()
     }
 
     // ═══════════════════════════════════════════════════════
@@ -369,15 +425,12 @@ class MainActivity : AppCompatActivity() {
         // Add JS bridge so dashboard.html can call Kotlin
         webView.addJavascriptInterface(DashboardBridge(), "Android")
 
-        // Load dashboard from assets
-        webView.loadUrl("file:///android_asset/dashboard.html")
-
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 // Push any existing results once page is loaded
-                pushCachedDiscoveryResultsToWebView()
-                pushDiscoveryResultsToWebView()
+                pushDiscoveryResultsToWebView(force = true)
+                pollHandler.postDelayed({ pushCachedDiscoveryResultsToWebViewAsync() }, 250L)
                 if (ScanServiceResultHolder.lastZerodhaResult != null) {
                     pushPortfolioResultsToWebView()
                 } else {
@@ -394,10 +447,18 @@ class MainActivity : AppCompatActivity() {
                         Log.d(TAG, "Rehydrated portfolio from disk snapshot")
                     }
                 }
+                updateLiveStreamSubscriptions()
+                pushLiveStreamStateToWebView()
+                // Fetch market context in background
+                fetchMarketIndexData()
                 // Fetch sector data in background
                 fetchSectorData()
             }
         }
+
+        // Load dashboard from assets after the client is attached so the
+        // onPageFinished hydration hook cannot be missed on a fast load.
+        webView.loadUrl("file:///android_asset/dashboard.html")
     }
 
     // ═══════════════════════════════════════════════════════
@@ -511,6 +572,11 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun fetchSectors() {
             fetchSectorData()
+        }
+
+        @JavascriptInterface
+        fun fetchMarketIndex() {
+            fetchMarketIndexData()
         }
 
         @JavascriptInterface
@@ -641,6 +707,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun isLiveStreamingEnabled(): Boolean = config.livePriceStreamingEnabled
+
+        @JavascriptInterface
+        fun toggleLiveStreaming(): Boolean {
+            val enabled = !config.livePriceStreamingEnabled
+            config.livePriceStreamingEnabled = enabled
+            runOnUiThread {
+                updateLiveStreamSubscriptions()
+                pushLiveStreamStateToWebView()
+                Toast.makeText(
+                    this@MainActivity,
+                    if (enabled) "Live prices enabled" else "Live prices stopped",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            return enabled
+        }
+
+        @JavascriptInterface
+        fun refreshLiveStreamSymbols() {
+            runOnUiThread { updateLiveStreamSubscriptions() }
+        }
+
+        @JavascriptInterface
         fun isDiscoveryRunning(): Boolean =
             ScanServiceResultHolder.isDiscoveryRunning
 
@@ -666,17 +756,15 @@ class MainActivity : AppCompatActivity() {
         // Reads positions + cash via the Trading 212 REST API (HTTP Basic auth).
         // Result delivered async via window.onT212PortfolioResult(json) so the
         // bridge call returns immediately and JS can show a spinner.
-        // Phase 2A: returns raw T212 fields (no Yahoo-candle enrichment).
-        // Phase 2B will add per-position StockAnalyzer scoring.
+        // Returns raw T212 fields plus per-position StockAnalyzer scoring.
         // ── Phase 2B.1: Trading 212 order primitives ──────────────────────────
         // Place / cancel orders. All run on background threads; the result is
         // delivered via window.onT212OrderResult(json) callback so the UI can
-        // show ✓ / ✗ inline. Audit log is written by Trading212Client itself,
-        // so every placement (real or simulated) appears in the GTT Audit modal.
+        // show ✓ / ✗ inline. Audit log is written by Trading212Client itself.
 
-        /** True if simulate-only mode is on — drives badge in the UI. */
+        /** Legacy bridge kept for older dashboard assets; T212 is always live. */
         @JavascriptInterface
-        fun isT212SimulateOnly(): Boolean = config.t212SimulateOnly
+        fun isT212SimulateOnly(): Boolean = false
 
         /**
          * Place a single-leg SELL stop order — i.e. the SL leg for an existing
@@ -714,11 +802,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         /**
-         * Simulated OCO — places SL stop + Target limit as two SEPARATE orders.
-         * T212 has no native OCO so Phase 2B.2 will add a watcher that cancels
-         * the surviving leg when the other fills. For 2B.1 we just place both;
-         * the audit log shows what would happen and the user can manually
-         * cancel the surviving leg from T212's app if needed.
+         * App-managed OCO — places SL stop + Target limit as two SEPARATE live
+         * orders. T212 has no native OCO, so the trailing pass reconciles fills
+         * and cancels the surviving leg when it next runs.
          */
         @JavascriptInterface
         fun placeT212SellOco(ticker: String, quantity: Double, stopPrice: Double, limitPrice: Double) {
@@ -729,10 +815,15 @@ class MainActivity : AppCompatActivity() {
                 // reconcile fills + cancel survivors. Parse the synthesised
                 // JSON we just built — slJson/tgJson are already the result
                 // strings runT212Order produced.
+                var rollbackJson = ""
                 try {
                     val sl = com.google.gson.JsonParser.parseString(slJson).asJsonObject
                     val tg = com.google.gson.JsonParser.parseString(tgJson).asJsonObject
-                    if (sl.get("ok")?.asBoolean == true && tg.get("ok")?.asBoolean == true) {
+                    val slOk = sl.get("ok")?.asBoolean == true
+                    val tgOk = tg.get("ok")?.asBoolean == true
+                    val slId = if (slOk) sl.get("id")?.asLong ?: 0L else 0L
+                    val tgId = if (tgOk) tg.get("id")?.asLong ?: 0L else 0L
+                    if (slOk && tgOk && slId > 0L && tgId > 0L) {
                         // Pull avgPrice from the latest portfolio snapshot if
                         // available — needed for hardFloor recompute on trail.
                         val avgPrice = try {
@@ -743,21 +834,35 @@ class MainActivity : AppCompatActivity() {
                         com.signalscope.app.data.T212OcoStore.add(applicationContext,
                             com.signalscope.app.data.T212OcoStore.Pair(
                                 ticker = ticker,
-                                slOrderId = sl.get("id").asLong,
-                                tgtOrderId = tg.get("id").asLong,
+                                slOrderId = slId,
+                                tgtOrderId = tgId,
                                 qty = quantity,
                                 slPrice = stopPrice,
                                 tgtPrice = limitPrice,
                                 avgPrice = avgPrice,
                                 createdAt = System.currentTimeMillis(),
-                                simulated = config.t212SimulateOnly
+                                simulated = false
                             ))
+                    } else if (slOk != tgOk) {
+                        val orphanLeg = if (slOk) "sl" else "tgt"
+                        val orphanId = if (slOk) slId else tgId
+                        if (orphanId > 0L) {
+                            val cancel = com.signalscope.app.network.Trading212Client(config).cancelOrder(orphanId)
+                            rollbackJson = when (cancel) {
+                                is com.signalscope.app.network.Trading212Client.T212Result.Success ->
+                                    ",\"rollback\":{\"attempted\":true,\"ok\":true,\"leg\":\"$orphanLeg\",\"id\":$orphanId}"
+                                is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
+                                    ",\"rollback\":{\"attempted\":true,\"ok\":false,\"leg\":\"$orphanLeg\",\"id\":$orphanId,\"error\":\"${cancel.message.replace("\"","")}\"}"
+                                is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured ->
+                                    ",\"rollback\":{\"attempted\":true,\"ok\":false,\"leg\":\"$orphanLeg\",\"id\":$orphanId,\"error\":\"not configured\"}"
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to record T212 OCO pair", e)
                 }
                 deliverAiCallback("window.onT212OrderResult",
-                    "{\"ok\":true,\"oco\":true,\"sl\":$slJson,\"tgt\":$tgJson}")
+                    "{\"ok\":true,\"oco\":true,\"sl\":$slJson,\"tgt\":$tgJson$rollbackJson}")
             }
         }
 
@@ -897,8 +1002,7 @@ class MainActivity : AppCompatActivity() {
                 val client = com.signalscope.app.network.Trading212Client(config)
                 when (val r = client.placeOrder(ticker, qty, side, orderType, limitPrice, stopPrice)) {
                     is com.signalscope.app.network.Trading212Client.T212Result.Success -> {
-                        val simulated = (r.data < 0)
-                        "{\"ok\":true,\"id\":${r.data},\"simulated\":$simulated,\"type\":\"$orderType\",\"side\":\"$side\",\"ticker\":\"$ticker\"}"
+                        "{\"ok\":true,\"id\":${r.data},\"simulated\":false,\"type\":\"$orderType\",\"side\":\"$side\",\"ticker\":\"$ticker\"}"
                     }
                     is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
                         "{\"ok\":false,\"error\":\"${r.message.replace("\"","")}\",\"httpCode\":${r.httpCode},\"type\":\"$orderType\",\"ticker\":\"$ticker\"}"
@@ -958,10 +1062,13 @@ class MainActivity : AppCompatActivity() {
                                 val candleResult = com.signalscope.app.network.YahooFinanceClient
                                     .fetchCandles(yahooSym, "NASDAQ")
                                 if (candleResult is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success) {
+                                    val displayName = name.trim().takeIf { it.isNotBlank() && !it.equals(pos.ticker, ignoreCase = true) }
+                                        ?: candleResult.name?.trim()?.takeIf { it.isNotBlank() }
+                                        ?: pos.ticker
                                     var a = com.signalscope.app.util.StockAnalyzer.analyze(
                                         candles = candleResult.candles,
                                         symbol = yahooSym,
-                                        name = name,
+                                        name = displayName,
                                         token = yahooSym,
                                         minAvgVolume = 0,   // bypass for portfolio holdings
                                         w = weights
@@ -976,7 +1083,9 @@ class MainActivity : AppCompatActivity() {
                                                 currentPrice = a!!.price,
                                                 w = weights
                                             )
+                                            val refreshedName = fundResult.data.name?.trim()?.takeIf { it.isNotBlank() } ?: a!!.name
                                             a = a!!.copy(
+                                                name = refreshedName,
                                                 trailingPe = vr.trailingPe,
                                                 forwardPe = vr.forwardPe,
                                                 priceToBook = vr.priceToBook,
@@ -1038,6 +1147,11 @@ class MainActivity : AppCompatActivity() {
                                 merged["price"]            = analysis.price
                                 merged["buyScore"]         = analysis.buyScore
                                 merged["buySignal"]        = analysis.buySignal
+                                merged["pullbackScore"]    = analysis.pullbackScore
+                                merged["pullbackSignal"]   = analysis.pullbackSignal
+                                merged["momentumScore"]    = analysis.momentumScore
+                                merged["momentumSignal"]   = analysis.momentumSignal
+                                merged["entryMode"]        = analysis.entryMode
                                 merged["profitScore"]      = analysis.profitScore
                                 merged["protectScore"]     = analysis.protectScore
                                 merged["sellScore"]        = analysis.sellScore
@@ -1077,7 +1191,10 @@ class MainActivity : AppCompatActivity() {
                                 merged["sma200"]           = analysis.sma200
                                 merged["sma200Slope"]      = analysis.sma200Slope
                                 merged["ema21"]            = analysis.ema21
+                                merged["ema21Slope"]       = analysis.ema21Slope
                                 merged["ema21PctDiff"]     = analysis.ema21PctDiff
+                                merged["ema50"]            = analysis.ema50
+                                merged["ema50Slope"]       = analysis.ema50Slope
                                 merged["ema200"]           = analysis.ema200
                                 merged["ema200Slope"]      = analysis.ema200Slope
                                 merged["bbUpper"]          = analysis.bbUpper
@@ -1116,6 +1233,8 @@ class MainActivity : AppCompatActivity() {
                                 merged["goldenBuy"]        = analysis.goldenBuy
                                 merged["goldenBuyReport"]  = analysis.goldenBuyReport
                                 merged["buyScoreReport"]   = analysis.buyScoreReport
+                                merged["pullbackScoreReport"] = analysis.pullbackScoreReport
+                                merged["momentumScoreReport"] = analysis.momentumScoreReport
                                 merged["trailingPe"]       = analysis.trailingPe
                                 merged["forwardPe"]        = analysis.forwardPe
                                 merged["priceToBook"]      = analysis.priceToBook
@@ -1153,6 +1272,12 @@ class MainActivity : AppCompatActivity() {
                             }
                             merged
                         }
+                        t212LiveSymbols = enrichedPositions
+                            .mapNotNull { it["yahooSymbol"] as? String }
+                            .map { it.trim().uppercase() }
+                            .filter { it.isNotBlank() }
+                            .toSet()
+                        runOnUiThread { updateLiveStreamSubscriptions() }
 
                         val cashJson = when (cashRes) {
                             is com.signalscope.app.network.Trading212Client.T212Result.Success ->
@@ -1175,6 +1300,50 @@ class MainActivity : AppCompatActivity() {
         // the JS side debounces to 300ms+, so blocking the WebView thread for
         // a single round-trip is acceptable. Returns a JSON array of
         // {symbol, name, exchange, quoteType} or an empty array on error.
+        private fun searchHitMatchesSpace(
+            hit: com.signalscope.app.network.YahooFinanceClient.SearchHit,
+            space: String
+        ): Boolean {
+            val sym = hit.symbol.trim().uppercase()
+            val ex = hit.exchange.trim().uppercase()
+            return when (space.uppercase()) {
+                "DE" -> sym.endsWith(".DE") ||
+                    ex.contains("XETRA") ||
+                    ex.contains("FRANKFURT") ||
+                    ex == "GER" ||
+                    ex == "FRA"
+                "US" -> !sym.contains(".") && (
+                    ex.isBlank() ||
+                    ex == "NMS" ||
+                    ex == "NYQ" ||
+                    ex == "ASE" ||
+                    ex == "PCX" ||
+                    ex == "BATS" ||
+                    ex == "NGM" ||
+                    ex == "NCM" ||
+                    ex.contains("NASDAQ") ||
+                    ex.contains("NYSE")
+                )
+                else -> sym.endsWith(".NS") ||
+                    sym.endsWith(".BO") ||
+                    ex == "NSI" ||
+                    ex == "BSE" ||
+                    ex.contains("NSE") ||
+                    ex.contains("BSE")
+            }
+        }
+
+        private fun normalizeManualSymbolForSpace(rawSymbol: String, space: String): String {
+            val raw = rawSymbol.trim().uppercase()
+            if (raw.isEmpty() || raw.startsWith("^")) return raw
+            val base = raw.substringBefore(".")
+            return when (space.uppercase()) {
+                "US" -> base
+                "DE" -> if (raw.endsWith(".DE")) raw else "$base.DE"
+                else -> if (raw.endsWith(".NS") || raw.endsWith(".BO")) raw else "$base.NS"
+            }
+        }
+
         @JavascriptInterface
         fun searchSymbols(query: String, isUS: Boolean = false): String {
             return searchSymbolsForSpace(query, if (isUS) "US" else "IN")
@@ -1191,7 +1360,8 @@ class MainActivity : AppCompatActivity() {
                 when (val r = com.signalscope.app.network.YahooFinanceClient
                     .searchSymbols(query, region)) {
                     is com.signalscope.app.network.YahooFinanceClient.SearchResult.Success -> {
-                        com.google.gson.Gson().toJson(r.hits)
+                        val filtered = r.hits.filter { hit -> searchHitMatchesSpace(hit, region) }
+                        com.google.gson.Gson().toJson(filtered)
                     }
                     is com.signalscope.app.network.YahooFinanceClient.SearchResult.RateLimited ->
                         "{\"error\":\"rate-limited\"}"
@@ -1225,14 +1395,7 @@ class MainActivity : AppCompatActivity() {
                         "DE" -> "DE"
                         else -> "IN"
                     }
-                    // Yahoo accepts NSE as `RELIANCE.NS`, Xetra as `.DE`, and US as plain.
-                    // If user typed without a dot suffix, add the suffix for the active space.
-                    val resolved = when {
-                        raw.contains(".") -> raw
-                        normalizedSpace == "US" -> raw
-                        normalizedSpace == "DE" -> "$raw.DE"
-                        else -> "$raw.NS"
-                    }
+                    val resolved = normalizeManualSymbolForSpace(raw, normalizedSpace)
                     val exchange = when (normalizedSpace) {
                         "US" -> "NASDAQ"
                         "DE" -> "DE"
@@ -1243,10 +1406,11 @@ class MainActivity : AppCompatActivity() {
                     when (candleResult) {
                         is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success -> {
                             val weights = config.scoringWeights
+                            val displayName = candleResult.name?.trim()?.takeIf { it.isNotBlank() } ?: resolved
                             var analysis = com.signalscope.app.util.StockAnalyzer.analyze(
                                 candles = candleResult.candles,
                                 symbol = resolved,
-                                name = resolved,
+                                name = displayName,
                                 token = resolved,
                                 minAvgVolume = 0,   // off-list stocks bypass the volume filter
                                 w = weights
@@ -1265,7 +1429,9 @@ class MainActivity : AppCompatActivity() {
                                             sectorMedianPe = null,
                                             w = weights
                                         )
+                                        val refreshedName = fundResult.data.name?.trim()?.takeIf { it.isNotBlank() } ?: analysis!!.name
                                         analysis = analysis!!.copy(
+                                            name = refreshedName,
                                             trailingPe = vr.trailingPe,
                                             forwardPe = vr.forwardPe,
                                             priceToBook = vr.priceToBook,
@@ -1402,11 +1568,12 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun addToWatchlist(symbol: String, exchange: String = "NSE", notes: String = ""): Int {
             return try {
-                val sym = symbol.trim().uppercase().removeSuffix(".NS")
+                val entry = normalizeWatchlistEntry(symbol, exchange, notes)
                 val list = com.signalscope.app.data.WatchlistStore.add(
                     applicationContext,
-                    com.signalscope.app.data.WatchlistStore.Entry(symbol = sym, exchange = exchange, notes = notes)
+                    entry
                 )
+                runOnUiThread { updateLiveStreamSubscriptions() }
                 list.size
             } catch (e: Exception) {
                 Log.e(TAG, "addToWatchlist failed", e)
@@ -1418,6 +1585,7 @@ class MainActivity : AppCompatActivity() {
         fun removeFromWatchlist(symbol: String): Int {
             return try {
                 val list = com.signalscope.app.data.WatchlistStore.remove(applicationContext, symbol)
+                runOnUiThread { updateLiveStreamSubscriptions() }
                 list.size
             } catch (e: Exception) {
                 Log.e(TAG, "removeFromWatchlist failed", e)
@@ -1441,6 +1609,51 @@ class MainActivity : AppCompatActivity() {
             com.signalscope.app.data.WatchlistStore.contains(applicationContext, symbol)
         } catch (_: Exception) { false }
 
+        @JavascriptInterface
+        fun getLiveBuyTrackersJson(): String {
+            return try {
+                gson.toJson(com.signalscope.app.data.LiveBuyTrackerStore.load(applicationContext))
+            } catch (e: Exception) {
+                Log.e(TAG, "getLiveBuyTrackersJson failed", e)
+                "[]"
+            }
+        }
+
+        @JavascriptInterface
+        fun armLiveBuyTracker(symbol: String, exchange: String, quantity: Int): String {
+            return try {
+                if (quantity <= 0) throw IllegalArgumentException("quantity must be > 0")
+                val entry = normalizeWatchlistEntry(symbol, exchange, "live buy tracker")
+                val watchlist = com.signalscope.app.data.WatchlistStore.add(
+                    applicationContext,
+                    entry.copy(notes = "live buy tracker - armed quantity $quantity")
+                )
+                val list = com.signalscope.app.data.LiveBuyTrackerStore.arm(
+                    applicationContext,
+                    entry.symbol,
+                    entry.exchange,
+                    quantity
+                )
+                runOnUiThread { updateLiveStreamSubscriptions() }
+                gson.toJson(mapOf("ok" to true, "count" to list.size, "watchlistCount" to watchlist.size))
+            } catch (e: Exception) {
+                Log.e(TAG, "armLiveBuyTracker failed", e)
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun cancelLiveBuyTracker(symbol: String): String {
+            return try {
+                val list = com.signalscope.app.data.LiveBuyTrackerStore.cancel(applicationContext, symbol)
+                runOnUiThread { updateLiveStreamSubscriptions() }
+                gson.toJson(mapOf("ok" to true, "count" to list.size))
+            } catch (e: Exception) {
+                Log.e(TAG, "cancelLiveBuyTracker failed", e)
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
         /** Re-fetch + re-score every watchlist entry. Result delivered async via
          *  window.onWatchlistRefreshed(json) — same pattern as scan callbacks. */
         @JavascriptInterface
@@ -1451,12 +1664,13 @@ class MainActivity : AppCompatActivity() {
                     val weights = config.scoringWeights
                     val results = entries.map { e ->
                         try {
-                            val resolved = if (e.symbol.contains(".")) e.symbol else "${e.symbol}.NS"
+                            val resolved = YahooFinanceClient.toYahooSymbol(e.symbol, e.exchange)
                             val cr = com.signalscope.app.network.YahooFinanceClient
                                 .fetchCandles(resolved, e.exchange)
                             if (cr is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success) {
+                                val displayName = cr.name?.trim()?.takeIf { it.isNotBlank() } ?: resolved
                                 val a = com.signalscope.app.util.StockAnalyzer.analyze(
-                                    candles = cr.candles, symbol = resolved, name = resolved,
+                                    candles = cr.candles, symbol = resolved, name = displayName,
                                     token = resolved, minAvgVolume = 0, w = weights
                                 )
                                 if (a != null) {
@@ -1472,6 +1686,9 @@ class MainActivity : AppCompatActivity() {
                                     val snap = com.signalscope.app.data.WatchlistStore.Snapshot(
                                         ltp = a.price, support = a.support, resistance = a.resistance,
                                         atr = a.atr, buyScore = a.buyScore, buySignal = a.buySignal,
+                                        pullbackScore = a.pullbackScore, pullbackSignal = a.pullbackSignal,
+                                        momentumScore = a.momentumScore, momentumSignal = a.momentumSignal,
+                                        entryMode = a.entryMode,
                                         proposedTrigger = trigger, capturedAt = System.currentTimeMillis()
                                     )
                                     com.signalscope.app.data.WatchlistStore.update(
@@ -1694,6 +1911,7 @@ class MainActivity : AppCompatActivity() {
          * Combines:
          *   - ScanService intraday alerts (from lastZerodhaResult.alerts)
          *   - DPM watchdog alerts (from macdWatchdogAlerts)
+         *   - Discovery smooth-turn buy timing alerts (from smoothTurnAlerts)
          * Both lists are deduped by symbol+alertType, sorted with most-severe first.
          * Used by the dashboard alert panel so MACD_FLIP firings are visible alongside
          * BOOK_PROFIT / PROTECT_CAPITAL / PEAK_WARNING.
@@ -1709,6 +1927,9 @@ class MainActivity : AppCompatActivity() {
                 val softSniper = synchronized(ScanServiceResultHolder.softSniperAlerts) {
                     ScanServiceResultHolder.softSniperAlerts.toList()
                 }
+                val smoothTurns = synchronized(ScanServiceResultHolder.smoothTurnAlerts) {
+                    ScanServiceResultHolder.smoothTurnAlerts.toList()
+                }
                 // Severity rank — lower = more severe (sorted ascending).
                 // SOFT_SNIPER ranked between MACD_FLIP and PROTECT_CAPITAL: it's a
                 // GTT-placement event (action taken) so it outranks plain advisories
@@ -1720,11 +1941,12 @@ class MainActivity : AppCompatActivity() {
                     com.signalscope.app.data.AlertType.PROTECT_CAPITAL -> 3
                     com.signalscope.app.data.AlertType.BOOK_PROFIT     -> 4
                     com.signalscope.app.data.AlertType.PEAK_WARNING    -> 5
-                    com.signalscope.app.data.AlertType.GOLDEN_BUY      -> 6
-                    com.signalscope.app.data.AlertType.STRONG_BUY      -> 7
+                    com.signalscope.app.data.AlertType.SMOOTH_BUY_TURN -> 6
+                    com.signalscope.app.data.AlertType.GOLDEN_BUY      -> 7
+                    com.signalscope.app.data.AlertType.STRONG_BUY      -> 8
                     else -> 99
                 }
-                val merged = (intraday + watchdog + softSniper)
+                val merged = (intraday + watchdog + softSniper + smoothTurns)
                     .distinctBy { "${it.symbol}|${it.alertType}" }
                     .sortedBy { rank(it.alertType) }
                     .map { a -> mapOf(
@@ -1941,21 +2163,30 @@ class MainActivity : AppCompatActivity() {
                 val text: String = try {
                     if (quantity <= 0) throw IllegalArgumentException("quantity must be > 0")
                     if (lastPrice <= 0) throw IllegalArgumentException("lastPrice invalid")
+                    val zc = com.signalscope.app.network.ZerodhaClient(config)
+                    val effectiveLastPrice = when (val fresh = zc.fetchLtp(exchange, symbol)) {
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Success -> fresh.lastPrice
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Expired -> throw IllegalStateException(fresh.message)
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Failure -> lastPrice
+                    }
                     // Clamp triggers only to Kite's ±25% hard limit. No 5% floor —
                     // user wants SL as tight as possible to minimize loss beyond volatility.
                     // Tiny 0.1% pad keeps SL strictly below LTP so it doesn't fire instantly.
                     val slMax = lastPrice * 0.999  // strictly below LTP (≥0.1% below)
-                    val slMin = lastPrice * 0.75   // at most 25% below (Kite hard limit)
+                    val slMin = effectiveLastPrice * 0.75   // at most 25% below (Kite hard limit)
                     val tgMin = lastPrice * 1.001  // strictly above LTP (≥0.1% above)
                     val tgMax = lastPrice * 1.25   // at most 25% above (Kite hard limit)
+                    val safeSlMax = effectiveLastPrice * 0.999
+                    val safeSlMin = effectiveLastPrice * 0.75
+                    val safeTgMin = effectiveLastPrice * 1.001
+                    val safeTgMax = effectiveLastPrice * 1.25
 
-                    var sl = slTrigger.coerceIn(slMin, slMax)
-                    var tg = targetTrigger.coerceIn(tgMin, tgMax)
+                    var sl = slTrigger.coerceIn(safeSlMin, safeSlMax)
+                    var tg = targetTrigger.coerceIn(safeTgMin, safeTgMax)
                     // Round to 2 decimals — Kite rejects anything finer than a tick
                     sl = Math.round(sl * 20.0) / 20.0   // 0.05 ticks
                     tg = Math.round(tg * 20.0) / 20.0
 
-                    val zc = com.signalscope.app.network.ZerodhaClient(config)
                     val orders = listOf(
                         com.signalscope.app.network.ZerodhaClient.GttOrderSpec("SELL", quantity, sl),
                         com.signalscope.app.network.ZerodhaClient.GttOrderSpec("SELL", quantity, tg)
@@ -1965,11 +2196,11 @@ class MainActivity : AppCompatActivity() {
                         exchange = exchange,
                         tradingsymbol = symbol,
                         triggerValues = listOf(sl, tg),
-                        lastPrice = lastPrice,
+                        lastPrice = effectiveLastPrice,
                         orders = orders
                     )) {
                         is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Success ->
-                            "{\"ok\":true,\"id\":${r.id},\"sl\":$sl,\"target\":$tg,\"symbol\":\"$symbol\"}"
+                            "{\"ok\":true,\"id\":${r.id},\"sl\":$sl,\"target\":$tg,\"ltp\":$effectiveLastPrice,\"symbol\":\"$symbol\"}"
                         is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Failure ->
                             "{\"ok\":false,\"error\":\"${r.message.replace("\"","")}\",\"symbol\":\"$symbol\"}"
                     }
@@ -1990,23 +2221,29 @@ class MainActivity : AppCompatActivity() {
             thread(isDaemon = true) {
                 val text: String = try {
                     if (quantity <= 0) throw IllegalArgumentException("quantity must be > 0")
-                    val pct = (triggerPrice - lastPrice) / lastPrice
+                    if (lastPrice <= 0) throw IllegalArgumentException("lastPrice invalid")
+                    val zc = com.signalscope.app.network.ZerodhaClient(config)
+                    val effectiveLastPrice = when (val fresh = zc.fetchLtp(exchange, symbol)) {
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Success -> fresh.lastPrice
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Expired -> throw IllegalStateException(fresh.message)
+                        is com.signalscope.app.network.ZerodhaClient.LtpResult.Failure -> lastPrice
+                    }
+                    val pct = (triggerPrice - effectiveLastPrice) / effectiveLastPrice
                     // No 5% minimum floor — user wants tight SLs. Only enforce side
                     // of LTP (with a tiny 0.1% pad) and the ±25% Kite hard limit.
                     if (kind == "SL" && pct >= -0.001) throw IllegalArgumentException("SL trigger must be strictly below LTP")
                     if (kind == "TARGET" && pct <= 0.001) throw IllegalArgumentException("Target trigger must be strictly above LTP")
                     if (Math.abs(pct) > 0.25) throw IllegalArgumentException("Trigger beyond ±25% of LTP (Kite hard limit)")
                     val trig = Math.round(triggerPrice * 20.0) / 20.0
-                    val zc = com.signalscope.app.network.ZerodhaClient(config)
                     val orders = listOf(
                         com.signalscope.app.network.ZerodhaClient.GttOrderSpec("SELL", quantity, trig)
                     )
                     when (val r = zc.createGttTrigger(
                         type = "single", exchange = exchange, tradingsymbol = symbol,
-                        triggerValues = listOf(trig), lastPrice = lastPrice, orders = orders
+                        triggerValues = listOf(trig), lastPrice = effectiveLastPrice, orders = orders
                     )) {
                         is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Success ->
-                            "{\"ok\":true,\"id\":${r.id},\"trigger\":$trig,\"kind\":\"$kind\",\"symbol\":\"$symbol\"}"
+                            "{\"ok\":true,\"id\":${r.id},\"trigger\":$trig,\"kind\":\"$kind\",\"ltp\":$effectiveLastPrice,\"symbol\":\"$symbol\"}"
                         is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Failure ->
                             "{\"ok\":false,\"error\":\"${r.message.replace("\"","")}\",\"kind\":\"$kind\",\"symbol\":\"$symbol\"}"
                     }
@@ -2055,19 +2292,13 @@ class MainActivity : AppCompatActivity() {
                     val zc = com.signalscope.app.network.ZerodhaClient(config)
                     var sweptCount = 0
                     var staleDeletedCount = 0
+                    val pendingStaleIds = mutableListOf<Long>()
 
                     if (staleIds != null) {
                         for (j in 0 until staleIds.length()) {
                             val staleId = staleIds.optLong(j, 0L)
                             if (staleId <= 0L) continue
-                            try {
-                                zc.deleteGttTrigger(staleId)
-                                sweptCount++
-                                staleDeletedCount++
-                                Thread.sleep(400L)
-                            } catch (e: Throwable) {
-                                Log.w(TAG, "stale sweep: delete GTT $staleId failed: ${e.message}")
-                            }
+                            pendingStaleIds.add(staleId)
                         }
                     }
 
@@ -2089,12 +2320,17 @@ class MainActivity : AppCompatActivity() {
                         val symbol = o.getString("symbol")
                         val exchange = o.optString("exchange", "NSE")
                         val qty = o.getInt("qty")
-                        val ltp = o.getDouble("ltp")
+                        var ltp = o.getDouble("ltp")
                         var sl = o.getDouble("sl")
                         var tg = o.getDouble("tgt")
 
                         val progressText: String = try {
                             if (qty <= 0) throw IllegalArgumentException("qty ≤ 0")
+                            ltp = when (val fresh = zc.fetchLtp(exchange, symbol)) {
+                                is com.signalscope.app.network.ZerodhaClient.LtpResult.Success -> fresh.lastPrice
+                                is com.signalscope.app.network.ZerodhaClient.LtpResult.Expired -> throw IllegalStateException(fresh.message)
+                                is com.signalscope.app.network.ZerodhaClient.LtpResult.Failure -> ltp
+                            }
                             if (ltp <= 0) throw IllegalArgumentException("bad ltp")
                             // ±25% Kite hard limit only. 0.1% pad keeps trigger
                             // strictly on its correct side of LTP.
@@ -2130,17 +2366,6 @@ class MainActivity : AppCompatActivity() {
                                 skipped.add("{\"symbol\":\"$symbol\",\"reason\":\"$msg\",\"sl\":$sl,\"tgt\":$tg}")
                                 "{\"i\":${i+1},\"total\":$total,\"symbol\":\"$symbol\",\"status\":\"skip\",\"error\":\"$msg\"}"
                             } else {
-                                // Delete any pre-existing SELL GTTs only after the downgrade
-                                // guard passes, then create a fresh OCO for idempotency.
-                                existingForSymbol.forEach { old ->
-                                    try {
-                                        zc.deleteGttTrigger(old.id)
-                                        sweptCount++
-                                        Thread.sleep(400L)
-                                    } catch (e: Throwable) {
-                                        Log.w(TAG, "sweep: delete GTT ${old.id} for $symbol failed: ${e.message}")
-                                    }
-                                }
                                 val orders = listOf(
                                     com.signalscope.app.network.ZerodhaClient.GttOrderSpec("SELL", qty, sl),
                                     com.signalscope.app.network.ZerodhaClient.GttOrderSpec("SELL", qty, tg)
@@ -2150,8 +2375,17 @@ class MainActivity : AppCompatActivity() {
                                     triggerValues = listOf(sl, tg), lastPrice = ltp, orders = orders
                                 )) {
                                     is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Success -> {
-                                        created.add("{\"symbol\":\"$symbol\",\"id\":${r.id},\"sl\":$sl,\"tgt\":$tg}")
-                                        "{\"i\":${i+1},\"total\":$total,\"symbol\":\"$symbol\",\"status\":\"ok\",\"id\":${r.id},\"sl\":$sl,\"tgt\":$tg}"
+                                        existingForSymbol.forEach { old ->
+                                            try {
+                                                zc.deleteGttTrigger(old.id)
+                                                sweptCount++
+                                                Thread.sleep(400L)
+                                            } catch (e: Throwable) {
+                                                Log.w(TAG, "post-create sweep: delete GTT ${old.id} for $symbol failed: ${e.message}")
+                                            }
+                                        }
+                                        created.add("{\"symbol\":\"$symbol\",\"id\":${r.id},\"sl\":$sl,\"tgt\":$tg,\"ltp\":$ltp}")
+                                        "{\"i\":${i+1},\"total\":$total,\"symbol\":\"$symbol\",\"status\":\"ok\",\"id\":${r.id},\"sl\":$sl,\"tgt\":$tg,\"ltp\":$ltp}"
                                     }
                                     is com.signalscope.app.network.ZerodhaClient.GttCreateResult.Failure -> {
                                         failed.add("{\"symbol\":\"$symbol\",\"error\":\"${r.message.replace("\"","")}\"}")
@@ -2169,6 +2403,18 @@ class MainActivity : AppCompatActivity() {
                         // Kite's published limit for order endpoints is ~3/sec; 1s spacing is 3× under cap.
                         if (i < total - 1) {
                             try { Thread.sleep(1000L) } catch (_: InterruptedException) {}
+                        }
+                    }
+                    if (pendingStaleIds.isNotEmpty() && created.isNotEmpty()) {
+                        pendingStaleIds.forEach { staleId ->
+                            try {
+                                zc.deleteGttTrigger(staleId)
+                                sweptCount++
+                                staleDeletedCount++
+                                Thread.sleep(400L)
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "post-create stale sweep: delete GTT $staleId failed: ${e.message}")
+                            }
                         }
                     }
                     val summary = "{\"created\":[${created.joinToString(",")}],\"failed\":[${failed.joinToString(",")}],\"skipped\":[${skipped.joinToString(",")}],\"total\":$total,\"swept\":$sweptCount,\"staleDeleted\":$staleDeletedCount}"
@@ -2285,12 +2531,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun startDiscoveryScan(action: String) {
         ensureServiceRunning()
+        lastDiscoveryPayloadPushAt = 0L
+        lastDiscoveryPayloadStockCount = -1
+        lastDiscoveryPayloadMarket = ""
+        lastDiscoveryPayloadComplete = false
         // Discovery scans can take 15–40 minutes. On OEM-modded Androids
         // (MIUI, ColorOS, OneUI) the OS will kill the foreground service
         // mid-scan unless the app is exempt from battery optimization.
         // Prompting here is idempotent — Android shows nothing if already exempt.
         requestBatteryOptimizationExemption()
-        startService(ScanService.createIntent(this, action))
+        ContextCompat.startForegroundService(this, ScanService.createIntent(this, action))
         btnStop.visibility = View.VISIBLE
         val market = when {
             action.contains("NIFTY") -> "NIFTY"
@@ -2310,15 +2560,34 @@ class MainActivity : AppCompatActivity() {
     // PUSH DATA TO WEBVIEW
     // ═══════════════════════════════════════════════════════
 
-    private fun pushDiscoveryResultsToWebView() {
+    private fun shouldPushDiscoveryPayload(result: DiscoveryScanResult, force: Boolean): Boolean {
+        if (force) return true
+        val now = android.os.SystemClock.uptimeMillis()
+        val stockCount = result.allStocks.size
+        if (result.market != lastDiscoveryPayloadMarket) return true
+        if (result.isComplete && !lastDiscoveryPayloadComplete) return true
+        if (stockCount - lastDiscoveryPayloadStockCount >= DISCOVERY_PUSH_MIN_STOCK_DELTA) return true
+        return now - lastDiscoveryPayloadPushAt >= DISCOVERY_PUSH_MIN_INTERVAL_MS
+    }
+
+    private fun markDiscoveryPayloadPushed(result: DiscoveryScanResult) {
+        lastDiscoveryPayloadPushAt = android.os.SystemClock.uptimeMillis()
+        lastDiscoveryPayloadStockCount = result.allStocks.size
+        lastDiscoveryPayloadMarket = result.market
+        lastDiscoveryPayloadComplete = result.isComplete
+    }
+
+    private fun pushDiscoveryResultsToWebView(force: Boolean = false) {
         // Access the service's static result holder
         val result = ScanServiceResultHolder.lastDiscoveryResult ?: return
         try {
+            if (!shouldPushDiscoveryPayload(result, force)) return
             val payload = discoveryPayload(result)
             val json = gson.toJson(payload)
             // Escape for JS string
             val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
             webView.evaluateJavascript("window.updateScanData('$escaped')", null)
+            markDiscoveryPayloadPushed(result)
         } catch (e: Exception) {
             Log.e(TAG, "Error pushing results to WebView", e)
         }
@@ -2345,17 +2614,25 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun pushCachedDiscoveryResultsToWebView() {
-        try {
-            DiscoveryResultStore.loadAll(this).forEach { cached ->
+    private fun pushCachedDiscoveryResultsToWebViewAsync() {
+        thread(isDaemon = true, name = "cached-discovery-push") {
+            try {
                 val live = ScanServiceResultHolder.lastDiscoveryResult
-                if (live != null && live.market == cached.market && !live.isComplete) return@forEach
-                val json = gson.toJson(discoveryPayload(cached, forceComplete = true))
-                val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
-                webView.evaluateJavascript("window.updateScanData('$escaped')", null)
+                val escapedPayloads = DiscoveryResultStore.loadAll(applicationContext)
+                    .mapNotNull { cached ->
+                        if (live != null && live.market == cached.market) return@mapNotNull null
+                        val json = gson.toJson(discoveryPayload(cached, forceComplete = true))
+                        json.replace("\\", "\\\\").replace("'", "\\'")
+                    }
+                if (escapedPayloads.isEmpty()) return@thread
+                runOnUiThread {
+                    escapedPayloads.forEach { escaped ->
+                        webView.evaluateJavascript("window.updateScanData('$escaped')", null)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error pushing cached discovery results", e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error pushing cached discovery results", e)
         }
     }
 
@@ -2394,6 +2671,11 @@ class MainActivity : AppCompatActivity() {
                 "source" to "zerodha",
                 "verdict" to h.verdict,
                 "buyScore" to (a?.buyScore ?: 0),
+                "pullbackScore" to (a?.pullbackScore ?: 0),
+                "pullbackSignal" to (a?.pullbackSignal ?: "—"),
+                "momentumScore" to (a?.momentumScore ?: 0),
+                "momentumSignal" to (a?.momentumSignal ?: "—"),
+                "entryMode" to (a?.entryMode ?: "NONE"),
                 "profitScore" to (a?.profitScore ?: 0),
                 "protectScore" to (a?.protectScore ?: 0),
                 "sellIntent" to (a?.sellIntent ?: "HOLD"),
@@ -2432,7 +2714,10 @@ class MainActivity : AppCompatActivity() {
                 "sma200" to (a?.sma200),
                 "sma200Slope" to (a?.sma200Slope ?: 0.0),
                 "ema21" to (a?.ema21),
+                "ema21Slope" to (a?.ema21Slope ?: 0.0),
                 "ema21PctDiff" to (a?.ema21PctDiff ?: 0.0),
+                "ema50" to (a?.ema50),
+                "ema50Slope" to (a?.ema50Slope ?: 0.0),
                 "ema200" to (a?.ema200),
                 "ema200Slope" to (a?.ema200Slope ?: 0.0),
                 "bbUpper" to (a?.bbUpper),
@@ -2465,6 +2750,8 @@ class MainActivity : AppCompatActivity() {
                 "obvDivergence" to (a?.obvDivergence ?: false),
                 "obvWeakness" to (a?.obvWeakness ?: false),
                 "buyScoreReport" to (a?.buyScoreReport ?: ""),
+                "pullbackScoreReport" to (a?.pullbackScoreReport ?: ""),
+                "momentumScoreReport" to (a?.momentumScoreReport ?: ""),
                 "trailingPe" to (a?.trailingPe),
                 "forwardPe" to (a?.forwardPe),
                 "priceToBook" to (a?.priceToBook),
@@ -2536,6 +2823,7 @@ class MainActivity : AppCompatActivity() {
             // process death (MIUI / OnePlus aggressive killing during app switching).
             // On cold start, MainActivity.onPageFinished will re-push this verbatim.
             PortfolioResultStore.save(applicationContext, json)
+            updateLiveStreamSubscriptions()
         } catch (e: Exception) {
             Log.e(TAG, "Error pushing portfolio to WebView", e)
         }
@@ -2544,6 +2832,305 @@ class MainActivity : AppCompatActivity() {
     // ═══════════════════════════════════════════════════════
     // SECTOR DATA — fetched from Yahoo Finance in background
     // ═══════════════════════════════════════════════════════
+
+    private fun normalizeWatchlistEntry(
+        symbol: String,
+        exchange: String,
+        notes: String
+    ): WatchlistStore.Entry {
+        val raw = symbol.trim().uppercase()
+        val normalizedExchange = when {
+            raw.endsWith(".NS") -> "NSE"
+            raw.endsWith(".BO") -> "BSE"
+            raw.endsWith(".DE") -> "DE"
+            exchange.equals("US", ignoreCase = true) -> "US"
+            exchange.equals("NASDAQ", ignoreCase = true) -> "NASDAQ"
+            exchange.equals("NYSE", ignoreCase = true) -> "NYSE"
+            exchange.equals("DE", ignoreCase = true) -> "DE"
+            exchange.equals("XETRA", ignoreCase = true) -> "DE"
+            exchange.equals("BSE", ignoreCase = true) -> "BSE"
+            else -> "NSE"
+        }
+        val storedSymbol = when (normalizedExchange) {
+            "NSE" -> raw.removeSuffix(".NS")
+            "BSE" -> raw.removeSuffix(".BO")
+            else -> raw
+        }
+        return WatchlistStore.Entry(symbol = storedSymbol, exchange = normalizedExchange, notes = notes)
+    }
+
+    private fun collectLiveStreamSymbols(): Set<String> {
+        val symbols = linkedSetOf<String>()
+        ScanServiceResultHolder.lastZerodhaResult?.holdings?.forEach { holding ->
+            symbols.add(YahooFinanceClient.toYahooSymbol(holding.symbol, holding.exchange))
+        }
+        if (ScanServiceResultHolder.lastZerodhaResult == null) {
+            addCachedPortfolioSymbols(symbols)
+        }
+        symbols.addAll(t212LiveSymbols)
+        WatchlistStore.load(applicationContext).forEach { entry ->
+            symbols.add(YahooFinanceClient.toYahooSymbol(entry.symbol, entry.exchange))
+        }
+        LiveBuyTrackerStore.load(applicationContext)
+            .filter { it.status == "ARMED" || it.status == "FIRING" }
+            .forEach { entry ->
+                symbols.add(YahooFinanceClient.toYahooSymbol(entry.symbol, entry.exchange))
+            }
+        return symbols
+            .map { it.trim().uppercase() }
+            .filter { it.isNotBlank() }
+            .toCollection(LinkedHashSet())
+    }
+
+    private fun addCachedPortfolioSymbols(symbols: MutableSet<String>) {
+        try {
+            val snap = PortfolioResultStore.load(applicationContext) ?: return
+            val root = org.json.JSONObject(snap.payloadJson)
+            val holdings = root.optJSONArray("holdings") ?: return
+            for (i in 0 until holdings.length()) {
+                val h = holdings.optJSONObject(i) ?: continue
+                val symbol = h.optString("symbol", "").trim()
+                val exchange = h.optString("exchange", "NSE").trim()
+                if (symbol.isNotBlank()) {
+                    symbols.add(YahooFinanceClient.toYahooSymbol(symbol, exchange))
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to read cached portfolio symbols for live stream", e)
+        }
+    }
+
+    private fun updateLiveStreamSubscriptions() {
+        if (!::liveStreamClient.isInitialized) return
+        if (!config.livePriceStreamingEnabled) {
+            liveStreamClient.stop("Live stream off")
+            liveStreamStatus = liveStreamStatus.copy(
+                enabled = false,
+                connected = false,
+                message = "Live stream off",
+                symbolCount = 0
+            )
+            LivePortfolioBars.updateStreamState(false, false, 0, "Live stream off")
+            pushLiveStreamStateToWebView()
+            return
+        }
+
+        val symbols = collectLiveStreamSymbols()
+        if (symbols.isEmpty()) {
+            liveStreamClient.stop("No portfolio/watchlist/tracker symbols")
+            liveStreamStatus = liveStreamStatus.copy(
+                enabled = true,
+                connected = false,
+                message = "Waiting for portfolio/watchlist/tracker symbols",
+                symbolCount = 0
+            )
+            LivePortfolioBars.updateStreamState(true, false, 0, "Waiting for portfolio/watchlist/tracker symbols")
+            pushLiveStreamStateToWebView()
+            return
+        }
+
+        liveStreamStatus = liveStreamStatus.copy(
+            enabled = true,
+            message = if (liveStreamStatus.connected) "Connected" else "Connecting...",
+            symbolCount = symbols.size
+        )
+        LivePortfolioBars.updateStreamState(
+            enabled = true,
+            connected = liveStreamStatus.connected,
+            symbolCount = symbols.size,
+            message = liveStreamStatus.message
+        )
+        pushLiveStreamStateToWebView()
+        liveStreamClient.setSymbols(symbols)
+    }
+
+    private fun pushLiveStreamStateToWebView() {
+        if (!::webView.isInitialized) return
+        val payload = mapOf(
+            "enabled" to config.livePriceStreamingEnabled,
+            "connected" to liveStreamStatus.connected,
+            "status" to liveStreamStatus.message,
+            "symbols" to liveStreamStatus.symbolCount
+        )
+        val escaped = gson.toJson(payload).replace("\\", "\\\\").replace("'", "\\'")
+        webView.evaluateJavascript("window.updateLiveStreamState && window.updateLiveStreamState('$escaped')", null)
+    }
+
+    private fun pushLiveQuoteToWebView(
+        quote: YahooFinanceStreamClient.LiveQuote,
+        signal: LivePortfolioBars.ReversalSignal?
+    ) {
+        if (!::webView.isInitialized || !config.livePriceStreamingEnabled) return
+        val payload = mapOf(
+            "symbol" to quote.symbol,
+            "price" to quote.price,
+            "time" to quote.time,
+            "currency" to quote.currency,
+            "exchange" to quote.exchange,
+            "quoteType" to quote.quoteType,
+            "marketHours" to quote.marketHours,
+            "changePercent" to quote.changePercent,
+            "dayVolume" to quote.dayVolume,
+            "dayHigh" to quote.dayHigh,
+            "dayLow" to quote.dayLow,
+            "change" to quote.change,
+            "priceHint" to quote.priceHint,
+            "receivedAt" to System.currentTimeMillis(),
+            "liveMacd" to signal?.let {
+                mapOf(
+                    "ready" to it.ready,
+                    "shouldProtect" to it.shouldProtect,
+                    "reason" to it.reason,
+                    "dropFromSessionHighPct" to it.dropFromSessionHighPct,
+                    "currentBarMovePct" to it.currentBarMovePct,
+                    "closeSlopePct" to it.closeSlopePct,
+                    "buyReady" to it.mtfMacd.buyReady,
+                    "sellWarning" to it.mtfMacd.sellWarning,
+                    "sellConfirmed" to it.mtfMacd.sellConfirmed,
+                    "summary" to it.mtfMacd.summary,
+                    "velocity30m" to velocityPayload(it.velocity30m),
+                    "oneHour" to framePayload(it.mtfMacd.oneHour),
+                    "twoHour" to framePayload(it.mtfMacd.twoHour),
+                    "fourHour" to framePayload(it.mtfMacd.fourHour)
+                )
+            }
+        )
+        val escaped = gson.toJson(payload).replace("\\", "\\\\").replace("'", "\\'")
+        webView.evaluateJavascript("window.updateLiveQuote && window.updateLiveQuote('$escaped')", null)
+    }
+
+    private fun framePayload(frame: LivePortfolioBars.FrameMacdSignal): Map<String, Any> = mapOf(
+        "label" to frame.label,
+        "ready" to frame.ready,
+        "bars" to frame.bars,
+        "macd" to frame.macd,
+        "histogram" to frame.histogram,
+        "slope" to frame.slope,
+        "previousSlope" to frame.previousSlope,
+        "buyHook" to frame.buyHook,
+        "sellWarning" to frame.sellWarning,
+        "reason" to frame.reason
+    )
+
+    private fun velocityPayload(signal: LivePortfolioBars.PriceVelocitySignal): Map<String, Any> = mapOf(
+        "label" to signal.label,
+        "ready" to signal.ready,
+        "bars" to signal.bars,
+        "velocityPct" to signal.velocityPct,
+        "previousVelocityPct" to signal.previousVelocityPct,
+        "accelerationPct" to signal.accelerationPct,
+        "warning" to signal.warning,
+        "severe" to signal.severe,
+        "confirmed" to signal.confirmed,
+        "summary" to signal.summary
+    )
+
+    private data class MarketIndexCandidate(
+        val symbol: String,
+        val name: String,
+        val index: String
+    )
+
+    private data class MarketIndexSpec(
+        val space: String,
+        val exchange: String,
+        val candidates: List<MarketIndexCandidate>
+    )
+
+    private val marketIndexSpecs = listOf(
+        MarketIndexSpec(
+            "IN",
+            "NSE",
+            listOf(
+                MarketIndexCandidate("^CRSLDX", "NIFTY 500", "NIFTY 500"),
+                MarketIndexCandidate("^NSEI", "NIFTY 50", "NIFTY 50")
+            )
+        ),
+        MarketIndexSpec(
+            "US",
+            "US",
+            listOf(
+                MarketIndexCandidate("^NDX", "NASDAQ 100", "NASDAQ 100"),
+                MarketIndexCandidate("^IXIC", "NASDAQ", "NASDAQ Composite")
+            )
+        ),
+        MarketIndexSpec(
+            "DE",
+            "DE",
+            listOf(
+                MarketIndexCandidate("^GDAXI", "DAX", "DAX")
+            )
+        )
+    )
+
+    @Volatile private var marketIndexFetchInProgress = false
+
+    private fun fetchMarketIndexData() {
+        if (marketIndexFetchInProgress) return
+        marketIndexFetchInProgress = true
+
+        thread(isDaemon = true) {
+            try {
+                val indices = mutableListOf<Map<String, Any?>>()
+
+                for (spec in marketIndexSpecs) {
+                    var added = false
+                    for (candidate in spec.candidates) {
+                        try {
+                            val result = YahooFinanceClient.fetchCandles(candidate.symbol, spec.exchange)
+                            if (result is YahooFinanceClient.CandleResult.Success && result.candles.size >= 2) {
+                                val candles = result.candles
+                                val latest = candles.last()
+                                val prev = candles[candles.size - 2]
+                                val dayChange = if (prev.close > 0) {
+                                    (latest.close - prev.close) / prev.close * 100.0
+                                } else 0.0
+                                val periodStart = if (candles.size > 120) candles[candles.size - 120] else candles.first()
+                                val periodChange = if (periodStart.close > 0) {
+                                    (latest.close - periodStart.close) / periodStart.close * 100.0
+                                } else 0.0
+                                val high = candles.takeLast(120).maxOfOrNull { it.high } ?: latest.high
+                                val low = candles.takeLast(120).minOfOrNull { it.low } ?: latest.low
+                                val closesForChart = candles.takeLast(60).map { it.close }
+
+                                indices.add(
+                                    mapOf(
+                                        "space" to spec.space,
+                                        "name" to candidate.name,
+                                        "index" to candidate.index,
+                                        "symbol" to candidate.symbol,
+                                        "price" to latest.close,
+                                        "dayChange" to dayChange,
+                                        "periodChange" to periodChange,
+                                        "high" to high,
+                                        "low" to low,
+                                        "closes" to closesForChart
+                                    )
+                                )
+                                added = true
+                                break
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Market index fetch error for ${candidate.symbol}", e)
+                        }
+                    }
+                    if (added) Thread.sleep(350) else Thread.sleep(200)
+                }
+
+                if (indices.isNotEmpty()) {
+                    val json = gson.toJson(indices)
+                    val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+                    runOnUiThread {
+                        webView.evaluateJavascript("window.updateMarketIndexData('$escaped')", null)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Market index data fetch failed", e)
+            } finally {
+                marketIndexFetchInProgress = false
+            }
+        }
+    }
 
     private val sectorIndices = listOf(
         Triple("Banking", "^NSEBANK", "NIFTY Bank"),
@@ -2752,9 +3339,24 @@ object ScanServiceResultHolder {
     val softSniperAlerts: MutableList<com.signalscope.app.data.StockAlert> =
         java.util.Collections.synchronizedList(mutableListOf<com.signalscope.app.data.StockAlert>())
 
+    // Discovery buy-timing alerts: quality-filtered smoothed MACD turns from
+    // the Setups -> Turned Today lens.
+    val smoothTurnAlerts: MutableList<com.signalscope.app.data.StockAlert> =
+        java.util.Collections.synchronizedList(mutableListOf<com.signalscope.app.data.StockAlert>())
+
     /** Helper: did the soft sniper fire for [symbol] on [yyyyMmDd] (IST trading date)? */
     fun isSoftSniperFired(symbol: String, yyyyMmDd: String): Boolean =
         softSniperFiredKeys.contains("$yyyyMmDd|$symbol")
+
+    /** Atomic one-shot guard shared by scan-based and live-ticker soft sniper paths. */
+    fun markSoftSniperFiredIfAbsent(symbol: String, yyyyMmDd: String): Boolean {
+        val key = "$yyyyMmDd|$symbol"
+        synchronized(softSniperFiredKeys) {
+            if (softSniperFiredKeys.contains(key)) return false
+            softSniperFiredKeys.add(key)
+            return true
+        }
+    }
 
     // ── Score persistence streak (Tier 1.5 anti-flicker gate) ──
     // Tracks how many consecutive 15-min scan ticks each symbol has had

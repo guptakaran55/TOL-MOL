@@ -75,13 +75,29 @@ object StockAnalyzer {
 
         // ── EMA(21) ──
         val ema21Val: Double?
+        val ema21Slope: Double
         val ema21PctDiff: Double
         if (n >= 21) {
             val ema21Series = Indicators.ema(closes, 21)
             ema21Val = ema21Series.last()
+            val ema21Prev = if (ema21Series.size >= 2) ema21Series[ema21Series.size - 2] else ema21Val
+            ema21Slope = ema21Val - ema21Prev
             ema21PctDiff = if (ema21Val > 0) ((price - ema21Val) / ema21Val * 100).round(2) else 0.0
         } else {
-            ema21Val = null; ema21PctDiff = 0.0
+            ema21Val = null; ema21Slope = 0.0; ema21PctDiff = 0.0
+        }
+
+        // EMA(50) for the trend stack.
+        val ema50Val: Double?
+        val ema50Slope: Double
+        if (n >= 50) {
+            val ema50Series = Indicators.ema(closes, 50)
+            ema50Val = ema50Series.last()
+            val ema50Prev = if (ema50Series.size >= 2) ema50Series[ema50Series.size - 2] else ema50Val
+            ema50Slope = ema50Val - ema50Prev
+        } else {
+            ema50Val = null
+            ema50Slope = 0.0
         }
 
         // ── EMA(200) ──
@@ -251,14 +267,14 @@ object StockAnalyzer {
         val rocPct = if (capitalNeeded > 0) (potentialProfit / capitalNeeded * 100).round(2) else 0.0
 
         // ═══════════════════════════════════════════════════
-        // BUY SCORE
+        // PULLBACK POINTS
         // ═══════════════════════════════════════════════════
-        var buyScore = 0
+        var pullbackScore = 0
 
         // 1. SMA trend
         val smaPass = sma200Val != null && price > sma200Val
         val smaPts = if (smaPass) smaMaxPts else 0
-        buyScore += smaPts
+        pullbackScore += smaPts
 
         // 2. MACD inflection
         // A qualified MACD setup is a setup-quality reversal: upward MACD curvature,
@@ -291,7 +307,7 @@ object StockAnalyzer {
         }
         val goldenBonus = if (goldenBuy) w.buyGoldenBonus else 0
         val pctlBonus = if (macdPctl <= w.buyMacdPctlThreshold && macdInfPts > 0) w.buyMacdPctlBonus else 0
-        buyScore += macdInfPts + goldenBonus + pctlBonus
+        pullbackScore += macdInfPts + goldenBonus + pctlBonus
 
         // 3. RSI graduated scoring + momentum flip bonus
         var rsiPts = 0
@@ -310,12 +326,12 @@ object StockAnalyzer {
         val rsiFlipValue = rsiToday ?: Double.NaN
         val rsiBuyFlipPts = if (rsiBuyFlip &&
             rsiFlipValue in w.buyRsiFlipLow..w.buyRsiFlipHigh) w.buyRsiFlipBonus else 0
-        buyScore += rsiPts + rsiBuyFlipPts
+        pullbackScore += rsiPts + rsiBuyFlipPts
 
         // 4. Bollinger Bands
         val bbPass = belowMidBand || touchedLowerBand
         val bbPts = if (bbPass) w.buyBbBasePts + (if (touchedLowerBand) w.buyBbLowerBonus else 0) else 0
-        buyScore += bbPts
+        pullbackScore += bbPts
 
         // 5. ADX with directional check
         val adxStrong = currAdx > w.buyAdxStrongThreshold
@@ -323,12 +339,12 @@ object StockAnalyzer {
         val adxPts = if (adxStrong && bullishTrend) {
             w.buyAdxBasePts + (if (adxVeryStrong) w.buyAdxVeryStrongBonus else 0)
         } else 0
-        buyScore += adxPts
+        pullbackScore += adxPts
 
         // 6. OBV
         val obvPass = obvCurrent > obv5 && obvCurrent > obv20
         val obvPts = if (obvPass) w.buyObvPts else 0
-        buyScore += obvPts
+        pullbackScore += obvPts
 
         // 7. EMA(21) proximity
         var emaPts = 0
@@ -343,15 +359,15 @@ object StockAnalyzer {
                 else -> 0
             }
         }
-        buyScore += emaPts
+        pullbackScore += emaPts
 
-        val buySignal = when {
-            buyScore >= w.buyStrongThreshold -> "STRONG BUY"
-            buyScore >= w.buyModerateThreshold -> "MODERATE BUY"
+        val pullbackSignal = when {
+            pullbackScore >= w.pullbackStrongThreshold -> "STRONG PULLBACK"
+            pullbackScore >= w.pullbackModerateThreshold -> "PULLBACK READY"
             else -> "NO SIGNAL"
         }
 
-        // ── Buy-score breakdown report ───────────────────────────────────────
+        // ── Pullback-points breakdown report ─────────────────────────────────
         // Per-bucket trace string consumed by dashboard.html detail modal
         // ("Why this score?" panel). Format = pipe-delimited rows separated by
         // newlines: bucket|status|points|max|reason. status is one of:
@@ -415,7 +431,111 @@ object StockAnalyzer {
         rows.add("ADX|${status(adxPts, w.buyAdxBasePts + w.buyAdxVeryStrongBonus)}|$adxPts|${w.buyAdxBasePts + w.buyAdxVeryStrongBonus}|$adxReason")
         rows.add("OBV|${status(obvPts, w.buyObvPts)}|$obvPts|${w.buyObvPts}|$obvReason")
         rows.add("EMA(21) proximity|${status(emaPts, w.buyEmaMaxPts)}|$emaPts|${w.buyEmaMaxPts}|$emaReason")
-        val buyScoreReport = rows.joinToString("\n")
+        val pullbackScoreReport = rows.joinToString("\n")
+
+        // MOMENTUM POINTS
+        // Continuation lens: rewards trend alignment and active upward pressure
+        // without requiring price to be in the pullback zone.
+        fun pctSlope(value: Double?, slope: Double): Double =
+            if (value != null && value > 0.0) (slope / value * 100.0) else 0.0
+
+        val smaTrendOk = smaPass || (sma200Val != null && price >= sma200Val * 0.99 && sma200Slope > 0)
+        val smaSlopePct = pctSlope(sma200Val, sma200Slope)
+        val ema21SlopePct = pctSlope(ema21Val, ema21Slope)
+        val ema50SlopePct = pctSlope(ema50Val, ema50Slope)
+        val ema200SlopePct = pctSlope(ema200Val, ema200Slope)
+        val rawTrendStack = listOf(
+            if (smaTrendOk) 30 else 0,
+            if (smaSlopePct > 0.0 || ema200SlopePct > 0.0) 25 else 0,
+            if (ema50SlopePct > 0.0) 25 else 0,
+            if (ema21SlopePct > 0.0) 20 else 0
+        ).sum()
+        val momentumTrendPts = Math.round(rawTrendStack / 100.0 * w.momentumTrendStackPts).toInt()
+
+        val momentumMacdPts = when {
+            (macdZeroCrossUp && macdAccel > 0) || slopeCrossUp -> w.momentumMacdPts
+            macdPhase == "BULLISH" && macdSlope > 0 -> Math.round(w.momentumMacdPts * 0.85).toInt()
+            macdSlope > 0 && macdAccel >= 0 -> Math.round(w.momentumMacdPts * 0.70).toInt()
+            earlyBuy && macdAccel > 0 -> Math.round(w.momentumMacdPts * 0.55).toInt()
+            else -> 0
+        }
+
+        val momentumEmaSlopePts = when {
+            ema21Val == null -> 0
+            ema21SlopePct > 0.0 && price >= ema21Val -> w.momentumEma21SlopePts
+            ema21SlopePct > 0.0 -> Math.round(w.momentumEma21SlopePts * 0.60).toInt()
+            else -> 0
+        }
+
+        val momentumRoomPts = if (ema21Val != null) {
+            val d = ema21PctDiff
+            when {
+                d in 0.0..4.0 -> w.momentumNotOverextendedPts
+                d in -2.0..0.0 -> Math.round(w.momentumNotOverextendedPts * 0.80).toInt()
+                d in 4.0..7.0 -> Math.round(w.momentumNotOverextendedPts * 0.45).toInt()
+                d in -4.0..-2.0 -> Math.round(w.momentumNotOverextendedPts * 0.35).toInt()
+                else -> 0
+            }
+        } else 0
+
+        val momentumRsiPts = if (rsiVal != null) {
+            when {
+                rsiVal in 45.0..68.0 -> w.momentumRsiRoomPts
+                rsiVal in 35.0..45.0 -> Math.round(w.momentumRsiRoomPts * 0.60).toInt()
+                rsiVal in 68.0..75.0 -> Math.round(w.momentumRsiRoomPts * 0.45).toInt()
+                rsiVal < 35.0 -> Math.round(w.momentumRsiRoomPts * 0.20).toInt()
+                else -> 0
+            }
+        } else 0
+
+        val momentumObvPts = if (obvPass) w.momentumObvPts else 0
+        val momentumScore = momentumTrendPts + momentumMacdPts + momentumEmaSlopePts +
+                momentumRoomPts + momentumRsiPts + momentumObvPts
+        val momentumSignal = when {
+            momentumScore >= w.momentumStrongThreshold -> "STRONG MOMENTUM"
+            momentumScore >= w.momentumModerateThreshold -> "MOMENTUM READY"
+            else -> "NO SIGNAL"
+        }
+
+        val momentumRows = mutableListOf<String>()
+        val trendReason = "trendStack=${rawTrendStack}/100, smaSlope=${"%.3f".format(smaSlopePct)}%, ema200=${"%.3f".format(ema200SlopePct)}%, ema50=${"%.3f".format(ema50SlopePct)}%, ema21=${"%.3f".format(ema21SlopePct)}%"
+        val momentumMacdReason = when {
+            macdZeroCrossUp && macdAccel > 0 -> "MACD crossed above zero with positive acceleration"
+            slopeCrossUp -> "MACD slope flipped positive"
+            macdPhase == "BULLISH" && macdSlope > 0 -> "MACD bullish and slope still positive"
+            macdSlope > 0 && macdAccel >= 0 -> "MACD slope rising with non-negative acceleration"
+            earlyBuy && macdAccel > 0 -> "early hook, but not full continuation yet"
+            else -> "MACD is not confirming continuation"
+        }
+        val emaSlopeReason = if (ema21Val != null)
+            "EMA21 slope=${"%.3f".format(ema21SlopePct)}%, price ${if (price >= ema21Val) "above" else "below"} EMA21"
+        else "EMA21 unavailable"
+        val roomReason = if (ema21Val != null) "price is ${"%.2f".format(ema21PctDiff)}% from EMA21" else "EMA21 unavailable"
+        val rsiMomentumReason = if (rsiVal != null) "RSI=${"%.1f".format(rsiVal)}; ideal continuation room is 45-68" else "RSI unavailable"
+        momentumRows.add("Trend stack|${status(momentumTrendPts, w.momentumTrendStackPts)}|$momentumTrendPts|${w.momentumTrendStackPts}|$trendReason")
+        momentumRows.add("MACD continuation|${status(momentumMacdPts, w.momentumMacdPts)}|$momentumMacdPts|${w.momentumMacdPts}|$momentumMacdReason")
+        momentumRows.add("EMA(21) slope|${status(momentumEmaSlopePts, w.momentumEma21SlopePts)}|$momentumEmaSlopePts|${w.momentumEma21SlopePts}|$emaSlopeReason")
+        momentumRows.add("Not overextended|${status(momentumRoomPts, w.momentumNotOverextendedPts)}|$momentumRoomPts|${w.momentumNotOverextendedPts}|$roomReason")
+        momentumRows.add("RSI room|${status(momentumRsiPts, w.momentumRsiRoomPts)}|$momentumRsiPts|${w.momentumRsiRoomPts}|$rsiMomentumReason")
+        momentumRows.add("OBV|${status(momentumObvPts, w.momentumObvPts)}|$momentumObvPts|${w.momentumObvPts}|$obvReason")
+        val momentumScoreReport = momentumRows.joinToString("\n")
+
+        val buyScore = maxOf(pullbackScore, momentumScore)
+        val entryMode = when {
+            pullbackScore >= w.pullbackModerateThreshold && momentumScore >= w.momentumModerateThreshold -> "PULLBACK + MOMENTUM"
+            momentumScore >= w.momentumModerateThreshold -> "MOMENTUM"
+            pullbackScore >= w.pullbackModerateThreshold -> "PULLBACK"
+            else -> "NONE"
+        }
+        val buySignal = when {
+            buyScore >= w.buyStrongThreshold && entryMode == "MOMENTUM" -> "STRONG MOMENTUM"
+            buyScore >= w.buyStrongThreshold && entryMode == "PULLBACK" -> "STRONG PULLBACK"
+            buyScore >= w.buyStrongThreshold -> "STRONG ENTRY"
+            buyScore >= w.buyModerateThreshold && entryMode == "MOMENTUM" -> "MOMENTUM READY"
+            buyScore >= w.buyModerateThreshold && entryMode == "PULLBACK" -> "PULLBACK READY"
+            buyScore >= w.buyModerateThreshold -> "ENTRY READY"
+            else -> "NO SIGNAL"
+        }
 
         // ═══════════════════════════════════════════════════════
         // SUB-SCORE A: PROFIT BOOKING (max ~58 pts)
@@ -658,7 +778,10 @@ object StockAnalyzer {
             minusDi = currMinusDi.round(1),
             obv = obvCurrent.round(0),
             ema21 = ema21Val?.round(2),
+            ema21Slope = ema21Slope.round(3),
             ema21PctDiff = ema21PctDiff,
+            ema50 = ema50Val?.round(2),
+            ema50Slope = ema50Slope.round(3),
             ema200 = ema200Val?.round(2),
             ema200Slope = ema200Slope.round(3),
             avgVol20 = avgVol20.round(0),
@@ -680,19 +803,30 @@ object StockAnalyzer {
             rocPct = rocPct,
             buyScore = buyScore,
             buySignal = buySignal,
+            pullbackScore = pullbackScore,
+            pullbackSignal = pullbackSignal,
+            momentumScore = momentumScore,
+            momentumSignal = momentumSignal,
+            entryMode = entryMode,
             profitScore = profitScore,
             protectScore = protectScore,
             sellIntent = sellIntent,
             sellScore = sellScore,
             sellSignal = sellSignal,
             goldenBuy = goldenBuy,
-            isBuy = buyScore >= 75,
-            isModerateBuy = buyScore >= 60,
+            isBuy = pullbackScore >= w.pullbackStrongThreshold ||
+                    momentumScore >= w.momentumStrongThreshold ||
+                    buyScore >= w.buyStrongThreshold,
+            isModerateBuy = pullbackScore >= w.pullbackModerateThreshold ||
+                    momentumScore >= w.momentumModerateThreshold ||
+                    buyScore >= w.buyModerateThreshold,
             isSell = sellIntent == "STRONG EXIT" || sellIntent == "PROTECT CAPITAL",
             isModerateSell = sellIntent == "BOOK PROFIT",
             obvDivergence = obvBearishDivergence,
             obvWeakness = obvDistributionWeakness,
-            buyScoreReport = buyScoreReport,
+            buyScoreReport = pullbackScoreReport,
+            pullbackScoreReport = pullbackScoreReport,
+            momentumScoreReport = momentumScoreReport,
             goldenBuyReport = goldenBuyReport,
             swingScore = swingScore,
             longTermScore = longTermScore,

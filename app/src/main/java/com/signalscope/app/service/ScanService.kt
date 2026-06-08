@@ -16,6 +16,7 @@ import com.signalscope.app.network.YahooFinanceClient
 import com.signalscope.app.ui.ScanServiceResultHolder
 import com.signalscope.app.network.ZerodhaClient
 import com.signalscope.app.trading.DailyPortfolioManager
+import com.signalscope.app.trading.LivePortfolioBars
 import com.signalscope.app.ui.MainActivity
 import com.signalscope.app.util.StockAnalyzer
 import com.signalscope.app.util.ValueAnalyzer
@@ -35,7 +36,7 @@ import java.util.*
  *
  * 2. DISCOVERY SCANNING (on-demand, anytime)
  *    - Scans full NIFTY 500 or NASDAQ 100 via Yahoo Finance
- *    - Shows buy scores, sell scores, all indicators
+ *    - Shows Pullback/Momentum entry points, sell scores, all indicators
  *    - NOT gated by market hours — user triggers manually
  *    - No sell notifications (not held stocks)
  *    - Results stored in lastDiscoveryResult for UI display
@@ -123,6 +124,7 @@ class ScanService : Service() {
         AlertType.BOOK_PROFIT         -> 30 * 60 * 1000L   // MACD slope peak — sell for max profit
         AlertType.PROTECT_CAPITAL     -> 24 * 60 * 60 * 1000L  // Structural break — once per day
         AlertType.PEAK_WARNING        -> 24 * 60 * 60 * 1000L  // Prepare alert — once per day
+        AlertType.SMOOTH_BUY_TURN     -> 24 * 60 * 60 * 1000L
         AlertType.GOLDEN_BUY          -> 24 * 60 * 60 * 1000L
         AlertType.STRONG_BUY          -> 24 * 60 * 60 * 1000L
         // Legacy types — fallback 24h
@@ -320,10 +322,11 @@ class ScanService : Service() {
         // follows a fresh startForeground() call on some OEMs (MIUI).
         // ROBUST mode can take 30+ min; give the wake lock plenty of headroom.
         acquireScanLocks(durationMs = (if (robust) 4 else 2) * 60 * 60 * 1000L)
-        if (!config.serviceRunning) {
-            config.serviceRunning = true
-            startForeground(NOTIFICATION_SCAN_ID, buildScanNotification("Starting discovery scan..."))
-        }
+        // Always re-promote discovery to foreground. `config.serviceRunning`
+        // is persisted, so after an OEM kills the old process it can still say
+        // true even though this new Service instance is not foreground yet.
+        config.serviceRunning = true
+        startForeground(NOTIFICATION_SCAN_ID, buildScanNotification("Starting discovery scan..."))
 
         isDiscoveryRunning = true
         discoveryAbort = false
@@ -370,7 +373,7 @@ class ScanService : Service() {
                         prior
                     } else null
                     when (market) {
-                        "nifty500"  -> runYahooDiscovery(NIFTY_500_YAHOO_SYMBOLS, "NIFTY 500", "₹", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
+                        "nifty500"  -> runYahooDiscovery(resolveNifty500Symbols(), "NIFTY 500", "₹", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
                         "nasdaq100" -> runYahooDiscovery(NASDAQ_100_SYMBOLS, "NASDAQ 100", "$", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
                         "dax"       -> runYahooDiscovery(DAX_SYMBOLS, "DAX 100", "€", robust = robust, resumeFrom = resumeFrom, previousComplete = previousComplete)
                         else        -> Log.w(TAG, "Unknown market '$market' — skipping discovery")
@@ -387,6 +390,29 @@ class ScanService : Service() {
                     ScanServiceResultHolder.isDiscoveryRunning = false
                     ScanServiceResultHolder.discoveryVersion++
                 }
+            }
+        }
+    }
+
+    private fun resolveNifty500Symbols(): List<String> {
+        updateScanNotification("Refreshing NIFTY 500 universe...")
+        return when (val result = YahooFinanceClient.fetchNifty500Symbols()) {
+            is YahooFinanceClient.NiftyUniverseResult.Success -> {
+                ScanServiceResultHolder.discoveryStatusText =
+                    "NIFTY 500 universe: ${result.symbols.size} symbols"
+                ScanServiceResultHolder.discoveryVersion++
+                result.symbols
+            }
+            is YahooFinanceClient.NiftyUniverseResult.Failure -> {
+                Log.w(
+                    TAG,
+                    "NIFTY 500 universe refresh failed (${result.message}); " +
+                            "using embedded fallback ${NIFTY_500_YAHOO_SYMBOLS.size}"
+                )
+                ScanServiceResultHolder.discoveryStatusText =
+                    "NIFTY 500 universe fallback: ${NIFTY_500_YAHOO_SYMBOLS.size} symbols"
+                ScanServiceResultHolder.discoveryVersion++
+                NIFTY_500_YAHOO_SYMBOLS
             }
         }
     }
@@ -418,6 +444,108 @@ class ScanService : Service() {
             smoothMacdTurnSourceTimestamp = if (turnedPositive) previousSmoothTimestamp else 0L
         )
     }
+
+    private fun smoothTurnQualityScore(analysis: StockAnalysis, weights: ScoringWeights): Int {
+        if (!analysis.smoothMacdTurnedPositiveToday) return 0
+        val pctlMax = weights.setupMacdPctlMax.coerceIn(0.0, 100.0)
+        var score = 25
+        score += if (analysis.smoothMacdAccel > 0.0) 22 else if (analysis.smoothMacdAccel >= 0.0) 10 else 0
+        score += if (analysis.smoothMacdLowDistPct <= 35.0) 22 else if (analysis.smoothMacdLowDistPct <= 55.0) 10 else 0
+        score += if (analysis.macdPctl <= pctlMax) 16 else if (analysis.macdPctl <= (pctlMax + 15.0).coerceAtMost(90.0)) 7 else 0
+        score += if (analysis.priceVel >= 0.0) 12 else if (analysis.priceVel >= -0.5) 5 else 0
+        score += if (analysis.sma200Slope >= 0.0) 8 else if (analysis.sma200Slope >= -0.1) 4 else 0
+        return score.coerceIn(0, 100)
+    }
+
+    private fun isQualitySmoothTurn(analysis: StockAnalysis, weights: ScoringWeights): Boolean =
+        analysis.smoothMacdTurnedPositiveToday &&
+                analysis.smoothMacdAccel > 0.0 &&
+                analysis.smoothMacdLowDistPct <= 35.0 &&
+                analysis.macdPctl <= weights.setupMacdPctlMax.coerceIn(0.0, 100.0) &&
+                analysis.priceVel >= -0.5 &&
+                analysis.sma200Slope >= -0.1
+
+    private fun maybeNotifySmoothTurn(analysis: StockAnalysis, marketName: String, weights: ScoringWeights) {
+        if (!isQualitySmoothTurn(analysis, weights)) return
+        val q = smoothTurnQualityScore(analysis, weights)
+        val zeroSide = if (analysis.macd >= 0.0) "above zero" else "below zero"
+        val alert = StockAlert(
+            symbol = analysis.symbol,
+            name = analysis.name,
+            alertType = AlertType.SMOOTH_BUY_TURN,
+            message = "Smooth MACD turn Q$q: slope crossed positive today ($zeroSide). Check price/support for entry.",
+            sellScore = 0,
+            buyScore = analysis.buyScore,
+            price = analysis.price,
+            macdPhase = analysis.macdPhase,
+            source = "discovery:$marketName"
+        )
+        synchronized(ScanServiceResultHolder.smoothTurnAlerts) {
+            val staleBefore = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+            ScanServiceResultHolder.smoothTurnAlerts.removeAll { it.timestamp < staleBefore }
+            ScanServiceResultHolder.smoothTurnAlerts.removeAll {
+                it.symbol == alert.symbol && it.alertType == AlertType.SMOOTH_BUY_TURN
+            }
+            ScanServiceResultHolder.smoothTurnAlerts.add(alert)
+            if (ScanServiceResultHolder.smoothTurnAlerts.size > 100) {
+                ScanServiceResultHolder.smoothTurnAlerts.removeAt(0)
+            }
+        }
+        processAlerts(listOf(alert))
+    }
+
+    private fun closedDailyCandlesForDiscovery(
+        candles: List<CandleData>,
+        marketName: String
+    ): List<CandleData> {
+        if (candles.size < 2) return candles
+
+        val (tzId, closeMinute) = when {
+            marketName.contains("NASDAQ", ignoreCase = true) -> "America/New_York" to (16 * 60)
+            marketName.contains("DAX", ignoreCase = true) -> "Europe/Berlin" to (17 * 60 + 30)
+            else -> "Asia/Kolkata" to (15 * 60 + 30)
+        }
+        val tz = TimeZone.getTimeZone(tzId)
+        val now = Calendar.getInstance(tz)
+        val day = now.get(Calendar.DAY_OF_WEEK)
+        if (day == Calendar.SATURDAY || day == Calendar.SUNDAY) return candles
+
+        val last = Calendar.getInstance(tz)
+        last.timeInMillis = candles.last().timestamp * 1000L
+        val sameTradingDay =
+            last.get(Calendar.YEAR) == now.get(Calendar.YEAR) &&
+                    last.get(Calendar.DAY_OF_YEAR) == now.get(Calendar.DAY_OF_YEAR)
+        if (!sameTradingDay) return candles
+
+        val nowMinute = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
+        return if (nowMinute < closeMinute) {
+            candles.dropLast(1)
+        } else {
+            candles
+        }
+    }
+
+    private fun discoveryExchangeFor(marketName: String): String = when {
+        marketName.contains("DAX", ignoreCase = true) -> "DE"
+        marketName.contains("NIFTY", ignoreCase = true) -> "NSE"
+        else -> "NASDAQ"
+    }
+
+    private fun discoveryMinAvgVolume(marketName: String): Int =
+        if (marketName.contains("NIFTY", ignoreCase = true)) 0 else 50000
+
+    private fun entryScore(analysis: StockAnalysis): Int =
+        maxOf(analysis.pullbackScore, analysis.momentumScore, analysis.buyScore)
+
+    private fun isModerateEntry(analysis: StockAnalysis): Boolean =
+        analysis.pullbackScore >= weights.pullbackModerateThreshold ||
+                analysis.momentumScore >= weights.momentumModerateThreshold ||
+                analysis.buyScore >= weights.buyModerateThreshold
+
+    private fun isStrongEntry(analysis: StockAnalysis): Boolean =
+        analysis.pullbackScore >= weights.pullbackStrongThreshold ||
+                analysis.momentumScore >= weights.momentumStrongThreshold ||
+                analysis.buyScore >= weights.buyStrongThreshold
 
     /**
      * Scan a list of symbols via Yahoo Finance with adaptive pacing & retry queue.
@@ -513,18 +641,20 @@ class ScanService : Service() {
             }
 
             try {
-                val exchange = if (currency == "₹") "NSE" else "NASDAQ"
+                val exchange = discoveryExchangeFor(marketName)
                 val candleResult = YahooFinanceClient.fetchCandles(symbol, exchange)
 
                 when (candleResult) {
                     is YahooFinanceClient.CandleResult.Success -> {
                         consecutiveErrors = 0
+                        val displayName = candleResult.name?.trim()?.takeIf { it.isNotBlank() } ?: symbol
+                        val closedCandles = closedDailyCandlesForDiscovery(candleResult.candles, marketName)
                         var analysis = StockAnalyzer.analyze(
-                            candles = candleResult.candles,
+                            candles = closedCandles,
                             symbol = symbol,
-                            name = symbol,
+                            name = displayName,
                             token = symbol,
-                            minAvgVolume = if (currency == "₹") 100000 else 50000,
+                            minAvgVolume = discoveryMinAvgVolume(marketName),
                             w = weights
                         )
                         if (analysis != null) {
@@ -549,7 +679,9 @@ class ScanService : Service() {
                                             w = weights
                                         )
                                         Log.d(TAG, "Value score for $symbol: ${vr.valueScore} (${vr.valueRating}) PE=${vr.trailingPe} PB=${vr.priceToBook}")
+                                        val refreshedName = fundResult.data.name?.trim()?.takeIf { it.isNotBlank() } ?: analysis.name
                                         analysis = analysis.copy(
+                                            name = refreshedName,
                                             trailingPe = vr.trailingPe,
                                             forwardPe = vr.forwardPe,
                                             priceToBook = vr.priceToBook,
@@ -600,7 +732,9 @@ class ScanService : Service() {
                             } catch (e: Exception) {
                                 Log.w(TAG, "Fundamentals fetch failed for $symbol — technical data kept", e)
                             }
-                            allStocks.add(annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp))
+                            val annotated = annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp)
+                            allStocks.add(annotated)
+                            maybeNotifySmoothTurn(annotated, marketName, weights)
                         } else {
                             skipped++
                         }
@@ -631,7 +765,11 @@ class ScanService : Service() {
                 }
 
                 // Update progress every stock (not just every 5 — gives smoother UI updates)
-                val sorted = allStocks.sortedByDescending { it.buyScore }
+                val sorted = allStocks.sortedWith(
+                    compareByDescending<StockAnalysis> { entryScore(it) }
+                        .thenByDescending { it.momentumScore }
+                        .thenByDescending { it.pullbackScore }
+                )
                 lastDiscoveryResult = DiscoveryScanResult(
                     market = marketName,
                     currency = currency,
@@ -643,8 +781,8 @@ class ScanService : Service() {
                     lastError = lastError,
                     isComplete = false,
                     allStocks = sorted,
-                    buySignals = sorted.filter { it.buyScore >= 60 },
-                    strongBuys = sorted.filter { it.buyScore >= 75 },
+                    buySignals = sorted.filter { isModerateEntry(it) },
+                    strongBuys = sorted.filter { isStrongEntry(it) },
                     goldenBuys = sorted.filter { it.goldenBuy },
                     setups = sorted.filter {
                         (it.sma200 != null && it.price > it.sma200) &&
@@ -708,17 +846,19 @@ class ScanService : Service() {
                 }
 
                 try {
-                    val exchange = if (currency == "₹") "NSE" else "NASDAQ"
+                    val exchange = discoveryExchangeFor(marketName)
                     val candleResult = YahooFinanceClient.fetchCandles(symbol, exchange)
 
                     when (candleResult) {
                         is YahooFinanceClient.CandleResult.Success -> {
+                            val displayName = candleResult.name?.trim()?.takeIf { it.isNotBlank() } ?: symbol
+                            val closedCandles = closedDailyCandlesForDiscovery(candleResult.candles, marketName)
                             var analysis = StockAnalyzer.analyze(
-                                candles = candleResult.candles,
+                                candles = closedCandles,
                                 symbol = symbol,
-                                name = symbol,
+                                name = displayName,
                                 token = symbol,
-                                minAvgVolume = if (currency == "₹") 100000 else 50000,
+                                minAvgVolume = discoveryMinAvgVolume(marketName),
                                 w = weights
                             )
                             if (analysis != null) {
@@ -726,7 +866,9 @@ class ScanService : Service() {
                                     val fundResult = YahooFinanceClient.fetchFundamentals(symbol, exchange)
                                     if (fundResult is YahooFinanceClient.FundamentalResult.Success) {
                                         val vr = ValueAnalyzer.analyze(fundResult.data, analysis.price, w = weights)
+                                        val refreshedName = fundResult.data.name?.trim()?.takeIf { it.isNotBlank() } ?: analysis.name
                                         analysis = analysis.copy(
+                                            name = refreshedName,
                                             trailingPe = vr.trailingPe, forwardPe = vr.forwardPe,
                                             priceToBook = vr.priceToBook, evToEbitda = vr.evToEbitda,
                                             debtToEquity = vr.debtToEquity, roce = vr.roce,
@@ -748,7 +890,9 @@ class ScanService : Service() {
                                         )
                                     }
                                 } catch (_: Exception) {}
-                                allStocks.add(annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp))
+                                val annotated = annotateSmoothMacdTurn(analysis, previousSmoothBySymbol, previousSmoothTimestamp)
+                                allStocks.add(annotated)
+                                maybeNotifySmoothTurn(annotated, marketName, weights)
                             } else {
                                 skipped++
                             }
@@ -766,15 +910,19 @@ class ScanService : Service() {
                     }
 
                     // Update UI during retry
-                    val sorted = allStocks.sortedByDescending { it.buyScore }
+                    val sorted = allStocks.sortedWith(
+                        compareByDescending<StockAnalysis> { entryScore(it) }
+                            .thenByDescending { it.momentumScore }
+                            .thenByDescending { it.pullbackScore }
+                    )
                     lastDiscoveryResult = DiscoveryScanResult(
                         market = marketName, currency = currency,
                         timestamp = System.currentTimeMillis(),
                         totalScanned = allStocks.size, totalSymbols = total,
                         skipped = skipped, errors = errors, lastError = lastError, isComplete = false,
                         allStocks = sorted,
-                        buySignals = sorted.filter { it.buyScore >= 60 },
-                        strongBuys = sorted.filter { it.buyScore >= 75 },
+                        buySignals = sorted.filter { isModerateEntry(it) },
+                        strongBuys = sorted.filter { isStrongEntry(it) },
                         goldenBuys = sorted.filter { it.goldenBuy },
                         setups = sorted.filter {
                             (it.sma200 != null && it.price > it.sma200) &&
@@ -806,7 +954,11 @@ class ScanService : Service() {
 
         // ── Final result ──
         applySectorPeMedians(allStocks, weights)
-        val sorted = allStocks.sortedByDescending { it.buyScore }
+        val sorted = allStocks.sortedWith(
+            compareByDescending<StockAnalysis> { entryScore(it) }
+                .thenByDescending { it.momentumScore }
+                .thenByDescending { it.pullbackScore }
+        )
         val elapsed = System.currentTimeMillis() - startTime
         lastDiscoveryResult = DiscoveryScanResult(
             market = marketName,
@@ -819,8 +971,8 @@ class ScanService : Service() {
             lastError = lastError,
             isComplete = !discoveryAbort,
             allStocks = sorted,
-            buySignals = sorted.filter { it.buyScore >= 60 },
-            strongBuys = sorted.filter { it.buyScore >= 75 },
+            buySignals = sorted.filter { isModerateEntry(it) },
+            strongBuys = sorted.filter { isStrongEntry(it) },
             goldenBuys = sorted.filter { it.goldenBuy },
             setups = sorted.filter {
                 (it.sma200 != null && it.price > it.sma200) &&
@@ -838,7 +990,7 @@ class ScanService : Service() {
             "Discovery done: ${allStocks.size} stocks in ${elapsed / 60000}m"
         updateScanNotification(statusMsg)
         ScanServiceResultHolder.discoveryStatusText = statusMsg
-        Log.i(TAG, "$statusMsg — ${sorted.count { it.buyScore >= 60 }} buy signals, " +
+        Log.i(TAG, "$statusMsg — ${sorted.count { isModerateEntry(it) }} entry signals, " +
                 "${sorted.count { it.goldenBuy }} qualified MACD setups" +
                 if (retryQueue.isNotEmpty()) " (retried ${retryQueue.size})" else "")
     }
@@ -936,7 +1088,8 @@ class ScanService : Service() {
         // ── Daily trailing-SL + MACD-exit tick ──
         // Runs ONCE per trading day after 15:20 IST, piggy-backing on the last
         // pre-close portfolio scan so we already have fresh analysis in memory.
-        // Gated by autoTrailingEnabled / autoExitEnabled — defaults OFF.
+        // Real execution is gated inside DailyPortfolioManager by the
+        // individual auto-create, auto-trailing, and auto-exit switches.
         maybeRunDailyTick(result)
     }
 
@@ -946,9 +1099,8 @@ class ScanService : Service() {
      *   - we haven't already ticked today (lastDailyTickEpoch is not today IST)
      *   - result holds at least one analyzed holding
      *
-     * The tick itself honors config.autoTrailingEnabled / autoExitEnabled;
-     * if both are false it runs in report-only mode (no API modifications),
-     * which gives the user a dashboard preview before opting in.
+     * The tick itself honors config.autoCreateGtt, autoTrailingEnabled, and
+     * autoExitEnabled for the specific actions it may take.
      */
     private suspend fun maybeRunDailyTick(result: ScanResult) {
         try {
@@ -973,9 +1125,7 @@ class ScanService : Service() {
 
             Log.i(TAG, "Running daily trailing-SL tick over ${analyzedHoldings.size} holdings")
             val mgr = com.signalscope.app.trading.DailyPortfolioManager(applicationContext, config)
-            // Dry-run whenever BOTH switches are off — user gets visibility without side-effects
-            val dryRun = !config.autoTrailingEnabled && !config.autoExitEnabled
-            val report = mgr.runDailyTick(analyzedHoldings, dryRun = dryRun)
+            val report = mgr.runDailyTick(analyzedHoldings, dryRun = false)
             Log.i(TAG, "Daily tick: ${report.slUpdates} SL updates · ${report.exitsFilled}/${report.exitsAttempted} exits · ${report.upperTargetsDeleted} targets removed · ${report.errors.size} errors")
             report.perSymbolLog.forEach { Log.d(TAG, "  • $it") }
             report.errors.forEach { Log.w(TAG, "  ✗ $it") }
@@ -998,7 +1148,6 @@ class ScanService : Service() {
         val gttList = when (val r = zerodhaClient.fetchGttTriggers()) {
             is ZerodhaClient.GttListResult.Success -> r.triggers
             is ZerodhaClient.GttListResult.Expired -> {
-                config.zerodhaAccessToken = ""
                 sendZerodhaExpiredNotification()
                 return
             }
@@ -1331,39 +1480,67 @@ class ScanService : Service() {
         if (!config.autoSoftSniperEnabled) return
         if (!config.autoCreateGtt) return  // soft sniper inherits the GTT master gate
 
-        // Gate 2: gain threshold — don't auto-protect underwater or marginal positions
-        val gainPct = returnPct  // already provided as % (e.g. 7.3 for +7.3%)
+        // Gate 2: one-shot per symbol per trading day
+        if (ScanServiceResultHolder.isSoftSniperFired(holding.symbol, today)) {
+            return  // silent — already fired earlier in the same session
+        }
+
+        // Gate 3: don't fight the hard watchdog — if it already fired, it owns the
+        // GTT slot. Defensive: BOOK_PROFIT branch also checks this, but defend in depth.
+        if (ScanServiceResultHolder.isMacdWatchdogFired(holding.symbol, today)) return
+
+        // Gate 4: data sanity
+        if (holding.ltp <= 0 || holding.quantity <= 0) return
+
+        val liveSignal =
+            if (config.livePriceStreamingEnabled) {
+                val yahooSymbol = YahooFinanceClient.toYahooSymbol(holding.symbol, holding.exchange)
+                LivePortfolioBars.signalForYahooSymbol(yahooSymbol)
+            } else null
+        val liveMode = liveSignal?.ready == true
+        val executionLtp = liveSignal
+            ?.takeIf { liveMode && it.latestPrice > 0.0 }
+            ?.latestPrice
+            ?: holding.ltp
+        val gainPct = if (liveMode && holding.avgPrice > 0.0) {
+            (executionLtp - holding.avgPrice) / holding.avgPrice * 100.0
+        } else {
+            returnPct
+        }
         if (gainPct < config.softSniperMinGainPct) {
             Log.i(TAG, "Soft sniper skipped for ${holding.symbol}: gain ${"%.1f".format(gainPct)}% < threshold ${config.softSniperMinGainPct}%")
             return
         }
 
-        // Gate 3: one-shot per symbol per trading day
-        if (ScanServiceResultHolder.isSoftSniperFired(holding.symbol, today)) {
-            return  // silent — already fired earlier in the same session
-        }
-
-        // Gate 4: don't fight the hard watchdog — if it already fired, it owns the
-        // GTT slot. Defensive: BOOK_PROFIT branch also checks this, but defend in depth.
-        if (ScanServiceResultHolder.isMacdWatchdogFired(holding.symbol, today)) return
-
-        // Gate 5: data sanity
-        if (holding.ltp <= 0 || holding.quantity <= 0) return
-
+        // Gate 6: live 15m rollover when the stream is healthy; otherwise the
+        // existing 2-scan persistence fallback remains in charge.
         // Gate 6 (A): score persistence — require profitScore ≥ threshold to
         // have held for at least 2 consecutive 15-min ticks (~30 min) before
         // committing capital. Kills single-tick intraday flicker fires that
         // happen because daily indicators reading a partial bar are noisy.
         // The streak counter is updated every scan in the holdings loop.
-        val streakKey = "$today|${holding.symbol}"
-        val streak = ScanServiceResultHolder.profitScoreStreak[streakKey] ?: 0
-        if (streak < 2) {
-            Log.i(
-                TAG,
-                "[SOFT SNIPER] ${holding.symbol} score-persistence wait: streak=$streak/2 " +
-                "(profitScore=${analysis.profitScore}). Will fire next tick if score holds."
-            )
-            return
+        if (liveMode) {
+            val signal = liveSignal ?: return
+            if (!signal.shouldProtect) {
+                Log.i(
+                    TAG,
+                    "[SOFT SNIPER] ${holding.symbol} live ticker active; waiting for 15m rollover " +
+                    "(${signal.reason}, pullback=${"%.2f".format(signal.dropFromSessionHighPct)}%, " +
+                    "slope=${"%.2f".format(signal.closeSlopePct)}%)"
+                )
+                return
+            }
+        } else {
+            val streakKey = "$today|${holding.symbol}"
+            val streak = ScanServiceResultHolder.profitScoreStreak[streakKey] ?: 0
+            if (streak < 2) {
+                Log.i(
+                    TAG,
+                    "[SOFT SNIPER] ${holding.symbol} score-persistence wait: streak=$streak/2 " +
+                    "(profitScore=${analysis.profitScore}). Will fire next tick if score holds."
+                )
+                return
+            }
         }
 
         // ─── DYNAMIC BUFFER SELECTION (Gemini's volume-confirmation tier) ───
@@ -1404,6 +1581,8 @@ class ScanService : Service() {
                 // Conviction signal but session is too young to trust the
                 // volume comparison — defensive 3% instead of aggressive 1.5%.
                 config.softSniperBufferPct to "NORMAL_EARLY"
+            liveMode ->
+                config.softSniperBufferPct to "LIVE_SCAN"
             analysis.obvDivergence ->
                 // OBV divergence with normal volume — defensive default.
                 config.softSniperBufferPct to "NORMAL"
@@ -1422,12 +1601,12 @@ class ScanService : Service() {
         // Mark BEFORE the API call so concurrent ticks (or a retry path) can't
         // fire a second placement. If the API call later fails we still keep
         // the key — failing closed is safer than risking a duplicate GTT.
-        ScanServiceResultHolder.softSniperFiredKeys.add("$today|${holding.symbol}")
+        if (!ScanServiceResultHolder.markSoftSniperFiredIfAbsent(holding.symbol, today)) return
 
         // Compute target levels — round to 0.05 ticks (Kite minimum)
-        val triggerRaw = holding.ltp * (1.0 - bufferPct)
+        val triggerRaw = executionLtp * (1.0 - bufferPct)
         val triggerPrice = (Math.round(triggerRaw * 20.0) / 20.0)
-            .coerceIn(holding.ltp * 0.75, holding.ltp * 0.999)  // Kite ±25% rule + must be < LTP
+            .coerceIn(executionLtp * 0.75, executionLtp * 0.999)  // Kite ±25% rule + must be < LTP
         val limitPrice = Math.round(triggerPrice * (1.0 - config.softSniperLimitPct) * 20.0) / 20.0
 
         // Fire-and-forget so the scan loop isn't blocked by the API round-trip.
@@ -1457,7 +1636,7 @@ class ScanService : Service() {
                     exchange = holding.exchange,
                     tradingsymbol = holding.symbol,
                     triggerValues = listOf(triggerPrice),
-                    lastPrice = holding.ltp,
+                    lastPrice = executionLtp,
                     orders = listOf(
                         ZerodhaClient.GttOrderSpec(
                             transactionType = "SELL",
@@ -1471,7 +1650,7 @@ class ScanService : Service() {
 
                 when (result) {
                     is ZerodhaClient.GttCreateResult.Success -> {
-                        val pctFromLtp = (triggerPrice / holding.ltp - 1) * 100
+                        val pctFromLtp = (triggerPrice / executionLtp - 1) * 100
                         val msg = "Auto-GTT [$bufferTier] @ ₹${"%.2f".format(triggerPrice)} (${"%.1f".format(pctFromLtp)}%) — limit ₹${"%.2f".format(limitPrice)}, gain ${"%.1f".format(gainPct)}%, vol ${"%.1f".format(volRatio)}x"
                         Log.i(TAG, "[SOFT SNIPER] ${holding.symbol} → GTT #${result.id} placed. $msg")
                         ScanServiceResultHolder.softSniperAlerts.add(StockAlert(
@@ -1479,7 +1658,7 @@ class ScanService : Service() {
                             alertType = AlertType.SOFT_SNIPER,
                             message = msg,
                             sellScore = analysis.sellScore, buyScore = analysis.buyScore,
-                            price = holding.ltp, macdPhase = analysis.macdPhase, source = "zerodha"
+                            price = executionLtp, macdPhase = analysis.macdPhase, source = if (liveMode) "zerodha-live" else "zerodha"
                         ))
                         // Bump portfolioVersion so the dashboard re-renders and
                         // shows the new GTT chip + SOFT_SNIPER alert immediately.
@@ -1574,6 +1753,7 @@ class ScanService : Service() {
             AlertType.PROTECT_CAPITAL -> "TREND BROKEN: ${alert.symbol}"
             AlertType.PEAK_WARNING    -> "⚡ Peak Approaching: ${alert.symbol}"
             AlertType.MACD_FLIP       -> "🚨 MACD FLIP: ${alert.symbol}"
+            AlertType.SMOOTH_BUY_TURN -> "Smooth MACD Turn: ${alert.symbol}"
             AlertType.GOLDEN_BUY      -> "MACD Setup: ${alert.symbol}"
             AlertType.STRONG_BUY      -> "🟢 Buy: ${alert.symbol}"
             else -> "📊 ${alert.alertType}: ${alert.symbol}"
@@ -1584,6 +1764,7 @@ class ScanService : Service() {
             AlertType.PROTECT_CAPITAL -> NotificationCompat.PRIORITY_HIGH
             AlertType.PEAK_WARNING    -> NotificationCompat.PRIORITY_DEFAULT
             AlertType.MACD_FLIP       -> NotificationCompat.PRIORITY_MAX  // DPM channel handles real-time push; this is panel-only
+            AlertType.SMOOTH_BUY_TURN -> NotificationCompat.PRIORITY_HIGH
             AlertType.GOLDEN_BUY      -> NotificationCompat.PRIORITY_DEFAULT
             AlertType.STRONG_BUY      -> NotificationCompat.PRIORITY_DEFAULT
             else -> NotificationCompat.PRIORITY_LOW
@@ -1594,6 +1775,7 @@ class ScanService : Service() {
             AlertType.PROTECT_CAPITAL -> 0xFFEAB308.toInt()  // Yellow
             AlertType.PEAK_WARNING    -> 0xFF8B5CF6.toInt()  // Purple
             AlertType.MACD_FLIP       -> 0xFFB91C1C.toInt()  // Deep red — watchdog confirmed
+            AlertType.SMOOTH_BUY_TURN -> 0xFF0D9488.toInt()  // Teal
             AlertType.GOLDEN_BUY      -> 0xFFD97706.toInt()  // Setup amber
             AlertType.STRONG_BUY      -> 0xFF059669.toInt()  // Green
             else -> 0xFF64748B.toInt()
@@ -1605,12 +1787,21 @@ class ScanService : Service() {
             AlertType.PROTECT_CAPITAL -> "⏱ Sell entire position — trend broken"
             AlertType.PEAK_WARNING    -> "⏱ Prepare to sell — MACD slope may flip soon"
             AlertType.MACD_FLIP       -> "🚨 Watchdog confirmed — sniper GTT / exit ladder fired"
+            AlertType.SMOOTH_BUY_TURN -> "Early entry timing - confirm price/support before buying"
             else -> ""
         }
 
+        val currency = when {
+            alert.source.contains("NASDAQ", ignoreCase = true) ||
+                    alert.source.contains("US", ignoreCase = true) -> "$"
+            alert.source.contains("DAX", ignoreCase = true) ||
+                    alert.source.contains("DE", ignoreCase = true) ||
+                    alert.source.contains("Germany", ignoreCase = true) -> "€"
+            else -> "₹"
+        }
         val bigBody = buildString {
             append(alert.message)
-            append("\n₹${String.format(Locale.US, "%.2f", alert.price)} · ${alert.macdPhase}")
+            append("\n$currency${String.format(Locale.US, "%.2f", alert.price)} · ${alert.macdPhase}")
             if (levelTag.isNotEmpty()) append("\n$levelTag")
         }
 
@@ -1631,6 +1822,7 @@ class ScanService : Service() {
                         AlertType.STRONG_EXIT     -> setVibrate(longArrayOf(0, 400, 150, 400, 150, 400))
                         AlertType.BOOK_PROFIT     -> setVibrate(longArrayOf(0, 300, 100, 300))
                         AlertType.PROTECT_CAPITAL -> setVibrate(longArrayOf(0, 250, 100, 250))
+                        AlertType.SMOOTH_BUY_TURN -> setVibrate(longArrayOf(0, 180, 80, 180))
                         else -> {}
                     }
                 }
@@ -1797,9 +1989,10 @@ val NIFTY_500_YAHOO_SYMBOLS = listOf(
 // ═══════════════════════════════════════════════════════
 // AUTOMATIC ROBUST DISCOVERY SCHEDULER
 //
-// Wakes the service every 2 hours during market hours (09:30, 11:30, 13:30,
-// 15:00 IST, weekdays) to run a ROBUST NIFTY 500 scan. Uses inexact
-// AlarmManager so Doze mode batches it with other wakeups for battery.
+// Wakes the service once per weekday after NSE close to run a ROBUST NIFTY 500
+// scan. Discovery indicators are daily-candle driven, so intraday repeats just
+// re-fetch the same Yahoo bars. One post-close pass refreshes the next-day
+// discovery/setup buckets without wasting requests.
 //
 // Schedules one alarm at a time (the next slot) and re-arms after each fire,
 // so the chain self-heals across reboots / process death without needing
@@ -1810,8 +2003,8 @@ object DiscoveryAutoScheduler {
     private const val ACTION_FIRE = "com.signalscope.AUTO_DISCOVERY_FIRE"
     private const val REQUEST_CODE = 0x5C0E
 
-    // 09:30, 11:30, 13:30, 15:00 IST — covers market open + every ~2h
-    private val SLOT_MINUTES = listOf(9 * 60 + 30, 11 * 60 + 30, 13 * 60 + 30, 15 * 60)
+    // 16:15 IST: after NSE close, with a buffer for Yahoo's daily candle to settle.
+    private val SLOT_MINUTES = listOf(16 * 60 + 15)
 
     fun ensureScheduled(ctx: Context) {
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -1823,6 +2016,8 @@ object DiscoveryAutoScheduler {
         val nextFireWallMs = nextSlotWallTimeMs()
         val delay = (nextFireWallMs - System.currentTimeMillis()).coerceAtLeast(60_000L)
         val triggerAt = SystemClock.elapsedRealtime() + delay
+        // Replace any pre-update intraday alarm that may still be pending.
+        am.cancel(pi)
         // ELAPSED_REALTIME so phone-clock changes don't surprise us.
         // setAndAllowWhileIdle so Doze doesn't suppress it (still inexact,
         // OS may delay by a few minutes — fine for a scheduled discovery).
@@ -1846,7 +2041,7 @@ object DiscoveryAutoScheduler {
                 if (isWeekday(today)) return today.timeInMillis
             }
         }
-        // Otherwise next valid weekday's first slot (09:30)
+        // Otherwise next valid weekday's post-close slot.
         val next = today.clone() as Calendar
         do {
             next.add(Calendar.DAY_OF_MONTH, 1)

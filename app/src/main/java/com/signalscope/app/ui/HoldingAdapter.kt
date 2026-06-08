@@ -51,11 +51,12 @@ class HoldingAdapter : ListAdapter<PortfolioHolding, HoldingAdapter.VH>(DIFF) {
             }
             h.phase.setTextColor(phaseColor)
 
-            // Buy score
-            h.buyScore.text = a.buyScore.toString()
+            // Entry points
+            h.buyScore.text = "Pb${a.pullbackScore}/Mo${a.momentumScore}"
             h.buyScore.setTextColor(
-                if (a.buyScore >= 75) 0xFF059669.toInt()
-                else if (a.buyScore >= 60) 0xFF0891b2.toInt()
+                if (a.momentumScore >= 75) 0xFF059669.toInt()
+                else if (a.pullbackScore >= 75) 0xFF2563eb.toInt()
+                else if (maxOf(a.pullbackScore, a.momentumScore) >= 60) 0xFF0891b2.toInt()
                 else 0xFF64748b.toInt()
             )
 

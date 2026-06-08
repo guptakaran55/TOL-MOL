@@ -36,7 +36,6 @@ class SettingsActivity : AppCompatActivity() {
     // ── Trading 212 fields (US space) ──
     private lateinit var etT212ApiKey: EditText
     private lateinit var etT212ApiSecret: EditText
-    private lateinit var switchT212SimulateOnly: Switch
     private lateinit var btnT212Test: Button
     private lateinit var tvT212Status: TextView
 
@@ -205,10 +204,9 @@ class SettingsActivity : AppCompatActivity() {
         // ── Trading 212 section (US space) ──
         addSection("🇺🇸 Trading 212 Credentials  (US space)")
         inner.addView(TextView(this).apply {
-            text = "Paste your Trading 212 API key from the live or demo dashboard.\n" +
+            text = "Paste your Trading 212 API key from the live dashboard.\n" +
                    "T212 docs: settings → API → generate token.\n" +
-                   "Phase 2A: read-only access (account balance, portfolio).\n" +
-                   "Order placement (Phase 2B) is not enabled yet."
+                   "Portfolio reads, SL/target orders, buy orders, cancels, and app-managed OCO tracking are live."
             textSize = 11f
             setPadding(0, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
@@ -218,15 +216,8 @@ class SettingsActivity : AppCompatActivity() {
         addLabel("API Secret (T212_API_SECRET)  —  REQUIRED.  T212 uses HTTP Basic auth = base64(key:secret).")
         etT212ApiSecret = addField("Paste Trading 212 API secret", isPassword = true)
 
-        switchT212SimulateOnly = Switch(this).apply {
-            text = "🎭 Simulate-only mode  (recommended ON until trust is built)"
-            setPadding(0, 12, 0, 0)
-        }
-        inner.addView(switchT212SimulateOnly)
         inner.addView(TextView(this).apply {
-            text = "When ON: SL / target / buy orders are LOGGED to the GTT audit but NEVER actually sent to T212.\n" +
-                   "Watch the audit log for ~1 week. Once the decisions look sane, flip this OFF — then orders go live.\n" +
-                   "⚠ Live mode places real orders on your real T212 account. There is no demo fallback."
+            text = "Trading 212 order actions are LIVE. SL, target, and buy actions send real orders to your Trading 212 account."
             textSize = 11f
             setPadding(0, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
@@ -386,7 +377,7 @@ class SettingsActivity : AppCompatActivity() {
             text = "⚠ THIS is the genuinely hot switch — places a live SELL order immediately.\n" +
                    "Fires only when: histogram < 50% of peak AND negative ≥ adaptive filter days AND gain > 3%.\n" +
                    "Places limit → limit → market ladder. Unlike GTT create/trail, this cannot be undone.\n" +
-                   "Enable only after you've watched the watchdog log in dry-run mode for a few weeks."
+                   "Enable only when you are comfortable with live exit automation."
             textSize = 10f
             setPadding(32, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#dc2626"))
@@ -685,7 +676,11 @@ class SettingsActivity : AppCompatActivity() {
 
             val et = EditText(this).apply {
                 inputType = if (default is Double) {
-                    val signed = if (key == "minSlopeMagnitude" || key == "setupSma200MinSlope") InputType.TYPE_NUMBER_FLAG_SIGNED else 0
+                    val signed = if (
+                        key == "minSlopeMagnitude" ||
+                        key == "setupSma200MinSlope" ||
+                        key.contains("PenaltyThreshold")
+                    ) InputType.TYPE_NUMBER_FLAG_SIGNED else 0
                     InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or signed
                 } else {
                     InputType.TYPE_CLASS_NUMBER
@@ -829,20 +824,20 @@ class SettingsActivity : AppCompatActivity() {
         // ── Section header ──
         addSection("Scoring Weights")
         inner.addView(TextView(this).apply {
-            text = "Adjust indicator weights used for Buy, Profit Booking, and Capital Protection scores.\nValues in [brackets] are recommended defaults. Tap a section header to expand."
+            text = "Adjust indicator weights used for Pullback Points, Momentum Points, Profit Booking, and Capital Protection.\nValues in [brackets] are recommended defaults. Tap a section header to expand."
             textSize = 11f
             setPadding(0, 0, 0, 8)
             setTextColor(Color.parseColor("#94a3b8"))
         })
 
         // ══════════════════════════════════════════════════
-        // BUY SCORE WEIGHTS
+        // ENTRY POINT WEIGHTS
         // ══════════════════════════════════════════════════
-        val buySection = addWeightSection("Buy Score Weights (max ~125)", "#2563eb")
+        val buySection = addWeightSection("Pullback Points (legacy entry score, max ~125)", "#2563eb")
 
         addSchemaNote(buySection,
-            "Identifies bullish entry opportunities. Score = sum of all triggered components.\n" +
-            "STRONG BUY ≥ 75 | MODERATE BUY ≥ 60 | NO SIGNAL < 60")
+            "Pullback Points identify quality stocks pulling back into a better entry zone.\n" +
+            "This keeps your original timing logic: uptrend + MACD hook + RSI/BB/EMA pullback.")
 
         // -- SMA --
         addSubHeader(buySection, "1. SMA Trend")
@@ -930,12 +925,29 @@ class SettingsActivity : AppCompatActivity() {
         addWeightRow(buySection, "buyEmaMaxPts", "EMA proximity max", defaults.buyEmaMaxPts)
 
         // -- Thresholds --
-        addSubHeader(buySection, "Signal Thresholds")
+        addSubHeader(buySection, "Pullback Thresholds")
         addSchemaNote(buySection,
-            "buyScore ≥ strong → STRONG BUY | buyScore ≥ moderate → MODERATE BUY\n" +
+            "Pullback Points >= strong -> STRONG PULLBACK | >= moderate -> PULLBACK READY\n" +
             "Lower these to be more aggressive, raise to be more selective.")
-        addWeightRow(buySection, "buyStrongThreshold", "Strong buy ≥", defaults.buyStrongThreshold)
-        addWeightRow(buySection, "buyModerateThreshold", "Moderate buy ≥", defaults.buyModerateThreshold)
+        addWeightRow(buySection, "pullbackStrongThreshold", "Strong pullback >=", defaults.pullbackStrongThreshold)
+        addWeightRow(buySection, "pullbackModerateThreshold", "Moderate pullback >=", defaults.pullbackModerateThreshold)
+
+        val momentumSection = addWeightSection("Momentum Points (trend continuation, max 100)", "#059669")
+        addSchemaNote(momentumSection,
+            "Momentum Points identify strong uptrends that are still pushing higher.\n" +
+            "They do not require price to be below EMA21, but they still penalize overextension.")
+        addSubHeader(momentumSection, "Momentum Buckets")
+        addWeightRow(momentumSection, "momentumTrendStackPts", "Trend stack pts", defaults.momentumTrendStackPts)
+        addWeightRow(momentumSection, "momentumMacdPts", "MACD continuation pts", defaults.momentumMacdPts)
+        addWeightRow(momentumSection, "momentumEma21SlopePts", "EMA21 rising pts", defaults.momentumEma21SlopePts)
+        addWeightRow(momentumSection, "momentumNotOverextendedPts", "Not overextended pts", defaults.momentumNotOverextendedPts)
+        addWeightRow(momentumSection, "momentumRsiRoomPts", "RSI room pts", defaults.momentumRsiRoomPts)
+        addWeightRow(momentumSection, "momentumObvPts", "OBV accumulation pts", defaults.momentumObvPts)
+        addSubHeader(momentumSection, "Momentum Thresholds")
+        addSchemaNote(momentumSection,
+            "Momentum Points >= strong -> STRONG MOMENTUM | >= moderate -> MOMENTUM READY.")
+        addWeightRow(momentumSection, "momentumStrongThreshold", "Strong momentum >=", defaults.momentumStrongThreshold)
+        addWeightRow(momentumSection, "momentumModerateThreshold", "Moderate momentum >=", defaults.momentumModerateThreshold)
 
         // ══════════════════════════════════════════════════
         // PROFIT BOOKING WEIGHTS
@@ -1080,8 +1092,34 @@ class SettingsActivity : AppCompatActivity() {
         addWeightRow(valueSection, "valueRoceMidThreshold", "ROCE mid threshold %", defaults.valueRoceMidThreshold)
         addWeightRow(valueSection, "valueCfoPositivePts", "CFO > Net Income pts", defaults.valueCfoPositivePts)
 
+        // -- Growth Durability --
+        addSubHeader(valueSection, "3. Growth Durability (max 18)")
+        addSchemaNote(valueSection,
+            "Protects against cheap-but-deteriorating value traps.\n" +
+            "Revenue/earnings growth use current Yahoo growth first, then annual history fallback.\n" +
+            "High growth earns full pts, mid growth earns partial pts, positive growth earns small confirmation.\n" +
+            "Negative growth penalties subtract from the final value score.")
+        addWeightRow(valueSection, "valueRevenueGrowthHighPts", "Revenue growth high pts", defaults.valueRevenueGrowthHighPts)
+        addWeightRow(valueSection, "valueRevenueGrowthMidPts", "Revenue growth mid pts", defaults.valueRevenueGrowthMidPts)
+        addWeightRow(valueSection, "valueRevenueGrowthPositivePts", "Revenue growth positive pts", defaults.valueRevenueGrowthPositivePts)
+        addWeightRow(valueSection, "valueRevenueGrowthHighThreshold", "Revenue high threshold %", defaults.valueRevenueGrowthHighThreshold)
+        addWeightRow(valueSection, "valueRevenueGrowthMidThreshold", "Revenue mid threshold %", defaults.valueRevenueGrowthMidThreshold)
+        addWeightRow(valueSection, "valueEarningsGrowthHighPts", "Earnings growth high pts", defaults.valueEarningsGrowthHighPts)
+        addWeightRow(valueSection, "valueEarningsGrowthMidPts", "Earnings growth mid pts", defaults.valueEarningsGrowthMidPts)
+        addWeightRow(valueSection, "valueEarningsGrowthPositivePts", "Earnings growth positive pts", defaults.valueEarningsGrowthPositivePts)
+        addWeightRow(valueSection, "valueEarningsGrowthHighThreshold", "Earnings high threshold %", defaults.valueEarningsGrowthHighThreshold)
+        addWeightRow(valueSection, "valueEarningsGrowthMidThreshold", "Earnings mid threshold %", defaults.valueEarningsGrowthMidThreshold)
+        addWeightRow(valueSection, "valueGrossMarginPts", "Gross margin quality pts", defaults.valueGrossMarginPts)
+        addWeightRow(valueSection, "valueGrossMarginThreshold", "Gross margin threshold %", defaults.valueGrossMarginThreshold)
+        addWeightRow(valueSection, "valueProfitMarginGrowthPts", "Profit margin + growth pts", defaults.valueProfitMarginGrowthPts)
+        addWeightRow(valueSection, "valueProfitMarginGrowthThreshold", "Profit margin threshold %", defaults.valueProfitMarginGrowthThreshold)
+        addWeightRow(valueSection, "valueRevenueGrowthPenaltyThreshold", "Revenue penalty below %", defaults.valueRevenueGrowthPenaltyThreshold)
+        addWeightRow(valueSection, "valueRevenueGrowthPenaltyPts", "Revenue decline penalty pts", defaults.valueRevenueGrowthPenaltyPts)
+        addWeightRow(valueSection, "valueEarningsGrowthPenaltyThreshold", "Earnings penalty below %", defaults.valueEarningsGrowthPenaltyThreshold)
+        addWeightRow(valueSection, "valueEarningsGrowthPenaltyPts", "Earnings decline penalty pts", defaults.valueEarningsGrowthPenaltyPts)
+
         // -- Shareholder Yield --
-        addSubHeader(valueSection, "3. Shareholder Yield (max 15)")
+        addSubHeader(valueSection, "4. Shareholder Yield (max 15)")
         addSchemaNote(valueSection,
             "Dividend yield \u2265 3% \u2192 full pts | 1\u20133% \u2192 mid pts.\n" +
             "Active buyback (declining share count) \u2192 bonus pts.")
@@ -1092,7 +1130,7 @@ class SettingsActivity : AppCompatActivity() {
         addWeightRow(valueSection, "valueBuybackPts", "Buyback pts", defaults.valueBuybackPts)
 
         // -- Price Discount --
-        addSubHeader(valueSection, "4. Price Discount (max 12)")
+        addSubHeader(valueSection, "5. Price Discount (max 12)")
         addSchemaNote(valueSection,
             "How close is the price to 52-week low?\n" +
             "< 15% from low \u2192 full pts (deep discount) | 15\u201330% \u2192 mid pts.")
@@ -1218,7 +1256,7 @@ class SettingsActivity : AppCompatActivity() {
         btnT212Test.setOnClickListener {
             config.t212ApiKey = etT212ApiKey.text.toString().trim()
             config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
-            config.t212SimulateOnly = switchT212SimulateOnly.isChecked
+            config.t212SimulateOnly = false
             if (!config.hasT212Credentials) {
                 tvT212Status.text = "❌ Both API key AND secret are required (Basic auth)"
                 tvT212Status.setTextColor(android.graphics.Color.parseColor("#dc2626"))
@@ -1265,7 +1303,6 @@ class SettingsActivity : AppCompatActivity() {
         // T212 credentials (US space)
         etT212ApiKey.setText(config.t212ApiKey)
         etT212ApiSecret.setText(config.t212ApiSecret)
-        switchT212SimulateOnly.isChecked = config.t212SimulateOnly
 
         // Interval spinner
         spinnerInterval.setSelection(when (config.portfolioScanIntervalMin) {
@@ -1337,7 +1374,17 @@ class SettingsActivity : AppCompatActivity() {
             "buyAdxStrongThreshold" to w.buyAdxStrongThreshold, "buyAdxVeryStrongThreshold" to w.buyAdxVeryStrongThreshold,
             "buyAdxBasePts" to w.buyAdxBasePts, "buyAdxVeryStrongBonus" to w.buyAdxVeryStrongBonus,
             "buyObvPts" to w.buyObvPts, "buyEmaMaxPts" to w.buyEmaMaxPts,
+            "pullbackStrongThreshold" to w.pullbackStrongThreshold,
+            "pullbackModerateThreshold" to w.pullbackModerateThreshold,
             "buyStrongThreshold" to w.buyStrongThreshold, "buyModerateThreshold" to w.buyModerateThreshold,
+            "momentumTrendStackPts" to w.momentumTrendStackPts,
+            "momentumMacdPts" to w.momentumMacdPts,
+            "momentumEma21SlopePts" to w.momentumEma21SlopePts,
+            "momentumNotOverextendedPts" to w.momentumNotOverextendedPts,
+            "momentumRsiRoomPts" to w.momentumRsiRoomPts,
+            "momentumObvPts" to w.momentumObvPts,
+            "momentumStrongThreshold" to w.momentumStrongThreshold,
+            "momentumModerateThreshold" to w.momentumModerateThreshold,
             "minSlopeMagnitude" to w.minSlopeMagnitude, "goldenBuyMaxSlope" to w.goldenBuyMaxSlope,
             "setupSma200MinSlope" to w.setupSma200MinSlope,
             "setupMacdLowPctMin" to w.setupMacdLowPctMin,
@@ -1377,6 +1424,24 @@ class SettingsActivity : AppCompatActivity() {
             "valueRoceHighPts" to w.valueRoceHighPts, "valueRoceMidPts" to w.valueRoceMidPts,
             "valueRoceHighThreshold" to w.valueRoceHighThreshold, "valueRoceMidThreshold" to w.valueRoceMidThreshold,
             "valueCfoPositivePts" to w.valueCfoPositivePts,
+            "valueRevenueGrowthHighPts" to w.valueRevenueGrowthHighPts,
+            "valueRevenueGrowthMidPts" to w.valueRevenueGrowthMidPts,
+            "valueRevenueGrowthPositivePts" to w.valueRevenueGrowthPositivePts,
+            "valueRevenueGrowthHighThreshold" to w.valueRevenueGrowthHighThreshold,
+            "valueRevenueGrowthMidThreshold" to w.valueRevenueGrowthMidThreshold,
+            "valueEarningsGrowthHighPts" to w.valueEarningsGrowthHighPts,
+            "valueEarningsGrowthMidPts" to w.valueEarningsGrowthMidPts,
+            "valueEarningsGrowthPositivePts" to w.valueEarningsGrowthPositivePts,
+            "valueEarningsGrowthHighThreshold" to w.valueEarningsGrowthHighThreshold,
+            "valueEarningsGrowthMidThreshold" to w.valueEarningsGrowthMidThreshold,
+            "valueGrossMarginPts" to w.valueGrossMarginPts,
+            "valueGrossMarginThreshold" to w.valueGrossMarginThreshold,
+            "valueProfitMarginGrowthPts" to w.valueProfitMarginGrowthPts,
+            "valueProfitMarginGrowthThreshold" to w.valueProfitMarginGrowthThreshold,
+            "valueRevenueGrowthPenaltyThreshold" to w.valueRevenueGrowthPenaltyThreshold,
+            "valueRevenueGrowthPenaltyPts" to w.valueRevenueGrowthPenaltyPts,
+            "valueEarningsGrowthPenaltyThreshold" to w.valueEarningsGrowthPenaltyThreshold,
+            "valueEarningsGrowthPenaltyPts" to w.valueEarningsGrowthPenaltyPts,
             "valueDivHighPts" to w.valueDivHighPts, "valueDivMidPts" to w.valueDivMidPts,
             "valueDivHighThreshold" to w.valueDivHighThreshold, "valueDivMidThreshold" to w.valueDivMidThreshold,
             "valueBuybackPts" to w.valueBuybackPts,
@@ -1422,8 +1487,18 @@ class SettingsActivity : AppCompatActivity() {
             buyAdxVeryStrongBonus = readInt("buyAdxVeryStrongBonus", d.buyAdxVeryStrongBonus),
             buyObvPts = readInt("buyObvPts", d.buyObvPts),
             buyEmaMaxPts = readInt("buyEmaMaxPts", d.buyEmaMaxPts),
-            buyStrongThreshold = readInt("buyStrongThreshold", d.buyStrongThreshold),
-            buyModerateThreshold = readInt("buyModerateThreshold", d.buyModerateThreshold),
+            pullbackStrongThreshold = readInt("pullbackStrongThreshold", d.pullbackStrongThreshold),
+            pullbackModerateThreshold = readInt("pullbackModerateThreshold", d.pullbackModerateThreshold),
+            buyStrongThreshold = readInt("pullbackStrongThreshold", d.buyStrongThreshold),
+            buyModerateThreshold = readInt("pullbackModerateThreshold", d.buyModerateThreshold),
+            momentumTrendStackPts = readInt("momentumTrendStackPts", d.momentumTrendStackPts),
+            momentumMacdPts = readInt("momentumMacdPts", d.momentumMacdPts),
+            momentumEma21SlopePts = readInt("momentumEma21SlopePts", d.momentumEma21SlopePts),
+            momentumNotOverextendedPts = readInt("momentumNotOverextendedPts", d.momentumNotOverextendedPts),
+            momentumRsiRoomPts = readInt("momentumRsiRoomPts", d.momentumRsiRoomPts),
+            momentumObvPts = readInt("momentumObvPts", d.momentumObvPts),
+            momentumStrongThreshold = readInt("momentumStrongThreshold", d.momentumStrongThreshold),
+            momentumModerateThreshold = readInt("momentumModerateThreshold", d.momentumModerateThreshold),
             minSlopeMagnitude = readDouble("minSlopeMagnitude", d.minSlopeMagnitude).coerceIn(-89.0, 89.0),
             goldenBuyMaxSlope = kotlin.math.abs(readDouble("goldenBuyMaxSlope", d.goldenBuyMaxSlope)).coerceIn(0.0, 89.0),
             setupSma200MinSlope = readDouble("setupSma200MinSlope", d.setupSma200MinSlope),
@@ -1478,6 +1553,24 @@ class SettingsActivity : AppCompatActivity() {
             valueRoceHighThreshold = readDouble("valueRoceHighThreshold", d.valueRoceHighThreshold),
             valueRoceMidThreshold = readDouble("valueRoceMidThreshold", d.valueRoceMidThreshold),
             valueCfoPositivePts = readInt("valueCfoPositivePts", d.valueCfoPositivePts),
+            valueRevenueGrowthHighPts = readInt("valueRevenueGrowthHighPts", d.valueRevenueGrowthHighPts),
+            valueRevenueGrowthMidPts = readInt("valueRevenueGrowthMidPts", d.valueRevenueGrowthMidPts),
+            valueRevenueGrowthPositivePts = readInt("valueRevenueGrowthPositivePts", d.valueRevenueGrowthPositivePts),
+            valueRevenueGrowthHighThreshold = readDouble("valueRevenueGrowthHighThreshold", d.valueRevenueGrowthHighThreshold),
+            valueRevenueGrowthMidThreshold = readDouble("valueRevenueGrowthMidThreshold", d.valueRevenueGrowthMidThreshold),
+            valueEarningsGrowthHighPts = readInt("valueEarningsGrowthHighPts", d.valueEarningsGrowthHighPts),
+            valueEarningsGrowthMidPts = readInt("valueEarningsGrowthMidPts", d.valueEarningsGrowthMidPts),
+            valueEarningsGrowthPositivePts = readInt("valueEarningsGrowthPositivePts", d.valueEarningsGrowthPositivePts),
+            valueEarningsGrowthHighThreshold = readDouble("valueEarningsGrowthHighThreshold", d.valueEarningsGrowthHighThreshold),
+            valueEarningsGrowthMidThreshold = readDouble("valueEarningsGrowthMidThreshold", d.valueEarningsGrowthMidThreshold),
+            valueGrossMarginPts = readInt("valueGrossMarginPts", d.valueGrossMarginPts),
+            valueGrossMarginThreshold = readDouble("valueGrossMarginThreshold", d.valueGrossMarginThreshold),
+            valueProfitMarginGrowthPts = readInt("valueProfitMarginGrowthPts", d.valueProfitMarginGrowthPts),
+            valueProfitMarginGrowthThreshold = readDouble("valueProfitMarginGrowthThreshold", d.valueProfitMarginGrowthThreshold),
+            valueRevenueGrowthPenaltyThreshold = readDouble("valueRevenueGrowthPenaltyThreshold", d.valueRevenueGrowthPenaltyThreshold),
+            valueRevenueGrowthPenaltyPts = readInt("valueRevenueGrowthPenaltyPts", d.valueRevenueGrowthPenaltyPts),
+            valueEarningsGrowthPenaltyThreshold = readDouble("valueEarningsGrowthPenaltyThreshold", d.valueEarningsGrowthPenaltyThreshold),
+            valueEarningsGrowthPenaltyPts = readInt("valueEarningsGrowthPenaltyPts", d.valueEarningsGrowthPenaltyPts),
             valueDivHighPts = readInt("valueDivHighPts", d.valueDivHighPts),
             valueDivMidPts = readInt("valueDivMidPts", d.valueDivMidPts),
             valueDivHighThreshold = readDouble("valueDivHighThreshold", d.valueDivHighThreshold),
@@ -1501,7 +1594,7 @@ class SettingsActivity : AppCompatActivity() {
         // Trading 212 (US space)
         config.t212ApiKey = etT212ApiKey.text.toString().trim()
         config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
-        config.t212SimulateOnly = switchT212SimulateOnly.isChecked
+        config.t212SimulateOnly = false
 
         // Scan config
         config.portfolioScanIntervalMin = when (spinnerInterval.selectedItemPosition) {

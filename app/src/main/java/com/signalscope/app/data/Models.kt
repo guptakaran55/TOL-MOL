@@ -104,7 +104,10 @@ data class StockAnalysis(
     val obv: Double,
 
     val ema21: Double?,
+    val ema21Slope: Double = 0.0,
     val ema21PctDiff: Double,
+    val ema50: Double? = null,
+    val ema50Slope: Double = 0.0,
     val ema200: Double? = null,
     val ema200Slope: Double = 0.0,
     val avgVol20: Double,
@@ -133,6 +136,11 @@ data class StockAnalysis(
 
     val buyScore: Int,
     val buySignal: String,
+    val pullbackScore: Int = 0,
+    val pullbackSignal: String = "NO SIGNAL",
+    val momentumScore: Int = 0,
+    val momentumSignal: String = "NO SIGNAL",
+    val entryMode: String = "NONE",
 
     // Dual sell scoring system — replaces single sellScore
     val profitScore: Int,       // Sub-score A: Profit Booking (max ~58)
@@ -159,6 +167,8 @@ data class StockAnalysis(
      *  in the dashboard. Pipe-delimited rows (bucket|status|points|max|reason),
      *  newline-separated. Empty string when not built (older cached analysis). */
     val buyScoreReport: String = "",
+    val pullbackScoreReport: String = "",
+    val momentumScoreReport: String = "",
 
     /** Read-only qualified MACD setup checklist for the detail modal.
      *  Pipe rows: label|pass|value|required. Empty for older cached analysis. */
@@ -232,6 +242,7 @@ enum class AlertType {
     SOFT_SNIPER,        // Tier 1.5 — auto-GTT placed on BOOK_PROFIT alert (intraday, 3% buffer)
 
     // Buy alerts
+    SMOOTH_BUY_TURN,    // Discovery: saved smooth MACD slope crossed positive with quality filters
     GOLDEN_BUY,
     STRONG_BUY,
 
@@ -289,13 +300,13 @@ data class DiscoveryScanResult(
     val lastError: String = "",    // last error message for UI display
     val isComplete: Boolean,       // false while still scanning
 
-    /** All analyzed stocks, sorted by buy score descending */
+    /** All analyzed stocks, sorted by strongest entry score descending */
     val allStocks: List<StockAnalysis>,
 
-    /** Stocks with buyScore ≥ 60 */
+    /** Stocks with moderate Pullback or Momentum points */
     val buySignals: List<StockAnalysis>,
 
-    /** Stocks with buyScore ≥ 75 */
+    /** Stocks with strong Pullback or Momentum points */
     val strongBuys: List<StockAnalysis>,
 
     /** Stocks matching qualified MACD setup criteria */
