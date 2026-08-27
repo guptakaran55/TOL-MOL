@@ -54,7 +54,8 @@ class ConfigManager(context: Context) {
                 val oldEncrypted = createEncryptedPrefs(context)
                 val keysToMigrate = listOf(
                     "ZERODHA_API_KEY", "ZERODHA_API_SECRET",
-                    "zerodha_access_token", "OPENAI_API_KEY"
+                    "zerodha_access_token", "OPENAI_API_KEY",
+                    "BINANCE_API_KEY", "BINANCE_API_SECRET"
                 )
                 val editor = newPrefs.edit()
                 var migrated = 0
@@ -171,6 +172,209 @@ class ConfigManager(context: Context) {
             "https://kite.zerodha.com/connect/login?v=3&api_key=$zerodhaApiKey"
         else ""
 
+    /**
+     * The last NSE universe successfully downloaded from the index CSV.
+     *
+     * The download is a network call and the universe is wanted on the main
+     * thread — when a card renders, when an algo is created. Keeping the last
+     * good copy means those callers get the CURRENT index rather than the
+     * embedded fallback, without any of them having to fetch.
+     *
+     * Blank until a scan has run once, which is the honest state: better to
+     * hand back the embedded list and say so than to block the UI on a
+     * multi-second request.
+     */
+    var nseUniverseCached: String
+        get() = prefs.getString("nse_universe_cached", "") ?: ""
+        set(v) = prefs.edit().putString("nse_universe_cached", v).apply()
+
+    var nseUniverseCachedAt: Long
+        get() = prefs.getLong("nse_universe_cached_at", 0L)
+        set(v) = prefs.edit().putLong("nse_universe_cached_at", v).apply()
+
+    // ── FLAT PER-ORDER FEE, PER SPACE ─────────────────────────────────────
+    // The percentage slippage constant models the SPREAD, which scales with the
+    // position. Brokerage, exchange charges and stamp duty do not: they are a
+    // fixed cash amount per order, and a fixed amount is a completely different
+    // shape of cost. On a large position it disappears; on a small one it can
+    // exceed the edge entirely. A strategy that looks profitable at €2,000 a
+    // trade and loses money at €80 is not visible at all through a percentage.
+    //
+    // Charged PER ORDER, so a round trip pays it twice — one on the way in, one
+    // on the way out.
+    //
+    // Kept in the space's own currency because a fee is cash: "5" is nothing in
+    // rupees and material in euros. Defaults are 0 everywhere, so nothing
+    // changes until these are deliberately set — an app that quietly started
+    // charging fees would invalidate every number already recorded.
+
+    /** Flat fee per order for US algos, in USD. */
+    var flatFeeUs: Double
+        get() = prefs.getFloat("flat_fee_us", 0f).toDouble()
+        set(v) = prefs.edit().putFloat("flat_fee_us", v.toFloat().coerceAtLeast(0f)).apply()
+
+    /** Flat fee per order for German algos, in EUR. */
+    var flatFeeDe: Double
+        get() = prefs.getFloat("flat_fee_de", 0f).toDouble()
+        set(v) = prefs.edit().putFloat("flat_fee_de", v.toFloat().coerceAtLeast(0f)).apply()
+
+    /** Flat fee per order for Indian algos, in INR. */
+    var flatFeeIn: Double
+        get() = prefs.getFloat("flat_fee_in", 0f).toDouble()
+        set(v) = prefs.edit().putFloat("flat_fee_in", v.toFloat().coerceAtLeast(0f)).apply()
+
+    /** Flat fee per order for crypto algos, in USDC. */
+    var flatFeeBinance: Double
+        get() = prefs.getFloat("flat_fee_binance", 0f).toDouble()
+        set(v) = prefs.edit().putFloat("flat_fee_binance", v.toFloat().coerceAtLeast(0f)).apply()
+
+    /** The flat per-order fee that applies to a namespace, in that space's currency. */
+    fun flatFeeFor(ns: String): Double =
+        when (com.signalscope.app.trading.Spaces.baseOf(ns)) {
+            "binance" -> flatFeeBinance
+            "de" -> flatFeeDe
+            "in" -> flatFeeIn
+            else -> flatFeeUs
+        }
+
+    /**
+     * The flat fee expressed as a percentage of one round trip, so the engines —
+     * which all work in percentage returns — can charge it alongside slippage.
+     *
+     * Two orders per round trip, both against the money actually committed. A
+     * position value of zero or less yields 0 rather than infinity: a fee cannot
+     * be charged against a position that was never taken, and returning a huge
+     * number there would silently zero out a strategy's entire return.
+     */
+    fun flatFeeRoundTripPct(ns: String, positionValue: Double): Double {
+        val fee = flatFeeFor(ns)
+        if (fee <= 0.0 || positionValue <= 0.0) return 0.0
+        return (2.0 * fee / positionValue) * 100.0
+    }
+
+    /**
+     * Last known Trading 212 free cash, cached by the reconciliation pass.
+     *
+     * The commitment warning has to render on every repaint, and T212 rate-limits
+     * account reads hard — so the number is fetched by the pass that is already
+     * making network calls and simply read from here. A slightly stale balance is
+     * the right trade: the warning is about a shortfall of tens of euros building
+     * up over hours, not about the last cent.
+     */
+    var t212FreeFundsCached: Double
+        get() = prefs.getFloat("t212_free_funds_cached", -1f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_free_funds_cached", v.toFloat()).apply()
+
+    var t212FreeFundsAt: Long
+        get() = prefs.getLong("t212_free_funds_at", 0L)
+        set(v) = prefs.edit().putLong("t212_free_funds_at", v).apply()
+
+    /**
+     * Whether PAPER trade notifications are sent at all.
+     *
+     * Six algos across four spaces produce a steady drip of these — each one
+     * true, none of them urgent, and together enough to bury the notifications
+     * that involve real money. Turning them off silences the paper channel ONLY;
+     * live fills, unfilled ladders and position mismatches are unaffected,
+     * because those are the ones you cannot afford to have learned to ignore.
+     */
+    var paperTradeNotifications: Boolean
+        get() = prefs.getBoolean("paper_trade_notifications", true)
+        set(v) = prefs.edit().putBoolean("paper_trade_notifications", v).apply()
+
+    // ── US PRICE SOURCE ───────────────────────────────────────────────────
+    // Yahoo's US quotes are redistributed and can lag badly. Finnhub streams
+    // actual trades. Same two-part shape as the India switch: a key, and a
+    // toggle that only does anything once the key is present.
+    //
+    // Stored in the ENCRYPTED prefs, like every other broker credential — a
+    // data key is still a key, and a leaked one is someone else's quota.
+
+    var finnhubApiKey: String
+        get() = encrypted.getString("FINNHUB_API_KEY", "") ?: ""
+        set(v) = encrypted.edit().putString("FINNHUB_API_KEY", v.trim()).apply()
+
+    val hasFinnhubKey: Boolean get() = finnhubApiKey.isNotBlank()
+
+    /** Live tick source for the US space: "yahoo" (default) or "finnhub". */
+    var usLivePriceSource: String
+        get() = prefs.getString("us_live_price_source", "yahoo") ?: "yahoo"
+        set(v) = prefs.edit().putString("us_live_price_source",
+            if (v == "finnhub") "finnhub" else "yahoo").apply()
+
+    val useFinnhubLiveTicks: Boolean
+        get() = usLivePriceSource == "finnhub" && hasFinnhubKey
+
+    // ── ZERODHA ALGO ORDERS ───────────────────────────────────────────────
+    // Same two-key shape as the Trading 212 side: a master freeze that blocks
+    // everything, and a mirror toggle that says algo orders are wanted at all.
+    // Both are needed, because they answer different questions — "is the system
+    // armed" and "is it allowed to trade right now" — and collapsing them into
+    // one switch removes the ability to stop everything without disarming each
+    // algo individually.
+
+    /** Master freeze for Indian algo orders. Defaults ON. Never flipped in code. */
+    var zerodhaLiveFrozen: Boolean
+        get() = prefs.getBoolean("zerodha_live_frozen", true)
+        set(v) = prefs.edit().putBoolean("zerodha_live_frozen", v).apply()
+
+    /** Whether algos may mirror into real Zerodha orders at all. Defaults OFF. */
+    var zerodhaLiveMirrorEnabled: Boolean
+        get() = prefs.getBoolean("zerodha_live_mirror_enabled", false)
+        set(v) = prefs.edit().putBoolean("zerodha_live_mirror_enabled", v).apply()
+
+    val canMirrorZerodhaLive: Boolean
+        get() = isZerodhaConnected && zerodhaLiveMirrorEnabled && !zerodhaLiveFrozen
+
+    // ── INDIA PRICE SOURCE ────────────────────────────────────────────────
+    // Two separate switches on purpose, because they carry different risk and
+    // are paid for differently.
+    //
+    // LIVE ticks come with the base Kite Connect subscription and are the same
+    // book the orders reach, so they are strictly better than a redistributed
+    // feed once the socket works.
+    //
+    // HISTORICAL candles are a SEPARATE paid add-on. A subscription taken out
+    // for a few weeks of backtest data will lapse, and when it does, every
+    // Indian algo would lose its bars mid-session. So the historical switch is
+    // advisory rather than binding: the app asks Kite first and silently uses
+    // Yahoo when Kite refuses — see [zerodhaHistoryLastRefusal].
+    //
+    // Both default to Yahoo. A price feed is not something to switch under
+    // someone by shipping a new default.
+
+    /** Live tick source for the India space: "yahoo" (default) or "zerodha". */
+    var indiaLivePriceSource: String
+        get() = prefs.getString("india_live_price_source", "yahoo") ?: "yahoo"
+        set(v) = prefs.edit().putString("india_live_price_source",
+            if (v == "zerodha") "zerodha" else "yahoo").apply()
+
+    val useZerodhaLiveTicks: Boolean
+        get() = indiaLivePriceSource == "zerodha" && isZerodhaConnected
+
+    /** Candle source for the India space: "yahoo" (default) or "zerodha". */
+    var indiaHistorySource: String
+        get() = prefs.getString("india_history_source", "yahoo") ?: "yahoo"
+        set(v) = prefs.edit().putString("india_history_source",
+            if (v == "zerodha") "zerodha" else "yahoo").apply()
+
+    val useZerodhaHistory: Boolean
+        get() = indiaHistorySource == "zerodha" && isZerodhaConnected
+
+    /**
+     * When Kite last refused a historical request, and why. Written by the
+     * fetcher on a 403 so the settings screen can say "your add-on has lapsed,
+     * candles are coming from Yahoo" instead of leaving a switch that claims to
+     * be on while nothing behind it works.
+     */
+    var zerodhaHistoryLastRefusal: String
+        get() = prefs.getString("zerodha_history_last_refusal", "") ?: ""
+        set(v) = prefs.edit().putString("zerodha_history_last_refusal", v).apply()
+
+    var zerodhaHistoryLastRefusalAt: Long
+        get() = prefs.getLong("zerodha_history_last_refusal_at", 0L)
+        set(v) = prefs.edit().putLong("zerodha_history_last_refusal_at", v).apply()
+
     // ═══════════════════════════════════════════════════════
     // TRADING 212 CREDENTIALS  (live US/DE broker)
     // ═══════════════════════════════════════════════════════
@@ -211,6 +415,127 @@ class ConfigManager(context: Context) {
     val hasT212Credentials: Boolean
         get() = t212ApiKey.isNotBlank() && t212ApiSecret.isNotBlank()
 
+    // ── T212 LIVE MIRROR (US space automated lab) ──────────────────────────
+    // OFF by default. When on, NEW paper BUY/SELL decisions on the NEWEST closed
+    // bar are mirrored into real T212 MARKET orders (a deliberately tiny size),
+    // recorded in a separate live ledger. Paper keeps running regardless.
+    var t212LiveMirrorEnabled: Boolean
+        get() = prefs.getBoolean("t212_live_mirror_enabled", false)
+        set(v) = prefs.edit().putBoolean("t212_live_mirror_enabled", v).apply()
+
+    /** Account-currency amount spent on each live mirrored T212 BUY. Hard-capped
+     *  small — this is a real-money test size, not a position sizer. */
+    var t212LivePerTradeAmount: Double
+        get() = prefs.getFloat("t212_live_per_trade_amount", 20.0f).toDouble()
+        set(v) = prefs.edit().putFloat(
+            "t212_live_per_trade_amount",
+            v.coerceIn(1.0, 3000.0).toFloat()
+        ).apply()
+
+    /**
+     * MASTER FREEZE over T212 live entries — the switch that used to be a
+     * hardcoded `const val LIVE_FROZEN = true` in T212LiveMirror.
+     *
+     * Frozen by default and deliberately separate from [t212LiveMirrorEnabled]:
+     * that flag says "this account may mirror", this one says "the execution layer
+     * is trusted enough to send an order". Both, plus a per-algo live flag, plus
+     * the per-algo allowlist, must agree before any real stock order is placed.
+     * Four independent gates is not paranoia when one wrong tick is a real loss.
+     *
+     * Prove the chain with the Live Test Bench before turning this off — the bench
+     * runs the same executor with the same reconciliation, one manual trade at a
+     * time, and it exists precisely so this switch is not the first real order.
+     */
+    var t212LiveFrozen: Boolean
+        get() = prefs.getBoolean("t212_live_frozen", true)
+        set(v) = prefs.edit().putBoolean("t212_live_frozen", v).apply()
+
+    val canMirrorT212Live: Boolean
+        get() = hasT212Credentials && t212LiveMirrorEnabled && !t212LiveFrozen
+
+    // ═══════════════════════════════════════════════════════
+    // BINANCE CREDENTIALS + LIVE MIRROR  (crypto space)
+    // ═══════════════════════════════════════════════════════
+    //
+    // Binance Strategy Lab always keeps its paper ledger running. When
+    // binanceLiveMirrorEnabled is true, NEW Binance paper BUY/SELL decisions
+    // are mirrored into live Spot MARKET orders and written to a separate live
+    // mirror ledger. No margin/futures/withdrawals are used.
+
+    var binanceApiKey: String
+        get() = encrypted.getString("BINANCE_API_KEY", "") ?: ""
+        set(v) = encrypted.edit().putString("BINANCE_API_KEY", v).apply()
+
+    var binanceApiSecret: String
+        get() = encrypted.getString("BINANCE_API_SECRET", "") ?: ""
+        set(v) = encrypted.edit().putString("BINANCE_API_SECRET", v).apply()
+
+    val hasBinanceCredentials: Boolean
+        get() = binanceApiKey.isNotBlank() && binanceApiSecret.isNotBlank()
+
+    var binanceLiveMirrorEnabled: Boolean
+        get() = prefs.getBoolean("binance_live_mirror_enabled", false)
+        set(v) = prefs.edit().putBoolean("binance_live_mirror_enabled", v).apply()
+
+    /** Quote amount spent on each live mirrored BUY. Kept separate from the
+     * paper notional so the user can shadow the exact same signals with a
+     * deliberately small real-money size. */
+    var binanceLiveQuoteOrderSize: Double
+        get() = prefs.getFloat("binance_live_quote_order_size", 10.0f).toDouble()
+        set(v) = prefs.edit().putFloat(
+            "binance_live_quote_order_size",
+            v.coerceIn(5.0, 10_000.0).toFloat()
+        ).apply()
+
+    /** Live sizing model for Binance mirror BUYs:
+     *  "FIXED"  — every entry uses binanceLiveQuoteOrderSize (legacy behaviour).
+     *  "BUDGET" — a total budget split equally across enrolled symbols, then
+     *             compounded per-symbol by the reinvest engine's balance. */
+    var binanceLiveSizingMode: String
+        get() = (prefs.getString("binance_live_sizing_mode", "FIXED") ?: "FIXED").uppercase()
+            .let { if (it == "BUDGET") "BUDGET" else "FIXED" }
+        set(v) = prefs.edit().putString(
+            "binance_live_sizing_mode",
+            if (v.uppercase() == "BUDGET") "BUDGET" else "FIXED"
+        ).apply()
+
+    /** Total live budget (USDT) split equally across the enrolled Binance basket
+     *  when binanceLiveSizingMode == "BUDGET". 0 disables budget sizing (falls
+     *  back to the fixed per-trade size). */
+    var binanceLiveBudget: Double
+        get() = prefs.getFloat("binance_live_budget", 0.0f).toDouble()
+        set(v) = prefs.edit().putFloat(
+            "binance_live_budget",
+            v.coerceIn(0.0, 1_000_000.0).toFloat()
+        ).apply()
+
+    /**
+     * Symbols the live mirror is allowed to place REAL orders for.
+     * Comma-separated; blank means "no restriction" (mirror every enrolled
+     * symbol — the old behaviour).
+     *
+     * Why this exists: the paper lab and the live mirror had no separation, so
+     * enrolling 16 coins for paper research also armed 16 coins for real money.
+     * Every paper entry attempted a real buy; the only thing stopping unwanted
+     * purchases was running out of USDC (which surfaced as "Insufficient
+     * balance" errors). Top the account up and it WOULD have bought all of
+     * them. Defaults to BTC/ETH so the safe direction is the default —
+     * research widely on paper, trade narrowly with real money.
+     */
+    var binanceLiveAllowlist: String
+        get() = prefs.getString("binance_live_allowlist", "BTCUSDC,ETHUSDC") ?: "BTCUSDC,ETHUSDC"
+        set(v) = prefs.edit().putString("binance_live_allowlist", v.trim().uppercase()).apply()
+
+    /** True when [sym] may receive REAL orders. Blank allowlist = allow all. */
+    fun binanceLiveAllows(sym: String): Boolean {
+        val list = binanceLiveAllowlist.split(',', ' ', ';')
+            .map { it.trim().uppercase() }.filter { it.isNotBlank() }
+        return list.isEmpty() || list.contains(sym.trim().uppercase())
+    }
+
+    val canMirrorBinanceLive: Boolean
+        get() = hasBinanceCredentials && binanceLiveMirrorEnabled
+
     // ═══════════════════════════════════════════════════════
     // SPACE / WORKSPACE  (which broker space the UI is currently in)
     // ═══════════════════════════════════════════════════════
@@ -221,11 +546,11 @@ class ConfigManager(context: Context) {
     var currentSpace: String
         get() {
             val s = (prefs.getString("current_space", "IN") ?: "IN").uppercase()
-            return if (s == "IN" || s == "US" || s == "DE") s else "IN"
+            return if (s == "IN" || s == "US" || s == "DE" || s == "BN") s else "IN"
         }
         set(v) {
             val s = v.uppercase()
-            if (s == "IN" || s == "US" || s == "DE") {
+            if (s == "IN" || s == "US" || s == "DE" || s == "BN") {
                 prefs.edit().putString("current_space", s).apply()
             }
         }
@@ -312,8 +637,8 @@ class ConfigManager(context: Context) {
                 }
                 if (!obj.has("pullbackStrongThreshold")) {
                     fixed = fixed.copy(
-                        pullbackStrongThreshold = fixed.buyStrongThreshold,
-                        pullbackModerateThreshold = fixed.buyModerateThreshold
+                        pullbackStrongThreshold = fixed.cherryStrongThreshold,
+                        pullbackModerateThreshold = fixed.cherryModerateThreshold
                     )
                 }
                 if (!obj.has("momentumTrendStackPts")) {
@@ -326,6 +651,29 @@ class ConfigManager(context: Context) {
                         momentumObvPts = d.momentumObvPts,
                         momentumStrongThreshold = d.momentumStrongThreshold,
                         momentumModerateThreshold = d.momentumModerateThreshold
+                    )
+                }
+                // v3 migration — when a stored config predates the long-term
+                // momentum overhaul, the 5 new buckets are missing AND the old
+                // short-term weights are still at their pre-overhaul values
+                // (~30/25/15/15/10/5 = 100 pts). We rewrite ALL momentum
+                // weights to the new defaults so the user sees the intended
+                // long-term-anchored mix instead of a weird 130-pt total.
+                if (!obj.has("momentumTrendPersistencePts")) {
+                    fixed = fixed.copy(
+                        // long-term primary (NEW)
+                        momentumTrendPersistencePts = d.momentumTrendPersistencePts,
+                        momentumEmaCascadePts = d.momentumEmaCascadePts,
+                        momentumDrawdownPts = d.momentumDrawdownPts,
+                        momentumLongReturnPts = d.momentumLongReturnPts,
+                        momentumSharpePts = d.momentumSharpePts,
+                        // short-term confirmation (REDUCED to v3 defaults)
+                        momentumTrendStackPts = d.momentumTrendStackPts,
+                        momentumMacdPts = d.momentumMacdPts,
+                        momentumEma21SlopePts = d.momentumEma21SlopePts,
+                        momentumNotOverextendedPts = d.momentumNotOverextendedPts,
+                        momentumRsiRoomPts = d.momentumRsiRoomPts,
+                        momentumObvPts = d.momentumObvPts
                     )
                 }
                 if (!obj.has("valueRevenueGrowthHighPts")) {
@@ -476,10 +824,100 @@ class ConfigManager(context: Context) {
         return mult.coerceIn(0.20, 8.00)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // TRADING 212 BROKER OVERRIDES (Option C: per-broker divergent params)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Zerodha and T212 have structurally different cost/order models that make
+    // a single shared parameter set wrong for one of them:
+    //
+    //   - T212 has NO target leg (shares get reserved by the first pending
+    //     sell). The SL is therefore the SOLE exit — it must trail closer to
+    //     the peak to lock profits, not just stop reversals.
+    //   - T212 has NO per-trade fee or DP charge on home-currency trades
+    //     (EUR-on-Xetra, USD-on-NASDAQ for USD accounts). Cancel + replace
+    //     cycles are basically free, so a tighter trail's whipsaw cost is
+    //     lower than its give-back-on-trend benefit — flipping the trade-off.
+    //   - T212 stocks (US large caps, German Xetra mid-caps) often have
+    //     higher daily ATR than NSE blue-chips, so a flat −10% hard floor
+    //     gets stopped on routine noise. A −15% floor gives breathing room.
+    //
+    // Therefore: the SL trail curve is tighter on T212, the hard floor is
+    // deeper, time decay accelerates faster, and auto-trail is ON by default
+    // (Zerodha leaves it user-opt-in because the GTT modify endpoint is rate
+    // limited). The Settings UI surfaces both as paired rows.
+
+    /** T212 hard floor as a fraction of entry price. Default 0.85 = −15% vs Zerodha's −10%. */
+    var t212NewPositionHardStopFraction: Double
+        get() = prefs.getFloat("t212_new_position_hard_stop_fraction", 0.85f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_new_position_hard_stop_fraction", v.toFloat()).apply()
+
+    /** T212 fixed-mult override (default 0 = use the tiered curve below). */
+    var t212SlChandelierFixedAtrMultiple: Double
+        get() = prefs.getFloat("t212_sl_chandelier_fixed_atr_multiple", 0.0f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_sl_chandelier_fixed_atr_multiple", v.toFloat()).apply()
+
+    /** T212 time-decay after 10d without a fresh peak. Default 0.65 (vs Zerodha 0.80). */
+    var t212SlTimeDecay10dFactor: Double
+        get() = prefs.getFloat("t212_sl_time_decay_10d_factor", 0.65f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_sl_time_decay_10d_factor", v.toFloat()).apply()
+
+    /** T212 time-decay after 20d. Default 0.45 (vs Zerodha 0.60). */
+    var t212SlTimeDecay20dFactor: Double
+        get() = prefs.getFloat("t212_sl_time_decay_20d_factor", 0.45f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_sl_time_decay_20d_factor", v.toFloat()).apply()
+
+    /** T212 limit pad below the SL trigger. Default 0.5% (Zerodha 2%) — T212
+     *  home-currency liquid names have tighter spreads, so a tight pad fills. */
+    var t212SlLimitPct: Double
+        get() = prefs.getFloat("t212_sl_limit_pct", 0.005f).toDouble()
+        set(v) = prefs.edit().putFloat("t212_sl_limit_pct", v.toFloat()).apply()
+
+    /** T212 auto-create protective stop for holdings without an exit leg. */
+    var t212AutoCreateGtt: Boolean
+        get() = prefs.getBoolean("t212_auto_create_gtt", false)
+        set(v) = prefs.edit().putBoolean("t212_auto_create_gtt", v).apply()
+
+    /** T212 auto-trail toggle. Default ON — trailing is the WHOLE point of
+     *  T212 management since there's no Target leg to catch winners. */
+    var t212AutoTrailingEnabled: Boolean
+        get() = prefs.getBoolean("t212_auto_trailing_enabled", true)
+        set(v) = prefs.edit().putBoolean("t212_auto_trailing_enabled", v).apply()
+
+    /** T212 chandelier multiplier with the TIGHTER curve (SL is sole exit so
+     *  trails closer to lock profits on the upside). Mirrors the shared
+     *  `slChandelierAtrMultiple` shape; uses T212-prefixed config getters. */
+    fun t212SlChandelierAtrMultiple(gainFraction: Double, daysSincePeak: Long = 0L): Double {
+        var mult = if (t212SlChandelierFixedAtrMultiple > 0.0) {
+            t212SlChandelierFixedAtrMultiple
+        } else {
+            // Tighter than Zerodha at every tier. The biggest divergence is
+            // at >30% gain (1.0 → 0.5) where T212's SL must catch reversals
+            // fast because there's no Target leg to lock the gain.
+            when {
+                gainFraction <= 0.05 -> 2.5
+                gainFraction <= 0.10 -> 1.8
+                gainFraction <= 0.20 -> 1.2
+                gainFraction <= 0.30 -> 0.8
+                else -> 0.5
+            }
+        }
+        mult *= when {
+            daysSincePeak >= 20 -> t212SlTimeDecay20dFactor.coerceIn(0.10, 1.00)
+            daysSincePeak >= 10 -> t212SlTimeDecay10dFactor.coerceIn(0.10, 1.00)
+            else -> 1.0
+        }
+        return mult.coerceIn(0.20, 8.00)
+    }
+
     /** Epoch ms of last successful daily tick — prevents double-runs within one trading day. */
     var lastDailyTickEpoch: Long
         get() = prefs.getLong("last_daily_tick_epoch", 0L)
         set(v) = prefs.edit().putLong("last_daily_tick_epoch", v).apply()
+
+    /** Separate T212 trailing/reconcile tick marker; US/DE market days differ from NSE. */
+    var lastT212DailyTickEpoch: Long
+        get() = prefs.getLong("last_t212_daily_tick_epoch", 0L)
+        set(v) = prefs.edit().putLong("last_t212_daily_tick_epoch", v).apply()
 
     /**
      * Auto-create OCO GTT for new holdings detected at the 15:20 IST daily tick.
@@ -613,6 +1051,44 @@ class ConfigManager(context: Context) {
     var targetMaxDailyStepPct: Double
         get() = prefs.getFloat("target_max_daily_step_pct", 0.08f).toDouble()
         set(v) = prefs.edit().putFloat("target_max_daily_step_pct", v.toFloat()).apply()
+
+    // ═══════════════════════════════════════════════════════
+    // BULK KEY IMPORT (upload one JSON instead of typing every key)
+    // ═══════════════════════════════════════════════════════
+
+    /**
+     * Import API credentials from a JSON object (the fill-in template).
+     * Only NON-BLANK string values are applied, so a partial file updates just
+     * those keys and never wipes an existing one with a blank. Snake_case and
+     * UPPER_CASE aliases are both accepted. Unknown keys are ignored.
+     *
+     * @return (countApplied, humanReadableSummary). Throws on invalid JSON so
+     *         the caller can surface a parse error.
+     */
+    fun importCredentialsJson(jsonText: String): Pair<Int, String> {
+        val o = com.google.gson.JsonParser.parseString(jsonText).asJsonObject
+        var n = 0
+        val applied = ArrayList<String>()
+        fun apply(aliases: List<String>, label: String, set: (String) -> Unit) {
+            for (k in aliases) {
+                if (o.has(k) && !o.get(k).isJsonNull) {
+                    val v = o.get(k).asString.trim()
+                    if (v.isNotEmpty()) { set(v); n++; applied.add(label) }
+                    return   // first matching alias wins, even if blank (don't overwrite with "")
+                }
+            }
+        }
+        apply(listOf("zerodha_api_key", "ZERODHA_API_KEY"), "Zerodha key") { zerodhaApiKey = it }
+        apply(listOf("zerodha_api_secret", "ZERODHA_API_SECRET"), "Zerodha secret") { zerodhaApiSecret = it }
+        apply(listOf("t212_api_key", "T212_API_KEY"), "T212 key") { t212ApiKey = it }
+        apply(listOf("t212_api_secret", "T212_API_SECRET"), "T212 secret") { t212ApiSecret = it }
+        apply(listOf("binance_api_key", "BINANCE_API_KEY"), "Binance key") { binanceApiKey = it }
+        apply(listOf("binance_api_secret", "BINANCE_API_SECRET"), "Binance secret") { binanceApiSecret = it }
+        apply(listOf("ai_api_key", "openai_api_key", "OPENAI_API_KEY", "llm_api_key"), "AI key") { openaiApiKey = it }
+        apply(listOf("llm_provider"), "LLM provider") { llmProvider = it.lowercase() }
+        apply(listOf("llm_model"), "LLM model") { llmModel = it }
+        return n to (if (applied.isEmpty()) "No recognized keys found in the file." else "Imported: " + applied.joinToString(", "))
+    }
 
     // ═══════════════════════════════════════════════════════
     // CLEAR

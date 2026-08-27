@@ -1,0 +1,10 @@
+# US examples
+# PepsiCo is PEP, MSCI is MSCI, CoStar Group is CSGP.
+PEP
+MSCI
+CSGP
+MSFT
+NVDA
+AVGO
+COST
+LIN

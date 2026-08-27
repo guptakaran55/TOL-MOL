@@ -224,6 +224,12 @@ object StockAnalyzer {
 
         // ── OBV ──
         val obvValues = Indicators.obv(closes, volumes)
+        // Two-pivot divergence (informational; feeds no score). Anchors on price
+        // swing pivots and compares MACD histogram + OBV at those swings.
+        val divergence = Indicators.divergence(closes, macdResult.histogram, obvValues)
+        // Raw-volume behaviour patterns (dry-up / capitulation / churning) —
+        // separate from the OBV divergence above; informational only.
+        val volPatterns = Indicators.volumePatterns(highs, lows, closes, volumes)
         val obvCurrent = obvValues.last()
         val obv5 = if (obvValues.size >= 5) obvValues[obvValues.size - 5] else obvValues[0]
         val obv20 = if (obvValues.size >= 20) obvValues[obvValues.size - 20] else obvValues[0]
@@ -260,11 +266,10 @@ object StockAnalyzer {
         val atrValues = Indicators.atr(highs, lows, closes, 14)
         val atrVal = atrValues.lastOrNull() ?: 0.0
         val riskInAtrs = if (atrVal > 0 && risk > 0) (risk / atrVal).round(2) else 0.0
-        val riskPerTrade = 10000.0
-        val positionSize = if (risk > 0) (riskPerTrade / risk).toInt() else 0
-        val capitalNeeded = if (positionSize > 0) (positionSize * price).round(0) else 0.0
-        val potentialProfit = if (positionSize > 0) (positionSize * reward).round(0) else 0.0
-        val rocPct = if (capitalNeeded > 0) (potentialProfit / capitalNeeded * 100).round(2) else 0.0
+        val positionSize = 0
+        val capitalNeeded = 0.0
+        val potentialProfit = 0.0
+        val rocPct = if (price > 0 && reward > 0) (reward / price * 100).round(2) else 0.0
 
         // ═══════════════════════════════════════════════════
         // PULLBACK POINTS
@@ -433,6 +438,86 @@ object StockAnalyzer {
         rows.add("EMA(21) proximity|${status(emaPts, w.buyEmaMaxPts)}|$emaPts|${w.buyEmaMaxPts}|$emaReason")
         val pullbackScoreReport = rows.joinToString("\n")
 
+        // ── Long-term momentum metrics ───────────────────────────────────
+        // These survive zoom-out — they describe whether this stock has been
+        // a quality buy-and-hold over the last 6-12 months, NOT whether
+        // today's setup looks good. The momentum score is now anchored on
+        // these; the short-term confirmation buckets (MACD / EMA21 / RSI)
+        // sit underneath at reduced weight.
+        //
+        // 1. Trend persistence — % of last 200 days price closed above SMA200.
+        //    A stock above its 200d 90% of the time is structurally trending;
+        //    one that's 50% above is choppy. Direct measure of "is this a
+        //    quietly trending stock?"
+        val trendPersistencePct: Double = if (n >= 200 && smaValues.size >= 200) {
+            val window = 200
+            val closesTail = closes.takeLast(window)
+            val smaTail = smaValues.takeLast(window)
+            var above = 0
+            var counted = 0
+            for (i in 0 until window) {
+                val sm = smaTail[i]
+                if (sm != null) {
+                    counted++
+                    if (closesTail[i] > sm) above++
+                }
+            }
+            if (counted > 0) above.toDouble() / counted else 0.0
+        } else 0.0
+
+        // 2. EMA cascade alignment — EMA21 > EMA50 > EMA200 with all three
+        //    slopes positive. Classic Stage-2 markup. "Strong" requires all
+        //    three slopes upward; "ok" is just the cascade order today.
+        val emaCascadeOk = ema21Val != null && ema50Val != null && ema200Val != null &&
+                ema21Val > ema50Val && ema50Val > ema200Val
+        val emaCascadeStrong = emaCascadeOk &&
+                ema21Slope > 0.0 && ema50Slope > 0.0 && ema200Slope > 0.0
+
+        // 3. Max drawdown over last 252 days — peak-to-trough decline.
+        //    Shallow drawdown (≤10%) = smoother ride a holder actually wants.
+        val maxDrawdownPct: Double = if (n >= 60) {
+            val window = closes.takeLast(minOf(252, n))
+            var peak = window.first()
+            var maxDd = 0.0
+            for (p in window) {
+                if (p > peak) peak = p
+                if (peak > 0.0) {
+                    val dd = (p - peak) / peak     // negative
+                    if (dd < maxDd) maxDd = dd
+                }
+            }
+            -maxDd                                  // flip to positive (0.15 = 15% DD)
+        } else 0.0
+
+        // 4. 6-month + 12-month cumulative returns.
+        val return6mPct: Double = if (n >= 126) {
+            val past = closes[n - 126]
+            if (past > 0.0) (price - past) / past * 100.0 else 0.0
+        } else 0.0
+        val return12mPct: Double = if (n >= 252) {
+            val past = closes[n - 252]
+            if (past > 0.0) (price - past) / past * 100.0 else 0.0
+        } else 0.0
+
+        // 5. Sharpe-like ratio: annualized mean daily return / annualized vol.
+        //    Over the available window (capped at 252 trading days). Higher =
+        //    better risk-adjusted compounding.
+        val sharpeLike: Double = if (n >= 60) {
+            val lookback = minOf(252, n - 1)
+            val daily = ArrayList<Double>(lookback)
+            for (i in 0 until lookback) {
+                val a = closes[n - lookback + i - 1]
+                val b = closes[n - lookback + i]
+                if (a > 0.0) daily.add((b - a) / a)
+            }
+            if (daily.size >= 30) {
+                val mean = daily.average()
+                val variance = daily.sumOf { val d = it - mean; d * d } / daily.size
+                val std = kotlin.math.sqrt(variance)
+                if (std > 0.0) (mean * 252.0) / (std * kotlin.math.sqrt(252.0)) else 0.0
+            } else 0.0
+        } else 0.0
+
         // MOMENTUM POINTS
         // Continuation lens: rewards trend alignment and active upward pressure
         // without requiring price to be in the pullback zone.
@@ -489,8 +574,69 @@ object StockAnalyzer {
         } else 0
 
         val momentumObvPts = if (obvPass) w.momentumObvPts else 0
+
+        // ── Long-term quality buckets (NEW, anchor the momentum score) ──
+
+        // Trend persistence — graduated
+        val momentumTrendPersistencePts = when {
+            trendPersistencePct >= 0.80 -> w.momentumTrendPersistencePts
+            trendPersistencePct >= 0.60 -> Math.round(w.momentumTrendPersistencePts * 0.75).toInt()
+            trendPersistencePct >= 0.40 -> Math.round(w.momentumTrendPersistencePts * 0.45).toInt()
+            trendPersistencePct >= 0.20 -> Math.round(w.momentumTrendPersistencePts * 0.20).toInt()
+            else -> 0
+        }
+
+        // EMA cascade alignment — full points for strong (all slopes up),
+        // 60% for the cascade order alone (no slope confirmation), 0 otherwise.
+        val momentumEmaCascadePts = when {
+            emaCascadeStrong -> w.momentumEmaCascadePts
+            emaCascadeOk    -> Math.round(w.momentumEmaCascadePts * 0.60).toInt()
+            else -> 0
+        }
+
+        // Max drawdown — inverted (lower drawdown = more points). Capped at
+        // 30%. Beyond 30% drawdown = 0 (genuinely volatile, not a holder pick).
+        val momentumDrawdownPts = when {
+            maxDrawdownPct <= 0.10 -> w.momentumDrawdownPts
+            maxDrawdownPct <= 0.20 -> Math.round(w.momentumDrawdownPts * 0.60).toInt()
+            maxDrawdownPct <= 0.30 -> Math.round(w.momentumDrawdownPts * 0.30).toInt()
+            else -> 0
+        }
+
+        // Long-term return — composite of 6m + 12m. 6m worth ~40%, 12m ~60%.
+        // 12m matters more because it captures a real holding cycle.
+        val momentumLongReturnPts: Int = run {
+            var pts = 0
+            // 6-month tranche
+            pts += when {
+                return6mPct >= 25.0 -> Math.round(w.momentumLongReturnPts * 0.40).toInt()
+                return6mPct >= 15.0 -> Math.round(w.momentumLongReturnPts * 0.30).toInt()
+                return6mPct >=  5.0 -> Math.round(w.momentumLongReturnPts * 0.20).toInt()
+                else -> 0
+            }
+            // 12-month tranche
+            pts += when {
+                return12mPct >= 40.0 -> Math.round(w.momentumLongReturnPts * 0.60).toInt()
+                return12mPct >= 25.0 -> Math.round(w.momentumLongReturnPts * 0.45).toInt()
+                return12mPct >= 10.0 -> Math.round(w.momentumLongReturnPts * 0.30).toInt()
+                else -> 0
+            }
+            pts.coerceAtMost(w.momentumLongReturnPts)
+        }
+
+        // Sharpe-like — risk-adjusted return. >=1.5 is top quality.
+        val momentumSharpePts = when {
+            sharpeLike >= 1.5 -> w.momentumSharpePts
+            sharpeLike >= 1.0 -> Math.round(w.momentumSharpePts * 0.70).toInt()
+            sharpeLike >= 0.5 -> Math.round(w.momentumSharpePts * 0.40).toInt()
+            sharpeLike >  0.0 -> Math.round(w.momentumSharpePts * 0.15).toInt()
+            else -> 0
+        }
+
         val momentumScore = momentumTrendPts + momentumMacdPts + momentumEmaSlopePts +
-                momentumRoomPts + momentumRsiPts + momentumObvPts
+                momentumRoomPts + momentumRsiPts + momentumObvPts +
+                momentumTrendPersistencePts + momentumEmaCascadePts +
+                momentumDrawdownPts + momentumLongReturnPts + momentumSharpePts
         val momentumSignal = when {
             momentumScore >= w.momentumStrongThreshold -> "STRONG MOMENTUM"
             momentumScore >= w.momentumModerateThreshold -> "MOMENTUM READY"
@@ -518,22 +664,57 @@ object StockAnalyzer {
         momentumRows.add("Not overextended|${status(momentumRoomPts, w.momentumNotOverextendedPts)}|$momentumRoomPts|${w.momentumNotOverextendedPts}|$roomReason")
         momentumRows.add("RSI room|${status(momentumRsiPts, w.momentumRsiRoomPts)}|$momentumRsiPts|${w.momentumRsiRoomPts}|$rsiMomentumReason")
         momentumRows.add("OBV|${status(momentumObvPts, w.momentumObvPts)}|$momentumObvPts|${w.momentumObvPts}|$obvReason")
+
+        // ── Long-term quality bucket rows ─────────────────────────────────
+        val persistenceReason = if (n >= 200)
+            "${"%.0f".format(trendPersistencePct * 100)}% of last 200 days price > SMA200; ≥80% earns full"
+        else "insufficient history (need 200d)"
+        momentumRows.add("Trend persistence|${status(momentumTrendPersistencePts, w.momentumTrendPersistencePts)}|$momentumTrendPersistencePts|${w.momentumTrendPersistencePts}|$persistenceReason")
+
+        val cascadeReason = when {
+            emaCascadeStrong -> "EMA21>EMA50>EMA200 with all three slopes positive (Stage-2)"
+            emaCascadeOk    -> "EMA21>EMA50>EMA200 today but slopes not all positive"
+            ema21Val == null || ema50Val == null || ema200Val == null -> "one or more EMAs unavailable"
+            else -> "EMA cascade out of order (not Stage-2)"
+        }
+        momentumRows.add("EMA cascade|${status(momentumEmaCascadePts, w.momentumEmaCascadePts)}|$momentumEmaCascadePts|${w.momentumEmaCascadePts}|$cascadeReason")
+
+        val drawdownReason = if (n >= 60)
+            "max DD over last ${minOf(252, n)}d = ${"%.1f".format(maxDrawdownPct * 100)}%; ≤10% earns full"
+        else "insufficient history (need 60d)"
+        momentumRows.add("Max drawdown|${status(momentumDrawdownPts, w.momentumDrawdownPts)}|$momentumDrawdownPts|${w.momentumDrawdownPts}|$drawdownReason")
+
+        val longReturnReason = buildString {
+            if (n >= 126) append("6m=${"%.1f".format(return6mPct)}%")
+            if (n >= 252) append(", 12m=${"%.1f".format(return12mPct)}%")
+            if (n < 126)  append("insufficient history (need 126d)")
+        }
+        momentumRows.add("Long-term return|${status(momentumLongReturnPts, w.momentumLongReturnPts)}|$momentumLongReturnPts|${w.momentumLongReturnPts}|$longReturnReason")
+
+        val sharpeReason = if (n >= 60) "Sharpe-like=${"%.2f".format(sharpeLike)}; ≥1.5 earns full"
+                          else "insufficient history (need 60d)"
+        momentumRows.add("Sharpe-like|${status(momentumSharpePts, w.momentumSharpePts)}|$momentumSharpePts|${w.momentumSharpePts}|$sharpeReason")
+
         val momentumScoreReport = momentumRows.joinToString("\n")
 
-        val buyScore = maxOf(pullbackScore, momentumScore)
+        // ── Composite viability score ────────────────────────────────────
+        // cherryPoints (was buyScore) = max(pullbackScore, momentumScore).
+        // Two lenses, whichever scored higher drives the verdict. The
+        // entryMode tells you which lens won so the UI / audit can show why.
+        val cherryPoints = maxOf(pullbackScore, momentumScore)
         val entryMode = when {
             pullbackScore >= w.pullbackModerateThreshold && momentumScore >= w.momentumModerateThreshold -> "PULLBACK + MOMENTUM"
             momentumScore >= w.momentumModerateThreshold -> "MOMENTUM"
             pullbackScore >= w.pullbackModerateThreshold -> "PULLBACK"
             else -> "NONE"
         }
-        val buySignal = when {
-            buyScore >= w.buyStrongThreshold && entryMode == "MOMENTUM" -> "STRONG MOMENTUM"
-            buyScore >= w.buyStrongThreshold && entryMode == "PULLBACK" -> "STRONG PULLBACK"
-            buyScore >= w.buyStrongThreshold -> "STRONG ENTRY"
-            buyScore >= w.buyModerateThreshold && entryMode == "MOMENTUM" -> "MOMENTUM READY"
-            buyScore >= w.buyModerateThreshold && entryMode == "PULLBACK" -> "PULLBACK READY"
-            buyScore >= w.buyModerateThreshold -> "ENTRY READY"
+        val cherrySignal = when {
+            cherryPoints >= w.cherryStrongThreshold && entryMode == "MOMENTUM" -> "STRONG MOMENTUM"
+            cherryPoints >= w.cherryStrongThreshold && entryMode == "PULLBACK" -> "STRONG PULLBACK"
+            cherryPoints >= w.cherryStrongThreshold -> "STRONG ENTRY"
+            cherryPoints >= w.cherryModerateThreshold && entryMode == "MOMENTUM" -> "MOMENTUM READY"
+            cherryPoints >= w.cherryModerateThreshold && entryMode == "PULLBACK" -> "PULLBACK READY"
+            cherryPoints >= w.cherryModerateThreshold -> "ENTRY READY"
             else -> "NO SIGNAL"
         }
 
@@ -801,8 +982,8 @@ object StockAnalyzer {
             capitalNeeded = capitalNeeded,
             potentialProfit = potentialProfit,
             rocPct = rocPct,
-            buyScore = buyScore,
-            buySignal = buySignal,
+            cherryPoints = cherryPoints,
+            cherrySignal = cherrySignal,
             pullbackScore = pullbackScore,
             pullbackSignal = pullbackSignal,
             momentumScore = momentumScore,
@@ -814,17 +995,27 @@ object StockAnalyzer {
             sellScore = sellScore,
             sellSignal = sellSignal,
             goldenBuy = goldenBuy,
-            isBuy = pullbackScore >= w.pullbackStrongThreshold ||
+            isCherry = pullbackScore >= w.pullbackStrongThreshold ||
                     momentumScore >= w.momentumStrongThreshold ||
-                    buyScore >= w.buyStrongThreshold,
-            isModerateBuy = pullbackScore >= w.pullbackModerateThreshold ||
+                    cherryPoints >= w.cherryStrongThreshold,
+            isModerateCherry = pullbackScore >= w.pullbackModerateThreshold ||
                     momentumScore >= w.momentumModerateThreshold ||
-                    buyScore >= w.buyModerateThreshold,
+                    cherryPoints >= w.cherryModerateThreshold,
             isSell = sellIntent == "STRONG EXIT" || sellIntent == "PROTECT CAPITAL",
             isModerateSell = sellIntent == "BOOK PROFIT",
             obvDivergence = obvBearishDivergence,
             obvWeakness = obvDistributionWeakness,
-            buyScoreReport = pullbackScoreReport,
+            divHistBullish = divergence.histBullish,
+            divHistBearish = divergence.histBearish,
+            divVolBullish = divergence.volBullish,
+            divVolBearish = divergence.volBearish,
+            divDetail = divergence.detail,
+            volBullDryUp = volPatterns.bullDryUp,
+            volBearDryUp = volPatterns.bearDryUp,
+            volBullCapitulation = volPatterns.bullCapitulation,
+            volBearChurning = volPatterns.bearChurning,
+            volPatternDetail = volPatterns.detail,
+            cherryPointsReport = pullbackScoreReport,
             pullbackScoreReport = pullbackScoreReport,
             momentumScoreReport = momentumScoreReport,
             goldenBuyReport = goldenBuyReport,

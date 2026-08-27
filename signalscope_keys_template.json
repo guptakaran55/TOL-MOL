@@ -1,0 +1,11 @@
+{
+  "zerodha_api_key": "",
+  "zerodha_api_secret": "",
+  "t212_api_key": "",
+  "t212_api_secret": "",
+  "binance_api_key": "",
+  "binance_api_secret": "",
+  "ai_api_key": "",
+  "llm_provider": "openai",
+  "llm_model": "gpt-4o-mini"
+}

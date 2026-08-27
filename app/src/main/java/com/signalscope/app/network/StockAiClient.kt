@@ -28,6 +28,74 @@ object StockAiClient {
 
     private const val TAG = "StockAiClient"
 
+    /**
+     * Market context for LLM prompts. Previously every prompt was hardcoded
+     * "NSE India" / "Indian NSE stocks" / "₹" — which leaked Indian terminology
+     * into the US/German Outlook outputs when the user was in those spaces.
+     *
+     * Defaults to [IN] so any caller that doesn't pass a context preserves the
+     * old behaviour exactly (no surprise regressions for legacy code paths).
+     *
+     * Resolved at the bridge layer from ConfigManager.currentSpace and passed
+     * into every analyze entry point.
+     */
+    data class MarketContext(
+        val space: String,            // "IN" / "US"
+        val marketLabel: String,      // user-prompt label e.g. "NSE India"
+        val analystPersona: String,   // system-prompt persona target
+        val traderRegion: String,     // adjective form e.g. "Indian" / "US"
+        val currencySymbol: String,   // "₹" / "$"
+        val newsHl: String,           // Google News hl param
+        val newsGl: String,           // Google News gl param
+        val newsCeid: String,         // Google News ceid param
+        val newsKeyword: String       // search suffix e.g. "NSE" or "" (none)
+    ) {
+        companion object {
+            val IN = MarketContext(
+                space = "IN",
+                marketLabel = "NSE India",
+                analystPersona = "Indian NSE stocks",
+                traderRegion = "Indian",
+                currencySymbol = "₹",
+                newsHl = "en-IN",
+                newsGl = "IN",
+                newsCeid = "IN:en",
+                newsKeyword = "NSE"
+            )
+            val US = MarketContext(
+                space = "US",
+                marketLabel = "US (NASDAQ/NYSE)",
+                analystPersona = "US-listed equities (NASDAQ / NYSE)",
+                traderRegion = "US",
+                currencySymbol = "$",
+                newsHl = "en-US",
+                newsGl = "US",
+                newsCeid = "US:en",
+                newsKeyword = ""
+            )
+            val DE = MarketContext(
+                space = "DE",
+                marketLabel = "Germany / Europe (Xetra / Frankfurt)",
+                analystPersona = "German and European listed equities (Xetra / Frankfurt / Euronext)",
+                traderRegion = "German/European",
+                currencySymbol = "€",
+                // English-language German edition of Google News: surfaces both
+                // local and international coverage of Xetra-listed names. (de-DE
+                // would bias toward German-only sources; en works better for the
+                // LLM and still returns the relevant European headlines.)
+                newsHl = "en-DE",
+                newsGl = "DE",
+                newsCeid = "DE:en",
+                newsKeyword = ""
+            )
+            fun fromSpace(space: String?): MarketContext = when {
+                space?.equals("US", ignoreCase = true) == true -> US
+                space?.equals("DE", ignoreCase = true) == true -> DE
+                else -> IN
+            }
+        }
+    }
+
     // MIUI/Xiaomi hardening — same recipe as Yahoo/Zerodha clients:
     // prefer IPv4 (flaky IPv6), HTTP/1.1 only (HTTP/2 is unstable on MIUI),
     // retry on connection failure, and a hard callTimeout so DNS hangs can't stall forever.
@@ -54,14 +122,37 @@ object StockAiClient {
     // GOOGLE NEWS — fetch recent headlines for a stock
     // ═══════════════════════════════════════════════════════
 
-    fun fetchNewsHeadlines(symbol: String, maxResults: Int = 8): List<String> {
-        // Clean symbol: remove .NS, .BO suffixes and -EQ
+    fun fetchNewsHeadlines(
+        symbol: String,
+        maxResults: Int = 8,
+        ctx: MarketContext = MarketContext.IN,
+        companyName: String? = null
+    ): List<String> {
+        // Clean the ticker: strip every exchange suffix Yahoo appends (Indian
+        // .NS/.BO, plus the European venues used by the DE space — .DE/.PA/.AS/
+        // .L/.MI/.MC/.SW/.ST/.HE/.OL) and the NSE -EQ series tag. Without this,
+        // a German ticker like "ENR.DE" was searched verbatim and matched no news.
         val cleanSymbol = symbol
-            .replace(".NS", "").replace(".BO", "")
+            .replace(Regex("\\.(NS|BO|DE|PA|AS|L|MI|MC|SW|ST|HE|OL)$", RegexOption.IGNORE_CASE), "")
             .replace("-EQ", "").replace("_", " ")
+            .trim()
 
-        val query = "$cleanSymbol stock NSE"
-        val url = "https://news.google.com/rss/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}&hl=en-IN&gl=IN&ceid=IN:en"
+        // Prefer the real company name for the news query when we have one — a
+        // human name ("Siemens Energy") surfaces far more coverage than a raw
+        // ticker ("ENR"), especially for European names. Fall back to the
+        // cleaned ticker when no name was passed.
+        val searchTerm = companyName?.trim()?.takeIf { it.isNotBlank() } ?: cleanSymbol
+
+        // Region-aware Google News query: append market keyword only when set
+        // (IN uses "NSE", US/DE use no suffix because those tickers aren't
+        // disambiguated by exchange in news headlines the same way).
+        val baseQuery = if (ctx.newsKeyword.isNotEmpty()) "$searchTerm stock ${ctx.newsKeyword}"
+                        else "$searchTerm stock"
+        // Recency: Google News's `when:30d` operator restricts results to the
+        // last 30 days server-side. parseRssHeadlines ALSO filters by pubDate
+        // as a hard guarantee in case the operator is ignored on some locales.
+        val query = "$baseQuery when:30d"
+        val url = "https://news.google.com/rss/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}&hl=${ctx.newsHl}&gl=${ctx.newsGl}&ceid=${ctx.newsCeid}"
 
         return try {
             val request = Request.Builder()
@@ -80,8 +171,18 @@ object StockAiClient {
         }
     }
 
+    /**
+     * Parse RSS <item> titles, now also reading <pubDate> so we can:
+     *   - drop stories older than 30 days (Google News is relevance-ranked, so
+     *     a stale headline can otherwise rank above recent ones),
+     *   - de-duplicate near-identical titles,
+     *   - prefix each kept headline with its date so the LLM can weigh recency.
+     * Items with an UNPARSEABLE/absent date are KEPT (we can't prove they're
+     * stale) — preserves the old behaviour when feeds omit pubDate.
+     */
     private fun parseRssHeadlines(xml: String, max: Int): List<String> {
-        val headlines = mutableListOf<String>()
+        data class Item(val title: String, val timeMs: Long?)
+        val items = mutableListOf<Item>()
         try {
             val factory = XmlPullParserFactory.newInstance()
             val parser = factory.newPullParser()
@@ -89,25 +190,30 @@ object StockAiClient {
 
             var inItem = false
             var currentTag = ""
+            var title = ""
+            var timeMs: Long? = null
 
             while (parser.eventType != XmlPullParser.END_DOCUMENT) {
                 when (parser.eventType) {
                     XmlPullParser.START_TAG -> {
                         currentTag = parser.name
-                        if (currentTag == "item") inItem = true
+                        if (currentTag == "item") { inItem = true; title = ""; timeMs = null }
                     }
                     XmlPullParser.TEXT -> {
-                        if (inItem && currentTag == "title" && parser.text.isNotBlank()) {
-                            val title = parser.text.trim()
-                            if (title.isNotEmpty() && !title.startsWith("<?")) {
-                                headlines.add(title)
+                        if (inItem && parser.text.isNotBlank()) {
+                            when (currentTag) {
+                                "title" -> {
+                                    val t = parser.text.trim()
+                                    if (t.isNotEmpty() && !t.startsWith("<?")) title = t
+                                }
+                                "pubDate" -> timeMs = parsePubDate(parser.text.trim())
                             }
                         }
                     }
                     XmlPullParser.END_TAG -> {
                         if (parser.name == "item") {
+                            if (title.isNotEmpty()) items.add(Item(title, timeMs))
                             inItem = false
-                            if (headlines.size >= max) return headlines
                         }
                         currentTag = ""
                     }
@@ -117,7 +223,32 @@ object StockAiClient {
         } catch (e: Exception) {
             Log.w(TAG, "RSS parse error", e)
         }
-        return headlines
+
+        val cutoff = System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000
+        val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+        val seen = HashSet<String>()
+        val out = ArrayList<String>()
+        for (it in items) {
+            if (it.timeMs != null && it.timeMs < cutoff) continue          // older than 30d
+            if (!seen.add(it.title.lowercase(java.util.Locale.US))) continue // exact-title dup
+            out.add(
+                if (it.timeMs != null) "[${dateFmt.format(java.util.Date(it.timeMs))}] ${it.title}"
+                else it.title
+            )
+            if (out.size >= max) break
+        }
+        return out
+    }
+
+    /** RFC-1123 pubDate → epoch ms; null if unparseable (caller keeps the item). */
+    private fun parsePubDate(raw: String): Long? {
+        val patterns = arrayOf("EEE, dd MMM yyyy HH:mm:ss zzz", "EEE, dd MMM yyyy HH:mm:ss Z")
+        for (p in patterns) {
+            try {
+                return java.text.SimpleDateFormat(p, java.util.Locale.US).parse(raw)?.time
+            } catch (_: Exception) { /* try next */ }
+        }
+        return null
     }
 
     // ═══════════════════════════════════════════════════════
@@ -129,15 +260,15 @@ object StockAiClient {
         data class Error(val message: String) : AiResult()
     }
 
-    private fun callLlm(config: ConfigManager, systemPrompt: String, userPrompt: String): AiResult {
+    private fun callLlm(config: ConfigManager, systemPrompt: String, userPrompt: String, maxTokens: Int = 500): AiResult {
         val apiKey = config.openaiApiKey
         if (apiKey.isBlank()) return AiResult.Error("No API key configured. Go to Settings → AI Stock Analysis.")
 
         return try {
             if (config.llmProvider == "anthropic") {
-                callAnthropic(apiKey, config.llmModel, systemPrompt, userPrompt)
+                callAnthropic(apiKey, config.llmModel, systemPrompt, userPrompt, maxTokens)
             } else {
-                callOpenAi(apiKey, config.llmModel, systemPrompt, userPrompt)
+                callOpenAi(apiKey, config.llmModel, systemPrompt, userPrompt, maxTokens)
             }
         } catch (e: Exception) {
             Log.e(TAG, "LLM call failed", e)
@@ -145,10 +276,10 @@ object StockAiClient {
         }
     }
 
-    private fun callOpenAi(apiKey: String, model: String, system: String, user: String): AiResult {
+    private fun callOpenAi(apiKey: String, model: String, system: String, user: String, maxTokens: Int = 500): AiResult {
         val json = JSONObject().apply {
             put("model", model)
-            put("max_tokens", 500)
+            put("max_tokens", maxTokens)
             put("temperature", 0.3)
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", system))
@@ -178,10 +309,10 @@ object StockAiClient {
         }
     }
 
-    private fun callAnthropic(apiKey: String, model: String, system: String, user: String): AiResult {
+    private fun callAnthropic(apiKey: String, model: String, system: String, user: String, maxTokens: Int = 500): AiResult {
         val json = JSONObject().apply {
             put("model", model)
-            put("max_tokens", 500)
+            put("max_tokens", maxTokens)
             put("temperature", 0.3)
             put("system", system)
             put("messages", JSONArray().apply {
@@ -227,11 +358,14 @@ object StockAiClient {
         rsi: Double? = null,
         adx: Double? = null,
         support: Double? = null,
-        resistance: Double? = null
+        resistance: Double? = null,
+        ctx: MarketContext = MarketContext.IN,
+        name: String? = null
     ): AiResult {
-        val headlines = fetchNewsHeadlines(symbol, 12)  // increased from 8 to 12 for richer context
+        val headlines = fetchNewsHeadlines(symbol, 12, ctx, name)  // increased from 8 to 12 for richer context
+        val displayName = name?.trim()?.takeIf { it.isNotBlank() }
         if (headlines.isEmpty()) {
-            return AiResult.Error("No recent news found for $symbol")
+            return AiResult.Error("No recent news found for ${displayName ?: symbol}")
         }
 
         val system = """You are a stock market analyst. Analyze a deep pullback critically and independently.
@@ -261,12 +395,12 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
 
         val srDesc = if (support != null && resistance != null) {
             val priceVsSupport = ((price - support) / support * 100)
-            "Price is ${String.format("%.1f%%", priceVsSupport)} above support (₹${String.format("%.2f", support)})"
+            "Price is ${String.format("%.1f%%", priceVsSupport)} above support (${ctx.currencySymbol}${String.format("%.2f", support)})"
         } else "Support/Resistance not available"
 
         val user = buildString {
-            append("Stock: $symbol (NSE India)\n")
-            append("Current price: ₹${String.format("%.2f", price)}\n")
+            append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} (${ctx.marketLabel})\n")
+            append("Current price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n")
             append("EMA(21) distance: ${String.format("%.1f", ema21PctDiff)}% (deep pullback trigger)\n")
             append("MACD Phase: $macdPhase\n\n")
 
@@ -298,7 +432,7 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
         config: ConfigManager,
         symbol: String,
         price: Double,
-        buyScore: Int,
+        cherryPoints: Int,
         profitScore: Int,
         protectScore: Int,
         sellIntent: String,
@@ -309,9 +443,12 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
         ema21PctDiff: Double,
         rrRatio: Double,
         priceVel: Double,
-        isInPortfolio: Boolean = false
+        isInPortfolio: Boolean = false,
+        ctx: MarketContext = MarketContext.IN,
+        name: String? = null
     ): AiResult {
-        val headlines = fetchNewsHeadlines(symbol, 12)
+        val displayName = name?.trim()?.takeIf { it.isNotBlank() }
+        val headlines = fetchNewsHeadlines(symbol, 12, ctx, name)
 
         // Allowed verdicts: HOLD is ONLY valid if the stock is currently in the user's portfolio.
         // Otherwise the LLM must commit to a directional call (BUY / WATCH / AVOID / SELL).
@@ -325,7 +462,7 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
         else
             "HOLD is NOT a valid verdict — the user does NOT own this stock, so you must commit to a directional call (BUY / WATCH / AVOID). Do not output HOLD under any circumstances."
 
-        val system = """You are a stock market analyst providing outlook summaries for Indian NSE stocks.
+        val system = """You are a stock market analyst providing outlook summaries for ${ctx.analystPersona}.
 Form your own independent opinion based PRIMARILY on recent news and publicly known fundamentals.
 Headlines are listed in chronological order (most recent first) — prioritize those heavily over older news.
 Do NOT assume any prior bullish or bearish bias — you are given current price, ownership status, and headlines only. Critically assess both risks and opportunities.
@@ -342,8 +479,8 @@ $holdRule
 Keep each section to 2-3 sentences max. Be specific about price levels when possible."""
 
         val user = buildString {
-            append("Stock: $symbol (NSE India)\n")
-            append("Current Price: ₹${String.format("%.2f", price)}\n")
+            append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} (${ctx.marketLabel})\n")
+            append("Current Price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n")
             append("User currently owns this: ${if (isInPortfolio) "YES" else "NO"}\n\n")
             // Technical context intentionally withheld here to keep the LLM
             // outlook independent from app-generated SMA/MACD bias.
@@ -363,7 +500,7 @@ Keep each section to 2-3 sentences max. Be specific about price levels when poss
             }
             append("Do not reference any app-generated scoring.")
         }
-        // NOTE: buyScore / profitScore / protectScore / sellIntent / rrRatio / rsi / ema21PctDiff /
+        // NOTE: cherryPoints / profitScore / protectScore / sellIntent / rrRatio / rsi / ema21PctDiff /
         // priceVel / SMA200 / MACD parameters are deliberately NOT passed to the LLM — per the
         // LLM-outlook rework: keep context minimal (price + ownership + news), drop technicals.
         // The params remain in the signature for backward compat with the JS bridge in MainActivity.
@@ -381,13 +518,16 @@ Keep each section to 2-3 sentences max. Be specific about price levels when poss
         symbol: String,
         userQuestion: String,
         price: Double,
-        previousAnalysis: String = ""
+        previousAnalysis: String = "",
+        ctx: MarketContext = MarketContext.IN,
+        name: String? = null
     ): AiResult {
+        val displayName = name?.trim()?.takeIf { it.isNotBlank() }
         // Fetch broader set of headlines for deeper company context
-        val headlines = fetchNewsHeadlines(symbol, maxResults = 20)
+        val headlines = fetchNewsHeadlines(symbol, maxResults = 20, ctx = ctx, companyName = name)
 
         if (headlines.isEmpty()) {
-            return AiResult.Error("No recent news found. Unable to answer questions about $symbol fundamentals.")
+            return AiResult.Error("No recent news found. Unable to answer questions about ${displayName ?: symbol} fundamentals.")
         }
 
         val system = """You are a stock market analyst with deep company knowledge.
@@ -399,8 +539,8 @@ If a question cannot be answered from the available news, say so explicitly.
 Keep answers concise (2-3 sentences) unless asked for more detail."""
 
         val user = buildString {
-            append("Stock: $symbol (NSE India)\n")
-            append("Current Price: ₹${String.format("%.2f", price)}\n\n")
+            append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} (${ctx.marketLabel})\n")
+            append("Current Price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n\n")
 
             if (previousAnalysis.isNotEmpty()) {
                 append("─ Previous Pullback Analysis ─\n")
@@ -424,7 +564,11 @@ Keep answers concise (2-3 sentences) unless asked for more detail."""
     //   { symbol, name, price, rsi, macdPhase, macdHist, ema21PctDiff, atr,
     //     support, resistance, buyScore, buySignal, sma200, adx, minBarsFilter }
     // Returns a formatted markdown table with entry quality scores.
-    fun analyseDeepPullbackBatch(config: ConfigManager, stocksJson: String): AiResult {
+    fun analyseDeepPullbackBatch(
+        config: ConfigManager,
+        stocksJson: String,
+        ctx: MarketContext = MarketContext.IN
+    ): AiResult {
         val arr = try {
             org.json.JSONArray(stocksJson)
         } catch (e: Exception) {
@@ -433,8 +577,8 @@ Keep answers concise (2-3 sentences) unless asked for more detail."""
 
         if (arr.length() == 0) return AiResult.Error("No stocks to analyse")
 
-        val system = """You are an expert Indian stock market trader specialising in pullback entries on momentum stocks.
-You will be given a batch of NSE stocks that have passed a 'deep pullback' technical filter.
+        val system = """You are an expert ${ctx.traderRegion} stock market trader specialising in pullback entries on momentum stocks.
+You will be given a batch of ${ctx.marketLabel} stocks that have passed a 'deep pullback' technical filter.
 Your job is to score each stock's current entry quality from 1 to 10 and give a brief rationale.
 
 Scoring guide:
@@ -475,13 +619,13 @@ Be direct and opinionated. Do NOT hedge excessively."""
                     return if (v.isNaN()) "—" else String.format("%.${decimals}f", v)
                 }
                 append("| ${s.optString("symbol", "?")} ")
-                append("| ₹${d("price")} ")
+                append("| ${ctx.currencySymbol}${d("price")} ")
                 append("| ${d("rsi", 1)} ")
                 append("| ${s.optString("macdPhase", "?")} ")
                 append("| ${d("macdHist")} ")
                 append("| ${d("ema21PctDiff", 1)}% ")
-                append("| ₹${d("support")} ")
-                append("| ₹${d("resistance")} ")
+                append("| ${ctx.currencySymbol}${d("support")} ")
+                append("| ${ctx.currencySymbol}${d("resistance")} ")
                 append("| ${d("atr")} ")
                 append("| ${d("adx", 1)} ")
                 append("| ${s.optInt("minBarsFilter", 5)} ")  // 5 = sensible default if AST didn't provide one
@@ -493,5 +637,132 @@ Be direct and opinionated. Do NOT hedge excessively."""
         }
 
         return callLlm(config, system, user)
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // FEATURE 4: PORTFOLIO NEWS SCAN (criticality triage)
+    // Batched, manually triggered. Fetches recent Google-News headlines for
+    // every current-space holding, then ONE LLM call classifies each into a
+    // 5-level verdict with a one-line conclusion + a portfolio summary.
+    // Returns strict JSON for the dashboard panel to render. No orders, no
+    // scoring — purely "what's in the news for my stocks right now".
+    //   stocksJson: [{ "symbol": "...", "name": "..." }]
+    // ═══════════════════════════════════════════════════════
+    fun analysePortfolioNews(
+        config: ConfigManager,
+        stocksJson: String,
+        ctx: MarketContext = MarketContext.IN
+    ): AiResult {
+        val arr = try { JSONArray(stocksJson) } catch (e: Exception) {
+            return AiResult.Error("Invalid JSON payload: ${e.message}")
+        }
+        if (arr.length() == 0) return AiResult.Error("No holdings to scan")
+
+        data class Item(val symbol: String, val name: String, val headlines: List<String>)
+        val items = mutableListOf<Item>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val sym = o.optString("symbol").trim()
+            if (sym.isEmpty()) continue
+            val nm = o.optString("name").trim().ifBlank { sym }
+            val hls = try { fetchNewsHeadlines(sym, 6, ctx, nm) } catch (e: Exception) { emptyList() }
+            items.add(Item(sym, nm, hls))
+            // Be gentle on Google News RSS — small gap between holdings.
+            if (i < arr.length() - 1) try { Thread.sleep(150) } catch (_: InterruptedException) {}
+        }
+        if (items.isEmpty()) return AiResult.Error("No valid holdings to scan")
+
+        val system = """You are an equity news analyst scanning a ${ctx.analystPersona} portfolio.
+For EACH stock, read its recent headlines (most recent first) and assign exactly one verdict:
+  CRITICAL      — serious negative: fraud, regulatory action, guidance cut, big earnings miss, lawsuit, crash, default
+  CAUTION       — mild or uncertain negative, or genuinely mixed signals worth watching
+  QUIET         — no material news / routine coverage only
+  POSITIVE      — clearly good developments
+  VERY_POSITIVE — major upside: big beat, cluster of upgrades, large contract/order, buyout or strategic catalyst
+Judge ONLY from the headlines provided — do not invent facts. If a stock has no headlines, verdict = QUIET and conclusion = "No recent news.".
+Be decisive; reserve CRITICAL and VERY_POSITIVE for genuinely strong signals.
+
+Output ONLY a JSON object (no markdown, no code fences), exactly this shape:
+{"summary":"<=20 word portfolio-level takeaway","stocks":[{"symbol":"AAA","verdict":"CRITICAL|CAUTION|QUIET|POSITIVE|VERY_POSITIVE","conclusion":"<=22 word plain-English summary of what's happening"}]}"""
+
+        val user = buildString {
+            append("Portfolio — ${items.size} holdings (${ctx.marketLabel}). Classify every one.\n\n")
+            items.forEach { it2 ->
+                append("### ${it2.name} (${it2.symbol})\n")
+                if (it2.headlines.isEmpty()) append("(no recent news)\n")
+                else it2.headlines.forEachIndexed { idx, h -> append("[${idx + 1}] $h\n") }
+                append("\n")
+            }
+            append("Return the JSON object now.")
+        }
+
+        // One row per holding — scale the budget with portfolio size.
+        val maxTokens = (300 + items.size * 60).coerceAtMost(2000)
+        return when (val res = callLlm(config, system, user, maxTokens)) {
+            // Validate + reconcile the model's JSON against the holdings we
+            // actually sent: coerce verdicts to the allowlist, drop fabricated
+            // symbols, and fill any the model omitted. Guarantees the panel
+            // reflects the real portfolio regardless of what the LLM returns.
+            is AiResult.Success -> AiResult.Success(
+                buildValidatedNewsJson(res.text, items.map { it.symbol to it.headlines.isNotEmpty() })
+            )
+            is AiResult.Error -> res
+        }
+    }
+
+    private val NEWS_VERDICTS = setOf("CRITICAL", "CAUTION", "QUIET", "POSITIVE", "VERY_POSITIVE")
+
+    /** Coerce a model-supplied verdict to the allowlist; anything else → QUIET. */
+    private fun normalizeVerdict(raw: String?): String {
+        val v = raw?.trim()?.uppercase(java.util.Locale.US)?.replace(' ', '_').orEmpty()
+        return if (v in NEWS_VERDICTS) v else "QUIET"
+    }
+
+    /**
+     * Rebuild the news JSON from the model output but anchored on the EXACT set
+     * of holdings we requested (in order). Unknown/fabricated symbols are
+     * dropped; missing ones are added as QUIET. Verdicts are allowlisted and
+     * strings length-capped. On unparseable output, returns an error object the
+     * dashboard already knows how to show.
+     *   requested: list of (symbol, hadHeadlines)
+     */
+    private fun buildValidatedNewsJson(rawText: String, requested: List<Pair<String, Boolean>>): String {
+        val obj = try { JSONObject(extractJsonObject(rawText)) } catch (e: Exception) { null }
+            ?: return JSONObject().put("error", "Could not parse news analysis").toString()
+
+        val summary = obj.optString("summary", "").trim().take(200)
+        val bySym = HashMap<String, Pair<String, String>>()
+        obj.optJSONArray("stocks")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val sym = o.optString("symbol").trim()
+                if (sym.isEmpty()) continue
+                bySym[sym.uppercase(java.util.Locale.US)] =
+                    normalizeVerdict(o.optString("verdict")) to o.optString("conclusion").trim().take(220)
+            }
+        }
+
+        val outStocks = JSONArray()
+        for ((sym, hadNews) in requested) {
+            val match = bySym[sym.uppercase(java.util.Locale.US)]
+            val conclusion = match?.second?.takeIf { it.isNotBlank() }
+                ?: if (hadNews) "No clear assessment from recent headlines." else "No recent news."
+            outStocks.put(JSONObject().apply {
+                put("symbol", sym)
+                put("verdict", match?.first ?: "QUIET")
+                put("conclusion", conclusion)
+            })
+        }
+        return JSONObject().apply {
+            put("summary", summary)
+            put("stocks", outStocks)
+        }.toString()
+    }
+
+    /** Trim anything around the JSON object so the dashboard can JSON.parse it
+     *  even if the model wrapped the reply in prose or ```json fences. */
+    private fun extractJsonObject(raw: String): String {
+        val s = raw.indexOf('{'); val e = raw.lastIndexOf('}')
+        return if (s >= 0 && e > s) raw.substring(s, e + 1) else raw
     }
 }

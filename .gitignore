@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Build output — regenerated on every build, machine-specific, never versioned.
+# ─────────────────────────────────────────────────────────────────────────────
+build/
+app/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gradle caches and daemon state. The WRAPPER (gradlew, gradlew.bat and
+# gradle/wrapper/) is deliberately NOT ignored — it is what lets a fresh clone
+# build without anyone installing Gradle by hand.
+# ─────────────────────────────────────────────────────────────────────────────
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine-specific. local.properties holds the SDK path of THIS computer; on
+# another machine it points at a directory that does not exist and the build
+# fails with a confusing error. Android Studio writes a correct one on first
+# open, so it must never travel with the repo.
+# ─────────────────────────────────────────────────────────────────────────────
+local.properties
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signing material. Nothing here today, listed so a keystore can never be
+# committed by accident later — a leaked release key cannot be revoked.
+# ─────────────────────────────────────────────────────────────────────────────
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generated analysis output that landed inside the source tree.
+# ─────────────────────────────────────────────────────────────────────────────
+graphify-out/
+**/graphify-out/
+.graphify_*
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python side (backtest lab)
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Logs and scratch
+*.log
+*.tmp
+captures/
+.externalNativeBuild/
+.cxx/

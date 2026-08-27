@@ -120,6 +120,29 @@ object Indicators {
         return MACDResult(macdLine, signalLine, histogram)
     }
 
+    /**
+     * EMA-smoothed first derivative of the MACD line.
+     *
+     * Raw `macdLine[i] - macdLine[i-1]` flips sign every 1-3 days on noisy
+     * candles — useless for trend detection. Smoothing with a short EMA
+     * (typical: 2 for fast/exit signals, 5 for slow/entry signals) collapses
+     * the noise and exposes the underlying inflection. Returns a series the
+     * same length as `macdLine`; first element is 0.0 (no prior to diff).
+     *
+     * Asymmetric smoothing across entry/exit windows is the standard
+     * recipe: use a longer window for entries (slower, fewer fakeouts) and
+     * a shorter window for exits (faster, less give-back when momentum dies).
+     */
+    fun macdSlopeSmoothed(macdLine: List<Double>, smoothingWindow: Int = 5): List<Double> {
+        if (macdLine.size < 2) return List(macdLine.size) { 0.0 }
+        val rawSlope = ArrayList<Double>(macdLine.size)
+        rawSlope.add(0.0)
+        for (i in 1 until macdLine.size) {
+            rawSlope.add(macdLine[i] - macdLine[i - 1])
+        }
+        return ema(rawSlope, smoothingWindow.coerceAtLeast(2))
+    }
+
     // ═══════════════════════════════════════════════════════
     // OBV
     // ═══════════════════════════════════════════════════════
@@ -133,6 +156,209 @@ object Indicators {
         }
         return result
     }
+
+    // ═══════════════════════════════════════════════════════
+    // TWO-PIVOT DIVERGENCE (price vs MACD histogram / OBV)
+    // ═══════════════════════════════════════════════════════
+
+    data class DivergenceResult(
+        val histBullish: Boolean = false,
+        val histBearish: Boolean = false,
+        val volBullish: Boolean = false,
+        val volBearish: Boolean = false,
+        val detail: String = ""
+    ) {
+        val any: Boolean get() = histBullish || histBearish || volBullish || volBearish
+    }
+
+    /**
+     * Classic two-pivot divergence. Anchors on the two most recent CONFIRMED
+     * swing pivots of price (close), then compares the indicator value (MACD
+     * histogram and OBV) at those same pivot bars:
+     *   Bearish — price higher-high but indicator lower-high (at swing highs)
+     *   Bullish — price lower-low  but indicator higher-low  (at swing lows)
+     *
+     * A pivot needs [k] strictly higher (highs) / lower (lows) closes on each
+     * side, so the last [k] bars are never pivots (unconfirmed). Only pivots
+     * within the last [lookback] bars are considered, for recency.
+     *
+     * Unlike the simpler OBV-vs-moving-average check in StockAnalyzer, this
+     * compares two real price swings against the indicator at those swings —
+     * the textbook definition. Purely informational; feeds no score.
+     */
+    fun divergence(
+        closes: List<Double>,
+        histogram: List<Double>,
+        obv: List<Double>,
+        lookback: Int = 60,
+        k: Int = 3
+    ): DivergenceResult {
+        val n = closes.size
+        if (n < 2 * k + 5 || histogram.size != n) return DivergenceResult()
+        val hasObv = obv.size == n
+        val from = maxOf(k, n - lookback)
+
+        val highs = ArrayList<Int>()
+        val lows = ArrayList<Int>()
+        for (i in from..(n - 1 - k)) {
+            var isHigh = true
+            var isLow = true
+            for (j in 1..k) {
+                if (closes[i] <= closes[i - j] || closes[i] <= closes[i + j]) isHigh = false
+                if (closes[i] >= closes[i - j] || closes[i] >= closes[i + j]) isLow = false
+            }
+            if (isHigh) highs.add(i)
+            if (isLow) lows.add(i)
+        }
+
+        var histBull = false; var histBear = false; var volBull = false; var volBear = false
+        val details = ArrayList<String>()
+
+        if (highs.size >= 2) {
+            val a = highs[highs.size - 2]; val b = highs[highs.size - 1]
+            if (closes[b] > closes[a]) {  // price higher high
+                if (histogram[b] < histogram[a]) {
+                    histBear = true
+                    details.add("Bearish hist: price HH ${divFmt(closes[a])}→${divFmt(closes[b])}, MACD-hist LH ${divFmt(histogram[a])}→${divFmt(histogram[b])}")
+                }
+                if (hasObv && obv[b] < obv[a]) {
+                    volBear = true
+                    details.add("Bearish vol: price HH but OBV lower (distribution)")
+                }
+            }
+        }
+        if (lows.size >= 2) {
+            val a = lows[lows.size - 2]; val b = lows[lows.size - 1]
+            if (closes[b] < closes[a]) {  // price lower low
+                if (histogram[b] > histogram[a]) {
+                    histBull = true
+                    details.add("Bullish hist: price LL ${divFmt(closes[a])}→${divFmt(closes[b])}, MACD-hist HL ${divFmt(histogram[a])}→${divFmt(histogram[b])}")
+                }
+                if (hasObv && obv[b] > obv[a]) {
+                    volBull = true
+                    details.add("Bullish vol: price LL but OBV higher (accumulation)")
+                }
+            }
+        }
+        return DivergenceResult(histBull, histBear, volBull, volBear, details.joinToString(" · "))
+    }
+
+    private fun divFmt(v: Double): String = String.format(java.util.Locale.US, "%.2f", v)
+
+    // ═══════════════════════════════════════════════════════
+    // RAW-VOLUME BEHAVIOUR PATTERNS (distinct from OBV divergence)
+    // ═══════════════════════════════════════════════════════
+    // Four named patterns, kept SEPARATE from the OBV two-pivot divergence above:
+    //   Bullish dry-up   — new swing low on LOWER raw volume (sellers exhausting)
+    //   Bullish climax    — new low + volume SPIKE + close near the bar's high
+    //                       (capitulation / long lower wick, supply absorbed)
+    //   Bearish dry-up   — new swing high on LOWER raw volume (buyers thinning)
+    //   Bearish churning  — volume SPIKE near the high with no price progress
+    //                       (distribution into demand)
+    // Heuristic thresholds (spikeMult / wickFrac / nearHighPct / churnMaxMovePct)
+    // are defaulted here and easy to tune later.
+
+    data class VolumePatternResult(
+        val bullDryUp: Boolean = false,
+        val bearDryUp: Boolean = false,
+        val bullCapitulation: Boolean = false,
+        val bearChurning: Boolean = false,
+        val detail: String = ""
+    ) {
+        val anyBull: Boolean get() = bullDryUp || bullCapitulation
+        val anyBear: Boolean get() = bearDryUp || bearChurning
+        val any: Boolean get() = anyBull || anyBear
+    }
+
+    fun volumePatterns(
+        highs: List<Double>,
+        lows: List<Double>,
+        closes: List<Double>,
+        volumes: List<Long>,
+        lookback: Int = 60,
+        k: Int = 3,
+        spikeMult: Double = 2.0,      // volume "spike" = >= 2x the recent average
+        wickFrac: Double = 0.6,       // close must sit in the top 40% of the bar's range
+        nearHighPct: Double = 0.97,   // bar high within 3% of the lookback high = "near resistance"
+        churnMaxMovePct: Double = 0.5 // day-over-day move under 0.5% = "no progress"
+    ): VolumePatternResult {
+        val n = closes.size
+        if (n < 2 * k + 5 || highs.size != n || lows.size != n || volumes.size != n) return VolumePatternResult()
+        val from = maxOf(k, n - lookback)
+
+        val volWindow = volumes.takeLast(20).map { it.toDouble() }
+        val avgVol = if (volWindow.isNotEmpty()) volWindow.average() else 0.0
+
+        // Price swing pivots — same definition as divergence().
+        val highsIdx = ArrayList<Int>(); val lowsIdx = ArrayList<Int>()
+        for (i in from..(n - 1 - k)) {
+            var isHigh = true; var isLow = true
+            for (j in 1..k) {
+                if (closes[i] <= closes[i - j] || closes[i] <= closes[i + j]) isHigh = false
+                if (closes[i] >= closes[i - j] || closes[i] >= closes[i + j]) isLow = false
+            }
+            if (isHigh) highsIdx.add(i)
+            if (isLow) lowsIdx.add(i)
+        }
+
+        var bullDry = false; var bearDry = false; var bullCap = false; var bearChurn = false
+        val details = ArrayList<String>()
+
+        // Bearish dry-up: two recent swing highs, higher price on lower volume.
+        if (highsIdx.size >= 2) {
+            val a = highsIdx[highsIdx.size - 2]; val b = highsIdx[highsIdx.size - 1]
+            if (closes[b] > closes[a] && volumes[b] < volumes[a]) {
+                bearDry = true
+                details.add("Bearish dry-up: new high on lighter volume (${volFmt(volumes[a])}→${volFmt(volumes[b])})")
+            }
+        }
+        // Bullish dry-up: two recent swing lows, lower price on lower volume.
+        if (lowsIdx.size >= 2) {
+            val a = lowsIdx[lowsIdx.size - 2]; val b = lowsIdx[lowsIdx.size - 1]
+            if (closes[b] < closes[a] && volumes[b] < volumes[a]) {
+                bullDry = true
+                details.add("Bullish dry-up: new low on lighter volume (${volFmt(volumes[a])}→${volFmt(volumes[b])})")
+            }
+        }
+
+        // Single-bar patterns: scan the last few bars for climax / churning.
+        if (avgVol > 0.0) {
+            val lookLow = lows.subList(from, n).min()
+            val lookHigh = highs.subList(from, n).max()
+            val scanStart = maxOf(1, n - 3)
+            for (i in scanStart until n) {
+                val range = highs[i] - lows[i]
+                val spike = volumes[i] >= spikeMult * avgVol
+                // Bullish capitulation: spike volume at a new low, close near the high.
+                if (!bullCap && spike && lows[i] <= lookLow * 1.001 && range > 0.0 &&
+                    closes[i] >= lows[i] + wickFrac * range
+                ) {
+                    bullCap = true
+                    details.add("Bullish capitulation: ${volSpikeLabel(volumes[i], avgVol)} volume at a new low, closed near the high")
+                }
+                // Bearish churning: spike volume near the high but no day-over-day progress.
+                if (!bearChurn && spike && highs[i] >= lookHigh * nearHighPct) {
+                    val movePct = if (closes[i - 1] > 0.0)
+                        kotlin.math.abs(closes[i] - closes[i - 1]) / closes[i - 1] * 100.0 else 999.0
+                    if (movePct < churnMaxMovePct) {
+                        bearChurn = true
+                        details.add("Bearish churning: ${volSpikeLabel(volumes[i], avgVol)} volume near resistance, price went nowhere")
+                    }
+                }
+            }
+        }
+
+        return VolumePatternResult(bullDry, bearDry, bullCap, bearChurn, details.joinToString(" · "))
+    }
+
+    private fun volFmt(v: Long): String = when {
+        v >= 1_000_000_000 -> String.format(java.util.Locale.US, "%.1fB", v / 1e9)
+        v >= 1_000_000 -> String.format(java.util.Locale.US, "%.1fM", v / 1e6)
+        v >= 1_000 -> String.format(java.util.Locale.US, "%.1fK", v / 1e3)
+        else -> v.toString()
+    }
+    private fun volSpikeLabel(v: Long, avg: Double): String =
+        if (avg > 0) String.format(java.util.Locale.US, "%.1f×", v / avg) else "high"
 
     // ═══════════════════════════════════════════════════════
     // ADX with Directional Indicators

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Only backup non-sensitive preferences -->
+        <include domain="sharedpref" path="signalscope_prefs.xml"/>
+        <!-- Exclude all credential files -->
+        <exclude domain="sharedpref" path="signalscope_credentials.xml"/>
+        <exclude domain="sharedpref" path="signalscope_secure_prefs.xml"/>
+        <exclude domain="sharedpref" path="signalscope_auth.xml"/>
+        <exclude domain="file" path="binance_live_mirror.json"/>
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="signalscope_prefs.xml"/>
+        <exclude domain="sharedpref" path="signalscope_credentials.xml"/>
+        <exclude domain="sharedpref" path="signalscope_secure_prefs.xml"/>
+        <exclude domain="sharedpref" path="signalscope_auth.xml"/>
+        <exclude domain="file" path="binance_live_mirror.json"/>
+    </device-transfer>
+</data-extraction-rules>

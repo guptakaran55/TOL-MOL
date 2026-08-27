@@ -1,0 +1,1 @@
+{"nodes": [], "edges": [{"source": "ic_launcher_foreground_xhdpi", "target": "ic_launcher_foreground", "relation": "semantically_similar_to", "confidence": "INFERRED", "confidence_score": 1.0, "source_file": "app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.webp", "source_location": null, "weight": 0.8}], "hyperedges": []}

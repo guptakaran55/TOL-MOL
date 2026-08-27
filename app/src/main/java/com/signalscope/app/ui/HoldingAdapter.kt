@@ -24,7 +24,7 @@ class HoldingAdapter : ListAdapter<PortfolioHolding, HoldingAdapter.VH>(DIFF) {
         val symbol: TextView = view.findViewById(R.id.holdSymbol)
         val phase: TextView = view.findViewById(R.id.holdPhase)
         val info: TextView = view.findViewById(R.id.holdInfo)
-        val buyScore: TextView = view.findViewById(R.id.holdBuyScore)
+        val cherryPoints: TextView = view.findViewById(R.id.holdBuyScore)
         val profitScore: TextView = view.findViewById(R.id.holdProfitScore)
         val protectScore: TextView = view.findViewById(R.id.holdProtectScore)
         val verdict: TextView = view.findViewById(R.id.holdVerdict)
@@ -52,8 +52,8 @@ class HoldingAdapter : ListAdapter<PortfolioHolding, HoldingAdapter.VH>(DIFF) {
             h.phase.setTextColor(phaseColor)
 
             // Entry points
-            h.buyScore.text = "Pb${a.pullbackScore}/Mo${a.momentumScore}"
-            h.buyScore.setTextColor(
+            h.cherryPoints.text = "Pb${a.pullbackScore}/Mo${a.momentumScore}"
+            h.cherryPoints.setTextColor(
                 if (a.momentumScore >= 75) 0xFF059669.toInt()
                 else if (a.pullbackScore >= 75) 0xFF2563eb.toInt()
                 else if (maxOf(a.pullbackScore, a.momentumScore) >= 60) 0xFF0891b2.toInt()
@@ -75,10 +75,10 @@ class HoldingAdapter : ListAdapter<PortfolioHolding, HoldingAdapter.VH>(DIFF) {
             )
         } else {
             h.phase.visibility = View.GONE
-            h.buyScore.text = "—"
+            h.cherryPoints.text = "—"
             h.profitScore.text = "—"
             h.protectScore.text = "—"
-            h.buyScore.setTextColor(0xFF64748b.toInt())
+            h.cherryPoints.setTextColor(0xFF64748b.toInt())
             h.profitScore.setTextColor(0xFF64748b.toInt())
             h.protectScore.setTextColor(0xFF64748b.toInt())
         }

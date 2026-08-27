@@ -1,10 +1,15 @@
 package com.signalscope.app.data
 
+import com.google.gson.annotations.SerializedName
+
 /**
  * Data models for SignalScope Android.
  * Matches the Python app's data structures exactly.
  *
  * v2: Added DiscoveryScanResult for full-universe discovery scans.
+ * v3: Renamed `buyScore` → `cherryPoints` (composite viability score = max
+ *     of pullback + momentum). @SerializedName keeps the wire format as
+ *     "buyScore" so persisted snapshots and the JS frontend keep working.
  */
 
 // ═══════════════════════════════════════════════════════
@@ -134,8 +139,13 @@ data class StockAnalysis(
     val potentialProfit: Double,
     val rocPct: Double,
 
-    val buyScore: Int,
-    val buySignal: String,
+    /** Composite viability score = max(pullbackScore, momentumScore).
+     *  @SerializedName keeps the JSON wire format as "buyScore" so old
+     *  persisted snapshots + the JS frontend keep working unchanged. */
+    @SerializedName("buyScore")
+    val cherryPoints: Int,
+    @SerializedName("buySignal")
+    val cherrySignal: String,
     val pullbackScore: Int = 0,
     val pullbackSignal: String = "NO SIGNAL",
     val momentumScore: Int = 0,
@@ -152,8 +162,10 @@ data class StockAnalysis(
     val sellSignal: String,
 
     val goldenBuy: Boolean,
-    val isBuy: Boolean,
-    val isModerateBuy: Boolean,
+    @SerializedName("isBuy")
+    val isCherry: Boolean,
+    @SerializedName("isModerateBuy")
+    val isModerateCherry: Boolean,
     val isSell: Boolean,
     val isModerateSell: Boolean,
 
@@ -163,10 +175,28 @@ data class StockAnalysis(
     val obvDivergence: Boolean = false,
     val obvWeakness: Boolean = false,
 
+    // ── Two-pivot divergence (price vs MACD histogram / OBV). Textbook
+    //    swing-to-swing divergence (see Indicators.divergence). Informational
+    //    chips + detail-modal only — does NOT feed any buy/sell score. ──
+    val divHistBullish: Boolean = false,
+    val divHistBearish: Boolean = false,
+    val divVolBullish: Boolean = false,
+    val divVolBearish: Boolean = false,
+    val divDetail: String = "",
+
+    // ── Raw-volume behaviour patterns (separate from the OBV divergence above).
+    //    Informational chips + detail only. See Indicators.volumePatterns(). ──
+    val volBullDryUp: Boolean = false,
+    val volBearDryUp: Boolean = false,
+    val volBullCapitulation: Boolean = false,
+    val volBearChurning: Boolean = false,
+    val volPatternDetail: String = "",
+
     /** Pre-formatted per-bucket trace for the "Why this score?" detail panel
      *  in the dashboard. Pipe-delimited rows (bucket|status|points|max|reason),
      *  newline-separated. Empty string when not built (older cached analysis). */
-    val buyScoreReport: String = "",
+    @SerializedName("buyScoreReport")
+    val cherryPointsReport: String = "",
     val pullbackScoreReport: String = "",
     val momentumScoreReport: String = "",
 
@@ -260,7 +290,8 @@ data class StockAlert(
     val alertType: AlertType,
     val message: String,
     val sellScore: Int,
-    val buyScore: Int,
+    @SerializedName("buyScore")
+    val cherryPoints: Int,
     val price: Double,
     val macdPhase: String,
     val source: String = "zerodha",

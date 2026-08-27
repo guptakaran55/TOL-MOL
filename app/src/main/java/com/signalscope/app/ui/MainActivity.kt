@@ -15,6 +15,8 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -49,6 +51,20 @@ import kotlin.concurrent.thread
  * even while the WebView is rendering a large table).
  * Everything below the controls is the WebView dashboard.
  */
+/** Result of cancelling a patient-ladder rung, used by DashboardBridge.
+ *
+ *  [gone]: the order is confirmed off the book (safe to place the next rung).
+ *  [likelyFilled]: it disappeared WITHOUT us successfully cancelling it — i.e.
+ *  it probably filled, as opposed to us cleanly cancelling a still-resting,
+ *  definitely-unfilled order. That distinction matters: only in the
+ *  "likely filled" case can T212's /equity/portfolio endpoint still be lagging
+ *  behind the fill, so only then must we wait for the position to catch up.
+ *
+ *  Declared at file level, not inside DashboardBridge: Kotlin forbids nested
+ *  class declarations inside an `inner class`.
+ */
+// CancelOutcome moved with the ladder into trading/PatientExecutor.kt.
+
 class MainActivity : AppCompatActivity() {
 
     companion object {
@@ -65,6 +81,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtStatus: TextView
     private lateinit var controlBar: LinearLayout
     private lateinit var liveStreamClient: YahooFinanceStreamClient
+    /** Built lazily — only if the India feed is switched to Kite. */
+    private var zerodhaStreamClient: com.signalscope.app.network.ZerodhaStreamClient? = null
+    /** Built lazily — only if the US feed is switched to Finnhub. */
+    private var finnhubStreamClient: com.signalscope.app.network.FinnhubStreamClient? = null
 
     private val gson = Gson()
     private var isServiceRunning = false
@@ -75,6 +95,258 @@ class MainActivity : AppCompatActivity() {
         symbolCount = 0
     )
     @Volatile private var t212LiveSymbols: Set<String> = emptySet()
+    @Volatile private var t212OcoReconcileRunning = false
+
+    // Strategy Lab CSV backtest file picker — registered as a field so it's
+    // available before STARTED. Result delivered to window.onStrategyLabBacktest.
+    private val backtestCsvPicker: ActivityResultLauncher<Array<String>> =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) handleBacktestCsv(uri)
+        }
+
+    // Strategy Lab CONFIG JSON file picker — attach a .json instead of pasting.
+    // The picked file's NAME is passed to the store as the config source so the
+    // UI can show which file each space is running (different file per space).
+    @Volatile private var configPickNs: String = "us"
+    private val configJsonPicker: ActivityResultLauncher<Array<String>> =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) handleConfigJson(uri)
+        }
+
+    private fun displayNameOf(uri: Uri): String {
+        return try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            } ?: uri.lastPathSegment ?: "config.json"
+        } catch (e: Exception) { uri.lastPathSegment ?: "config.json" }
+    }
+
+    private fun handleConfigJson(uri: Uri) {
+        val ns = configPickNs
+        thread(isDaemon = true, name = "strategy-lab-config") {
+            val out: String = try {
+                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                val fileName = displayNameOf(uri)
+                if (text.isBlank()) gson.toJson(mapOf("ok" to false, "error" to "Empty file"))
+                else when (val pr = com.signalscope.app.trading.StrategyLabConfig.fromJson(text, fileName)) {
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Ok -> {
+                        // Store with the file NAME as the source so the panel shows it.
+                        com.signalscope.app.data.StrategyLabStore.setConfig(applicationContext, text, fileName, ns)
+                        // A new config is a new strategy: the cached what-if belongs
+                        // to the old one and would silently misreport in the
+                        // comparison table.
+                        com.signalscope.app.data.WhatIfStore.remove(applicationContext, ns)
+                        gson.toJson(mapOf("ok" to true, "source" to fileName,
+                            "summary" to pr.config.summary(), "ns" to ns,
+                            // Slippage drives how a P&L should be read, so it is
+                            // returned explicitly rather than buried in the summary.
+                            "slippagePct" to pr.config.slippagePct,
+                            "entryTf" to pr.config.resample,
+                            "exitTf" to (if (pr.config.multiTimeframe) pr.config.exitBars else pr.config.resample),
+                            "warmupBars" to pr.config.warmupBars))
+                    }
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Rejected ->
+                        gson.toJson(mapOf("ok" to false, "error" to pr.reason))
+                }
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "read failed")))
+            }
+            // Outer-class delivery (deliverAiCallback lives on the inner bridge):
+            // mirror handleBacktestCsv's evaluateJavascript pattern.
+            val escaped = out.replace("\\", "\\\\").replace("'", "\\'")
+                .replace("\n", "\\n").replace("\r", "")
+            runOnUiThread {
+                try {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                        webView.evaluateJavascript("window.onStrategyLabConfigFile('$escaped')", null)
+                } catch (e: Throwable) { Log.e(TAG, "config deliver failed", e) }
+            }
+        }
+    }
+
+    // Gate walk-forward backtest: pick MANY symbol CSVs, run engine per symbol,
+    // then replay Mode 3b / Mode 2 over the union of days (GateBacktest).
+    @Volatile private var gateBtNs: String = "us"
+    @Volatile private var gateBtParamsJson: String = "{}"
+    private val gateBtPicker: ActivityResultLauncher<Array<String>> =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (!uris.isNullOrEmpty()) handleGateBacktest(uris)
+        }
+
+    // FOLDER picker — the practical path for 100-symbol universes. Android's
+    // multi-file picker has no "select all", so a full DAX folder would need
+    // 100 long-press taps. Pick the folder once; every *.csv inside is used.
+    private val gateBtFolderPicker: ActivityResultLauncher<Uri?> =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) handleGateBacktestFolder(uri)
+        }
+
+    private fun handleGateBacktestFolder(tree: Uri) {
+        thread(isDaemon = true, name = "gate-bt-scan") {
+            try {
+                val docId = android.provider.DocumentsContract.getTreeDocumentId(tree)
+                val children = android.provider.DocumentsContract
+                    .buildChildDocumentsUriUsingTree(tree, docId)
+                val found = ArrayList<Pair<String, Uri>>()
+                contentResolver.query(children, arrayOf(
+                    android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                ), null, null, null)?.use { c ->
+                    while (c.moveToNext()) {
+                        val id = c.getString(0)
+                        val name = c.getString(1) ?: ""
+                        if (name.lowercase().endsWith(".csv"))
+                            found.add(name to android.provider.DocumentsContract
+                                .buildDocumentUriUsingTree(tree, id))
+                    }
+                }
+                if (found.isEmpty()) {
+                    deliverGateBt("{\"ok\":false,\"error\":\"No .csv files found in the selected folder (top level only — subfolders are not scanned).\"}")
+                    return@thread
+                }
+                found.sortBy { it.first.lowercase() }   // deterministic order
+                handleGateBacktest(found.map { it.second })
+            } catch (e: Exception) {
+                deliverGateBt(gson.toJson(mapOf("ok" to false,
+                    "error" to "Folder scan failed: ${e.message}")))
+            }
+        }
+    }
+
+    private fun handleGateBacktest(uris: List<Uri>) {
+        val ns = gateBtNs
+        val paramsJson = gateBtParamsJson
+        thread(isDaemon = true, name = "gate-backtest") {
+            val out: String = try {
+                val po = org.json.JSONObject(paramsJson)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                val params = com.signalscope.app.trading.GateBacktest.Params(
+                    mode = po.optString("mode", "3B"),
+                    holdN = po.optInt("holdN", 5),
+                    smoothing = po.optInt("smoothing", 5),
+                    notional = po.optDouble("notional", 1000.0),
+                    confirmDays = po.optInt("confirmDays", 1),
+                    // Liquidation slippage comes from the CONFIG (these champions carry
+                    // slippagePct=0.2), not a hardcoded 0.05. Only bites MONTHLY-mode
+                    // month-end forced sales, but otherwise a liquidation would cost
+                    // 0.05 while every normal close costs the config's 0.2.
+                    slippagePct = po.optDouble("slippagePct", cfg.slippagePct),
+                    topN = po.optInt("topN", 20))
+                val data = ArrayList<com.signalscope.app.trading.GateBacktest.SymbolData>()
+                val failed = ArrayList<String>()
+                // One file at a time: parse → engine → daily+slope → discard candles,
+                // so peak memory is a single symbol's intraday series.
+                for ((i, uri) in uris.withIndex()) {
+                    deliverGateBt("{\"progress\":true,\"done\":$i,\"total\":${uris.size}}")
+                    try {
+                        val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                        val (sym, candles) = com.signalscope.app.trading.StrategyLabBacktest.parseCsv(text)
+                        // Report WHY, not just the name: "0 rows" means the datetime
+                        // format wasn't understood (see normalizeTs), which previously
+                        // showed up as a bare symbol list with no explanation.
+                        if (candles.size < 50) {
+                            failed.add("${sym.ifBlank { "file$i" }}(${candles.size} rows parsed)")
+                            continue
+                        }
+                        val r = com.signalscope.app.trading.StrategyLabEngine.run(sym, candles, cfg)
+                        if (r.error != null) { failed.add("$sym(${r.error})"); continue }
+                        data.add(com.signalscope.app.trading.GateBacktest.build(sym, candles, r.trades, params.smoothing))
+                    } catch (e: Exception) { failed.add("file$i(${e.message})") }
+                }
+                deliverGateBt("{\"progress\":true,\"done\":${uris.size},\"total\":${uris.size},\"phase\":\"walk-forward\"}")
+                val rep = com.signalscope.app.trading.GateBacktest.run(data, params)
+                val map = mutableMapOf<String, Any?>(
+                    "ok" to (rep.error == null), "error" to rep.error, "mode" to rep.mode,
+                    "symbols" to data.size, "failedFiles" to failed,
+                    // Ride along with the result: a return is only interpretable
+                    // against the friction assumed to produce it.
+                    "slippagePct" to params.slippagePct,
+                    "notional" to params.notional, "holdNParam" to params.holdN,
+                    "injected" to rep.injected, "finalValue" to rep.finalValue,
+                    "openMtmAdj" to rep.openMtmAdj, "compoundedPct" to rep.compoundedPct,
+                    "cagrPct" to rep.cagrPct, "maxDrawdownPct" to rep.maxDrawdownPct,
+                    "t0" to rep.t0, "lastDay" to rep.lastDay,
+                    "closedCount" to rep.closedCount, "winRatePct" to rep.winRatePct,
+                    "liquidations" to rep.liquidations, "liquidationAvgPct" to rep.liquidationAvgPct,
+                    "cashDaysPct" to rep.cashDaysPct,
+                    "perSymbol" to rep.perSymbol, "log" to rep.log,
+                    // Per-seat equity curve (EUR) for the aggregate slot chart.
+                    "slotSeries" to rep.slotSeries, "holdN" to params.holdN)
+                gson.toJson(map)
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "gate backtest failed")))
+            }
+            deliverGateBt(out)
+        }
+    }
+
+    /** Push one daily-gate progress tick to window.onGateEvalProgress. */
+    private fun deliverGateEval(json: String) {
+        val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+            .replace("\n", "\\n").replace("\r", "")
+        runOnUiThread {
+            try {
+                if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                    webView.evaluateJavascript("window.onGateEvalProgress('$escaped')", null)
+            } catch (e: Throwable) { Log.e(TAG, "gate eval deliver failed", e) }
+        }
+    }
+
+    private fun deliverGateBt(json: String) {
+        val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+            .replace("\n", "\\n").replace("\r", "")
+        runOnUiThread {
+            try {
+                if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                    webView.evaluateJavascript("window.onGateBacktestResult('$escaped')", null)
+            } catch (e: Throwable) { Log.e(TAG, "gate bt deliver failed", e) }
+        }
+    }
+
+    // Holds the last backtest's full report CSV (desktop format) for export.
+    @Volatile private var lastBacktestReport: String? = null
+    // Which Strategy Lab namespace the pending CSV backtest belongs to ("us" or
+    // "binance") — set just before the file picker launches, read on result.
+    @Volatile private var backtestNs: String = "us"
+
+    private val reportExportLauncher: ActivityResultLauncher<String> =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+            val text = lastBacktestReport
+            if (uri != null && text != null) thread(isDaemon = true, name = "strategy-lab-export") {
+                try { contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } }
+                catch (e: Exception) { Log.e(TAG, "report export write failed", e) }
+            }
+        }
+
+    private fun handleBacktestCsv(uri: Uri) {
+        thread(isDaemon = true, name = "strategy-lab-backtest") {
+            val out: String = try {
+                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                if (text.isBlank()) gson.toJson(mapOf("error" to "Empty file"))
+                else {
+                    val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, backtestNs)
+                    val rawJson = com.signalscope.app.data.StrategyLabStore.load(applicationContext, backtestNs).configJson
+                    val t0 = System.currentTimeMillis()
+                    val result = com.signalscope.app.trading.StrategyLabBacktest.run(text, cfg)
+                    val elapsed = System.currentTimeMillis() - t0
+                    lastBacktestReport = if (result.error == null)
+                        com.signalscope.app.trading.StrategyLabReport.build(result, cfg, rawJson, elapsed) else null
+                    gson.toJson(result)
+                }
+            } catch (e: Exception) {
+                gson.toJson(mapOf("error" to (e.message ?: "read failed")))
+            }
+            val escaped = out.replace("\\", "\\\\").replace("'", "\\'")
+                .replace("\n", "\\n").replace("\r", "")
+            runOnUiThread {
+                try {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                        webView.evaluateJavascript("window.onStrategyLabBacktest('$escaped')", null)
+                } catch (e: Throwable) { Log.e(TAG, "backtest deliver failed", e) }
+            }
+        }
+    }
 
     // ── Polling-based UI refresh (replaces unreliable broadcasts on MIUI) ──
     private val pollHandler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -157,12 +429,23 @@ class MainActivity : AppCompatActivity() {
         config = ConfigManager(this)
         liveStreamClient = YahooFinanceStreamClient(
             onQuote = { quote ->
+                // Free mark-to-market for algo positions: this price already
+                // arrived, so valuing an open seat off it costs no request.
+                com.signalscope.app.trading.MarkToMarket.onQuote(
+                    quote.symbol, quote.price, quote.time.takeIf { it > 0L } ?: System.currentTimeMillis())
                 val liveSignal = LivePortfolioBars.recordQuote(quote)
                 if (liveSignal != null) {
                     LiveSoftSniperEngine.onSignal(applicationContext, config, liveSignal)
                     LiveBuyTrackerEngine.onSignal(applicationContext, config, liveSignal)
                 }
-                runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+                // Dummy GTT alerts (all spaces): vibrate + notify when a watched
+                // SL/target level is reached. Places no broker order.
+                com.signalscope.app.trading.DummyGttMonitor.onQuote(
+                    applicationContext, quote.symbol, quote.price
+                )
+                runOnUiThread {
+                    pushLiveQuoteToWebView(quote, liveSignal)
+                }
             },
             onStatus = { status ->
                 LivePortfolioBars.updateStreamState(
@@ -227,13 +510,83 @@ class MainActivity : AppCompatActivity() {
         // Push whatever results we have (live or cached) to WebView
         pushDiscoveryResultsToWebView(force = true)
         pushPortfolioResultsToWebView()
+        // Strategy Lab live paper loop (US space) — self-gates on enabled;
+        // throttled so a resume doesn't re-fetch more than every 10 min.
+        com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 10 * 60 * 1000L)
+        // Germany (Xetra / T212) paper loop — independent namespace.
+        com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 10 * 60 * 1000L, "de")
+        // Crypto (Binance) paper loop — independent namespace, own config/ledger.
+        com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 10 * 60 * 1000L, "binance")
         updateLiveStreamSubscriptions()
         pushLiveStreamStateToWebView()
+        reconcileT212OcoPairsInBackground("resume")
+        com.signalscope.app.service.T212DailyTrailScheduler.ensureScheduled(this)
+        com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(this)
         pollHandler.postDelayed({ pushCachedDiscoveryResultsToWebViewAsync() }, 250L)
 
         // Start polling for live updates (reliable even on MIUI)
         pollHandler.removeCallbacks(pollRunnable)
         pollHandler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
+    }
+
+    private fun reconcileT212OcoPairsInBackground(reason: String) {
+        if (!config.hasT212Credentials || t212OcoReconcileRunning) return
+        t212OcoReconcileRunning = true
+        thread(isDaemon = true, name = "t212-oco-reconcile") {
+            try {
+                val summary = com.signalscope.app.trading.Trading212TrailingManager
+                    .reconcileOnly(applicationContext, config)
+                if (summary.reconciledFilled > 0 || summary.reconciledClosed > 0 || summary.errors.isNotEmpty()) {
+                    Log.i(TAG, "T212 OCO reconcile ($reason): $summary")
+                }
+                val json = gson.toJson(mapOf("ok" to summary.errors.isEmpty(), "summary" to summary, "reason" to reason))
+                val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+                    .replace("\n", "\\n").replace("\r", "")
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized) {
+                        webView.evaluateJavascript(
+                            "if(window.onT212ReconcileResult)window.onT212ReconcileResult('$escaped')",
+                            null
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "T212 OCO reconcile failed ($reason)", e)
+            } finally {
+                t212OcoReconcileRunning = false
+            }
+        }
+    }
+
+    /**
+     * The app was already running when the notification was tapped. onCreate does
+     * not run again, so without this the tap would merely bring the app forward
+     * on whatever screen it was left — which is exactly what it did before.
+     */
+    override fun onNewIntent(newIntent: Intent) {
+        super.onNewIntent(newIntent)
+        setIntent(newIntent)
+        consumeAlgoDeepLink(newIntent)
+    }
+
+    /**
+     * Open one algo's card, in its own space, from a notification tap.
+     *
+     * The extra is CLEARED after use. Android hands the same intent back on every
+     * later resume, so leaving it in place would drag the user back to the same
+     * algo every time they returned to the app — long after the trade that
+     * prompted it stopped being interesting.
+     */
+    private fun consumeAlgoDeepLink(src: Intent?) {
+        val ns = src?.getStringExtra(com.signalscope.app.trading.LabNotifier.EXTRA_OPEN_NS)
+        if (ns.isNullOrBlank()) return
+        src.removeExtra(com.signalscope.app.trading.LabNotifier.EXTRA_OPEN_NS)
+        if (!::webView.isInitialized) return
+        val safe = ns.replace("\\", "").replace("'", "")
+        webView.post {
+            webView.evaluateJavascript(
+                "window.openAlgoFromNotification && window.openAlgoFromNotification('$safe')", null)
+        }
     }
 
     override fun onPause() {
@@ -243,6 +596,11 @@ class MainActivity : AppCompatActivity() {
             LivePortfolioBars.updateStreamState(false, false, 0, "Paused")
             liveStreamClient.stop("Paused")
         }
+        // The Kite socket must go down with it. A broker feed left open in the
+        // background burns the connection allowance and the battery for prices
+        // nothing is reading.
+        zerodhaStreamClient?.stop("Paused")
+        finnhubStreamClient?.stop("Paused")
         try { unregisterReceiver(scanReceiver) } catch (_: Exception) {}
     }
 
@@ -251,6 +609,8 @@ class MainActivity : AppCompatActivity() {
             LivePortfolioBars.updateStreamState(false, false, 0, "Activity destroyed")
             liveStreamClient.stop("Activity destroyed")
         }
+        zerodhaStreamClient?.stop("Activity destroyed")
+        finnhubStreamClient?.stop("Activity destroyed")
         super.onDestroy()
     }
 
@@ -425,9 +785,88 @@ class MainActivity : AppCompatActivity() {
         // Add JS bridge so dashboard.html can call Kotlin
         webView.addJavascriptInterface(DashboardBridge(), "Android")
 
+        // Daily-gate progress → a determinate overlay in the dashboard. The
+        // universe fetch is ONE daily series per candidate (~1s each), so a
+        // 106-name evaluation runs for minutes; with no signal the UI looked
+        // frozen and "Save & run" read as doing nothing.
+        com.signalscope.app.trading.MacdGateEngine.progressSink = { ns, phase, done, total ->
+            deliverGateEval(gson.toJson(mapOf(
+                "ns" to ns, "phase" to phase, "done" to done, "total" to total)))
+        }
+
+        // Run-pass progress → an inline busy chip + % next to "Run now", so a tap
+        // visibly does something instead of returning a toast and going quiet.
+        com.signalscope.app.trading.StrategyLabRunner.progressSink = { ns, phase, done, total ->
+            val json = gson.toJson(mapOf(
+                "ns" to ns, "phase" to phase, "done" to done, "total" to total))
+            val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+                .replace("\n", "\\n").replace("\r", "")
+            runOnUiThread {
+                try {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                        webView.evaluateJavascript("window.onRunProgress('$escaped')", null)
+                } catch (e: Throwable) { Log.e(TAG, "run progress deliver failed", e) }
+                // A pass can OPEN a position, and the stream only carries what it
+                // was told to subscribe to — so re-derive the list when a pass ends,
+                // or a brand-new holding would sit on bar prices until the next
+                // resume. Cheap: it diffs and no-ops when nothing changed.
+                if (phase == "done") {
+                    try { updateLiveStreamSubscriptions() }
+                    catch (e: Exception) { Log.w(TAG, "stream resubscribe failed", e) }
+                }
+            }
+        }
+
+        // Marks refreshed on a background thread → repaint. Without this the card
+        // keeps showing the price it was drawn with: the live-quote stream normally
+        // repaints often enough to mask it, but after the market closes there are
+        // no quotes and "(stale price)" persists even though a fresh price arrived.
+        com.signalscope.app.trading.MarkToMarket.onRefreshed = {
+            runOnUiThread {
+                try {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                        webView.evaluateJavascript(
+                            "try{if(window.STATE&&STATE.tab==='algos')renderKeepScroll()}catch(e){}", null)
+                } catch (e: Throwable) { Log.e(TAG, "mark repaint failed", e) }
+            }
+        }
+
+        // What-if progress → the bulb panel's own counter. Under mode 3b the replay
+        // fetches the whole ranking universe (100+ names), so without this it would
+        // spin silently for a minute or more — the exact failure mode "Save & run
+        // does nothing" turned out to be.
+        com.signalscope.app.trading.StrategyLabRunner.whatIfSink = { ns, done, total ->
+            val json = gson.toJson(mapOf("ns" to ns, "done" to done, "total" to total))
+            val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
+                .replace("\n", "\\n").replace("\r", "")
+            runOnUiThread {
+                try {
+                    if (!isFinishing && !isDestroyed && ::webView.isInitialized)
+                        webView.evaluateJavascript("window.onWhatIfProgress('$escaped')", null)
+                } catch (e: Throwable) { Log.e(TAG, "what-if progress deliver failed", e) }
+            }
+        }
+
         webView.webViewClient = object : WebViewClient() {
+            // SECURITY: this WebView holds the live trading JS bridge. It must
+            // never navigate away from the bundled dashboard asset. If injected
+            // content (e.g. a prompt-injected AI/news payload) tries to send the
+            // page to an external URL, block it — don't load it in the
+            // privileged context. Only file:///android_asset/ is allowed.
+            override fun shouldOverrideUrlLoading(
+                view: WebView?, request: android.webkit.WebResourceRequest?
+            ): Boolean {
+                val url = request?.url?.toString().orEmpty()
+                return !url.startsWith("file:///android_asset/")
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                // A notification tap that arrived while the process was dead is
+                // handled HERE, not in onCreate: the page has to exist before it
+                // can be told where to go, and on a cold start onCreate runs long
+                // before it does.
+                consumeAlgoDeepLink(intent)
                 // Push any existing results once page is loaded
                 pushDiscoveryResultsToWebView(force = true)
                 pollHandler.postDelayed({ pushCachedDiscoveryResultsToWebViewAsync() }, 250L)
@@ -525,6 +964,36 @@ class MainActivity : AppCompatActivity() {
                 )
             } catch (e: Throwable) {
                 Log.e(TAG, "getRiskSettingsJson failed", e); "{}"
+            }
+        }
+
+        @JavascriptInterface
+        fun planOcoSellJson(
+            ltp: Double,
+            support: Double,
+            resistance: Double,
+            atr: Double,
+            avgPrice: Double,
+            projectedCeiling: Double,
+            tickSize: Double
+        ): String {
+            return try {
+                val plan = com.signalscope.app.trading.OcoPlanner.planSellOco(
+                    config,
+                    com.signalscope.app.trading.OcoPlanner.Input(
+                        ltp = ltp,
+                        support = support,
+                        resistance = resistance,
+                        atr = atr,
+                        avgPrice = avgPrice,
+                        projectedCeiling = projectedCeiling.takeIf { it > 0.0 },
+                        tickSize = tickSize.takeIf { it > 0.0 } ?: 0.05
+                    )
+                )
+                gson.toJson(plan)
+            } catch (e: Throwable) {
+                Log.e(TAG, "planOcoSellJson failed", e)
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "exception")))
             }
         }
 
@@ -676,7 +1145,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun setCurrentSpace(space: String) {
             val s = space.uppercase()
-            if (s == "IN" || s == "US" || s == "DE") {
+            if (s == "IN" || s == "US" || s == "DE" || s == "BN") {
                 config.currentSpace = s
                 runOnUiThread { applySpaceVisibility() }
             }
@@ -791,6 +1260,32 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * Place a single-leg SELL stop-limit order — same intent as a stop, but
+         * with downside-floor protection. When price falls to [stopPrice], the
+         * order activates as a LIMIT SELL at [limitPrice] (which must be ≤
+         * stopPrice for it to fill on a normal drop). If a gap takes the market
+         * below [limitPrice] the order does NOT fill — protects against
+         * catastrophic slippage on illiquid / volatile names.
+         *
+         * Trade-off vs plain STOP: a stop always fills (possibly badly); a
+         * stop-limit might not fill at all in a real crash, but never fills at
+         * a terrible price. T212 reserves shares for either flavour identically.
+         */
+        @JavascriptInterface
+        fun placeT212StopLimitSell(
+            ticker: String,
+            quantity: Double,
+            stopPrice: Double,
+            limitPrice: Double
+        ) {
+            thread(isDaemon = true) {
+                val out = runT212Order("STOP_LIMIT", "SELL", ticker, quantity,
+                    limitPrice = limitPrice, stopPrice = stopPrice)
+                deliverAiCallback("window.onT212OrderResult", out)
+            }
+        }
+
         /** Place a BUY limit order — used by the watchlist "buy on dip" flow. */
         @JavascriptInterface
         fun placeT212LimitBuy(ticker: String, quantity: Double, limitPrice: Double) {
@@ -808,6 +1303,11 @@ class MainActivity : AppCompatActivity() {
          */
         @JavascriptInterface
         fun placeT212SellOco(ticker: String, quantity: Double, stopPrice: Double, limitPrice: Double) {
+            deliverAiCallback(
+                "window.onT212OrderResult",
+                "{\"ok\":false,\"ticker\":\"${ticker.replace("\"","")}\",\"error\":\"Trading 212 API does not support native OCO/GTT pairs. A pending sell order reserves the shares, so the second full-quantity sell leg is rejected as owned 0.0. Place either SL or target as the live order.\"}"
+            )
+            return
             thread(isDaemon = true) {
                 val slJson = runT212Order("STOP", "SELL", ticker, quantity, null, stopPrice)
                 val tgJson = runT212Order("LIMIT", "SELL", ticker, quantity, limitPrice, null)
@@ -889,6 +1389,22 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** Returns the persisted T212 OCO pairs as JSON — drives badges in UI. */
+        @JavascriptInterface
+        fun reconcileT212OcoPairs() {
+            thread(isDaemon = true) {
+                val resultJson: String = try {
+                    val s = com.signalscope.app.trading.Trading212TrailingManager.reconcileOnly(
+                        applicationContext, config
+                    )
+                    "{\"ok\":${s.errors.isEmpty()},\"summary\":${gson.toJson(s)}}"
+                } catch (e: Exception) {
+                    Log.e(TAG, "reconcileT212OcoPairs failed", e)
+                    "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+                }
+                deliverAiCallback("window.onT212ReconcileResult", resultJson)
+            }
+        }
+
         @JavascriptInterface
         fun getT212OcoPairs(): String {
             return try {
@@ -977,6 +1493,93 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * Bulk single-leg T212 exit placement. Receives a JSON payload from the
+         * dashboard "Bulk SL" / "Bulk Target" buttons of the form:
+         *   { "mode": "STOP" | "LIMIT",
+         *     "orders": [ { "ticker": "...", "qty": N, "price": P }, ... ] }
+         *
+         * Each order is placed sequentially with 2500 ms spacing — T212 rate-
+         * limits order endpoints to ~1 req / 2 s, so going faster risks 429s
+         * mid-batch. Per-order failure is recorded but doesn't abort the batch.
+         * Every placement (success OR failure) lands in the GTT audit log so
+         * the user has the full trail. Result delivered via the bulk-specific
+         * callback `window.onT212BulkResult(json)` with shape:
+         *   { ok, mode, requested, placed, failures: [{ticker, error}] }
+         */
+        @JavascriptInterface
+        fun placeT212BulkSingleLeg(payloadJson: String) {
+            thread(isDaemon = true) {
+                val resultJson: String = try {
+                    val obj = org.json.JSONObject(payloadJson)
+                    val mode = obj.optString("mode", "STOP").uppercase()
+                    if (mode != "STOP" && mode != "LIMIT") {
+                        throw IllegalArgumentException("mode must be STOP or LIMIT, got '$mode'")
+                    }
+                    val orders = obj.optJSONArray("orders")
+                        ?: throw IllegalArgumentException("missing 'orders' array")
+                    val client = com.signalscope.app.network.Trading212Client(config)
+                    val failures = mutableListOf<Map<String, String>>()
+                    var placed = 0
+                    val total = orders.length()
+                    for (i in 0 until total) {
+                        val o = orders.getJSONObject(i)
+                        val ticker = o.optString("ticker", "")
+                        val qty = o.optDouble("qty", 0.0)
+                        val price = o.optDouble("price", 0.0)
+                        if (ticker.isBlank() || qty <= 0.0 || price <= 0.0) {
+                            failures.add(mapOf(
+                                "ticker" to ticker,
+                                "error" to "invalid input (qty=$qty price=$price)"
+                            ))
+                            continue
+                        }
+                        val limitPrice = if (mode == "LIMIT") price else null
+                        val stopPrice = if (mode == "STOP") price else null
+                        try {
+                            val r = client.placeOrder(
+                                ticker = ticker,
+                                quantity = qty,
+                                side = "SELL",
+                                orderType = mode,
+                                limitPrice = limitPrice,
+                                stopPrice = stopPrice
+                            )
+                            when (r) {
+                                is com.signalscope.app.network.Trading212Client.T212Result.Success ->
+                                    placed++
+                                is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
+                                    failures.add(mapOf("ticker" to ticker, "error" to r.message))
+                                is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured ->
+                                    failures.add(mapOf("ticker" to ticker, "error" to "not configured"))
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Bulk T212 leg failed for $ticker", e)
+                            failures.add(mapOf(
+                                "ticker" to ticker,
+                                "error" to (e.message ?: "exception")
+                            ))
+                        }
+                        // Rate-limit-aware spacing — last iteration doesn't sleep
+                        if (i < total - 1) Thread.sleep(2500L)
+                    }
+                    val gson = com.google.gson.Gson()
+                    val payload = mapOf(
+                        "ok" to true,
+                        "mode" to mode,
+                        "requested" to total,
+                        "placed" to placed,
+                        "failures" to failures
+                    )
+                    gson.toJson(payload)
+                } catch (e: Exception) {
+                    Log.e(TAG, "placeT212BulkSingleLeg failed", e)
+                    "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+                }
+                deliverAiCallback("window.onT212BulkResult", resultJson)
+            }
+        }
+
         @JavascriptInterface
         fun fetchT212OpenOrders(): String {
             return try {
@@ -993,25 +1596,441 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // ── German reference price: Tradegate (real-time) with Yahoo (delayed,
+        // ~15min on Xetra — measured, not assumed) as fallback and display
+        // companion. Never surfaces a Tradegate failure to the user as an
+        // error — a rejected/unreachable quote just means "use Yahoo," same
+        // as if Tradegate didn't exist. Called once per confirm dialog, so a
+        // blocking network call here (same pattern as fetchT212OpenOrders
+        // above) is cheap enough not to need a background thread.
+        @JavascriptInterface
+        fun t212GermanRef(tickerOrSymbol: String, yahooRefPrice: Double): String {
+            return try {
+                val client = com.signalscope.app.network.Trading212Client(config)
+                val raw = tickerOrSymbol.trim()
+                val ticker = if (raw.contains("_")) raw else client.resolveT212Ticker(raw.uppercase(), "DE")
+                val isin = ticker?.let {
+                    when (val r = client.fetchInstrumentMetadata(setOf(it))) {
+                        is com.signalscope.app.network.Trading212Client.T212Result.Success -> r.data[it]?.isin
+                        else -> null
+                    }
+                }
+                val q = isin?.let { com.signalscope.app.network.TradegateClient.fetchQuote(it, yahooRefPrice) }
+                if (q != null) {
+                    gson.toJson(mapOf(
+                        "source" to "tradegate", "price" to q.mid, "bid" to q.bid, "ask" to q.ask,
+                        "last" to q.last, "yahooPrice" to yahooRefPrice))
+                } else {
+                    gson.toJson(mapOf("source" to "yahoo", "price" to yahooRefPrice, "yahooPrice" to yahooRefPrice))
+                }
+            } catch (e: Exception) {
+                gson.toJson(mapOf("source" to "yahoo", "price" to yahooRefPrice, "yahooPrice" to yahooRefPrice))
+            }
+        }
+
         /** Internal helper — runs placeOrder + builds the JSON response. */
+        // ── MANUAL US ORDERS — user-initiated one-tap buy / sell-to-cash. ──
+        // NOT gated by the T212 live freeze: that freeze stops the ALGO
+        // from placing orders; these fire only on an explicit user tap.
+        // Both use MARKETABLE LIMITS (never market orders, per user doctrine):
+        // buy capped at ref×1.005, sell floored at ref×0.995 — near-certain
+        // immediate fill with a hard bound on the worst-case price.
+
+        /** Minimum gap between two order requests (T212 allows ~1 order / 2s). */
+        private val ORDER_SPACING_MS = 2500L
+        /** Extra wait after a 429 before re-sending the same order. */
+        private val ORDER_RATE_BACKOFF_MS = 6000L
+
+        @JavascriptInterface
+        fun t212ManualBuy(symbol: String, usdAmount: Double, refPrice: Double, space: String) {
+            thread(isDaemon = true) {
+                val spc = if (space.uppercase() == "DE") "DE" else "US"
+                val out = try {
+                    if (usdAmount <= 0.0) throw IllegalArgumentException("Enter an amount greater than 0")
+                    if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
+                    val client = com.signalscope.app.network.Trading212Client(config)
+                    val raw = symbol.trim()
+                    // A pre-resolved T212 ticker (contains "_", e.g. a held position's
+                    // exact ticker passed from the UI) is used as-is — bypasses the
+                    // Yahoo→T212 resolver entirely, so it's always correct. Case is
+                    // SIGNIFICANT here: Xetra tickers carry a lowercase venue letter
+                    // ("SZGd_EQ"), so uppercasing one turns it into a 404.
+                    val ticker = if (raw.contains("_")) raw
+                    else {
+                        val sym = raw.uppercase()   // Yahoo symbols are case-insensitive
+                        resolveTickerWithRetry(client, sym, spc)
+                            ?: throw IllegalArgumentException(
+                                "Couldn't resolve \"$sym\": ${client.resolveFailureReason(sym, spc)}")
+                    }
+                    val limit = Math.round(refPrice * 1.005 * 100.0) / 100.0
+                    val rawQty = usdAmount / refPrice
+                    // Adaptive quantity precision: European instruments often reject
+                    // 5-dp fractional quantities. A precision-mismatch is a 400 that
+                    // places NOTHING, so retrying at a coarser precision is safe —
+                    // step 5→3→2→whole until T212 accepts.
+                    // Built with Gson, never string concatenation: a broker error body can
+                    // contain newlines/quotes, and a hand-built string turns those into
+                    // invalid JSON — which shows the user a parse error INSTEAD of the
+                    // real reason their order failed.
+                    var res = gson.toJson(mapOf("ok" to false, "error" to "no order attempted", "ticker" to ticker))
+                    // T212 rate-limits order placement (~1 request / 2s). The precision
+                    // walk below fires several orders, so each attempt after the first
+                    // MUST be spaced out or the retry trips a 429 on itself.
+                    var sentOnce = false
+                    loop@ for (dp in intArrayOf(5, 3, 2, 0)) {
+                        val f = Math.pow(10.0, dp.toDouble())
+                        val q = Math.floor(rawQty * f) / f
+                        if (q <= 0.0) {
+                            res = gson.toJson(mapOf("ok" to false, "ticker" to ticker,
+                                "error" to ("${"%.2f".format(usdAmount)} is too small for $ticker's share step " +
+                                    "(rounds to 0 at ${dp}dp — this instrument may be whole-share only; try a larger amount).")))
+                            break@loop
+                        }
+                        var rateRetries = 0
+                        attempt@ while (true) {
+                            if (sentOnce) Thread.sleep(ORDER_SPACING_MS)
+                            sentOnce = true
+                            when (val r = client.placeOrder(ticker, q, "BUY", "LIMIT", limit, null)) {
+                                is com.signalscope.app.network.Trading212Client.T212Result.Success ->
+                                    { res = gson.toJson(mapOf("ok" to true, "id" to r.data, "type" to "LIMIT",
+                                        "side" to "BUY", "ticker" to ticker, "qty" to q)); break@loop }
+                                is com.signalscope.app.network.Trading212Client.T212Result.Failure -> {
+                                    res = gson.toJson(mapOf("ok" to false, "error" to r.message,
+                                        "httpCode" to r.httpCode, "ticker" to ticker))
+                                    // A 429 places NOTHING — safe to back off and re-send
+                                    // the SAME quantity (never a coarser one).
+                                    if (r.httpCode == 429 && rateRetries < 2) {
+                                        rateRetries++; Thread.sleep(ORDER_RATE_BACKOFF_MS); continue@attempt
+                                    }
+                                    // A precision reject also places nothing → try coarser.
+                                    if (r.message.contains("precision", true)) break@attempt
+                                    break@loop  // any other error is real → stop
+                                }
+                                is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured ->
+                                    { res = gson.toJson(mapOf("ok" to false, "error" to "not configured", "ticker" to ticker)); break@loop }
+                            }
+                        }
+                    }
+                    res
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "manual buy failed"), "ticker" to symbol))
+                }
+                deliverAiCallback("window.onT212OrderResult", out)
+            }
+        }
+
+        @JavascriptInterface
+        fun t212ManualSell(ticker: String, quantity: Double, refPrice: Double) {
+            thread(isDaemon = true) {
+                val out = try {
+                    if (quantity <= 0.0) throw IllegalArgumentException("No held quantity to sell")
+                    if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
+                    val client = com.signalscope.app.network.Trading212Client(config)
+                    val t = ticker.trim()
+                    // A resting SL/target order reserves the shares and would make
+                    // the sell bounce with "owned: 0.0" — clear the ticker's open
+                    // orders first (T212's one-working-order constraint).
+                    try { client.cancelOpenOrdersForTicker(t) }
+                    catch (e: Exception) { Log.w(TAG, "manual pre-sell cancel failed", e) }
+                    val limit = Math.round(refPrice * 0.995 * 100.0) / 100.0
+                    runT212Order("LIMIT", "SELL", t, quantity, limitPrice = limit, stopPrice = null)
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "manual sell failed"), "ticker" to ticker))
+                }
+                deliverAiCallback("window.onT212OrderResult", out)
+            }
+        }
+
+        // Patient-ladder tuning, ATR estimation, fresh-price re-anchoring,
+        // cancel-confirmation and fill-polling all moved to
+        // trading/PatientExecutor.kt so the algo live-mirror can reuse the same
+        // proven executor. Only resolveTickerWithRetry stays — it is still used by
+        // the plain (non-patient) order path below.
+
+        /**
+         * Resolve with one rate-limit retry. T212's instrument-list endpoint
+         * allows 1 request / 30s; on a cold cache the first resolve can fail
+         * with "list not loaded yet" (observed live with AVGO). We're on a
+         * background thread, so waiting out one window beats erroring at the
+         * user. Still null after the retry → genuinely unresolvable.
+         */
+        private fun resolveTickerWithRetry(
+            client: com.signalscope.app.network.Trading212Client, sym: String, spc: String
+        ): String? {
+            client.resolveT212Ticker(sym, spc)?.let { return it }
+            Thread.sleep(31_000L)
+            return client.resolveT212Ticker(sym, spc)
+        }
+
+
+        // ── PATIENT ORDER BRIDGES ─────────────────────────────────────────
+        // The ladder itself now lives in trading/PatientExecutor.kt so the algo
+        // live-mirror can call the SAME proven executor instead of a market order.
+        // These are thin adapters: run it off the UI thread, forward its progress
+        // to the WebView on the unchanged window.onT212PatientProgress contract,
+        // post the same notification, deliver the same result JSON.
+        private fun patientProgressSink(): (Map<String, Any?>) -> Unit = { m ->
+            deliverAiCallback("window.onT212PatientProgress", gson.toJson(m))
+        }
+
+        /** One bench order at a time. Two concurrent ladders on the same account
+         *  fight over the cancel-open-orders step and can strand each other's
+         *  rungs — and the bench exists to isolate one variable, not race. */
+        private val benchBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        @JavascriptInterface
+        fun t212PatientSell(ticker: String, yahooSymbol: String, space: String, quantity: Double, refPrice: Double) {
+            thread(isDaemon = true) {
+                val r = com.signalscope.app.trading.PatientExecutor.sell(
+                    config, ticker, yahooSymbol, space, quantity, refPrice, patientProgressSink())
+                val out = if (r.error != null)
+                    gson.toJson(mapOf("ok" to false, "error" to r.error, "ticker" to r.ticker, "patient" to true))
+                else {
+                    postT212PatientNotice(r.ticker, "sell", r.ok, r.filled, r.remaining, r.staleOrder)
+                    gson.toJson(mapOf("ok" to r.ok, "ticker" to r.ticker, "sold" to r.filled,
+                        "remaining" to r.remaining, "note" to r.note,
+                        "patient" to true, "staleOrder" to r.staleOrder))
+                }
+                deliverAiCallback("window.onT212OrderResult", out)
+            }
+        }
+
+        @JavascriptInterface
+        fun t212PatientBuy(symbol: String, yahooSymbol: String, space: String, cashAmount: Double, refPrice: Double) {
+            thread(isDaemon = true) {
+                val r = com.signalscope.app.trading.PatientExecutor.buy(
+                    config, symbol, yahooSymbol, space, cashAmount, refPrice, patientProgressSink())
+                val out = if (r.error != null)
+                    gson.toJson(mapOf("ok" to false, "error" to r.error, "ticker" to r.ticker, "patient" to true))
+                else {
+                    postT212PatientNotice(r.ticker, "buy", r.ok, r.filled, r.remaining, r.staleOrder)
+                    gson.toJson(mapOf("ok" to r.ok, "ticker" to r.ticker, "bought" to r.filled,
+                        "remaining" to r.remaining, "note" to r.note,
+                        "patient" to true, "staleOrder" to r.staleOrder))
+                }
+                deliverAiCallback("window.onT212OrderResult", out)
+            }
+        }
+
+        private fun postT212PatientNotice(
+            ticker: String, side: String, filled: Boolean, done: Double, remaining: Double,
+            staleOrderWarning: Boolean = false
+        ) {
+            try {
+                val ctx = applicationContext
+                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                val ch = "t212_patient_order"
+                nm.createNotificationChannel(android.app.NotificationChannel(
+                    ch, "Patient order result", android.app.NotificationManager.IMPORTANCE_HIGH
+                ).apply { description = "Result of a patient (best-price) Trading 212 order" })
+                val pi = android.app.PendingIntent.getActivity(
+                    ctx, ticker.hashCode(),
+                    android.content.Intent(ctx, MainActivity::class.java),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
+                val verb = if (side == "buy") "Bought" else "Sold"
+                val title = when {
+                    staleOrderWarning -> "⚠️ Patient $side — check T212 app — $ticker"
+                    filled -> "✅ Patient $side filled — $ticker"
+                    else -> "⏳ Patient $side unfilled — $ticker"
+                }
+                val text = when {
+                    // We couldn't confirm T212 actually dropped the last resting order —
+                    // don't say "nothing resting" when that might not be true.
+                    staleOrderWarning -> "Couldn't confirm the last resting order was cancelled. " +
+                        "Open the T212 app and check pending orders for $ticker before placing anything else on it."
+                    filled -> "$verb ${"%.6f".format(done)} at your held-out price."
+                    else -> "No rung filled to the cap. ${"%.6f".format(remaining)} left un-${side}ed — nothing resting. Retry when you like."
+                }
+                val n = androidx.core.app.NotificationCompat.Builder(ctx, ch)
+                    .setContentTitle(title).setContentText(text)
+                    .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(text))
+                    .setSmallIcon(android.R.drawable.ic_menu_sort_by_size)
+                    .setContentIntent(pi).setAutoCancel(true)
+                    .setPriority(if (staleOrderWarning) androidx.core.app.NotificationCompat.PRIORITY_MAX
+                                 else androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                    .build()
+                nm.notify(9200 + ticker.hashCode().mod(100), n)
+            } catch (e: Exception) { Log.w(TAG, "patient order notice failed", e) }
+        }
+
         private fun runT212Order(
             orderType: String, side: String, ticker: String, qty: Double,
             limitPrice: Double?, stopPrice: Double?
         ): String {
             return try {
                 val client = com.signalscope.app.network.Trading212Client(config)
+                // Gson, not concatenation — broker error bodies contain newlines/quotes
+                // that would otherwise produce invalid JSON and mask the real error.
                 when (val r = client.placeOrder(ticker, qty, side, orderType, limitPrice, stopPrice)) {
-                    is com.signalscope.app.network.Trading212Client.T212Result.Success -> {
-                        "{\"ok\":true,\"id\":${r.data},\"simulated\":false,\"type\":\"$orderType\",\"side\":\"$side\",\"ticker\":\"$ticker\"}"
-                    }
+                    is com.signalscope.app.network.Trading212Client.T212Result.Success ->
+                        gson.toJson(mapOf("ok" to true, "id" to r.data, "simulated" to false,
+                            "type" to orderType, "side" to side, "ticker" to ticker))
                     is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
-                        "{\"ok\":false,\"error\":\"${r.message.replace("\"","")}\",\"httpCode\":${r.httpCode},\"type\":\"$orderType\",\"ticker\":\"$ticker\"}"
+                        gson.toJson(mapOf("ok" to false, "error" to r.message, "httpCode" to r.httpCode,
+                            "type" to orderType, "ticker" to ticker))
                     is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured ->
-                        "{\"ok\":false,\"error\":\"not configured\",\"ticker\":\"$ticker\"}"
+                        gson.toJson(mapOf("ok" to false, "error" to "not configured", "ticker" to ticker))
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "runT212Order failed", e)
-                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\",\"ticker\":\"$ticker\"}"
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown"), "ticker" to ticker))
+            }
+        }
+
+        private fun t212YahooExchange(symbol: String): String =
+            if (symbol.endsWith(".DE", ignoreCase = true)) "DE" else "NASDAQ"
+
+        private fun enrichT212AnalysisWithFundamentals(
+            symbol: String,
+            analysis: com.signalscope.app.data.StockAnalysis,
+            weights: com.signalscope.app.data.ScoringWeights
+        ): com.signalscope.app.data.StockAnalysis {
+            return try {
+                val fundResult = com.signalscope.app.network.YahooFinanceClient
+                    .fetchFundamentals(symbol, t212YahooExchange(symbol))
+                if (fundResult !is com.signalscope.app.network.YahooFinanceClient.FundamentalResult.Success) {
+                    return analysis
+                }
+
+                val vr = com.signalscope.app.util.ValueAnalyzer.analyze(
+                    fundamentals = fundResult.data,
+                    currentPrice = analysis.price,
+                    w = weights
+                )
+                val refreshedName = fundResult.data.name?.trim()?.takeIf { it.isNotBlank() } ?: analysis.name
+                analysis.copy(
+                    name = refreshedName,
+                    trailingPe = vr.trailingPe,
+                    forwardPe = vr.forwardPe,
+                    priceToBook = vr.priceToBook,
+                    evToEbitda = vr.evToEbitda,
+                    debtToEquity = vr.debtToEquity,
+                    roce = vr.roce,
+                    revenueGrowth = vr.revenueGrowth,
+                    earningsGrowth = vr.earningsGrowth,
+                    grossMargins = vr.grossMargins,
+                    operatingMargins = vr.operatingMargins,
+                    profitMargins = vr.profitMargins,
+                    dividendYield = vr.dividendYield,
+                    operatingCashflow = vr.operatingCashflow,
+                    freeCashflow = vr.freeCashflow,
+                    netIncome = vr.netIncome,
+                    totalRevenue = vr.totalRevenue,
+                    totalCash = vr.totalCash,
+                    totalDebt = vr.totalDebt,
+                    currentRatio = vr.currentRatio,
+                    annualRevenueGrowth = vr.annualRevenueGrowth,
+                    annualNetIncomeGrowth = vr.annualNetIncomeGrowth,
+                    fiftyTwoWeekLow = vr.fiftyTwoWeekLow,
+                    fiftyTwoWeekHigh = vr.fiftyTwoWeekHigh,
+                    sharesOutstanding = vr.sharesOutstanding,
+                    sector = vr.sector,
+                    industry = vr.industry,
+                    sectorMedianPe = vr.sectorMedianPe,
+                    hasBuyback = vr.hasBuyback,
+                    valueScore = vr.valueScore,
+                    valueRating = vr.valueRating,
+                    valueScoreReport = vr.valueScoreReport
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "T212 fundamentals enrichment failed for $symbol: ${e.message}")
+                analysis
+            }
+        }
+
+        private fun yahooMatchKeys(symbol: String?): Set<String> {
+            val raw = symbol?.trim()?.uppercase(Locale.US).orEmpty()
+            if (raw.isBlank()) return emptySet()
+            val bare = raw.substringBefore(".")
+            return listOf(raw, bare).filter { it.isNotBlank() }.toSet()
+        }
+
+        private fun findCachedT212DiscoveryAnalysis(
+            client: com.signalscope.app.network.Trading212Client,
+            ticker: String,
+            currency: String?
+        ): com.signalscope.app.data.StockAnalysis? {
+            return try {
+                val wantedExact = client.t212ToYahooCandidates(ticker, currency)
+                    .map { it.trim().uppercase(Locale.US) }
+                    .filter { it.isNotBlank() }
+                    .toSet()
+                val wantedBare = wantedExact.map { it.substringBefore(".") }.toSet()
+                if (wantedExact.isEmpty() && wantedBare.isEmpty()) return null
+
+                val cached = DiscoveryResultStore.loadAll(applicationContext)
+                    .asSequence()
+                    .flatMap { it.allStocks.asSequence() }
+                    .toList()
+
+                cached.firstOrNull { a ->
+                    val keys = setOf(a.symbol, a.token)
+                        .map { it.trim().uppercase(Locale.US) }
+                        .filter { it.isNotBlank() }
+                    keys.any { it in wantedExact }
+                } ?: cached.firstOrNull { a ->
+                    val keys = setOf(a.symbol, a.token)
+                        .flatMap { yahooMatchKeys(it) }
+                    keys.any { it in wantedBare }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "T212 cached discovery lookup failed for $ticker: ${e.message}")
+                null
+            }
+        }
+
+        private fun parseT212OpenOrders(raw: String): List<Map<String, Any?>> {
+            return try {
+                val root = com.google.gson.JsonParser.parseString(raw)
+                val arr = when {
+                    root.isJsonArray -> root.asJsonArray
+                    root.isJsonObject && root.asJsonObject.has("items") -> root.asJsonObject.getAsJsonArray("items")
+                    root.isJsonObject && root.asJsonObject.has("orders") -> root.asJsonObject.getAsJsonArray("orders")
+                    else -> return emptyList()
+                }
+                val out = mutableListOf<Map<String, Any?>>()
+                for (el in arr) {
+                    if (!el.isJsonObject) continue
+                    val o = el.asJsonObject
+                    val instrument = o.get("instrument")?.takeIf { it.isJsonObject }?.asJsonObject
+                    val ticker = o.get("ticker")?.takeIf { !it.isJsonNull }?.asString
+                        ?: instrument?.get("ticker")?.takeIf { !it.isJsonNull }?.asString
+                        ?: continue
+                    val status = o.get("status")?.takeIf { !it.isJsonNull }?.asString ?: "PENDING"
+                    val statusKey = status.uppercase(Locale.US)
+                    if (statusKey in setOf("CANCELLED", "FILLED", "REJECTED")) continue
+                    val type = o.get("type")?.takeIf { !it.isJsonNull }?.asString ?: "ORDER"
+                    val quantity = o.get("quantity")?.takeIf { !it.isJsonNull }?.asDouble ?: 0.0
+                    val side = o.get("side")?.takeIf { !it.isJsonNull }?.asString
+                        ?: if (quantity < 0.0) "SELL" else "BUY"
+                    val stopPrice = o.get("stopPrice")?.takeIf { !it.isJsonNull }?.asDouble
+                    val limitPrice = o.get("limitPrice")?.takeIf { !it.isJsonNull }?.asDouble
+                    val price = stopPrice ?: limitPrice ?: 0.0
+                    val kind = if (side.equals("SELL", ignoreCase = true)) {
+                        when {
+                            type.contains("STOP", ignoreCase = true) -> "SL"
+                            type.contains("LIMIT", ignoreCase = true) -> "TARGET"
+                            else -> "SELL"
+                        }
+                    } else "BUY"
+                    out.add(mapOf(
+                        "id" to (o.get("id")?.takeIf { !it.isJsonNull }?.asLong ?: 0L),
+                        "ticker" to ticker,
+                        "type" to type,
+                        "status" to status,
+                        "side" to side.uppercase(Locale.US),
+                        "quantity" to quantity,
+                        "absQuantity" to kotlin.math.abs(quantity),
+                        "stopPrice" to stopPrice,
+                        "limitPrice" to limitPrice,
+                        "price" to price,
+                        "kind" to kind
+                    ))
+                }
+                out
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to parse T212 open orders: ${e.message}")
+                emptyList()
             }
         }
 
@@ -1023,6 +2042,14 @@ class MainActivity : AppCompatActivity() {
                         "{\"ok\":false,\"error\":\"Trading 212 not configured — add API key + secret in Settings\"}"
                     } else {
                         val t212 = com.signalscope.app.network.Trading212Client(config)
+                        val reconcileSummary = try {
+                            com.signalscope.app.trading.Trading212TrailingManager.reconcileOnly(
+                                applicationContext, config
+                            )
+                        } catch (e: Exception) {
+                            Log.w(TAG, "T212 reconcile before portfolio fetch failed", e)
+                            null
+                        }
                         val cashRes = t212.fetchAccountSummary()
                         val portRes = t212.fetchPortfolio()
                         val positions = when (portRes) {
@@ -1047,18 +2074,29 @@ class MainActivity : AppCompatActivity() {
                                 is com.signalscope.app.network.Trading212Client.T212Result.Success -> mRes.data
                                 else -> emptyMap()  // Fall through with raw tickers if metadata unavailable
                             }
+                        val openOrdersByTicker: Map<String, List<Map<String, Any?>>> =
+                            when (val oRes = t212.fetchOpenOrders()) {
+                                is com.signalscope.app.network.Trading212Client.T212Result.Success ->
+                                    parseT212OpenOrders(oRes.data).groupBy { (it["ticker"] as? String).orEmpty() }
+                                is com.signalscope.app.network.Trading212Client.T212Result.Failure -> {
+                                    Log.w(TAG, "T212 open-order fetch failed: ${oRes.message}")
+                                    emptyMap()
+                                }
+                                is com.signalscope.app.network.Trading212Client.T212Result.NotConfigured -> emptyMap()
+                            }
                         // 2) For each position, fetch Yahoo candles + run
                         //    StockAnalyzer so the user sees the same scores
                         //    as the Indian portfolio. Sequential to respect
                         //    Yahoo's rate limit (~2 req/s ceiling).
                         val weights = config.scoringWeights
                         val enrichedPositions = positions.map { pos ->
-                            val yahooSym = t212.t212ToYahooSymbol(pos.ticker)
+                            var yahooSym = t212.t212ToYahooSymbol(pos.ticker)
                             val meta = metaMap[pos.ticker]
                             val name = meta?.shortName ?: pos.ticker
                             val currency = meta?.currencyCode ?: "USD"
+                            var analysisError = ""
                             // Run analyzer on Yahoo candles (NASDAQ default exchange ID)
-                            val analysis: com.signalscope.app.data.StockAnalysis? = try {
+                            var analysis: com.signalscope.app.data.StockAnalysis? = try {
                                 val candleResult = com.signalscope.app.network.YahooFinanceClient
                                     .fetchCandles(yahooSym, "NASDAQ")
                                 if (candleResult is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success) {
@@ -1074,7 +2112,7 @@ class MainActivity : AppCompatActivity() {
                                         w = weights
                                     )
                                     if (a != null) {
-                                        val exchange = if (yahooSym.endsWith(".DE", ignoreCase = true)) "DE" else "NASDAQ"
+                                        val exchange = t212YahooExchange(yahooSym)
                                         val fundResult = com.signalscope.app.network.YahooFinanceClient
                                             .fetchFundamentals(yahooSym, exchange)
                                         if (fundResult is com.signalscope.app.network.YahooFinanceClient.FundamentalResult.Success) {
@@ -1124,7 +2162,59 @@ class MainActivity : AppCompatActivity() {
                                 } else null
                             } catch (e: Exception) {
                                 Log.w(TAG, "T212 enrichment failed for ${pos.ticker}: ${e.message}")
+                                analysisError = e.message ?: "unknown"
                                 null
+                            }
+                            if (analysis == null) {
+                                for (candidate in t212.t212ToYahooCandidates(pos.ticker, currency)) {
+                                    if (candidate.equals(yahooSym, ignoreCase = true)) continue
+                                    val exchange = if (candidate.endsWith(".DE", ignoreCase = true)) "DE" else "NASDAQ"
+                                    try {
+                                        when (val candleResult = com.signalscope.app.network.YahooFinanceClient
+                                            .fetchCandles(candidate, exchange)) {
+                                            is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success -> {
+                                                val displayName = name.trim().takeIf { it.isNotBlank() && !it.equals(pos.ticker, ignoreCase = true) }
+                                                    ?: candleResult.name?.trim()?.takeIf { it.isNotBlank() }
+                                                    ?: pos.ticker
+                                                val fallback = com.signalscope.app.util.StockAnalyzer.analyze(
+                                                    candles = candleResult.candles,
+                                                    symbol = candidate,
+                                                    name = displayName,
+                                                    token = candidate,
+                                                    minAvgVolume = 0,
+                                                    w = weights
+                                                )
+                                                if (fallback != null) {
+                                                    yahooSym = candidate
+                                                    analysis = enrichT212AnalysisWithFundamentals(candidate, fallback, weights)
+                                                    analysisError = ""
+                                                    break
+                                                } else {
+                                                    analysisError = "insufficient candles for $candidate"
+                                                }
+                                            }
+                                            is com.signalscope.app.network.YahooFinanceClient.CandleResult.RateLimited -> {
+                                                analysisError = "Yahoo rate-limited while trying $candidate"
+                                                break
+                                            }
+                                            is com.signalscope.app.network.YahooFinanceClient.CandleResult.Error ->
+                                                analysisError = "Yahoo $candidate: ${candleResult.message}"
+                                            is com.signalscope.app.network.YahooFinanceClient.CandleResult.NoData ->
+                                                analysisError = "No Yahoo candles for $candidate"
+                                        }
+                                    } catch (e: Exception) {
+                                        analysisError = e.message ?: "unknown"
+                                    }
+                                }
+                            }
+                            if (analysis == null) {
+                                val cached = findCachedT212DiscoveryAnalysis(t212, pos.ticker, currency)
+                                if (cached != null) {
+                                    yahooSym = cached.symbol
+                                    analysis = cached
+                                    analysisError = ""
+                                    Log.i(TAG, "T212 ${pos.ticker}: using cached discovery analysis ${cached.symbol}")
+                                }
                             }
                             // Merge T212 raw + name + analysis into one map.
                             // JS detail-modal reads stock objects directly so all
@@ -1133,7 +2223,7 @@ class MainActivity : AppCompatActivity() {
                                 "ticker"        to pos.ticker,
                                 "yahooSymbol"   to yahooSym,
                                 "symbol"        to yahooSym,            // expected by detail modal
-                                "name"          to name,
+                                "name"          to (analysis?.name?.trim()?.takeIf { it.isNotBlank() } ?: name),
                                 "currency"      to currency,
                                 "quantity"      to pos.quantity,
                                 "averagePrice"  to pos.averagePrice,
@@ -1142,11 +2232,18 @@ class MainActivity : AppCompatActivity() {
                                 "pplTotal"      to pos.pplTotal,
                                 "isin"          to meta?.isin
                             )
+                            val pendingOrders = openOrdersByTicker[pos.ticker].orEmpty()
+                            if (pendingOrders.isNotEmpty()) {
+                                merged["pendingOrders"] = pendingOrders
+                                merged["reservedSellQuantity"] = pendingOrders
+                                    .filter { (it["side"] as? String).equals("SELL", ignoreCase = true) }
+                                    .sumOf { (it["absQuantity"] as? Double) ?: 0.0 }
+                            }
                             // Inline the StockAnalysis fields if we got one.
                             if (analysis != null) {
                                 merged["price"]            = analysis.price
-                                merged["buyScore"]         = analysis.buyScore
-                                merged["buySignal"]        = analysis.buySignal
+                                merged["buyScore"]         = analysis.cherryPoints
+                                merged["buySignal"]        = analysis.cherrySignal
                                 merged["pullbackScore"]    = analysis.pullbackScore
                                 merged["pullbackSignal"]   = analysis.pullbackSignal
                                 merged["momentumScore"]    = analysis.momentumScore
@@ -1230,9 +2327,19 @@ class MainActivity : AppCompatActivity() {
                                 merged["styleScoreReport"] = analysis.styleScoreReport
                                 merged["obvDivergence"]    = analysis.obvDivergence
                                 merged["obvWeakness"]      = analysis.obvWeakness
+                                merged["divHistBullish"]   = analysis.divHistBullish
+                                merged["divHistBearish"]   = analysis.divHistBearish
+                                merged["divVolBullish"]    = analysis.divVolBullish
+                                merged["divVolBearish"]    = analysis.divVolBearish
+                                merged["divDetail"]        = analysis.divDetail
+                                merged["volBullDryUp"]        = analysis.volBullDryUp
+                                merged["volBearDryUp"]        = analysis.volBearDryUp
+                                merged["volBullCapitulation"] = analysis.volBullCapitulation
+                                merged["volBearChurning"]     = analysis.volBearChurning
+                                merged["volPatternDetail"]    = analysis.volPatternDetail
                                 merged["goldenBuy"]        = analysis.goldenBuy
                                 merged["goldenBuyReport"]  = analysis.goldenBuyReport
-                                merged["buyScoreReport"]   = analysis.buyScoreReport
+                                merged["buyScoreReport"]   = analysis.cherryPointsReport
                                 merged["pullbackScoreReport"] = analysis.pullbackScoreReport
                                 merged["momentumScoreReport"] = analysis.momentumScoreReport
                                 merged["trailingPe"]       = analysis.trailingPe
@@ -1269,6 +2376,9 @@ class MainActivity : AppCompatActivity() {
                                 merged["hasAnalysis"]      = true
                             } else {
                                 merged["hasAnalysis"]      = false
+                                if (analysisError.isNotBlank()) {
+                                    merged["analysisError"] = analysisError
+                                }
                             }
                             merged
                         }
@@ -1285,7 +2395,8 @@ class MainActivity : AppCompatActivity() {
                             else -> "null"
                         }
                         val positionsJson = gson.toJson(enrichedPositions)
-                        "{\"ok\":true,\"positions\":$positionsJson,\"summary\":$cashJson,\"capturedAt\":${System.currentTimeMillis()}}"
+                        val reconcileJson = if (reconcileSummary != null) gson.toJson(reconcileSummary) else "null"
+                        "{\"ok\":true,\"positions\":$positionsJson,\"summary\":$cashJson,\"reconcile\":$reconcileJson,\"capturedAt\":${System.currentTimeMillis()}}"
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "fetchT212Portfolio failed", e)
@@ -1488,6 +2599,115 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** Analyze a Binance crypto pair with DAILY candles (≈1y) through the same
+         *  StockAnalyzer the stock spaces use, then hand the result to the shared
+         *  detail view (window.onManualAnalysisResult → showDetail) so the crypto
+         *  space gets the 252-day price SVG, MACD, momentum, pullback, RSI, etc.
+         *  Fundamentals (P/E, dividends…) are skipped — they don't apply to crypto. */
+        @JavascriptInterface
+        fun analyzeCryptoSymbol(symbol: String) {
+            thread(isDaemon = true) {
+                val resultJson: String = try {
+                    val sym = symbol.trim().uppercase()
+                    if (sym.isEmpty()) throw IllegalArgumentException("empty symbol")
+                    when (val cr = com.signalscope.app.network.BinanceClient.fetchDailyCandles(sym)) {
+                        is com.signalscope.app.network.YahooFinanceClient.CandleResult.Success -> {
+                            val analysis = com.signalscope.app.util.StockAnalyzer.analyze(
+                                candles = cr.candles, symbol = sym, name = sym, token = sym,
+                                minAvgVolume = 0, w = config.scoringWeights
+                            )
+                            if (analysis == null)
+                                "{\"ok\":false,\"error\":\"insufficient candle history (need 50+ daily bars)\",\"symbol\":\"$sym\"}"
+                            else com.google.gson.Gson().toJson(mapOf("ok" to true, "analysis" to analysis))
+                        }
+                        is com.signalscope.app.network.YahooFinanceClient.CandleResult.RateLimited ->
+                            "{\"ok\":false,\"error\":\"Binance rate-limited — try again shortly\",\"symbol\":\"$symbol\"}"
+                        is com.signalscope.app.network.YahooFinanceClient.CandleResult.Error ->
+                            "{\"ok\":false,\"error\":\"${cr.message.replace("\"","")}\",\"symbol\":\"$symbol\"}"
+                        is com.signalscope.app.network.YahooFinanceClient.CandleResult.NoData ->
+                            "{\"ok\":false,\"error\":\"No data — check the pair (e.g. BTCUSDT)\",\"symbol\":\"$symbol\"}"
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "analyzeCryptoSymbol failed", e)
+                    "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+                }
+                deliverAiCallback("window.onManualAnalysisResult", resultJson)
+            }
+        }
+
+        /** Per-bar "why did/didn't it trade" review for one enrolled lab symbol.
+         *  Delivers the chart series + trades + per-bar entry/exit checklists to
+         *  window.onLabReview. space → lab namespace (US/DE/BN). */
+        @JavascriptInterface
+        fun labReview(space: String, symbol: String) {
+            thread(isDaemon = true) {
+                val ns = when (space.uppercase()) { "BN" -> "binance"; "DE" -> "de"; else -> "us" }
+                val out = try {
+                    gson.toJson(com.signalscope.app.trading.StrategyLabRunner.reviewPayload(applicationContext, ns, symbol))
+                } catch (e: Exception) {
+                    Log.e(TAG, "labReview failed", e)
+                    gson.toJson(mapOf("symbol" to symbol, "error" to (e.message ?: "review failed")))
+                }
+                deliverAiCallback("window.onLabReview", out)
+            }
+        }
+
+        /** Momentum screener (SCREENER_REINVEST_KOTLIN_PORT.md Part A): fetch daily
+         *  bars for the given universe in the given space, rank by the momentum
+         *  quality score, and deliver the ordered result to window.onScreenerResult.
+         *  Per-symbol progress → window.onScreenerProgress. */
+        /** The exact universe Discovery scans for a space, as a space-joined
+         *  string for the screener's default box — so the two never drift.
+         *  DE symbols are stripped of ".DE" to match the box's bare convention
+         *  (the fetcher re-adds the suffix from the exchange). BN/IN have no
+         *  Discovery constant, so the JS keeps its own fallback for those. */
+        @JavascriptInterface
+        fun discoveryUniverse(space: String): String {
+            return try {
+                when (space.uppercase()) {
+                    "US" -> com.signalscope.app.service.NASDAQ_100_SYMBOLS.joinToString(" ")
+                    "DE" -> com.signalscope.app.service.DAX_SYMBOLS.joinToString(" ") { it.removeSuffix(".DE") }
+                    // India is the one space whose universe is DOWNLOADED rather
+                    // than hardcoded, so prefer the last live copy a scan saved
+                    // and fall back to the embedded list. Never fetch here: this
+                    // runs on the main thread from a rendering card.
+                    "IN", "INDIA" -> {
+                        val cached = config.nseUniverseCached.trim()
+                        if (cached.isNotEmpty()) cached
+                        else com.signalscope.app.service.NIFTY_500_YAHOO_SYMBOLS.joinToString(" ")
+                    }
+                    else -> ""
+                }
+            } catch (e: Exception) { "" }
+        }
+
+        @JavascriptInterface
+        fun runScreener(symbolsJson: String, space: String) {
+            thread(isDaemon = true) {
+                val out: String = try {
+                    val arr = com.google.gson.JsonParser.parseString(symbolsJson).asJsonArray
+                    val syms = arr.mapNotNull { runCatching { it.asString }.getOrNull() }
+                    if (syms.size < 2) throw IllegalArgumentException("Need at least 2 symbols to rank a universe.")
+                    val cfg = com.signalscope.app.screener.ScreenerConfig()
+                    val res = com.signalscope.app.screener.ScreenerRunner.run(space, syms, cfg) { done, total ->
+                        deliverAiCallback("window.onScreenerProgress", "{\"done\":$done,\"total\":$total}")
+                    }
+                    gson.toJson(mapOf(
+                        "ok" to true, "asOf" to res.asOf, "universeSize" to res.universeSize,
+                        "skipped" to res.skipped, "ranked" to res.ranked, "space" to space.uppercase(),
+                        // Expose the scoring parameters so the UI breakdown reads them
+                        // from source (weights are per-config, not hardcoded in JS).
+                        "weightReturn" to cfg.weightReturn, "weightVol" to cfg.weightVol,
+                        "weightAboveSma" to cfg.weightAboveSma, "lookbackDays" to cfg.lookbackDays,
+                        "smaPeriod" to cfg.smaPeriod))
+                } catch (e: Exception) {
+                    Log.e(TAG, "runScreener failed", e)
+                    gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "screen failed")))
+                }
+                deliverAiCallback("window.onScreenerResult", out)
+            }
+        }
+
         @JavascriptInterface
         fun analyzeDeepStyle(symbol: String, space: String = "IN") {
             thread(isDaemon = true) {
@@ -1564,6 +2784,16 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        private fun watchlistEntryMatchesSpace(entry: com.signalscope.app.data.WatchlistStore.Entry, space: String): Boolean {
+            val sym = entry.symbol.trim().uppercase()
+            val ex = entry.exchange.trim().uppercase()
+            return when (space.uppercase()) {
+                "DE" -> ex == "DE" || ex == "XETRA" || sym.endsWith(".DE")
+                "US" -> ex == "US" || ex == "NASDAQ" || ex == "NYSE"
+                else -> ex == "NSE" || ex == "BSE" || sym.endsWith(".NS") || sym.endsWith(".BO")
+            }
+        }
+
         /** Add a symbol. No-ops if already present. Returns updated count. */
         @JavascriptInterface
         fun addToWatchlist(symbol: String, exchange: String = "NSE", notes: String = ""): Int {
@@ -1594,6 +2824,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun removeFromWatchlistForSpace(symbol: String, exchange: String): Int {
+            return try {
+                val entry = normalizeWatchlistEntry(symbol, exchange, "")
+                val list = com.signalscope.app.data.WatchlistStore.remove(
+                    applicationContext,
+                    entry.symbol,
+                    entry.exchange
+                )
+                runOnUiThread { updateLiveStreamSubscriptions() }
+                list.size
+            } catch (e: Exception) {
+                Log.e(TAG, "removeFromWatchlistForSpace failed", e)
+                -1
+            }
+        }
+
+        @JavascriptInterface
         fun updateWatchlistNotes(symbol: String, notes: String): Boolean {
             return try {
                 com.signalscope.app.data.WatchlistStore.update(applicationContext, symbol, notes = notes)
@@ -1605,8 +2852,31 @@ class MainActivity : AppCompatActivity() {
         }
 
         @JavascriptInterface
+        fun updateWatchlistNotesForSpace(symbol: String, exchange: String, notes: String): Boolean {
+            return try {
+                val entry = normalizeWatchlistEntry(symbol, exchange, "")
+                com.signalscope.app.data.WatchlistStore.update(
+                    applicationContext,
+                    entry.symbol,
+                    exchange = entry.exchange,
+                    notes = notes
+                )
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "updateWatchlistNotesForSpace failed", e)
+                false
+            }
+        }
+
+        @JavascriptInterface
         fun isInWatchlist(symbol: String): Boolean = try {
             com.signalscope.app.data.WatchlistStore.contains(applicationContext, symbol)
+        } catch (_: Exception) { false }
+
+        @JavascriptInterface
+        fun isInWatchlistForSpace(symbol: String, exchange: String): Boolean = try {
+            val entry = normalizeWatchlistEntry(symbol, exchange, "")
+            com.signalscope.app.data.WatchlistStore.contains(applicationContext, entry.symbol, entry.exchange)
         } catch (_: Exception) { false }
 
         @JavascriptInterface
@@ -1654,13 +2924,2971 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // ── DUMMY GTT ALERTS ──────────────────────────────────────────────
+        // App-only SL/target levels that vibrate + notify when reached (no
+        // broker order placed). Foundation for T212 manual execution; works in
+        // all spaces. See DummyGttStore / DummyGttMonitor.
+        @JavascriptInterface
+        fun getDummyGtts(): String =
+            try { gson.toJson(com.signalscope.app.data.DummyGttStore.load(applicationContext)) }
+            catch (e: Exception) { Log.e(TAG, "getDummyGtts failed", e); "[]" }
+
+        /** Create a dummy GTT alert. exchange feeds the Yahoo symbol resolver so
+         *  the live stream subscribes to the right ticker. */
+        @JavascriptInterface
+        fun addDummyGtt(
+            symbol: String, exchange: String, slPrice: Double, targetPrice: Double,
+            qty: Double, refPrice: Double, ticker: String = "", note: String = ""
+        ): String {
+            return try {
+                val space = config.currentSpace
+                val yahoo = YahooFinanceClient.toYahooSymbol(symbol.trim(), exchange).uppercase()
+                val gtt = com.signalscope.app.data.DummyGttStore.DummyGtt(
+                    space = space,
+                    symbol = symbol.trim().uppercase(),
+                    yahooSymbol = yahoo,
+                    ticker = ticker,
+                    qty = qty,
+                    slPrice = if (slPrice > 0.0) slPrice else null,
+                    targetPrice = if (targetPrice > 0.0) targetPrice else null,
+                    refPrice = refPrice,
+                    note = note
+                )
+                val list = com.signalscope.app.data.DummyGttStore.add(applicationContext, gtt)
+                runOnUiThread { updateLiveStreamSubscriptions() }
+                gson.toJson(mapOf("ok" to true, "count" to list.size, "id" to gtt.id))
+            } catch (e: Exception) {
+                Log.e(TAG, "addDummyGtt failed", e)
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun removeDummyGtt(id: String): String {
+            return try {
+                val list = com.signalscope.app.data.DummyGttStore.remove(applicationContext, id)
+                runOnUiThread { updateLiveStreamSubscriptions() }
+                gson.toJson(mapOf("ok" to true, "count" to list.size))
+            } catch (e: Exception) {
+                Log.e(TAG, "removeDummyGtt failed", e)
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Clears notified stamps so the level alerts again on the next cross. */
+        @JavascriptInterface
+        fun reArmDummyGtt(id: String): String {
+            return try {
+                com.signalscope.app.data.DummyGttStore.reArm(applicationContext, id)
+                gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) {
+                Log.e(TAG, "reArmDummyGtt failed", e)
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        // ── STRATEGY LAB — LIVE AUTOMATED TRADING MODE (US space, PAPER ONLY) ──
+        // Config-driven MACD engine running on live US bars; emits paper trades +
+        // audit, never places real orders. See StrategyLab* classes + the spec.
+        @JavascriptInterface
+        fun strategyLabGetState(): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.load(applicationContext)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext)
+                val closed = s.trades.filter { it.status == "CLOSED" }
+                val wins = closed.count { it.pctReturn > 0 }
+                val board = mapOf(
+                    "open" to s.trades.count { it.status == "OPEN" },
+                    "closed" to closed.size,
+                    "wins" to wins,
+                    "losses" to closed.count { it.pctReturn < 0 },
+                    "totalPnl" to closed.sumOf { it.pnlNotional },
+                    "totalPct" to closed.sumOf { it.pctReturn }
+                )
+                val t212Live = com.signalscope.app.data.T212LiveStore.load(applicationContext)
+                gson.toJson(mapOf(
+                    "enabled" to s.enabled,
+                    "source" to s.configSource,
+                    "summary" to cfg.summary(),
+                    "lastRunAt" to s.lastRunAt,
+                    "enrolled" to s.enrolled,
+                    "trades" to s.trades,
+                    "audit" to s.audit,
+                    "statuses" to s.statuses,
+                    "scoreboard" to board,
+                    "liveMirror" to mapOf(
+                        "broker" to "t212", "unit" to "",
+                        "enabled" to config.t212LiveMirrorEnabled,
+                        "frozen" to config.t212LiveFrozen,
+                        "configured" to config.hasT212Credentials,
+                        "quoteOrderSize" to config.t212LivePerTradeAmount,
+                        "open" to t212Live.trades.count { it.status == "OPEN" },
+                        "closed" to t212Live.trades.count { it.status == "CLOSED" },
+                        "errors" to t212Live.trades.count { it.status == "ERROR" || it.error.isNotBlank() },
+                        "pnlQuote" to 0.0,
+                        // Real fills, backfilled from T212's executed-order history
+                        // (T212LiveMirror.reconcileFills). Reports 0 samples until
+                        // some round trip has BOTH fill prices known — including
+                        // orders placed by hand in the T212 app, which is how this
+                        // can be calibrated before live entries are unfrozen.
+                        "slippage" to com.signalscope.app.trading.SlippageStats.toMap(
+                            com.signalscope.app.trading.SlippageStats.compute(
+                                com.signalscope.app.trading.T212LiveMirror.slippageSamples(applicationContext))),
+                        "trades" to t212Live.trades
+                    )
+                ))
+            } catch (e: Exception) {
+                Log.e(TAG, "strategyLabGetState failed", e)
+                "{\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun strategyLabSetEnabled(on: Boolean): Boolean {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.setEnabled(applicationContext, on)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                if (on) com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L) {
+                    deliverAiCallback("window.onStrategyLabUpdate", "{}")
+                }
+                on
+            } catch (e: Exception) { Log.e(TAG, "strategyLabSetEnabled failed", e); false }
+        }
+
+        private fun normalizeUsStrategyLabExchange(raw: String): String? {
+            return when (raw.trim().uppercase()) {
+                "", "US", "NASDAQ", "NMS", "NGM", "NCM", "NYQ", "NYSE", "ASE", "AMEX", "PCX", "BATS" -> "US"
+                else -> null
+            }
+        }
+
+        @JavascriptInterface
+        fun strategyLabEnroll(symbol: String, exchange: String): String {
+            return try {
+                val norm = symbol.trim().uppercase()
+                // Reject obvious non-tickers (spaces, punctuation, empty) up front.
+                // A format-valid but non-existent ticker still enrolls, but its
+                // per-symbol status will report "no data — check the ticker".
+                if (!Regex("^[A-Z0-9.\\-]{1,12}$").matches(norm)) {
+                    return gson.toJson(mapOf("ok" to false,
+                        "error" to "\"$symbol\" isn't a valid ticker — letters/digits only (e.g. AAPL, AVGO, BRK-B)."))
+                }
+                val normalizedExchange = normalizeUsStrategyLabExchange(exchange)
+                    ?: return gson.toJson(mapOf("ok" to false,
+                        "error" to "Strategy Lab US space only accepts US Yahoo/Nasdaq/NYSE listings."))
+                val s = com.signalscope.app.data.StrategyLabStore.enroll(applicationContext, norm, normalizedExchange)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun strategyLabUnenroll(symbol: String): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.unenroll(applicationContext, symbol)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        // ── Daily-MACD gate (Mode 3b) bridges ─────────────────────────────
+        private fun gateNs(ns: String): String {
+            // A bucket namespace ("<space>__<id>") is ALREADY a valid data ns — pass
+            // it through untouched so a per-algo backtest reads THAT bucket's config
+            // (config/enrolled/gate are all keyed on the bucket ns). Without this the
+            // else-branch would collapse it to bare "us" and backtest the wrong book.
+            if (ns.contains("__")) return ns
+            return when (ns.lowercase()) {
+                "bn", "binance" -> "binance"; "de" -> "de"; else -> "us"
+            }
+        }
+
+        @JavascriptInterface
+        fun macdGateState(ns: String): String {
+            return try {
+                val gns = gateNs(ns)
+                val s = com.signalscope.app.data.MacdGateStore.load(applicationContext, gns)
+                // ONE ledger read for the whole panel — the per-slot lookup below
+                // would otherwise re-read and re-value it once per seat.
+                val mtmAll = try {
+                    com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, gns).values
+                } catch (e: Exception) { emptyList() }
+                gson.toJson(mapOf(
+                    "ok" to true, "enabled" to s.enabled, "holdN" to s.holdN,
+                    "notional" to s.notionalPerSlot, "smoothing" to s.smoothing,
+                    "confirmDays" to s.confirmDays, "injected" to s.injected,
+                    "useScreenerSelection" to s.useScreenerSelection,
+                    "totalValue" to com.signalscope.app.data.MacdGateStore.totalValue(s),
+                    "lastEvalDay" to s.lastEvalDay,
+                    // `capital` is the REALISED seat balance — the number the gate
+                    // compounds and sizes the next position from, so it must not move
+                    // while a position is merely up on paper. `mtmValue` is the same
+                    // seat marked at the live price, for DISPLAY only.
+                    "slots" to s.slots.map { sl ->
+                        val mk = sl.symbol?.let { sy -> mtmAll.firstOrNull { it.symbol.equals(sy, true) } }
+                        mapOf(
+                            "symbol" to sl.symbol, "capital" to sl.capital,
+                            "since" to sl.since, "negDays" to sl.negDays, "flagged" to sl.flagged,
+                            "mtmPct" to (mk?.pctReturn ?: 0.0),
+                            "mtmValue" to (mk?.let { sl.capital * (1.0 + it.pctReturn / 100.0) } ?: sl.capital),
+                            "mtmStale" to (mk?.stale ?: true),
+                            "hasMtm" to (mk != null))
+                    },
+                    "log" to s.log.takeLast(30)))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        /** Enable/disable the gate. First enable initializes N cash slots at
+         *  notional each (injected = N × notional — cash slots count, §10.5).
+         *  Disabling stops evaluation but leaves enrollment as-is: the user
+         *  takes back manual control of the current basket. */
+        @JavascriptInterface
+        fun macdGateSetEnabled(ns: String, on: Boolean): String {
+            return try {
+                val n = gateNs(ns)
+                val s = com.signalscope.app.data.MacdGateStore.mutate(applicationContext, n) { st ->
+                    if (on && st.slots.isEmpty()) {
+                        val slots = (1..st.holdN).map {
+                            com.signalscope.app.data.MacdGateStore.Slot(null, st.notionalPerSlot, System.currentTimeMillis(), 0, false)
+                        }
+                        com.signalscope.app.data.MacdGateStore.appendLog(
+                            st.copy(enabled = true, slots = slots,
+                                injected = st.notionalPerSlot * st.holdN, lastEvalDay = ""),
+                            "initialized ${st.holdN} slots × ${st.notionalPerSlot}")
+                    } else st.copy(enabled = on, lastEvalDay = if (on) "" else st.lastEvalDay)
+                }
+                // Kick a pass so an enable acts within seconds, not at the next tick.
+                if (on) com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, n)
+                gson.toJson(mapOf("ok" to true, "enabled" to s.enabled))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        /**
+         * Toggle the screener's "pick the best N" step. Off ⇒ every symbol gets its
+         * own seat and only the daily-MACD gate decides — the honest configuration
+         * on a 2-coin universe, where "top 1 of 2 by a three-factor percentile
+         * screen" overstates what the strategy is doing.
+         *
+         * Reshaping seats is the same hazard as macdGateConfigure, so it is refused
+         * mid-position rather than silently orphaning or duplicating live capital.
+         * Takes effect on the next Save & run, which re-derives the slot array.
+         */
+        @JavascriptInterface
+        fun macdGateSetSelection(ns: String, on: Boolean): String {
+            return try {
+                val n = gateNs(ns)
+                var err: String? = null
+                com.signalscope.app.data.MacdGateStore.mutate(applicationContext, n) { st ->
+                    if (st.useScreenerSelection == on) st
+                    else if (st.slots.any { it.symbol != null }) {
+                        err = "Seats hold live symbols — changing this reshapes the seat count. " +
+                              "Disable the gate and let positions close first."
+                        st
+                    } else st.copy(useScreenerSelection = on, slots = emptyList(),
+                                   injected = 0.0, lastEvalDay = "")
+                }
+                if (err != null) gson.toJson(mapOf("ok" to false, "error" to err))
+                else gson.toJson(mapOf("ok" to true, "on" to on))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** Reconfigure slots/sizing — only while every slot is cash (changing N
+         *  mid-flight would orphan or duplicate live capital). */
+        @JavascriptInterface
+        fun macdGateConfigure(ns: String, holdN: Int, notional: Double, smoothing: Int): String {
+            return try {
+                val n = gateNs(ns)
+                var err: String? = null
+                com.signalscope.app.data.MacdGateStore.mutate(applicationContext, n) { st ->
+                    if (st.slots.any { it.symbol != null }) { err = "Slots hold live symbols — disable the gate and let positions close first."; st }
+                    else st.copy(
+                        holdN = holdN.coerceIn(1, 20),
+                        notionalPerSlot = notional.coerceIn(10.0, 1_000_000.0),
+                        smoothing = smoothing.coerceIn(1, 30),
+                        slots = emptyList(), injected = 0.0)
+                }
+                if (err != null) "{\"ok\":false,\"error\":\"$err\"}"
+                else gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        /** Open a multi-file picker for symbol CSVs (desktop format) and replay
+         *  the gate/reinvest walk-forward over them — parity vs the Python lab.
+         *  paramsJson: {mode:"3B"|"MONTHLY", holdN, smoothing, notional, topN}.
+         *  Progress + result → window.onGateBacktestResult. */
+        @JavascriptInterface
+        fun gateBacktestPick(ns: String, paramsJson: String) {
+            gateBtNs = gateNs(ns)
+            gateBtParamsJson = paramsJson
+            runOnUiThread {
+                try { gateBtPicker.launch(arrayOf("*/*")) }
+                catch (e: Exception) { Log.e(TAG, "gate bt picker launch failed", e) }
+            }
+        }
+
+        /** Pick a whole FOLDER of symbol CSVs — every top-level *.csv is used.
+         *  The right path for 100-symbol universes (no select-all in Android's
+         *  file picker). Same params/result contract as gateBacktestPick. */
+        @JavascriptInterface
+        fun gateBacktestPickFolder(ns: String, paramsJson: String) {
+            gateBtNs = gateNs(ns)
+            gateBtParamsJson = paramsJson
+            runOnUiThread {
+                try { gateBtFolderPicker.launch(null) }
+                catch (e: Exception) { Log.e(TAG, "gate bt folder picker launch failed", e) }
+            }
+        }
+
+        /** Force a fresh evaluation now (clears the once-per-day guard). */
+        @JavascriptInterface
+        fun macdGateEvalNow(ns: String): String {
+            return try {
+                val n = gateNs(ns)
+                com.signalscope.app.data.MacdGateStore.mutate(applicationContext, n) { it.copy(lastEvalDay = "") }
+                com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, n)
+                "{\"ok\":true}"
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        /** Open a system file picker for a .json config and apply it to [ns]'s
+         *  Strategy Lab. The picked file's NAME becomes the config source, so the
+         *  panel shows which file each space runs. Result → onStrategyLabConfigFile. */
+        @JavascriptInterface
+        fun strategyLabPickConfigFile(ns: String) {
+            configPickNs = when (ns.lowercase()) { "bn", "binance" -> "binance"; "de" -> "de"; else -> "us" }
+            runOnUiThread {
+                try { configJsonPicker.launch(arrayOf("application/json", "text/plain", "*/*")) }
+                catch (e: Exception) { Log.e(TAG, "config picker launch failed", e) }
+            }
+        }
+
+        /** Validate + activate a pasted config JSON. Engine params only — any
+         *  symbols/dataset/etc. in the file are ignored by the parser. */
+        @JavascriptInterface
+        fun strategyLabUploadConfig(jsonText: String, filename: String = "uploaded"): String {
+            return try {
+                when (val r = com.signalscope.app.trading.StrategyLabConfig.fromJson(jsonText, filename)) {
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Ok -> {
+                        com.signalscope.app.data.StrategyLabStore.setConfig(applicationContext, jsonText, filename)
+                        gson.toJson(mapOf("ok" to true, "summary" to r.config.summary()))
+                    }
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Rejected ->
+                        gson.toJson(mapOf("ok" to false, "error" to r.reason))
+                }
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun strategyLabResetConfig(): String {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.resetToPreset(applicationContext)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext)
+                gson.toJson(mapOf("ok" to true, "summary" to cfg.summary()))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun strategyLabResetPaper(): String {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.resetPaperState(applicationContext)
+                gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Force a run now; result delivered via window.onStrategyLabUpdate. */
+        @JavascriptInterface
+        fun strategyLabRunNow() {
+            com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L) {
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        /** Open a file picker for a CSV (same format as the desktop backtester);
+         *  runs it against the ACTIVE config and delivers the result to
+         *  window.onStrategyLabBacktest — for verifying parity with Python. */
+        @JavascriptInterface
+        fun strategyLabBacktestPickCsv() {
+            backtestNs = "us"
+            runOnUiThread {
+                try { backtestCsvPicker.launch(arrayOf("*/*")) }
+                catch (e: Exception) { Log.e(TAG, "csv picker launch failed", e) }
+            }
+        }
+
+        /** Read-only: run the engine on each enrolled symbol's live window and
+         *  report trades + P&L without touching the ledger. → window.onStrategyLabPreview */
+        @JavascriptInterface
+        fun strategyLabPreview() {
+            thread(isDaemon = true) {
+                val out = try {
+                    gson.toJson(mapOf("ok" to true,
+                        "symbols" to com.signalscope.app.trading.StrategyLabRunner.preview(applicationContext)))
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "preview failed")))
+                }
+                deliverAiCallback("window.onStrategyLabPreview", out)
+            }
+        }
+
+        /** Ingest the recent live window into the ledger so P&L appears now. */
+        @JavascriptInterface
+        fun strategyLabBackfill() {
+            thread(isDaemon = true) {
+                try { com.signalscope.app.trading.StrategyLabRunner.backfill(applicationContext) }
+                catch (e: Exception) { Log.e(TAG, "backfill failed", e) }
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        /** Export the last backtest's report in the desktop Python CSV format. */
+        @JavascriptInterface
+        fun strategyLabExportReport(): Boolean {
+            if (lastBacktestReport == null) return false
+            runOnUiThread {
+                try { reportExportLauncher.launch("signalscope_report_${System.currentTimeMillis()}.csv") }
+                catch (e: Exception) { Log.e(TAG, "report export launch failed", e) }
+            }
+            return true
+        }
+
+        // ── MONTHLY REINVEST (rescan→reinvest loop, §4) — "us" / "binance" ───
+        private fun reinvestNs(space: String) = when (space.uppercase()) { "BN" -> "binance"; "DE" -> "de"; else -> "us" }
+
+        // ── BUCKETS — multiple strategies per space ──
+        private fun bucketBaseNs(space: String) = when (space.uppercase()) {
+            "BN", "BINANCE" -> "binance"; "DE" -> "de"; "IN", "INDIA" -> "in"; else -> "us"
+        }
+
+        @JavascriptInterface
+        fun bucketsList(space: String): String {
+            return try {
+                // Opportunistic, non-blocking, self-throttled to 30 min: opening the
+                // tab tops up prices for open positions the stream doesn't carry.
+                // Returns immediately — this call must never wait on the network.
+                try { com.signalscope.app.trading.MarkToMarket.refreshAsync(applicationContext) }
+                catch (e: Exception) { Log.w(TAG, "mark refresh kick failed", e) }
+                val base = bucketBaseNs(space)
+                val bucketable = com.signalscope.app.data.BucketStore.isBucketable(base)
+                val rows = com.signalscope.app.data.BucketStore.list(applicationContext, base).map { b ->
+                    val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, b.ns)
+                    val closed = lab.trades.filter { it.status == "CLOSED" }
+                    // Live position count per algo, per broker. T212 buckets returned
+                    // a hardcoded 0 because live stocks were frozen when this was
+                    // written — so the arming panel could never show a German algo
+                    // what it was actually holding.
+                    val liveOpen = if (b.space == "binance")
+                        com.signalscope.app.data.BinanceLiveStore.load(applicationContext, b.ns)
+                            .trades.count { it.status == "OPEN" }
+                    else com.signalscope.app.data.T212LiveStore.load(applicationContext)
+                        .trades.count { it.ns == b.ns && (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
+                    // PORTFOLIO return for a 3b bucket = slot capital ÷ injected.
+                    // `paperPnlPct` below is a raw SUM of every closed trade's return
+                    // across every scanned name — research, not the book — so it is
+                    // not comparable to the backtest. Show this instead when armed.
+                    val gate = com.signalscope.app.data.MacdGateStore.load(applicationContext, b.ns)
+                    val gateOn = gate.enabled && gate.slots.isNotEmpty()
+                    val gateValue = com.signalscope.app.data.MacdGateStore.totalValue(gate)
+                    val gatePct = if (gateOn && gate.injected > 0.0)
+                        (gateValue / gate.injected - 1.0) * 100.0 else 0.0
+                    // OPEN positions valued on the live clock. Kept SEPARATE from
+                    // gatePct/paperPnlPct (both realised-only) rather than folded in:
+                    // the realised figures are what the gate compounds and sizes the
+                    // next position from, so they must not drift with an unclosed
+                    // position. The UI adds them for the headline; the stores don't.
+                    val mtm = try {
+                        com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, b.ns)
+                    } catch (e: Exception) { com.signalscope.app.trading.MarkToMarket.Snapshot() }
+                    // Contribution to the whole book: each open seat is one slot of
+                    // N, so its unrealised % counts for 1/N of the portfolio.
+                    val seatsForMtm = if (gateOn) gate.slots.size.coerceAtLeast(1)
+                                      else lab.enrolled.size.coerceAtLeast(1)
+                    val openMtmPct = mtm.values.sumOf { it.pctReturn } / seatsForMtm
+                    // Slippage is the single assumption that most changes how a P&L
+                    // should be read (0% vs 0.20% can flip a champion into a loser),
+                    // so it rides along with every algo row rather than being
+                    // something the user has to open the JSON to recall.
+                    val acfg = com.signalscope.app.data.StrategyLabStore
+                        .activeConfig(applicationContext, b.ns)
+                    mapOf(
+                        "id" to b.id, "ns" to b.ns, "name" to b.name, "space" to b.space,
+                        "symbols" to b.symbols, "mode" to b.mode.name, "capital" to b.capital,
+                        "holdN" to b.holdN, "smoothing" to b.smoothing,
+                        "slippagePct" to acfg.slippagePct,
+                        // What a round trip ACTUALLY costs this algo, after the
+                        // exclusive choice between a percentage and a flat fee has
+                        // been resolved. The badge must show the figure the engine
+                        // charges, not the one the strategy file happens to state.
+                        // WHICH SETTINGS THE FILE TAKES OVER. Config outranks the UI
+                        // so a run is reproducible from the JSON alone (§10) — but
+                        // the card never said so, leaving the Slots box looking
+                        // broken when a file declared its own top-N and quietly won.
+                        "cfgTopN" to acfg.topNOverride,
+                        "cfgSmoothing" to acfg.slopeSmoothingOverride,
+                        "cfgConfirmDays" to acfg.slopeConfirmDaysOverride,
+                        "cfgLookback" to acfg.screenerLookbackOverride,
+                        "flatFeePct" to acfg.flatFeeRoundTripPct,
+                        "effCostPct" to (acfg.slippagePct + acfg.flatFeeRoundTripPct),
+                        "entryTf" to acfg.resample,
+                        "exitTf" to (if (acfg.multiTimeframe) acfg.exitBars else acfg.resample),
+                        "warmupBars" to acfg.warmupBars,
+                        "configSource" to lab.configSource, "enabled" to lab.enabled,
+                        "enrolledCount" to lab.enrolled.size,
+                        "openCount" to lab.trades.count { it.status == "OPEN" },
+                        "closedCount" to closed.size,
+                        "paperPnlPct" to closed.sumOf { it.pctReturn },
+                        "openMtmPct" to openMtmPct,
+                        "openPriced" to mtm.priced, "openUnpriced" to mtm.unpriced,
+                        "markedAt" to mtm.markedAtMs,
+                        "openMarks" to mtm.values.map { mapOf(
+                            "symbol" to it.symbol, "entryPrice" to it.entryPrice,
+                            "price" to it.price, "pctReturn" to it.pctReturn,
+                            "stale" to it.stale, "source" to it.source) },
+                        "useScreenerSelection" to gate.useScreenerSelection,
+                        "gateOn" to gateOn, "gatePct" to gatePct,
+                        "gateValue" to gateValue, "gateInjected" to gate.injected,
+                        "gateFilled" to gate.slots.count { it.symbol != null },
+                        "live" to b.live, "liveBudget" to b.liveBudget,
+                        "liveAllowlist" to b.liveAllowlist, "liveOpen" to liveOpen,
+                        // Both the RESOLVED cost (what the engine will actually
+                        // charge) and whether it came from an override, so the
+                        // card can show the number in force and mark it as
+                        // differing from the strategy file.
+                        "slipOverride" to b.slippagePctOverride,
+                        "flatFeeOverride" to b.flatFeeOverride,
+                        "flatFeeEffective" to (b.flatFeeOverride
+                            ?: config.flatFeeFor(b.ns)),
+                        "currency" to com.signalscope.app.trading.Spaces.currencyOf(b.ns))
+                }
+                gson.toJson(mapOf("ok" to true, "bucketable" to bucketable, "space" to base, "buckets" to rows))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun bucketCreate(space: String, name: String): String {
+            return try {
+                val base = bucketBaseNs(space)
+                if (!com.signalscope.app.data.BucketStore.isBucketable(base))
+                    return "{\"ok\":false,\"error\":\"Buckets are US/DE only for now (crypto live path unchanged).\"}"
+                val b = com.signalscope.app.data.BucketStore.create(applicationContext, base, name)
+                gson.toJson(mapOf("ok" to true, "id" to b.id, "ns" to b.ns))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun bucketDelete(ns: String): String {
+            return try {
+                com.signalscope.app.data.BucketStore.delete(applicationContext, ns)
+                "{\"ok\":true}"
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Set a bucket's symbol group, mode, capital, and gate params. Also
+         *  syncs the underlying lab enrollment to match the symbol list and
+         *  arms the chosen mode (3b gate / monthly reinvest). */
+        @JavascriptInterface
+        fun bucketConfigure(ns: String, patchJson: String): String {
+            return try {
+                val cur = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
+                    ?: return "{\"ok\":false,\"error\":\"bucket not found\"}"
+                val p = org.json.JSONObject(patchJson)
+                val symbols = if (p.has("symbols")) {
+                    val arr = p.getJSONArray("symbols")
+                    (0 until arr.length()).map { arr.getString(it).trim().uppercase() }.filter { it.isNotBlank() }
+                } else cur.symbols
+                val mode = if (p.has("mode"))
+                    com.signalscope.app.data.BucketStore.Mode.valueOf(p.getString("mode")) else cur.mode
+                val liveAllow = if (p.has("liveAllowlist")) {
+                    val arr = p.getJSONArray("liveAllowlist")
+                    (0 until arr.length()).map { arr.getString(it).trim().uppercase() }.filter { it.isNotBlank() }
+                } else cur.liveAllowlist
+                // COST OVERRIDES. Absent key = leave as is; explicit JSON null =
+                // clear back to the config/setting; a number = use it, including
+                // 0. optDouble cannot express those three states, so read the
+                // key directly — using it here would turn "clear" into "zero"
+                // and silently claim the strategy trades for free.
+                val slipOv = when {
+                    !p.has("slippagePctOverride") -> cur.slippagePctOverride
+                    p.isNull("slippagePctOverride") -> null
+                    else -> p.getDouble("slippagePctOverride").coerceIn(0.0, 10.0)
+                }
+                val feeOv = when {
+                    !p.has("flatFeeOverride") -> cur.flatFeeOverride
+                    p.isNull("flatFeeOverride") -> null
+                    else -> p.getDouble("flatFeeOverride").coerceAtLeast(0.0)
+                }
+                val next = cur.copy(
+                    name = p.optString("name", cur.name),
+                    symbols = symbols, mode = mode,
+                    capital = p.optDouble("capital", cur.capital),
+                    holdN = p.optInt("holdN", cur.holdN),
+                    smoothing = p.optInt("smoothing", cur.smoothing),
+                    slippagePctOverride = slipOv,
+                    flatFeeOverride = feeOv,
+                    // Real money, either broker. This used to force `false` for any
+                    // non-Binance bucket on the grounds that "T212 is frozen anyway"
+                    // — true when the freeze was a compile-time const, and quietly
+                    // wrong once it became a switch the user can throw. It meant a
+                    // German algo could never be armed: the checkbox, the save path
+                    // and the mirror's own gate were all correct, and this line
+                    // discarded the answer before it reached disk.
+                    //
+                    // Arming is still not sufficient on its own — the master freeze,
+                    // the Settings mirror toggle and a non-empty allowlist must all
+                    // agree before a real stock order leaves the app.
+                    live = p.optBoolean("live", cur.live),
+                    liveBudget = p.optDouble("liveBudget", cur.liveBudget),
+                    liveAllowlist = liveAllow)
+                // A CHANGED COST INVALIDATES THE STORED REPLAY. That summary is
+                // a return produced under the old friction, and leaving it on
+                // the card next to the new setting would invite exactly the
+                // comparison it cannot support. Dropped, so the card asks for a
+                // fresh run rather than quoting a stale one.
+                if (next.slippagePctOverride != cur.slippagePctOverride ||
+                    next.flatFeeOverride != cur.flatFeeOverride) {
+                    try { com.signalscope.app.data.WhatIfStore.remove(applicationContext, ns) }
+                    catch (e: Exception) { Log.w(TAG, "what-if drop failed: ${e.message}") }
+                }
+                // §5.2 — REFUSE a config whose entry frame can never clear warmup
+                // on the deepest feed available. Silence was the original failure
+                // mode (a 240min config on a 15m/60d feed ran forever and could not
+                // fire a single signal), so this must fail loudly at save time.
+                val cfgNow = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                val planCheck = com.signalscope.app.trading.FeedPlan.plan(cfgNow, ns)
+                if (!planCheck.ok) return gson.toJson(mapOf("ok" to false,
+                    "error" to (planCheck.problem ?: "This config cannot clear its warmup on any available feed.")))
+                Log.i(TAG, "[$ns] engine feed → ${com.signalscope.app.trading.FeedPlan.describe(planCheck)}")
+
+                com.signalscope.app.data.BucketStore.update(applicationContext, next)
+
+                // Seat-reshape outcome, reported back so a change that could NOT be
+                // applied says so instead of appearing to have been accepted.
+                // Screener selection, per algo. Off = gate only, one seat per
+                // symbol, ranking never consulted — the way to run a single name.
+                val wantSelection = if (p.has("useScreenerSelection"))
+                    p.getBoolean("useScreenerSelection")
+                else try {
+                    com.signalscope.app.data.MacdGateStore.load(applicationContext, ns).useScreenerSelection
+                } catch (e: Exception) { true }
+                var gateReshapeBlocked = false
+                var gateHeldSeats = 0
+                var gateSeatsNow = 0
+
+                // ENROLLMENT OWNERSHIP depends on the mode:
+                //  • GATE_3B — `symbols` is the CANDIDATE UNIVERSE to rank, NOT the
+                //    basket. MacdGateEngine owns enrollment: it enrolls a name when
+                //    it fills a slot and unenrolls it on eject. Enrolling the whole
+                //    list here made the engine simulate every candidate (106 names →
+                //    24 "open" research trades) instead of the ≤holdN the gate picked.
+                //    So enrolled := exactly the names the gate currently holds; the
+                //    daily evaluation fills the rest.
+                //  • MANUAL / MONTHLY — `symbols` IS the basket, so enroll it as-is.
+                val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, ns)
+                val have = lab.enrolled.map { it.symbol.uppercase() }.toSet()
+                val want = if (mode == com.signalscope.app.data.BucketStore.Mode.GATE_3B)
+                    com.signalscope.app.data.MacdGateStore.load(applicationContext, ns)
+                        .slots.mapNotNull { it.symbol?.uppercase() }.toSet()
+                else symbols.toSet()
+                val exch = com.signalscope.app.trading.Spaces.exchangeOf(ns)
+                for (s in want - have) com.signalscope.app.data.StrategyLabStore.enroll(applicationContext, s, exch, ns)
+                for (s in have - want) com.signalscope.app.data.StrategyLabStore.unenroll(applicationContext, s, ns)
+
+                // Arm the chosen mode.
+                when (mode) {
+                    com.signalscope.app.data.BucketStore.Mode.GATE_3B -> {
+                        // §10 PRECEDENCE: config > UI. A JSON carrying the portfolio
+                        // knobs makes "run this file, get 374 trades" reproducible;
+                        // "set the Slots box to 5 first" is not, and that is exactly
+                        // how a silent mismatch survives. Log which source won.
+                        val effHoldN = cfgNow.topNOverride ?: next.holdN
+                        val effSmooth = cfgNow.slopeSmoothingOverride ?: next.smoothing
+                        val effConfirm = cfgNow.slopeConfirmDaysOverride ?: 1
+                        Log.i(TAG, "[$ns] gate params — " +
+                            "holdN=$effHoldN(${if (cfgNow.topNOverride != null) "config" else "UI"}) " +
+                            "smoothing=$effSmooth(${if (cfgNow.slopeSmoothingOverride != null) "config" else "UI"}) " +
+                            "confirmDays=$effConfirm(${if (cfgNow.slopeConfirmDaysOverride != null) "config" else "default"}) " +
+                            "lookback=${cfgNow.screenerLookbackOverride ?: 90}" +
+                            "(${if (cfgNow.screenerLookbackOverride != null) "config" else "default"})" +
+                            (cfgNow.reinvestStrategy?.let { " strategy=$it" } ?: ""))
+                        com.signalscope.app.data.MacdGateStore.mutate(applicationContext, ns) { st ->
+                            // Screener selection OFF ⇒ one seat per symbol, so the
+                            // ranking never decides anything and the gate alone governs
+                            // each name. Capital is still the bucket's, just divided
+                            // over more seats — total exposure is unchanged.
+                            // Seats must follow the selection setting being SAVED,
+                            // not the one already on disk. Reading the stored flag
+                            // here meant switching ranking off left the seat count
+                            // at its old value — the card kept saying 1/5 for a
+                            // one-company gate-only algo that should read 1/1.
+                            val seats = com.signalscope.app.data.MacdGateStore
+                                .effectiveHoldN(
+                                    st.copy(holdN = effHoldN, useScreenerSelection = wantSelection),
+                                    next.symbols.size)
+                            val per = next.capital / seats.coerceAtLeast(1)
+                            // lastEvalDay="" forces a re-evaluation on the Save & run
+                            // pass below, so a universe/holdN change takes effect now
+                            // instead of waiting for tomorrow's once-a-day window.
+                            val armed = st.copy(enabled = true, holdN = seats,
+                                smoothing = effSmooth, confirmDays = effConfirm,
+                                notionalPerSlot = per, lastEvalDay = "",
+                                useScreenerSelection = wantSelection)
+                            // The N cash slots must EXIST or the fill loop has nothing
+                            // to iterate and the gate silently never trades.
+                            //
+                            // RESHAPE ON COUNT *OR* CAPITAL. The old test looked only
+                            // at the seat count, so changing capital alone left the
+                            // seats and the injected total at their previous size —
+                            // and injected is the denominator of this algo's headline
+                            // return, which then measured performance against money
+                            // the algo no longer has. One card read "capital 400"
+                            // above "1000 of 1000 injected".
+                            //
+                            // Still never mid-position: splitting or merging seats
+                            // that hold shares would orphan or duplicate capital. But
+                            // a skip must now be REPORTED (see reshapeBlocked below)
+                            // rather than silently ignored, which is how a 6-seat
+                            // layout survived a change to 5 for weeks unnoticed.
+                            // "HOLDS A NAME" IS NOT "HOLDS SHARES". A seat is assigned
+                            // its symbol the moment the gate picks it, but the trade
+                            // only opens later, when the strategy's own entry fires —
+                            // so a seat can carry a name for days with every euro of
+                            // it still in cash. Blocking on the name meant the reshape
+                            // could never run: six seats stayed six, "1000 of 1000"
+                            // stayed stale, and the warning fired on a card that also
+                            // said "no open positions". Money at risk is the ledger's
+                            // answer, not the seat label's.
+                            val investedSyms = try {
+                                com.signalscope.app.data.StrategyLabStore
+                                    .load(applicationContext, ns).trades
+                                    .filter { it.status == "OPEN" }
+                                    .map { it.symbol.uppercase() }.toSet()
+                            } catch (e: Exception) { emptySet<String>() }
+                            val allCash = armed.slots.none {
+                                it.symbol?.uppercase()?.let { s -> s in investedSyms } == true
+                            }
+                            val wantsReshape = armed.slots.size != seats ||
+                                kotlin.math.abs(armed.injected - next.capital) > 0.01
+                            val needsInit = armed.slots.isEmpty() || (allCash && wantsReshape)
+                            gateReshapeBlocked = !armed.slots.isEmpty() && !allCash && wantsReshape
+                            gateHeldSeats = armed.slots.count {
+                                it.symbol?.uppercase()?.let { s -> s in investedSyms } == true
+                            }
+                            gateSeatsNow = if (needsInit) seats else armed.slots.size
+                            if (needsInit) {
+                                // KEEP THE MONEY, don't just report losing it.
+                                //
+                                // A rebuild used to re-derive every seat from the
+                                // CONFIGURED capital, so seats that had grown to 440
+                                // snapped back to 400 and 40 of real gains left the
+                                // book. Merely logging that is visibility, not a fix.
+                                //
+                                // The two reasons a rebuild happens want opposite
+                                // treatment, and the existing test already tells them
+                                // apart:
+                                //  - CAPITAL CHANGED — the user just declared a new
+                                //    total. Honour it; that is the whole point of
+                                //    typing a new number.
+                                //  - ONLY THE SEAT COUNT CHANGED — a layout change,
+                                //    not a funding decision. Redistribute what the
+                                //    seats are actually WORTH across the new count,
+                                //    and leave the injected baseline alone so the
+                                //    performance history survives re-shaping.
+                                val nowMs = System.currentTimeMillis()
+                                val beforeVal = com.signalscope.app.data.MacdGateStore
+                                    .totalValue(armed)
+                                val capitalChanged =
+                                    kotlin.math.abs(armed.injected - next.capital) > 0.01
+                                val keepGrowth = !capitalChanged && beforeVal > 0.0 &&
+                                    armed.slots.isNotEmpty()
+                                val perEff = if (keepGrowth) beforeVal / seats else per
+                                val injectedEff =
+                                    if (keepGrowth) armed.injected else perEff * seats
+                                val wasPct = if (armed.injected > 0.0)
+                                    (beforeVal / armed.injected - 1.0) * 100.0 else 0.0
+                                // Every running span ends here — a rebuild tears the
+                                // seats down, so leaving spans open would make later
+                                // trades appear to sit inside an enrollment that no
+                                // longer exists.
+                                val ended = com.signalscope.app.data.MacdGateStore
+                                    .closeAllEnrollments(armed, "seat_rebuild", nowMs)
+                                com.signalscope.app.data.MacdGateStore.appendLog(
+                                    ended.copy(
+                                        slots = (1..seats).map {
+                                            com.signalscope.app.data.MacdGateStore.Slot(
+                                                null, perEff, nowMs, 0, false)
+                                        },
+                                        injected = injectedEff),
+                                    "initialized $seats slots × ${"%.0f".format(perEff)}" +
+                                        (if (!st.useScreenerSelection) " (gate only — one seat per symbol)" else "") +
+                                        (if (armed.slots.isEmpty()) ""
+                                         else if (keepGrowth)
+                                            " — reshaped from ${armed.slots.size} seats, " +
+                                            "${"%.2f".format(beforeVal)} kept " +
+                                            "(${"%+.2f".format(wasPct)}% preserved)"
+                                         else
+                                            " — capital changed to ${"%.0f".format(next.capital)}, " +
+                                            "rebuilt from ${"%.2f".format(beforeVal)} " +
+                                            "(${"%+.2f".format(wasPct)}% discarded)"))
+                            }
+                            else armed
+                        }
+                    }
+                    else -> {
+                        // Non-gate modes: make sure the gate is off for this bucket.
+                        com.signalscope.app.data.MacdGateStore.mutate(applicationContext, ns) { it.copy(enabled = false) }
+                    }
+                }
+                com.signalscope.app.data.StrategyLabStore.setEnabled(applicationContext, true, ns)
+                com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, ns)
+                gson.toJson(mapOf("ok" to true,
+                    "reshapeBlocked" to gateReshapeBlocked,
+                    "heldSeats" to gateHeldSeats,
+                    "seatsNow" to gateSeatsNow))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Attach a config JSON file to a specific bucket namespace. */
+        @JavascriptInterface
+        fun bucketPickConfigFile(ns: String) {
+            configPickNs = ns
+            runOnUiThread {
+                try { configJsonPicker.launch(arrayOf("application/json", "text/plain", "*/*")) }
+                catch (e: Exception) { Log.e(TAG, "bucket config picker launch failed", e) }
+            }
+        }
+
+        /** Candle + entry/exit review for ONE symbol under a bucket's config →
+         *  window.onLabReview (same payload/chart the old lab used). */
+        @JavascriptInterface
+        fun bucketReview(ns: String, symbol: String) {
+            thread(isDaemon = true) {
+                val out = try {
+                    gson.toJson(com.signalscope.app.trading.StrategyLabRunner.reviewPayload(applicationContext, ns, symbol))
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("symbol" to symbol, "error" to (e.message ?: "review failed")))
+                }
+                deliverAiCallback("window.onLabReview", out)
+            }
+        }
+
+        /** Force a paper evaluation of a bucket now. */
+        @JavascriptInterface
+        fun bucketRunNow(ns: String) {
+            com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, ns)
+        }
+
+        /**
+         * Can this algo's portfolio layer be replayed at all? Reads local state
+         * only (config, feed plan, bucket, gate) — no network — so the UI can warn
+         * BEFORE starting a fetch that would take minutes and then fail anyway.
+         * Returns {ok, warn, title, detail, fix}.
+         */
+        @JavascriptInterface
+        fun bucketPortfolioFeasible(ns: String): String {
+            return try {
+                val f = com.signalscope.app.trading.StrategyLabRunner
+                    .portfolioFeasibility(applicationContext, ns)
+                gson.toJson(mapOf("ok" to f.ok, "warn" to f.warn,
+                    "title" to f.title, "detail" to f.detail, "fix" to f.fix))
+            } catch (e: Exception) {
+                // Never block the action on a check failure — let the real run report.
+                gson.toJson(mapOf("ok" to true, "warn" to false))
+            }
+        }
+
+        /**
+         * Export the PORTFOLIO layer: three joined CSVs (trades / enrollments /
+         * equity) sharing one run_id. Distinct from bucketExportTrades, which dumps
+         * the ENGINE layer — that file cannot show what 3b did, because 3b only
+         * holds a name while it is enrolled and the engine replays every symbol
+         * over its whole history.
+         */
+        @JavascriptInterface
+        fun bucketExportPortfolio(ns: String) {
+            thread(isDaemon = true) {
+                val res = try {
+                    com.signalscope.app.trading.StrategyLabRunner.portfolioCsv(applicationContext, ns)
+                } catch (e: Exception) {
+                    com.signalscope.app.trading.StrategyLabRunner.PortfolioCsv(
+                        false, e.message ?: "export failed")
+                }
+                if (!res.ok) {
+                    deliverAiCallback("window.onPortfolioCsv",
+                        gson.toJson(mapOf("ok" to false, "note" to res.note)))
+                    return@thread
+                }
+                try {
+                    val uris = ArrayList<android.net.Uri>()
+                    for (f in res.files) {
+                        val file = java.io.File(cacheDir, f.name)
+                        file.writeText(f.content)
+                        uris.add(androidx.core.content.FileProvider.getUriForFile(
+                            this@MainActivity, "$packageName.fileprovider", file))
+                    }
+                    runOnUiThread {
+                        try {
+                            val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                type = "text/csv"
+                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                                putExtra(Intent.EXTRA_SUBJECT, res.runId)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(send, "Export portfolio CSVs"))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "share portfolio csvs failed", e)
+                        }
+                    }
+                    deliverAiCallback("window.onPortfolioCsv", gson.toJson(mapOf(
+                        "ok" to true, "runId" to res.runId, "note" to res.note,
+                        "files" to res.files.map { it.name },
+                        "trades" to res.trades, "enrollments" to res.enrollments,
+                        "equityDays" to res.equityDays, "universeSize" to res.universeSize,
+                        "seats" to res.seats, "symbolsTraded" to res.symbolsTraded,
+                        "neverTraded" to res.neverTraded)))
+                } catch (e: Exception) {
+                    deliverAiCallback("window.onPortfolioCsv", gson.toJson(mapOf(
+                        "ok" to false, "note" to (e.message ?: "write failed"))))
+                }
+            }
+        }
+
+        /**
+         * Export this algo's ENGINE-layer trades over the live window as a flat CSV.
+         * Useful for signal-level debugging against Python, but it is NOT the
+         * strategy: it replays each symbol independently over its full history, so
+         * for a 3b algo most rows are trades the portfolio never took. Use
+         * bucketExportPortfolio to audit what 3b actually did. → window.onTradesCsv.
+         */
+        /**
+         * Export the LIVE ledger and its seat spans — what this phone actually did.
+         *
+         * The portfolio export next to it runs a fresh simulation and reads no live
+         * state at all, so it cannot show a defect that exists only in the live
+         * path. This one reads nothing but stored state, which is why it is the one
+         * that can answer "did every trade sit inside its own seat's span".
+         * → window.onLiveLedgerCsv.
+         */
+        @JavascriptInterface
+        fun bucketExportLive(ns: String) {
+            thread(isDaemon = true) {
+                val res = try {
+                    com.signalscope.app.trading.StrategyLabRunner.liveLedgerCsv(applicationContext, ns)
+                } catch (e: Exception) {
+                    com.signalscope.app.trading.StrategyLabRunner.LiveLedgerCsv(
+                        false, e.message ?: "export failed")
+                }
+                if (!res.ok) {
+                    deliverAiCallback("window.onLiveLedgerCsv",
+                        gson.toJson(mapOf("ok" to false, "note" to res.note)))
+                    return@thread
+                }
+                try {
+                    val uris = ArrayList<android.net.Uri>()
+                    for (f in res.files) {
+                        val file = java.io.File(cacheDir, f.name)
+                        file.writeText(f.content)
+                        uris.add(androidx.core.content.FileProvider.getUriForFile(
+                            this@MainActivity, "$packageName.fileprovider", file))
+                    }
+                    runOnUiThread {
+                        try {
+                            val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                                type = "text/csv"
+                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                                putExtra(Intent.EXTRA_SUBJECT, res.runId)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(send, "Export live ledger CSVs"))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "share live ledger csvs failed", e)
+                        }
+                    }
+                    deliverAiCallback("window.onLiveLedgerCsv", gson.toJson(mapOf(
+                        "ok" to true, "note" to res.note, "runId" to res.runId,
+                        "trades" to res.trades, "spans" to res.spans,
+                        "orphans" to res.orphans, "unknown" to res.unknown,
+                        "warmupViolations" to res.warmupViolations)))
+                } catch (e: Exception) {
+                    deliverAiCallback("window.onLiveLedgerCsv",
+                        gson.toJson(mapOf("ok" to false, "note" to (e.message ?: "write failed"))))
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun bucketExportTrades(ns: String) {
+            thread(isDaemon = true) {
+                val res = try {
+                    com.signalscope.app.trading.StrategyLabRunner.tradesCsv(applicationContext, ns)
+                } catch (e: Exception) {
+                    com.signalscope.app.trading.StrategyLabRunner.TradesCsv(false, e.message ?: "export failed")
+                }
+                if (!res.ok) {
+                    deliverAiCallback("window.onTradesCsv",
+                        gson.toJson(mapOf("ok" to false, "note" to res.note)))
+                    return@thread
+                }
+                try {
+                    val f = java.io.File(cacheDir, res.fileName)
+                    f.writeText(res.content)
+                    runOnUiThread {
+                        try {
+                            val uri = androidx.core.content.FileProvider.getUriForFile(
+                                this@MainActivity, "$packageName.fileprovider", f)
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/csv"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putExtra(Intent.EXTRA_SUBJECT, res.fileName)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(Intent.createChooser(send, "Export trades CSV"))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "share trades csv failed", e)
+                        }
+                    }
+                    deliverAiCallback("window.onTradesCsv", gson.toJson(mapOf(
+                        "ok" to true, "trades" to res.trades, "symbols" to res.symbols,
+                        "file" to res.fileName)))
+                } catch (e: Exception) {
+                    deliverAiCallback("window.onTradesCsv",
+                        gson.toJson(mapOf("ok" to false, "note" to (e.message ?: "write failed"))))
+                }
+            }
+        }
+
+        /**
+         * IMMEDIATE real-money disarm for ONE algo. Flips live=false and nothing
+         * else, the moment the user unticks the box.
+         *
+         * Deliberately NOT routed through bucketConfigure: that path validates the
+         * config (feed/warmup) and can REFUSE the save — which would silently leave
+         * the algo ARMED after the user asked to disarm it. Same asymmetry as the
+         * rest of the live mirror: reducing risk is never gated, adding risk is.
+         * Exits are unaffected — an already-open real position can still be sold.
+         */
+        @JavascriptInterface
+        fun bucketDisarmLive(ns: String): String {
+            return try {
+                val b = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
+                    ?: return "{\"ok\":false,\"error\":\"algo not found\"}"
+                com.signalscope.app.data.BucketStore.update(applicationContext, b.copy(live = false))
+                // Count against the RIGHT broker. This read Binance unconditionally,
+                // so disarming a German algo would always report "0 open" — exactly
+                // when knowing a real position is still out there matters most.
+                val openLive = if (b.space == "binance")
+                    com.signalscope.app.data.BinanceLiveStore
+                        .load(applicationContext, ns).trades.count { it.status == "OPEN" }
+                else com.signalscope.app.data.T212LiveStore.load(applicationContext)
+                    .trades.count { it.ns == ns && (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
+                Log.w(TAG, "[$ns] REAL orders DISARMED by user (open live positions: $openLive)")
+                gson.toJson(mapOf("ok" to true, "openLive" to openLive))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** "What would this algo have made?" — replays the CURRENT config over the
+         *  live data window the engine already fetches (no CSV needed) and reports
+         *  the net P&L plus the exact horizon it covers. Read-only.
+         *  Result → window.onBucketHypothetical. */
+        @JavascriptInterface
+        fun bucketHypothetical(ns: String) {
+            thread(isDaemon = true) {
+                val out = try {
+                    val b = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
+                    val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                    val cap = b?.capital ?: cfg.notional
+                    val r = com.signalscope.app.trading.StrategyLabRunner
+                        .hypothetical(applicationContext, ns, cap)
+                    // Keep the result so the algos comparison table can show it
+                    // without re-running a multi-minute fetch per algo. Slippage and
+                    // frames are stored WITH it — a return is not interpretable
+                    // without the assumptions that produced it.
+                    if (r.ok) try {
+                        com.signalscope.app.data.WhatIfStore.put(applicationContext,
+                            com.signalscope.app.data.WhatIfStore.Summary(
+                                ns = ns, name = b?.name ?: ns,
+                                computedAt = System.currentTimeMillis(),
+                                layer = r.layer,
+                                configSource = com.signalscope.app.data.StrategyLabStore
+                                    .load(applicationContext, ns).configSource,
+                                slippagePct = cfg.slippagePct,
+                                entryTf = r.entryTf, exitTf = r.exitTf, interval = r.interval,
+                                compoundedPct = r.compoundedPct, cagrPct = r.cagrPct,
+                                maxDrawdownPct = r.maxDrawdownPct, spanDays = r.spanDays,
+                                fromTs = r.fromTs, toTs = r.toTs,
+                                closed = r.closed, symbols = r.symbols, seats = r.holdN,
+                                note = r.note))
+                    } catch (e: Exception) { Log.w(TAG, "what-if summary save failed", e) }
+                    gson.toJson(r)
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "note" to (e.message ?: "what-if failed")))
+                }
+                deliverAiCallback("window.onBucketHypothetical", out)
+            }
+        }
+
+        /**
+         * Recent REAL T212 fills, each attributed to the algo that placed it.
+         *
+         * ATTRIBUTION IS BY ORDER ID, captured at placement time: the mirror stores
+         * the id T212 returned against (ns, paperTradeId), so matching is exact and
+         * needs no guessing from symbol+timestamp — which would be ambiguous anyway,
+         * since several German algos share one universe and can enter the same
+         * ticker on the same bar. Anything with no stored id is a MANUAL order (or
+         * one placed before this wiring existed) and is labelled as such rather
+         * than being force-fitted to an algo.
+         *
+         * Doubles as the smoke test for fetchOrderHistory — if the endpoint path or
+         * key scopes are wrong, this is where it says so.
+         */
+        @JavascriptInterface
+        fun t212Fills(limit: Int): String {
+            return try {
+                val cfg = com.signalscope.app.data.ConfigManager(applicationContext)
+                if (!cfg.hasT212Credentials)
+                    return gson.toJson(mapOf("ok" to false,
+                        "error" to "No T212 API key saved — add it in Settings first."))
+                val client = com.signalscope.app.network.Trading212Client(cfg)
+                val fills = when (val r = client.fetchOrderHistory(limit.coerceIn(1, 50))) {
+                    is com.signalscope.app.network.Trading212Client.T212Result.Success -> r.data
+                    is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
+                        return gson.toJson(mapOf("ok" to false, "error" to r.message))
+                    else -> return gson.toJson(mapOf("ok" to false, "error" to "T212 not configured"))
+                }
+                val mirrored = com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
+                // orderId -> the algo row that placed it, plus which leg it was.
+                // EVERY rung maps back, not just the first: a patient ladder's later
+                // rungs would otherwise show up as "manual / unmatched" in this list
+                // — the exact orders that cost the most, attributed to nobody.
+                val byBuy = HashMap<Long, com.signalscope.app.data.T212LiveStore.LiveTrade>()
+                val bySell = HashMap<Long, com.signalscope.app.data.T212LiveStore.LiveTrade>()
+                mirrored.forEach { t ->
+                    t.allBuyIds().forEach { byBuy[it] = t }
+                    t.allSellIds().forEach { bySell[it] = t }
+                }
+                val nameOf = HashMap<String, String>()
+                fun algoName(ns: String): String {
+                    if (ns.isBlank()) return "—"
+                    return nameOf.getOrPut(ns) {
+                        com.signalscope.app.data.BucketStore.get(applicationContext, ns)?.name ?: ns
+                    }
+                }
+                // The constant the paper ledger CHARGES ITSELF. StrategyLabEngine
+                // subtracts slippagePct once per CLOSED ROUND TRIP, not per leg —
+                // which is why the honest comparison below pairs the two legs before
+                // measuring. Comparing it against a per-leg median would flatter the
+                // strategy by exactly a factor of two.
+                val assumedFor = HashMap<String, Double>()
+                fun assumedOf(ns: String): Double = assumedFor.getOrPut(ns) {
+                    try { com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns).slippagePct }
+                    catch (e: Exception) { 0.0 }
+                }
+                val rows = fills.map { f ->
+                    val m = byBuy[f.orderId] ?: bySell[f.orderId]
+                    val leg = if (byBuy.containsKey(f.orderId)) "ENTRY"
+                              else if (bySell.containsKey(f.orderId)) "EXIT" else ""
+                    val paper = when (leg) {
+                        "ENTRY" -> m?.paperEntryPrice ?: 0.0
+                        "EXIT" -> m?.paperExitPrice ?: 0.0
+                        else -> 0.0
+                    }
+                    val legIds = when (leg) {
+                        "ENTRY" -> m?.allBuyIds()
+                        "EXIT" -> m?.allSellIds()
+                        else -> null
+                    }
+                    // Signed so it reads the way a trader expects: POSITIVE = worse
+                    // for you. Paid above the paper price on a buy, or sold below it
+                    // on a sell. Both directions occur; the MEAN is the real cost.
+                    val slipPct = if (paper > 0.0 && f.fillPrice > 0.0) {
+                        if (leg == "EXIT") (paper - f.fillPrice) / paper * 100.0
+                        else (f.fillPrice - paper) / paper * 100.0
+                    } else null
+                    // Price improvement vs the limit we placed: POSITIVE = the ladder
+                    // got a better price than it asked for (bought below / sold above).
+                    // This is the patient executor's own scorecard, independent of any
+                    // paper comparison — it exists even for manual orders.
+                    val impPct = if (f.limitPrice > 0.0 && f.fillPrice > 0.0) {
+                        if (f.side == "SELL") (f.fillPrice - f.limitPrice) / f.limitPrice * 100.0
+                        else (f.limitPrice - f.fillPrice) / f.limitPrice * 100.0
+                    } else null
+                    mapOf(
+                        "orderId" to f.orderId, "ticker" to f.ticker, "side" to f.side,
+                        "qty" to f.filledQuantity, "price" to f.fillPrice,
+                        "limitPrice" to f.limitPrice, "improvedPct" to impPct,
+                        "value" to f.filledValue, "time" to f.dateExecuted,
+                        "status" to f.status,
+                        "algo" to (m?.let { algoName(it.ns) } ?: "manual"),
+                        "matched" to (m != null), "leg" to leg,
+                        "symbol" to (m?.symbol ?: ""),
+                        "paperPrice" to paper, "slipPct" to slipPct,
+                        "assumedPct" to m?.let { assumedOf(it.ns) },
+                        // WHICH RUNG of the ladder this order was. Without it a leg
+                        // that filled across six orders reads as six unrelated trades
+                        // in the same name, which is how a partial fill gets mistaken
+                        // for over-trading.
+                        "rungIdx" to legIds?.indexOf(f.orderId)?.takeIf { it >= 0 }?.plus(1),
+                        "rungTotal" to legIds?.size)
+                }
+                // ── ROUND TRIPS: assumed vs measured, the only fair comparison ──
+                // Built from the RECONCILED weighted averages, not from a single
+                // fill row: one rung of a six-rung ladder is not the trade's price.
+                // Both legs must be complete — a buy whose sell is still filling has
+                // half a cost and would drag every average down.
+                val roundTrips = mirrored.mapNotNull { t ->
+                    if (!t.buyComplete() || !t.sellComplete()) return@mapNotNull null
+                    val pe = t.paperEntryPrice
+                    val px = t.paperExitPrice ?: 0.0
+                    if (pe <= 0.0 || px <= 0.0 || t.liveEntryPrice <= 0.0 || t.liveExitPrice <= 0.0)
+                        return@mapNotNull null
+                    val entrySlip = (t.liveEntryPrice - pe) / pe * 100.0   // + = paid more
+                    val exitSlip = (px - t.liveExitPrice) / px * 100.0     // + = sold lower
+                    val measured = entrySlip + exitSlip
+                    val assumed = assumedOf(t.ns)
+                    // SPLIT THE ENTRY COST INTO ITS TWO CAUSES. Latency is the market
+                    // moving between the signal bar's close and the order going out —
+                    // fixed by ticking faster. Execution is the ladder's own cost from
+                    // its anchor to the fill — fixed by changing the ladder. Reported
+                    // as one number they are unactionable; the fix for one does
+                    // nothing for the other.
+                    val ref = t.refEntryPrice
+                    val latency = if (ref > 0.0) (ref - pe) / pe * 100.0 else null
+                    val exec = if (ref > 0.0) (t.liveEntryPrice - ref) / ref * 100.0 else null
+                    // A BENCH row has no config, so assumedOf() hands back the
+                    // StrategyLabConfig default (0.05%), NOT the 0.20% the German
+                    // algos actually charge themselves. Flagged so the panel can say
+                    // so — otherwise the reference line silently answers a different
+                    // question from the one being asked.
+                    val isBench = t.ns == com.signalscope.app.trading.LiveTestBench.NS
+                    mapOf("symbol" to t.symbol,
+                        "algo" to (if (isBench) "test bench" else algoName(t.ns)),
+                        "isBench" to isBench,
+                        "entrySlipPct" to entrySlip, "exitSlipPct" to exitSlip,
+                        "measuredPct" to measured, "assumedPct" to assumed,
+                        "deviationPct" to (measured - assumed),
+                        "latencyPct" to latency, "execPct" to exec,
+                        "rungs" to (t.allBuyIds().size + t.allSellIds().size),
+                        "paperEntry" to pe, "liveEntry" to t.liveEntryPrice,
+                        "paperExit" to px, "liveExit" to t.liveExitPrice,
+                        "closedAt" to (t.exitTs ?: 0L))
+                }.sortedBy { it["closedAt"] as? Long ?: 0L }
+                // Legs still filling — shown so a stuck ladder is visible rather than
+                // just absent from the averages.
+                val pendingLegs = mirrored.count {
+                    (it.allBuyIds().isNotEmpty() && !it.buyComplete()) ||
+                    (it.allSellIds().isNotEmpty() && !it.sellComplete())
+                }
+                val rtMeasured = roundTrips.mapNotNull { it["measuredPct"] as? Double }.sorted()
+                val rtAssumed = roundTrips.mapNotNull { it["assumedPct"] as? Double }
+                // Every T212-eligible algo's assumed constant, so the panel can state
+                // what is being trusted even before a single real round trip exists.
+                val assumedByAlgo = (com.signalscope.app.data.BucketStore.allNamespaces(applicationContext)
+                    + listOf("us", "de"))
+                    .filter { com.signalscope.app.trading.Spaces.baseOf(it).let { b -> b == "us" || b == "de" } }
+                    .distinct()
+                    .mapNotNull { n ->
+                        val a = assumedOf(n)
+                        if (a <= 0.0) null else mapOf("algo" to algoName(n), "ns" to n, "assumedPct" to a)
+                    }
+                // Nothing parsed → attach the raw payload. Otherwise "responded but
+                // returned no executed orders" is indistinguishable from an empty
+                // account, and there is no way to tell from the phone which it is.
+                val rawDiag = if (rows.isEmpty()) {
+                    when (val d = client.fetchOrderHistoryRaw(limit.coerceIn(1, 50))) {
+                        is com.signalscope.app.network.Trading212Client.T212Result.Success -> d.data
+                        is com.signalscope.app.network.Trading212Client.T212Result.Failure -> d.message
+                        else -> null
+                    }
+                } else null
+                val slips = rows.mapNotNull { it["slipPct"] as? Double }.sorted()
+                // A true median: with an EVEN count, average the two middle values.
+                // `sorted[size/2]` picks the upper one, so at 2 samples it reported
+                // the worse fill and called it the median — the first bench run read
+                // "median +0.297%" from [-0.215, +0.297], where the honest answer is
+                // +0.041%. Small samples are exactly when this is most misleading.
+                fun medianOf(xs: List<Double>): Double? = when {
+                    xs.isEmpty() -> null
+                    xs.size % 2 == 1 -> xs[xs.size / 2]
+                    else -> (xs[xs.size / 2 - 1] + xs[xs.size / 2]) / 2.0
+                }
+                gson.toJson(mapOf("ok" to true, "fills" to rows,
+                    "raw" to rawDiag,
+                    "matchedCount" to rows.count { it["matched"] == true },
+                    "slipSamples" to slips.size,
+                    "slipMean" to (if (slips.isEmpty()) null else slips.average()),
+                    "slipMedian" to medianOf(slips),
+                    // Round-trip layer: what the config ASSUMED vs what the broker
+                    // actually charged, per completed trade and in aggregate.
+                    "roundTrips" to roundTrips,
+                    "rtCount" to roundTrips.size,
+                    "rtMeasuredMean" to (if (rtMeasured.isEmpty()) null else rtMeasured.average()),
+                    "rtMeasuredMedian" to medianOf(rtMeasured),
+                    "rtAssumedMean" to (if (rtAssumed.isEmpty()) null else rtAssumed.average()),
+                    "assumedByAlgo" to assumedByAlgo,
+                    "pendingLegs" to pendingLegs,
+                    "drag" to com.signalscope.app.trading.SlippageStats.toMap(
+                        com.signalscope.app.trading.SlippageStats.compute(
+                            com.signalscope.app.trading.T212LiveMirror.slippageSamples(applicationContext)))))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * Ledger-vs-broker position reconciliation.
+         *
+         * [force] = true does the network round trip; false returns the cached
+         * report so the banner can render on every repaint without hammering the
+         * API (T212 rate-limits portfolio reads).
+         */
+        @JavascriptInterface
+        fun t212PositionAudit(force: Boolean): String {
+            return try {
+                val r = if (force) com.signalscope.app.trading.T212PositionAudit.run(applicationContext)
+                        else com.signalscope.app.trading.T212PositionAudit.last(applicationContext)
+                gson.toJson(mapOf(
+                    "ok" to r.ok, "error" to r.error, "checkedAt" to r.checkedAt,
+                    "positionsSeen" to r.positionsSeen, "rowsChecked" to r.rowsChecked,
+                    "criticalCount" to r.critical.size,
+                    "drifts" to r.drifts.map { d ->
+                        mapOf("kind" to d.kind, "ticker" to d.ticker, "symbol" to d.symbol,
+                            // WHOSE POSITION IS THIS. The whole point of the row is to
+                            // send you somewhere to fix it, so an internal namespace is
+                            // a dead end — the bench's own id read as a nonexistent algo
+                            // and sent the reader hunting through six cards for a trade
+                            // no algo had. Resolve to the name shown on the card, and
+                            // name the bench explicitly as not-an-algo.
+                            "algos" to d.algos.map { n ->
+                                when {
+                                    n == com.signalscope.app.trading.LiveTestBench.NS ->
+                                        "the test bench (not an algo)"
+                                    else -> com.signalscope.app.data.BucketStore
+                                        .get(applicationContext, n)?.name
+                                        ?: "a deleted algo"
+                                }
+                            },
+                            // Lets the page route the fix: bench rows are cleared from
+                            // the bench panel, algo rows from the algo's own card.
+                            "isBench" to d.algos.any {
+                                it == com.signalscope.app.trading.LiveTestBench.NS },
+                            // THE RAW NAMESPACES, so the row can ACT and not merely
+                            // point. Only display names were sent, which meant the
+                            // banner could name the owner but had no way to call
+                            // anything — and its instruction ("open that algo and
+                            // mark it sold by hand") becomes impossible to follow
+                            // the moment the algo's paper book is reset, because
+                            // that control only exists on an open paper row.
+                            "nsList" to d.algos,
+                            "expectedQty" to d.expectedQty, "actualQty" to d.actualQty,
+                            "deltaQty" to d.deltaQty, "actualValue" to d.actualValue)
+                    }))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * LIVE TEST BENCH — fire ONE small real trade through the algos' own
+         * execution path and watch every link in the chain.
+         *
+         * Runs on a background thread and reports through the SAME
+         * window.onT212PatientProgress channel the Portfolio ladder uses, so the
+         * existing progress renderer works unchanged. Blocking: a six-rung ladder
+         * dwells per rung, so this can take minutes — which is exactly why it must
+         * never be called from a tick.
+         */
+        @JavascriptInterface
+        fun benchBuy(symbol: String, space: String, amount: Double): String {
+            if (!benchBusy.compareAndSet(false, true)) return gson.toJson(mapOf("ok" to false,
+                "error" to "A bench order is already running. One at a time — that is the point."))
+            thread(isDaemon = true) {
+                val out = try {
+                    com.signalscope.app.trading.LiveTestBench.buy(
+                        applicationContext, symbol, space, amount, patientProgressSink())
+                } catch (e: Exception) {
+                    com.signalscope.app.trading.LiveTestBench.Outcome(
+                        false, "execute", e.message ?: "unknown")
+                } finally { benchBusy.set(false) }
+                deliverAiCallback("window.onBenchResult", gson.toJson(benchOut(out)))
+            }
+            return gson.toJson(mapOf("ok" to true, "started" to true))
+        }
+
+        @JavascriptInterface
+        fun benchSell(paperTradeId: String, space: String): String {
+            if (!benchBusy.compareAndSet(false, true)) return gson.toJson(mapOf("ok" to false,
+                "error" to "A bench order is already running."))
+            thread(isDaemon = true) {
+                val out = try {
+                    com.signalscope.app.trading.LiveTestBench.sell(
+                        applicationContext, paperTradeId, space, patientProgressSink())
+                } catch (e: Exception) {
+                    com.signalscope.app.trading.LiveTestBench.Outcome(
+                        false, "execute", e.message ?: "unknown")
+                } finally { benchBusy.set(false) }
+                deliverAiCallback("window.onBenchResult", gson.toJson(benchOut(out)))
+            }
+            return gson.toJson(mapOf("ok" to true, "started" to true))
+        }
+
+        private fun benchOut(o: com.signalscope.app.trading.LiveTestBench.Outcome) = mapOf(
+            "ok" to o.ok, "stage" to o.stage, "error" to o.error,
+            "ticker" to o.ticker, "symbol" to o.symbol, "side" to o.side,
+            "refPrice" to o.refPrice, "quotePrice" to o.quotePrice,
+            "filled" to o.filled, "remaining" to o.remaining,
+            "rungs" to o.orderIds.size, "atr" to o.atr, "note" to o.note,
+            "id" to o.paperTradeId, "anchorSource" to o.anchorSource)
+
+        /**
+         * Every bench trade with its full price chain resolved. This is the table
+         * that answers "does the app's book match reality" line by line: what the
+         * decision saw, what the ladder anchored on, what actually filled, how many
+         * shares, over how many rungs.
+         */
+        @JavascriptInterface
+        fun benchRows(): String {
+            return try {
+                val rows = com.signalscope.app.trading.LiveTestBench.rows(applicationContext)
+                gson.toJson(mapOf("ok" to true, "busy" to benchBusy.get(),
+                    "rows" to rows.map { t ->
+                        val entryChain = if (t.paperEntryPrice > 0.0 && t.liveEntryPrice > 0.0)
+                            (t.liveEntryPrice - t.paperEntryPrice) / t.paperEntryPrice * 100.0 else null
+                        val exitChain = if ((t.paperExitPrice ?: 0.0) > 0.0 && t.liveExitPrice > 0.0)
+                            (t.paperExitPrice!! - t.liveExitPrice) / t.paperExitPrice!! * 100.0 else null
+                        mapOf(
+                            "id" to t.paperTradeId, "symbol" to t.symbol, "ticker" to t.t212Ticker,
+                            "status" to t.status, "entryTs" to t.entryTs, "exitTs" to t.exitTs,
+                            "signalEntry" to t.paperEntryPrice, "anchorEntry" to t.refEntryPrice,
+                            "fillEntry" to t.liveEntryPrice,
+                            "signalExit" to (t.paperExitPrice ?: 0.0), "anchorExit" to t.refExitPrice,
+                            "fillExit" to t.liveExitPrice,
+                            "qtyOrdered" to t.qty, "qtyFilled" to t.liveQtyFilled,
+                            "qtyExited" to t.liveExitQty,
+                            "buyRungs" to t.allBuyIds().size, "buyRungsSeen" to t.buyRungsSeen,
+                            "sellRungs" to t.allSellIds().size, "sellRungsSeen" to t.sellRungsSeen,
+                            "entryValue" to t.liveEntryValue, "exitValue" to t.liveExitValue,
+                            "entrySlipPct" to entryChain, "exitSlipPct" to exitChain,
+                            // What an exit would actually sell, and how much of the
+                            // pooled T212 position belongs to someone else. Shown
+                            // before the tap, because "sell it back" silently
+                            // liquidating a shared holding is not recoverable.
+                            // Real cash the exit brought in from shares this row never
+                            // owned. Shown on its own line so it can never be mistaken
+                            // for strategy return.
+                            "sweptQty" to t.sweptQty,
+                            "sweptValue" to t.sweptValue(),
+                            "sellQty" to (if (t.liveQtyFilled > 0.0) t.liveQtyFilled else t.qty),
+                            "otherClaims" to com.signalscope.app.data.T212LiveStore.otherClaimsQty(
+                                applicationContext, t.t212Ticker,
+                                com.signalscope.app.trading.LiveTestBench.NS, t.paperTradeId),
+                            "error" to t.error)
+                    }))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** Read fills for bench rows on demand — the bench is used interactively
+         *  and should not wait for the hourly tick to learn what it paid. */
+        @JavascriptInterface
+        fun benchReconcile(): String {
+            return try {
+                val n = com.signalscope.app.trading.T212LiveMirror.reconcileFills(applicationContext)
+                val audit = com.signalscope.app.trading.T212PositionAudit.run(applicationContext)
+                gson.toJson(mapOf("ok" to true, "updated" to n,
+                    "auditOk" to audit.ok, "criticalCount" to audit.critical.size,
+                    "auditError" to audit.error))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * WILL THE ACCOUNT COVER WHAT THE ARMED ALGOS CAN SPEND?
+         *
+         * Worst case, not expected case: every armed algo fills every seat it has
+         * left to fill, all at once. That is not a pessimistic invention — the gate
+         * evaluates all seats in one pass, so a day when several names turn eligible
+         * together is exactly when the whole commitment lands at once, and it is
+         * also the day a shortfall is most expensive: the orders that fail are the
+         * ones the strategy most wanted.
+         *
+         *   commitment = Σ each armed algo's budget
+         *   deployed   = what its open live positions already cost
+         *   still to spend = commitment − deployed
+         *
+         * Compared against free cash. Pure local read — the balance was cached by
+         * the reconciliation pass, which is already on the network.
+         */
+        @JavascriptInterface
+        fun t212CashCommitment(): String {
+            return try {
+                val rows = com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
+                var commitment = 0.0
+                var deployed = 0.0
+                var armed = 0
+                val perAlgo = ArrayList<Map<String, Any?>>()
+                for (n in com.signalscope.app.data.BucketStore.allNamespaces(applicationContext)) {
+                    if (com.signalscope.app.trading.Spaces.baseOf(n).let { it != "de" && it != "us" }) continue
+                    val b = com.signalscope.app.data.BucketStore.get(applicationContext, n) ?: continue
+                    if (!b.live || b.liveBudget <= 0.0 || b.liveAllowlist.isEmpty()) continue
+                    armed++
+                    val spent = rows.filter { it.ns == n && it.status in setOf("OPEN", "PENDING", "EXITING") }
+                        .sumOf { it.liveEntryValue }
+                    commitment += b.liveBudget
+                    deployed += spent
+                    perAlgo.add(mapOf("name" to b.name, "budget" to b.liveBudget,
+                        "deployed" to spent, "remaining" to (b.liveBudget - spent).coerceAtLeast(0.0)))
+                }
+                val stillToSpend = (commitment - deployed).coerceAtLeast(0.0)
+                val free = config.t212FreeFundsCached
+                val at = config.t212FreeFundsAt
+                // A negative cache means "never read" — report unknown rather than
+                // a shortfall, because a false alarm here trains you to ignore it.
+                val known = free >= 0.0 && at > 0L
+                gson.toJson(mapOf("ok" to true,
+                    "known" to known, "free" to free, "checkedAt" to at,
+                    "commitment" to commitment, "deployed" to deployed,
+                    "stillToSpend" to stillToSpend,
+                    "shortfall" to (if (known) (stillToSpend - free).coerceAtLeast(0.0) else 0.0),
+                    "armed" to armed, "frozen" to config.t212LiveFrozen,
+                    "currency" to (if (com.signalscope.app.trading.Spaces.baseOf(
+                            bucketBaseNs("DE")) == "de") "EUR" else "EUR"),
+                    "algos" to perAlgo))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** India's four gates, same shape as the T212 strip. */
+        @JavascriptInterface
+        fun zerodhaLiveGates(): String {
+            return try {
+                val armed = com.signalscope.app.trading.ZerodhaLiveMirror
+                    .armedAlgos(applicationContext).map { (n, name) ->
+                        val b = com.signalscope.app.data.BucketStore.get(applicationContext, n)
+                        mapOf("ns" to n, "name" to name,
+                            "budget" to (b?.liveBudget ?: 0.0),
+                            "names" to (b?.liveAllowlist?.size ?: 0))
+                    }
+                gson.toJson(mapOf("ok" to true,
+                    "frozen" to config.zerodhaLiveFrozen,
+                    "mirrorEnabled" to config.zerodhaLiveMirrorEnabled,
+                    "configured" to config.isZerodhaConnected,
+                    "armedAlgos" to armed,
+                    "canTrade" to (config.canMirrorZerodhaLive && armed.isNotEmpty())))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** Flip India's master freeze. [frozen] is the state to END UP IN. */
+        @JavascriptInterface
+        fun zerodhaSetLiveFrozen(frozen: Boolean): String {
+            return try {
+                config.zerodhaLiveFrozen = frozen
+                Log.w(TAG, "Zerodha live freeze set to $frozen by user")
+                gson.toJson(mapOf("ok" to true, "frozen" to config.zerodhaLiveFrozen))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * The T212 live master switch, and everything that gates it.
+         *
+         * Returns all four gates so the UI can say exactly WHY nothing would trade,
+         * rather than showing one toggle that silently does nothing because a
+         * different gate is shut.
+         */
+        @JavascriptInterface
+        fun t212LiveGates(): String {
+            return try {
+                val armed = com.signalscope.app.data.BucketStore.allNamespaces(applicationContext)
+                    .filter { com.signalscope.app.trading.Spaces.baseOf(it).let { b -> b == "de" || b == "us" } }
+                    .mapNotNull { n ->
+                        val b = com.signalscope.app.data.BucketStore.get(applicationContext, n) ?: return@mapNotNull null
+                        if (!b.live) null else mapOf(
+                            "ns" to n, "name" to b.name, "budget" to b.liveBudget,
+                            // Gson can hand back null for a list written before the
+                            // field existed — see the gson-defaults hazard.
+                            "allowlist" to (b.liveAllowlist ?: emptyList<String>()))
+                    }
+                gson.toJson(mapOf("ok" to true,
+                    "frozen" to config.t212LiveFrozen,
+                    "mirrorEnabled" to config.t212LiveMirrorEnabled,
+                    "configured" to config.hasT212Credentials,
+                    "armedAlgos" to armed,
+                    "canTrade" to (config.canMirrorT212Live && armed.isNotEmpty())))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** Flip the master freeze. Called only from an explicit double-confirmed tap. */
+        @JavascriptInterface
+        fun t212SetLiveFrozen(frozen: Boolean): String {
+            return try {
+                config.t212LiveFrozen = frozen
+                Log.w(TAG, "T212 live freeze set to $frozen by user")
+                gson.toJson(mapOf("ok" to true, "frozen" to config.t212LiveFrozen))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * THE DUST LEDGER — where sub-€1 remainders came from and went.
+         *
+         * Two different quantities, deliberately not netted into one:
+         *
+         *  • SWEPT   — dust an algo's exit cleared. Real cash into the account,
+         *              excluded from strategy P&L because it was never bought.
+         *  • CREATED — the algo's OWN shares its exit failed to sell. This is the
+         *              diagnostic one: an algo that keeps creating residue has an
+         *              execution problem (chase too tight, dwell too short, names too
+         *              illiquid), and that shows up here long before it shows up as
+         *              a stranded position.
+         *
+         * Netting them would hide exactly the algo worth investigating — one that
+         * sweeps a lot AND creates a lot nets to zero and looks perfectly healthy.
+         */
+        @JavascriptInterface
+        fun t212DustLedger(): String {
+            return try {
+                val rows = com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
+                val byNs = rows.groupBy { it.ns }
+                val perAlgo = byNs.mapNotNull { (ns, list) ->
+                    val sweptQty = list.sumOf { it.sweptQty }
+                    val sweptVal = list.sumOf { it.sweptValue() }
+                    val madeQty = list.sumOf { it.ownResidueQty() }
+                    val madeVal = list.sumOf { it.ownResidueValue() }
+                    if (sweptQty <= 0.0 && madeQty <= 0.0) return@mapNotNull null
+                    mapOf(
+                        "ns" to ns,
+                        "name" to (if (ns == com.signalscope.app.trading.LiveTestBench.NS) "test bench"
+                                   else com.signalscope.app.data.BucketStore.get(applicationContext, ns)?.name ?: ns),
+                        "sweptQty" to sweptQty, "sweptValue" to sweptVal,
+                        "sweptCount" to list.count { it.sweptQty > 0.0 },
+                        "createdQty" to madeQty, "createdValue" to madeVal,
+                        "createdCount" to list.count { it.ownResidueQty() > 0.0 })
+                }.sortedByDescending { (it["createdValue"] as? Double ?: 0.0) + (it["sweptValue"] as? Double ?: 0.0) }
+                gson.toJson(mapOf("ok" to true,
+                    "perAlgo" to perAlgo,
+                    "totalSweptValue" to rows.sumOf { it.sweptValue() },
+                    "totalSweptCount" to rows.count { it.sweptQty > 0.0 },
+                    "totalCreatedValue" to rows.sumOf { it.ownResidueValue() },
+                    "totalCreatedCount" to rows.count { it.ownResidueQty() > 0.0 }))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * THE REAL BOOK for ONE algo — what the broker actually did, per algo.
+         *
+         * The third of three layers the Algos tab reports, and until now the only one
+         * with no per-algo home: BOOK (paper ledger) and REPLAY (💡) were both on the
+         * card, while REAL lived exclusively in a global dialog. A blended execution
+         * figure across six algos hides the one executing badly, which is the whole
+         * reason to measure it.
+         *
+         * Reads ONLY the local store — no network. Fills are backfilled by the tick
+         * and by the bench's explicit refresh, so this can be called on every render.
+         */
+        @JavascriptInterface
+        fun bucketRealBook(ns: String): String {
+            return try {
+                val rows = com.signalscope.app.data.T212LiveStore.load(applicationContext)
+                    .trades.filter { it.ns == ns }
+                val openNow = rows.count { it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING" }
+                // Only fully reconciled round trips can be measured. A leg still
+                // filling contributes nothing rather than a fraction of itself.
+                // Strategy-executed round trips only. Hand-closed ones are real cash
+                // but not the algo's doing, so they are reported on their own line
+                // rather than folded into its performance or its execution stats.
+                val done = rows.filter {
+                    it.status == "CLOSED" && !it.isManual() && it.buyComplete() && it.sellComplete()
+                }
+                val manual = rows.filter { it.isManual() }
+                // ── ENTRY-ONLY DEVIATION, for positions still open ────────────────
+                // Half a round trip is still a real measurement, and it is available
+                // MINUTES after the first live buy instead of days later when the
+                // strategy happens to exit. It answers "did the ladder fill near the
+                // signal price?" — which is the first thing worth knowing when an
+                // algo goes live, and the last thing you want to wait for.
+                //
+                // Reported separately and NEVER against the config constant: that
+                // constant is charged once per COMPLETED trade, so holding an entry
+                // leg against it would flatter the algo by roughly half.
+                val openPriced = rows.filter {
+                    (it.status == "OPEN" || it.status == "EXITING") && !it.isManual() &&
+                    it.buyComplete() && it.paperEntryPrice > 0.0 && it.liveEntryPrice > 0.0
+                }
+                val entryBars = openPriced.map { t ->
+                    mapOf("symbol" to t.symbol,
+                        "entrySlipPct" to (t.liveEntryPrice - t.paperEntryPrice) / t.paperEntryPrice * 100.0,
+                        "signal" to t.paperEntryPrice, "fill" to t.liveEntryPrice,
+                        "anchor" to t.refEntryPrice)
+                }
+                val entrySlips = entryBars.mapNotNull { it["entrySlipPct"] as? Double }.sorted()
+                val manualPnl = manual.sumOf { t ->
+                    val px = t.manualExitPrice
+                    val q = if (t.manualExitQty > 0.0) t.manualExitQty else t.liveQtyFilled
+                    if (px > 0.0 && t.liveEntryPrice > 0.0 && q > 0.0) (px - t.liveEntryPrice) * q else 0.0
+                }
+                val spent = done.sumOf { it.liveEntryValue }
+                val got = done.sumOf { it.ownExitValue() }
+                val slips = done.mapNotNull { t ->
+                    val pe = t.paperEntryPrice; val px = t.paperExitPrice ?: 0.0
+                    if (pe <= 0.0 || px <= 0.0 || t.liveEntryPrice <= 0.0 || t.liveExitPrice <= 0.0) null
+                    else (t.liveEntryPrice - pe) / pe * 100.0 + (px - t.liveExitPrice) / px * 100.0
+                }.sorted()
+                val med = when {
+                    slips.isEmpty() -> null
+                    slips.size % 2 == 1 -> slips[slips.size / 2]
+                    else -> (slips[slips.size / 2 - 1] + slips[slips.size / 2]) / 2.0
+                }
+                val assumed = try {
+                    com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns).slippagePct
+                } catch (e: Exception) { 0.0 }
+                // EVERY ALGO'S YARDSTICK, not just this one's.
+                //
+                // The bench belongs to no algo, so its "assumed" figure is whatever
+                // the DEFAULT config happens to carry — 0.050%. Two of the German
+                // algos really do use 0.050% and the rest use 0.200%, so a single
+                // comparison silently picks one camp's yardstick and reports the
+                // answer as if it were universal.
+                //
+                // What the bench measures is a property of the VENUE and the ladder,
+                // not of any strategy: the same fill is legitimately judged against
+                // every algo's own assumption. So ship them all and let the panel
+                // show one measurement scored against each constant — which is also
+                // the only way "my algos assume different slippage" becomes visible
+                // rather than being averaged into a number describing nobody.
+                val yardsticks = (com.signalscope.app.data.BucketStore
+                        .allNamespaces(applicationContext) + listOf("de", "us"))
+                    .filter { com.signalscope.app.trading.Spaces.baseOf(it)
+                        .let { b -> b == "de" || b == "us" } }
+                    .distinct()
+                    .mapNotNull { n ->
+                        val nm = com.signalscope.app.data.BucketStore
+                            .get(applicationContext, n)?.name ?: return@mapNotNull null
+                        val a = try {
+                            com.signalscope.app.data.StrategyLabStore
+                                .activeConfig(applicationContext, n).slippagePct
+                        } catch (e: Exception) { 0.0 }
+                        if (a <= 0.0) null else mapOf(
+                            "algo" to nm, "ns" to n, "assumedPct" to a,
+                            "deviationPp" to (if (med == null) null else med - a))
+                    }
+                    .sortedBy { it["assumedPct"] as? Double ?: 0.0 }
+                gson.toJson(mapOf("ok" to true,
+                    "yardsticks" to yardsticks,
+                    "openNow" to openNow,
+                    "closed" to done.size,
+                    "pending" to rows.count { it.allBuyIds().isNotEmpty() && !it.buyComplete() },
+                    "errors" to rows.count { it.status == "ERROR" },
+                    // THE MESSAGE, not just the count. "2 error" told you something
+                    // went wrong and nothing about what — while the broker's own
+                    // explanation (no cash, ladder unfilled, ticker unknown) was
+                    // sitting on the row all along, readable only from a log.
+                    "errorRows" to rows.filter { it.status == "ERROR" }
+                        .sortedByDescending { maxOf(it.buyAt, it.sellAt) }
+                        .take(6)
+                        .map { mapOf(
+                            "symbol" to it.symbol,
+                            "error" to it.error,
+                            "at" to maxOf(it.buyAt, it.sellAt)) },
+                    "cashIn" to spent, "cashOut" to got,
+                    "cashPnl" to (got - spent),
+                    "cashPnlPct" to (if (spent > 0.0) (got / spent - 1.0) * 100.0 else 0.0),
+                    "slipSamples" to slips.size,
+                    "slipMedian" to med,
+                    "assumedPct" to assumed,
+                    "deviationPp" to (if (med == null) null else med - assumed),
+                    "bars" to done.mapNotNull { t ->
+                        val pe = t.paperEntryPrice; val px = t.paperExitPrice ?: 0.0
+                        if (pe <= 0.0 || px <= 0.0 || t.liveEntryPrice <= 0.0 || t.liveExitPrice <= 0.0) null
+                        else mapOf("symbol" to t.symbol,
+                            "measuredPct" to ((t.liveEntryPrice - pe) / pe * 100.0 +
+                                              (px - t.liveExitPrice) / px * 100.0),
+                            "assumedPct" to assumed)
+                    },
+                    "entryBars" to entryBars,
+                    "entryMedian" to when {
+                        entrySlips.isEmpty() -> null
+                        entrySlips.size % 2 == 1 -> entrySlips[entrySlips.size / 2]
+                        else -> (entrySlips[entrySlips.size / 2 - 1] + entrySlips[entrySlips.size / 2]) / 2.0
+                    },
+                    "manualCount" to manual.size,
+                    "manualPnl" to manualPnl,
+                    "manualPriced" to manual.count { it.manualExitPrice > 0.0 },
+                    "manualSymbols" to manual.map { it.symbol }.distinct(),
+                    "sweptValue" to rows.sumOf { it.sweptValue() },
+                    "createdValue" to rows.sumOf { it.ownResidueValue() },
+                    "lastSyncAt" to (rows.maxOfOrNull { it.fillsSyncedAt } ?: 0L)))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * "I sold that one myself." Explicit, user-confirmed only — see
+         * [com.signalscope.app.trading.ManualIntervention] for why it is never
+         * inferred from a missing share.
+         */
+        @JavascriptInterface
+        fun algoMarkSoldByHand(ns: String, symbol: String): String {
+            return try {
+                val r = com.signalscope.app.trading.ManualIntervention
+                    .markSoldByHand(applicationContext, ns, symbol)
+                gson.toJson(mapOf("ok" to r.ok, "error" to r.error, "symbol" to r.symbol,
+                    "paperRemoved" to r.paperRemoved, "discardedPnlPct" to r.discardedPnlPct,
+                    "seatFreed" to r.seatFreed, "liveMarked" to r.liveMarked,
+                    "matchedFill" to r.matchedFill, "exitPrice" to r.exitPrice,
+                    "exitQty" to r.exitQty, "realPnl" to r.realPnl))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** Stop the in-flight replay at the next symbol boundary. */
+        @JavascriptInterface
+        fun bucketCancelWhatIf(): String {
+            return try {
+                com.signalscope.app.trading.StrategyLabRunner.cancelWhatIf()
+                gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * Rename an algo. Cosmetic only — the namespace (and therefore every
+         * ledger, gate state and saved result keyed by it) is deliberately left
+         * alone, so renaming can never orphan history or disturb a live position.
+         */
+        @JavascriptInterface
+        fun bucketRename(ns: String, name: String): String {
+            return try {
+                val clean = name.trim().take(40)
+                if (clean.isBlank())
+                    return gson.toJson(mapOf("ok" to false, "error" to "Name cannot be empty."))
+                val b = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
+                    ?: return gson.toJson(mapOf("ok" to false, "error" to "Algo not found."))
+                com.signalscope.app.data.BucketStore.update(applicationContext, b.copy(name = clean))
+                // Keep the saved what-if label in step, or the comparison table
+                // would keep showing the old name against the same numbers.
+                try {
+                    com.signalscope.app.data.WhatIfStore.get(applicationContext, ns)?.let {
+                        com.signalscope.app.data.WhatIfStore.put(applicationContext, it.copy(name = clean))
+                    }
+                } catch (e: Exception) { Log.w(TAG, "what-if rename sync failed", e) }
+                gson.toJson(mapOf("ok" to true, "name" to clean))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "rename failed")))
+            }
+        }
+
+        /** Saved what-if results for every algo in a space, for the comparison
+         *  table. Pure read of stored summaries — no fetching, no recompute. */
+        @JavascriptInterface
+        fun whatIfSummaries(space: String): String {
+            return try {
+                val base = bucketBaseNs(space)
+                val saved = com.signalscope.app.data.WhatIfStore.all(applicationContext)
+                val rows = com.signalscope.app.data.BucketStore.list(applicationContext, base).map { b ->
+                    val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, b.ns)
+                    val s = saved[b.ns]
+                    mapOf(
+                        "ns" to b.ns, "name" to b.name, "mode" to b.mode.name,
+                        "configSource" to com.signalscope.app.data.StrategyLabStore
+                            .load(applicationContext, b.ns).configSource,
+                        // Always live from the CURRENT config, so a changed slippage
+                        // is visible even against a stale saved result.
+                        "slippageNow" to cfg.slippagePct,
+                        "has" to (s != null),
+                        "computedAt" to (s?.computedAt ?: 0L),
+                        "layer" to (s?.layer ?: ""),
+                        "slippagePct" to (s?.slippagePct ?: cfg.slippagePct),
+                        "entryTf" to (s?.entryTf ?: cfg.resample),
+                        "exitTf" to (s?.exitTf ?: cfg.exitBars),
+                        "interval" to (s?.interval ?: ""),
+                        "compoundedPct" to (s?.compoundedPct ?: 0.0),
+                        "cagrPct" to (s?.cagrPct ?: 0.0),
+                        "maxDrawdownPct" to (s?.maxDrawdownPct ?: 0.0),
+                        "spanDays" to (s?.spanDays ?: 0.0),
+                        "fromTs" to (s?.fromTs ?: 0L), "toTs" to (s?.toTs ?: 0L),
+                        "closed" to (s?.closed ?: 0), "symbols" to (s?.symbols ?: 0),
+                        "seats" to (s?.seats ?: 0))
+                }
+                gson.toJson(mapOf("ok" to true, "rows" to rows))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** The 3b gate's current state for the Algos panel: the N capital slots,
+         *  the bench (eligible + ranked but unheld) and the blocked names (ranked
+         *  but slope ≤ 0). Pure read of the LAST daily evaluation — no refetch,
+         *  no recompute, so opening the panel is free. */
+        @JavascriptInterface
+        fun bucketGate(ns: String): String {
+            return try {
+                val st = com.signalscope.app.data.MacdGateStore.load(applicationContext, ns)
+                if (!st.enabled || st.slots.isEmpty())
+                    return "{\"ok\":true,\"enabled\":false}"
+                val slopes = st.lastSlopes
+                val held = st.slots.mapNotNull { it.symbol?.uppercase() }.toSet()
+                val rankOf = HashMap<String, Int>()
+                st.lastRanking.forEachIndexed { i, s -> rankOf[s.uppercase()] = i + 1 }
+                // Null for any ranking computed before scores were kept — the page
+                // simply omits the column rather than printing a fabricated zero.
+                val scoreByUpper = st.lastScores?.entries
+                    ?.associate { it.key.uppercase() to it.value } ?: emptyMap()
+                val slots = st.slots.map { sl ->
+                    val u = sl.symbol?.uppercase()
+                    mapOf("symbol" to sl.symbol, "capital" to sl.capital,
+                        "flagged" to sl.flagged, "negDays" to sl.negDays, "since" to sl.since,
+                        "rank" to (u?.let { rankOf[it] } ?: 0),
+                        "score" to u?.let { scoreByUpper[it] },
+                        "slope" to (u?.let { slopes[it] } ?: 0.0))
+                }
+                // WHY THIS SEAT IS CASH. The panel used to print "no eligible name"
+                // on every empty seat as a hardcoded caption — a claim nothing had
+                // checked, and one that read as an outright contradiction on a card
+                // that listed 35 eligible names two rows below. Derive it instead,
+                // and if names really are waiting, say that the fill is a once-a-day
+                // step rather than implying nobody qualified.
+                val eligibleUnheld = st.lastRanking.count { r ->
+                    r.uppercase() !in held && (slopes[r.uppercase()] ?: slopes[r] ?: -1.0) > 0.0
+                }
+                val emptyReason = when {
+                    st.lastRanking.isEmpty() -> "no evaluation yet"
+                    slopes.values.none { it > 0.0 } -> "no rising trend in the whole list today"
+                    eligibleUnheld == 0 -> "every eligible name is already held"
+                    else -> "$eligibleUnheld waiting — fills at the next evaluation"
+                }
+                // AN OPEN POSITION NO SEAT OWNS. Reported the moment it exists, not
+                // when it closes: while it is unseated its result cannot compound
+                // into any seat, so the value-vs-injected figure above is describing
+                // less money than is actually at risk.
+                val orphans = try {
+                    com.signalscope.app.data.StrategyLabStore
+                        .load(applicationContext, ns).trades
+                        .filter { it.status == "OPEN" }
+                        .map { it.symbol.uppercase() }.distinct()
+                        .filter { it !in held }
+                } catch (e: Exception) { emptyList<String>() }
+                // Walk the ranking ONCE, in order, splitting unheld names into the
+                // bench (slope > 0 — these fill the next empty slot, in this order)
+                // and blocked (slope ≤ 0 — ranked high but the gate refuses them).
+                val bench = ArrayList<Map<String, Any?>>()
+                val blocked = ArrayList<Map<String, Any?>>()
+                for ((i, s) in st.lastRanking.withIndex()) {
+                    val u = s.uppercase()
+                    if (u in held) continue
+                    val sl = slopes[u] ?: continue
+                    val row = mapOf("symbol" to s, "rank" to (i + 1), "slope" to sl,
+                        "score" to scoreByUpper[u])
+                    if (sl > 0.0) { if (bench.size < 5) bench.add(row) }
+                    else if (blocked.size < 5) blocked.add(row)
+                }
+                gson.toJson(mapOf("ok" to true, "enabled" to true,
+                    "holdN" to st.holdN, "smoothing" to st.smoothing,
+                    "lastEvalDay" to st.lastEvalDay,
+                    "rankedAt" to st.lastRankedAt,
+                    "scanned" to slopes.size,
+                    // HOW MANY NAMES THE SCORE WAS MEASURED AGAINST. The score is a
+                    // percentile inside the set that was ranked, so two runs over
+                    // slightly different sets give the same name different numbers.
+                    // Without this the panel looked like it disagreed with the
+                    // screener for no reason.
+                    "rankedCount" to st.lastRanking.size,
+                    "eligible" to slopes.values.count { it > 0.0 },
+                    "filled" to held.size,
+                    "injected" to st.injected,
+                    "value" to com.signalscope.app.data.MacdGateStore.totalValue(st),
+                    "slots" to slots, "bench" to bench, "blocked" to blocked,
+                    "emptyReason" to emptyReason, "orphans" to orphans,
+                    "blockedTotal" to slopes.values.count { it <= 0.0 },
+                    "log" to st.log.takeLast(6).reversed()))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /**
+         * ROC PER COMPANY, taken from this space's last DISCOVERY SCAN.
+         *
+         * This is the app's own ROC — headroom to the nearest resistance:
+         *
+         *     ROC % = (resistance − price) ÷ price × 100
+         *
+         * NOT the textbook Rate of Change indicator. Same three letters, entirely
+         * different quantity: one measures how far price has already travelled,
+         * this measures how far it can travel before it meets a ceiling. The
+         * discovery table labels it "ROC to Resistance" and that is the meaning
+         * carried here, so a threshold set in the picker means exactly what the
+         * same number means on the discovery row.
+         *
+         * PURE READ of the cached scan — opening the picker costs nothing and
+         * never starts a scan. Resistance comes from the adaptive support and
+         * resistance pass, which needs the full analysis; there is no cheap way
+         * to recompute it for one company, and no reason to, since the discovery
+         * tab already maintains it per market.
+         *
+         * Symbols are stripped of their exchange suffix so they match the bare
+         * tickers the picker lists — otherwise every German name would miss.
+         */
+        @JavascriptInterface
+        fun universeMetrics(ns: String): String {
+            return try {
+                val market = when (com.signalscope.app.trading.Spaces.baseOf(ns).uppercase()) {
+                    "US" -> "NASDAQ 100"
+                    "DE" -> "DAX 100"
+                    "IN" -> "NIFTY 500"
+                    else -> return gson.toJson(mapOf("ok" to false,
+                        "error" to "ROC comes from a discovery scan, and this space has none."))
+                }
+                val cached = com.signalscope.app.data.DiscoveryResultStore
+                    .load(applicationContext, market)
+                    ?: return gson.toJson(mapOf("ok" to false, "market" to market,
+                        "error" to "No $market discovery scan cached yet."))
+                val rows = HashMap<String, Double>()
+                for (s in cached.allStocks) {
+                    val key = s.symbol.trim().uppercase().substringBefore('.')
+                    if (key.isNotBlank() && s.rocPct > 0.0) rows[key] = s.rocPct
+                }
+                gson.toJson(mapOf("ok" to true, "market" to market,
+                    "scannedAt" to cached.timestamp, "complete" to cached.isComplete,
+                    "totalScanned" to cached.totalScanned,
+                    "count" to rows.size, "rows" to rows))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /** FLAT-START reset for ONE algo: clears its paper ledger + watermarks so
+         *  tracking restarts from the next bar (no orders placed). Refuses while
+         *  REAL positions are open — same guard as binanceLabResetPaper: wiping
+         *  paper severs every live record from its counterpart, and that exact
+         *  desync once had the orphan sweep liquidate a real ETH position.
+         *
+         *  IT MUST ALSO RESET THE SEATS. The headline % for an armed 3b algo is
+         *  seat capital ÷ injected, which lives in the gate store, NOT in the paper
+         *  ledger. Clearing only the ledger left the card reading -1.0% over a book
+         *  showing "0 trades · +0.0% booked" — the reset visibly did not take, and
+         *  worse, the stale seat capital is what sizes the NEXT position. A reset
+         *  that says "starts flat" has to make every number that claims to describe
+         *  this algo agree, or none of them can be trusted.
+         *
+         *  Seats are re-created empty at par rather than deleted, so the card still
+         *  reads N/N slots and the algo is immediately runnable; lastEvalDay is
+         *  cleared so the gate re-evaluates on the next pass instead of tomorrow. */
+        @JavascriptInterface
+        fun bucketResetPaper(ns: String): String {
+            return try {
+                if (com.signalscope.app.trading.Spaces.baseOf(ns) == "binance") {
+                    val openLive = com.signalscope.app.data.BinanceLiveStore
+                        .load(applicationContext, ns).trades.filter { it.status == "OPEN" }
+                    if (openLive.isNotEmpty()) {
+                        return gson.toJson(mapOf("ok" to false, "error" to
+                            "Refused: ${openLive.size} REAL Binance position(s) still open (" +
+                            openLive.joinToString(", ") { it.symbol } +
+                            "). Resetting paper now would desync the live ledger — " +
+                            "let them close (or sell manually) first."))
+                    }
+                } else {
+                    // Same hazard on the T212 side: a real mirrored position is tied
+                    // to the paper trade that produced it. Wipe the paper and the
+                    // live row has no counterpart, so nothing can price or close it.
+                    val openLive = com.signalscope.app.data.T212LiveStore
+                        .load(applicationContext).trades.filter {
+                            it.ns == ns && it.status in setOf("OPEN", "PENDING", "EXITING")
+                        }
+                    if (openLive.isNotEmpty()) {
+                        return gson.toJson(mapOf("ok" to false, "error" to
+                            "Refused: ${openLive.size} REAL Trading 212 position(s) still open (" +
+                            openLive.joinToString(", ") { it.symbol } +
+                            "). Resetting paper now would orphan them — close them first, " +
+                            "or mark them sold by hand if you already did."))
+                    }
+                }
+                com.signalscope.app.data.StrategyLabStore.resetPaperState(applicationContext, ns)
+
+                // The seats, which is where the headline % actually comes from.
+                var seatsReset = 0
+                var wasPct = 0.0
+                com.signalscope.app.data.MacdGateStore.mutate(applicationContext, ns) { st ->
+                    if (!st.enabled || st.slots.isEmpty()) st else {
+                        val before = com.signalscope.app.data.MacdGateStore.totalValue(st)
+                        wasPct = if (st.injected > 0.0) (before / st.injected - 1.0) * 100.0 else 0.0
+                        // ADOPT THE CONFIGURED SHAPE, don't perpetuate the old one.
+                        // Keeping the existing seat count meant a layout left over
+                        // from an earlier setting survived every reset — six pockets
+                        // under a five-slot config, refilled to six on the next
+                        // evaluation. A flat start has to start flat in shape too.
+                        // All seats are being emptied here, so this is exactly the
+                        // moment a reshape is safe.
+                        val bkt = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
+                        val seats = com.signalscope.app.data.MacdGateStore
+                            .effectiveHoldN(st, bkt?.symbols?.size ?: st.slots.size)
+                            .coerceAtLeast(1)
+                        val capital = bkt?.capital?.takeIf { it > 0.0 }
+                            ?: (if (st.injected > 0.0) st.injected else before)
+                        val per = capital / seats
+                        seatsReset = seats
+                        val now = System.currentTimeMillis()
+                        com.signalscope.app.data.MacdGateStore.appendLog(
+                            com.signalscope.app.data.MacdGateStore
+                                .closeAllEnrollments(st, "paper_reset", now)
+                                .copy(
+                                slots = (1..seats).map {
+                                    com.signalscope.app.data.MacdGateStore.Slot(
+                                        null, per, now, 0, false)
+                                },
+                                injected = per * seats,
+                                lastEvalDay = "",
+                                lastRanking = emptyList(),
+                                lastSlopes = emptyMap(),
+                                lastScores = null, lastRankedAt = 0L),
+                            "${java.time.LocalDate.now()} paper reset — $seats seats back to " +
+                                "${"%.0f".format(per)} each (was ${"%+.2f".format(wasPct)}%)")
+                    }
+                }
+                gson.toJson(mapOf("ok" to true,
+                    "seatsReset" to seatsReset, "clearedPct" to wasPct))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** A bucket's paper ledger (trades + rollup) for the Algos ledger view. */
+        @JavascriptInterface
+        fun bucketLedger(ns: String): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.load(applicationContext, ns)
+                val closed = s.trades.filter { it.status == "CLOSED" }
+                // FEED FRESHNESS, per symbol. The watermark is the timestamp of the
+                // newest bar the engine has actually PROCESSED — the only honest
+                // answer to "are the candles old". Distinct from the gate date (once
+                // a day) and from the mark-to-market stamp (live price), which is why
+                // "old candles" was ambiguous without it. Note a 240min/120min config
+                // legitimately trails by up to one exit bar, and always sits behind
+                // the current time because unclosed bars are deliberately discarded.
+                //
+                // Plus, per trade, WHY it never became a real order — the question a
+                // paper position with nothing behind it always raises.
+                val skips = try {
+                    com.signalscope.app.data.LiveSkipStore.forNs(applicationContext, ns)
+                } catch (e: Exception) { emptyMap<String, String>() }
+                gson.toJson(mapOf("ok" to true, "skips" to skips,
+                    "open" to s.trades.count { it.status == "OPEN" },
+                    "closed" to closed.size,
+                    "wins" to closed.count { it.pctReturn > 0 },
+                    "pnlPct" to closed.sumOf { it.pctReturn },
+                    "lastRunAt" to s.lastRunAt,
+                    "watermarks" to s.watermarks,
+                    "bars" to s.statuses.mapValues { it.value.bars },
+                    // The frame the watermark is measured in, so the UI can say when
+                    // the current bar CLOSED (wm + frame) and when the next one will
+                    // (wm + 2 frames) — which is also exactly when the runner stops
+                    // skipping and fetches again.
+                    "frameSec" to run {
+                        val c = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                        val p = com.signalscope.app.trading.FeedPlan.plan(c, ns)
+                        maxOf((if (c.multiTimeframe) p.exitMin else p.entryMin).toLong() * 60L, p.sourceSec)
+                    },
+                    "trades" to s.trades.takeLast(80)))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Launch the walk-forward CSV backtest against a bucket's active config. */
+        @JavascriptInterface
+        fun bucketBacktestPickCsv(ns: String) {
+            backtestNs = ns
+            runOnUiThread {
+                try { backtestCsvPicker.launch(arrayOf("*/*")) }
+                catch (e: Exception) { Log.e(TAG, "bucket csv picker launch failed", e) }
+            }
+        }
+
+        @JavascriptInterface
+        fun reinvestGetState(space: String): String {
+            return try {
+                val ns = reinvestNs(space)
+                val s = com.signalscope.app.data.ReinvestStore.load(applicationContext, ns)
+                val balancesSorted = s.balances.entries.sortedByDescending { it.value }
+                    .map { mapOf("symbol" to it.key, "balance" to it.value) }
+                gson.toJson(mapOf(
+                    "enabled" to s.enabled, "initialized" to s.initialized, "mode" to s.mode,
+                    "notional" to s.notional, "topN" to s.topN, "universe" to s.universe,
+                    "balances" to balancesSorted, "injectedCapital" to s.injectedCapital, "idleCash" to s.idleCash,
+                    "windingDown" to (s.windingDown ?: emptyList<String>()),
+                    "totalValue" to com.signalscope.app.data.ReinvestStore.totalValue(s),
+                    "compoundedPct" to com.signalscope.app.data.ReinvestStore.compoundedPct(s),
+                    "lastRebalanceMonth" to s.lastRebalanceMonth, "lastRebalanceAt" to s.lastRebalanceAt,
+                    "history" to s.history.reversed().take(24)))
+            } catch (e: Exception) {
+                Log.e(TAG, "reinvestGetState failed", e)
+                "{\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun reinvestInitialize(space: String, universeJson: String, totalInvest: Double, mode: String, topN: Int) {
+            thread(isDaemon = true) {
+                val ns = reinvestNs(space)
+                try {
+                    val arr = com.google.gson.JsonParser.parseString(universeJson).asJsonArray
+                    val syms = arr.mapNotNull { runCatching { it.asString }.getOrNull() }
+                    val r = com.signalscope.app.screener.ReinvestEngine.initialize(
+                        applicationContext, ns, syms, totalInvest, mode, topN) { done, total ->
+                        deliverAiCallback("window.onScreenerProgress", "{\"done\":$done,\"total\":$total}")
+                    }
+                    // Crypto: funding reinvest is a no-op for live sizing unless the
+                    // mirror is in BUDGET mode (that's the only mode that reads the
+                    // sleeves). Auto-switch so the user can't fund a pot yet keep
+                    // trading the flat fixed size by mistake.
+                    if (r.ok && ns == "binance") config.binanceLiveSizingMode = "BUDGET"
+                    deliverAiCallback("window.onReinvestUpdate",
+                        gson.toJson(mapOf("ok" to r.ok, "message" to r.message, "added" to r.added)))
+                } catch (e: Exception) {
+                    Log.e(TAG, "reinvestInitialize failed", e)
+                    deliverAiCallback("window.onReinvestUpdate",
+                        gson.toJson(mapOf("ok" to false, "message" to (e.message ?: "init failed"))))
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun reinvestRebalanceNow(space: String) {
+            thread(isDaemon = true) {
+                val ns = reinvestNs(space)
+                val r = try {
+                    com.signalscope.app.screener.ReinvestEngine.rebalance(applicationContext, ns) { done, total ->
+                        deliverAiCallback("window.onScreenerProgress", "{\"done\":$done,\"total\":$total}")
+                    }
+                } catch (e: Exception) {
+                    com.signalscope.app.screener.ReinvestEngine.RunOutcome(false, e.message ?: "rebalance failed")
+                }
+                deliverAiCallback("window.onReinvestUpdate",
+                    gson.toJson(mapOf("ok" to r.ok, "message" to r.message, "added" to r.added, "dropped" to r.dropped)))
+            }
+        }
+
+        @JavascriptInterface
+        fun reinvestSetEnabled(space: String, on: Boolean): Boolean {
+            return try { com.signalscope.app.data.ReinvestStore.setEnabled(applicationContext, reinvestNs(space), on); on }
+            catch (e: Exception) { Log.e(TAG, "reinvestSetEnabled failed", e); false }
+        }
+
+        @JavascriptInterface
+        fun reinvestReset(space: String): String {
+            return try { com.signalscope.app.data.ReinvestStore.reset(applicationContext, reinvestNs(space)); "{\"ok\":true}" }
+            catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        // ── BINANCE STRATEGY LAB (CRYPTO space, PAPER ONLY) ───────────────────
+        // Same engine + store + runner as the US lab, but namespace "binance":
+        // its own config file, ledger and Binance 15-min spot klines. No keys,
+        // no real orders. Mirrors the strategyLab* bridges above. Results are
+        // delivered to the SAME window.onStrategyLab* callbacks (only one space
+        // is active at a time, so they can be shared).
+        private val BN = "binance"
+
+        private fun coreBinancePairs(): List<Map<String, String>> = listOf(
+            mapOf(
+                "symbol" to "BTCUSDC",
+                "base" to "BTC",
+                "quote" to "USDC",
+                "name" to "Bitcoin",
+                "why" to "Largest and most liquid crypto asset."
+            ),
+            mapOf(
+                "symbol" to "ETHUSDC",
+                "base" to "ETH",
+                "quote" to "USDC",
+                "name" to "Ethereum",
+                "why" to "Large-cap smart-contract network."
+            ),
+            mapOf(
+                "symbol" to "BNBUSDC",
+                "base" to "BNB",
+                "quote" to "USDC",
+                "name" to "BNB",
+                "why" to "Large-cap Binance ecosystem token."
+            )
+        )
+
+        /** The USDC size a live BUY would actually use right now — mirrors
+         *  BinanceLiveMirror.perTradeQuoteSize so the UI never shows a number
+         *  that disagrees with what really gets ordered. For BUDGET mode with a
+         *  funded reinvest book this is the average enrolled sleeve. */
+        private fun effectiveBinanceBuySize(): Double {
+            if (config.binanceLiveSizingMode != "BUDGET") return config.binanceLiveQuoteOrderSize
+            val enrolled = com.signalscope.app.data.StrategyLabStore.load(applicationContext, BN).enrolled
+            val rs = com.signalscope.app.data.ReinvestStore.load(applicationContext, BN)
+            if (rs.initialized && rs.balances.isNotEmpty()) {
+                val bals = enrolled.mapNotNull { rs.balances[it.symbol.uppercase()] }.filter { it > 0.0 }
+                if (bals.isNotEmpty()) return bals.average()
+            }
+            if (config.binanceLiveBudget > 0.0)
+                return config.binanceLiveBudget / enrolled.size.coerceAtLeast(1)
+            return config.binanceLiveQuoteOrderSize
+        }
+
+        private fun binanceAccountStateJson(): String {
+            fun baseState(extra: Map<String, Any?> = emptyMap()): Map<String, Any?> =
+                mapOf(
+                    "configured" to config.hasBinanceCredentials,
+                    "liveEnabled" to config.binanceLiveMirrorEnabled,
+                    "quoteOrderSize" to config.binanceLiveQuoteOrderSize,
+                    "sizingMode" to config.binanceLiveSizingMode,
+                    "budget" to config.binanceLiveBudget,
+                    "effectiveBuySize" to effectiveBinanceBuySize(),
+                    "liveAllowlist" to config.binanceLiveAllowlist,
+                    "core" to coreBinancePairs()
+                ) + extra
+
+            if (!config.hasBinanceCredentials) {
+                return gson.toJson(baseState(mapOf(
+                    "ok" to false,
+                    "error" to "Binance API key/secret not saved yet."
+                )))
+            }
+
+            return try {
+                when (val r = com.signalscope.app.network.BinanceClient.fetchAccount(config)) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> {
+                        val account = r.data
+                        val preferred = listOf("USDT", "BTC", "ETH", "BNB")
+                        val balances = account.balances.values
+                            .map {
+                                mapOf(
+                                    "asset" to it.asset,
+                                    "free" to it.free,
+                                    "locked" to it.locked,
+                                    "freeValue" to (it.free.toDoubleOrNull() ?: 0.0),
+                                    "lockedValue" to (it.locked.toDoubleOrNull() ?: 0.0)
+                                )
+                            }
+                            .filter {
+                                ((it["freeValue"] as? Double) ?: 0.0) > 0.0 ||
+                                    ((it["lockedValue"] as? Double) ?: 0.0) > 0.0 ||
+                                    preferred.contains(it["asset"] as? String)
+                            }
+                            .sortedWith(compareBy<Map<String, Any?>> {
+                                val asset = it["asset"] as? String ?: ""
+                                val idx = preferred.indexOf(asset)
+                                if (idx >= 0) idx else preferred.size + 1
+                            }.thenBy { it["asset"] as? String ?: "" })
+
+                        val usdt = account.balances["USDT"]
+                        gson.toJson(baseState(mapOf(
+                            "ok" to true,
+                            "accountType" to account.accountType,
+                            "canTrade" to account.canTrade,
+                            "usdtFree" to (usdt?.free ?: "0"),
+                            "usdtLocked" to (usdt?.locked ?: "0"),
+                            "balances" to balances
+                        )))
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure ->
+                        gson.toJson(baseState(mapOf("ok" to false, "error" to r.message)))
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured ->
+                        gson.toJson(baseState(mapOf(
+                            "ok" to false,
+                            "configured" to false,
+                            "error" to "Binance API key/secret not saved yet."
+                        )))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "binanceAccountStateJson failed", e)
+                gson.toJson(baseState(mapOf(
+                    "ok" to false,
+                    "error" to (e.message ?: "Binance account fetch failed")
+                )))
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceAccountGetState(): String = binanceAccountStateJson()
+
+        @JavascriptInterface
+        fun fetchBinanceAccount() {
+            thread(isDaemon = true, name = "binance-account") {
+                deliverAiCallback("window.onBinanceAccount", binanceAccountStateJson())
+            }
+        }
+
+        /** Remove never-filled ERROR rows from the live ledger (e.g. buys rejected
+         *  for insufficient balance). Records with real executed quantity are kept
+         *  — see BinanceLiveStore.clearFailedEntries. */
+        @JavascriptInterface
+        fun binanceClearFailedLive(): String {
+            return try {
+                val n = com.signalscope.app.data.BinanceLiveStore.clearFailedEntries(applicationContext)
+                gson.toJson(mapOf("ok" to true, "removed" to n))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        /** Set which symbols may receive REAL Binance orders. Blank = all
+         *  enrolled (the pre-allowlist behaviour). Paper is never affected. */
+        @JavascriptInterface
+        fun binanceSetLiveAllowlist(csv: String): String {
+            return try {
+                config.binanceLiveAllowlist = csv
+                gson.toJson(mapOf("ok" to true, "liveAllowlist" to config.binanceLiveAllowlist))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        // ── LIVE SIZING (fixed per-trade vs budget ÷ enrolled, PnL-compounded) ──
+        @JavascriptInterface
+        fun binanceSetSizing(mode: String, budget: Double, fixedSize: Double): String {
+            return try {
+                config.binanceLiveSizingMode = mode
+                if (budget >= 0.0) config.binanceLiveBudget = budget
+                if (fixedSize > 0.0) config.binanceLiveQuoteOrderSize = fixedSize
+                gson.toJson(mapOf(
+                    "ok" to true,
+                    "mode" to config.binanceLiveSizingMode,
+                    "budget" to config.binanceLiveBudget,
+                    "fixedSize" to config.binanceLiveQuoteOrderSize
+                ))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+            }
+        }
+
+        // ── MANUAL TEST ORDERS (crypto only): invest = market BUY of $X USDT,
+        //    withdraw = market SELL the full free base balance back to USDT.
+        //    Reuses the exact signed-order path the auto mirror uses, so a
+        //    success here proves keys + Spot permission + rules all work. ──
+        @JavascriptInterface
+        fun binanceManualBuy(symbol: String, usdt: Double) {
+            thread(isDaemon = true, name = "binance-manual-buy") {
+                deliverAiCallback("window.onBinanceManualResult", binanceManualBuyJson(symbol, usdt))
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceManualSell(symbol: String) {
+            thread(isDaemon = true, name = "binance-manual-sell") {
+                deliverAiCallback("window.onBinanceManualResult", binanceManualSellJson(symbol))
+            }
+        }
+
+        private fun manualErr(msg: String, sym: String, action: String): String =
+            gson.toJson(mapOf("ok" to false, "action" to action, "symbol" to sym, "error" to msg))
+
+        private fun binanceManualBuyJson(symbol: String, usdt: Double): String {
+            val sym = symbol.trim().uppercase()
+            val bc = com.signalscope.app.network.BinanceClient
+            val quote = bc.quoteAssetOf(sym)
+            if (!config.hasBinanceCredentials) return manualErr("Binance API key/secret not saved yet.", sym, "BUY")
+            if (quote == null) return manualErr(
+                "Manual buy supports ${bc.SUPPORTED_QUOTES.joinToString("/")} spot pairs only (e.g. BTCUSDC).", sym, "BUY")
+            if (usdt <= 0.0) return manualErr("Enter a $quote amount greater than 0.", sym, "BUY")
+            return try {
+                when (val a = bc.fetchAccount(config)) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> {
+                        if (!a.data.canTrade) return manualErr("API key cannot trade — enable Spot trading permission.", sym, "BUY")
+                        val free = a.data.balances[quote]?.free?.toDoubleOrNull() ?: 0.0
+                        if (free < usdt) return manualErr(
+                            "Insufficient $quote free: have ${"%.2f".format(free)}, need ${"%.2f".format(usdt)}.", sym, "BUY")
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure -> return manualErr(a.message, sym, "BUY")
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured -> return manualErr("Binance API key/secret not saved yet.", sym, "BUY")
+                }
+                val coid = "ss_man_b_${System.currentTimeMillis()}".take(36)
+                when (val r = bc.placeMarketBuy(config, sym, usdt, coid)) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> {
+                        val o = r.data
+                        gson.toJson(mapOf(
+                            "ok" to true, "action" to "BUY", "symbol" to sym,
+                            "orderId" to o.orderId, "status" to o.status,
+                            "executedQty" to o.executedQty, "spentQuote" to o.cummulativeQuoteQty,
+                            "avgPrice" to o.averagePrice
+                        ))
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure -> manualErr(r.message, sym, "BUY")
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured -> manualErr("Binance API key/secret not saved yet.", sym, "BUY")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "binanceManualBuy failed", e)
+                manualErr(e.message ?: "Manual buy failed", sym, "BUY")
+            }
+        }
+
+        private fun binanceManualSellJson(symbol: String): String {
+            val sym = symbol.trim().uppercase()
+            val bc = com.signalscope.app.network.BinanceClient
+            val quote = bc.quoteAssetOf(sym)
+            if (!config.hasBinanceCredentials) return manualErr("Binance API key/secret not saved yet.", sym, "SELL")
+            if (quote == null) return manualErr(
+                "Manual sell supports ${bc.SUPPORTED_QUOTES.joinToString("/")} spot pairs only (e.g. BTCUSDC).", sym, "SELL")
+            val base = bc.baseAssetOf(sym) ?: sym.removeSuffix(quote)
+            return try {
+                val free = when (val a = bc.fetchAccount(config)) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> a.data.balances[base]?.free?.toDoubleOrNull() ?: 0.0
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure -> return manualErr(a.message, sym, "SELL")
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured -> return manualErr("Binance API key/secret not saved yet.", sym, "SELL")
+                }
+                if (free <= 0.0) return manualErr("No free $base balance to sell.", sym, "SELL")
+                val coid = "ss_man_s_${System.currentTimeMillis()}".take(36)
+                val qty = java.math.BigDecimal.valueOf(free).stripTrailingZeros().toPlainString()
+                when (val r = bc.placeMarketSell(config, sym, qty, coid, null)) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> {
+                        val o = r.data
+                        gson.toJson(mapOf(
+                            "ok" to true, "action" to "SELL", "symbol" to sym,
+                            "orderId" to o.orderId, "status" to o.status,
+                            "executedQty" to o.executedQty, "receivedQuote" to o.cummulativeQuoteQty,
+                            "avgPrice" to o.averagePrice
+                        ))
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure -> manualErr(r.message, sym, "SELL")
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured -> manualErr("Binance API key/secret not saved yet.", sym, "SELL")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "binanceManualSell failed", e)
+                manualErr(e.message ?: "Manual sell failed", sym, "SELL")
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabGetState(): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.load(applicationContext, BN)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, BN)
+                val live = com.signalscope.app.data.BinanceLiveStore.load(applicationContext)
+                val closed = s.trades.filter { it.status == "CLOSED" }
+                val wins = closed.count { it.pctReturn > 0 }
+                // PARTIAL trades carry realized cash P&L too (prorated cost basis).
+                val liveClosed = live.trades.filter { it.status == "CLOSED" || it.status == "PARTIAL" }
+                val board = mapOf(
+                    "open" to s.trades.count { it.status == "OPEN" },
+                    "closed" to closed.size,
+                    "wins" to wins,
+                    "losses" to closed.count { it.pctReturn < 0 },
+                    "totalPnl" to closed.sumOf { it.pnlNotional },
+                    "totalPct" to closed.sumOf { it.pctReturn }
+                )
+                gson.toJson(mapOf(
+                    "enabled" to s.enabled,
+                    "source" to s.configSource,
+                    "summary" to cfg.summary(),
+                    "lastRunAt" to s.lastRunAt,
+                    "enrolled" to s.enrolled,
+                    "trades" to s.trades,
+                    "audit" to s.audit,
+                    "statuses" to s.statuses,
+                    "scoreboard" to board,
+                    "liveMirror" to mapOf(
+                        "enabled" to config.binanceLiveMirrorEnabled,
+                        "configured" to config.hasBinanceCredentials,
+                        "quoteOrderSize" to config.binanceLiveQuoteOrderSize,
+                        "sizingMode" to config.binanceLiveSizingMode,
+                        "budget" to config.binanceLiveBudget,
+                        "enrolledCount" to s.enrolled.size,
+                        "perSymbolSize" to effectiveBinanceBuySize(),
+                        "open" to live.trades.count { it.status == "OPEN" },
+                        "closed" to liveClosed.size,
+                        "errors" to live.trades.count { it.status == "ERROR" || it.error.isNotBlank() },
+                        "pnlQuote" to liveClosed.sumOf { it.livePnlQuote },
+                        "unmanaged" to live.unmanaged,
+                        // Paper-vs-real execution drag (slippage + fees). Only
+                        // fully-CLOSED trades with all four prices contribute.
+                        "slippage" to com.signalscope.app.trading.SlippageStats.toMap(
+                            com.signalscope.app.trading.SlippageStats.compute(
+                                liveClosed.filter { it.status == "CLOSED" }.map {
+                                    com.signalscope.app.trading.SlippageStats.Sample(
+                                        paperEntry = it.paperEntryPrice,
+                                        liveEntry = it.liveAvgBuyPrice,
+                                        paperExit = it.paperExitPrice ?: 0.0,
+                                        liveExit = it.liveAvgSellPrice,
+                                        quoteSpent = it.buyQuoteQty.toDoubleOrNull() ?: 0.0,
+                                        livePnlQuote = it.livePnlQuote)
+                                })),
+                        "trades" to live.trades
+                    )
+                ))
+            } catch (e: Exception) {
+                Log.e(TAG, "binanceLabGetState failed", e)
+                "{\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabSetEnabled(on: Boolean): Boolean {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.setEnabled(applicationContext, on, BN)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                if (on) com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, BN) {
+                    deliverAiCallback("window.onStrategyLabUpdate", "{}")
+                }
+                on
+            } catch (e: Exception) { Log.e(TAG, "binanceLabSetEnabled failed", e); false }
+        }
+
+        @JavascriptInterface
+        fun binanceLabEnroll(symbol: String, exchange: String): String {
+            return try {
+                val norm = symbol.trim().uppercase()
+                // Binance spot pairs: letters/digits only, e.g. BTCUSDT, ETHUSDT.
+                if (!Regex("^[A-Z0-9]{4,20}$").matches(norm)) {
+                    return gson.toJson(mapOf("ok" to false,
+                        "error" to "\"$symbol\" isn't a valid Binance pair — letters/digits only (e.g. BTCUSDT, ETHUSDT, SOLUSDT)."))
+                }
+                val s = com.signalscope.app.data.StrategyLabStore.enroll(applicationContext, norm, "BINANCE", BN)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabUnenroll(symbol: String): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.unenroll(applicationContext, symbol, BN)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabUploadConfig(jsonText: String, filename: String = "uploaded"): String {
+            return try {
+                when (val r = com.signalscope.app.trading.StrategyLabConfig.fromJson(jsonText, filename)) {
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Ok -> {
+                        com.signalscope.app.data.StrategyLabStore.setConfig(applicationContext, jsonText, filename, BN)
+                        gson.toJson(mapOf("ok" to true, "summary" to r.config.summary()))
+                    }
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Rejected ->
+                        gson.toJson(mapOf("ok" to false, "error" to r.reason))
+                }
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabResetConfig(): String {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.resetToPreset(applicationContext, BN)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, BN)
+                gson.toJson(mapOf("ok" to true, "summary" to cfg.summary()))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        /** Retire the legacy bare crypto lab: unenroll all its coins, disable it,
+         *  reset its monthly-reinvest, and restrict real-money coins to BTC/ETH.
+         *  Crypto strategy moves to Algos buckets. Refuses while real positions
+         *  are open (they must be closed first, or the ledger desyncs). */
+        @JavascriptInterface
+        fun binanceRetireLegacy(): String {
+            return try {
+                val openLive = com.signalscope.app.data.BinanceLiveStore
+                    .load(applicationContext).trades.filter { it.status == "OPEN" }
+                if (openLive.isNotEmpty()) return gson.toJson(mapOf("ok" to false,
+                    "error" to "Close the ${openLive.size} open live position(s) first: " +
+                        openLive.joinToString(", ") { it.symbol }))
+                val enrolled = com.signalscope.app.data.StrategyLabStore.load(applicationContext, "binance").enrolled
+                for (e in enrolled) com.signalscope.app.data.StrategyLabStore.unenroll(applicationContext, e.symbol, "binance")
+                com.signalscope.app.data.StrategyLabStore.setEnabled(applicationContext, false, "binance")
+                try { com.signalscope.app.data.ReinvestStore.reset(applicationContext, "binance") } catch (_: Exception) {}
+                try { com.signalscope.app.data.MacdGateStore.mutate(applicationContext, "binance") { it.copy(enabled = false) } } catch (_: Exception) {}
+                config.binanceLiveAllowlist = "BTCUSDC,ETHUSDC"
+                gson.toJson(mapOf("ok" to true, "unenrolled" to enrolled.size))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabResetPaper(): String {
+            return try {
+                // RESET GUARD: wiping the paper ledger while REAL positions are
+                // open severs every live record from its paper counterpart —
+                // that exact desync caused a real ETH position to be liquidated
+                // by the orphan sweep. Refuse until live positions are flat.
+                val openLive = com.signalscope.app.data.BinanceLiveStore
+                    .load(applicationContext).trades.filter { it.status == "OPEN" }
+                if (openLive.isNotEmpty()) {
+                    return gson.toJson(mapOf("ok" to false, "error" to
+                        "Refused: ${openLive.size} REAL Binance position(s) still open (" +
+                        openLive.joinToString(", ") { it.symbol } +
+                        "). Resetting paper now would desync the live ledger — " +
+                        "let them close (or sell manually) first."))
+                }
+                com.signalscope.app.data.StrategyLabStore.resetPaperState(applicationContext, BN)
+                gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) {
+                "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabRunNow() {
+            com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, BN) {
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabBacktestPickCsv() {
+            backtestNs = BN
+            runOnUiThread {
+                try { backtestCsvPicker.launch(arrayOf("*/*")) }
+                catch (e: Exception) { Log.e(TAG, "csv picker launch failed", e) }
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabPreview() {
+            thread(isDaemon = true) {
+                val out = try {
+                    gson.toJson(mapOf("ok" to true,
+                        "symbols" to com.signalscope.app.trading.StrategyLabRunner.preview(applicationContext, BN)))
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "preview failed")))
+                }
+                deliverAiCallback("window.onStrategyLabPreview", out)
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabBackfill() {
+            thread(isDaemon = true) {
+                try { com.signalscope.app.trading.StrategyLabRunner.backfill(applicationContext, BN) }
+                catch (e: Exception) { Log.e(TAG, "binance backfill failed", e) }
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        @JavascriptInterface
+        fun binanceLabExportReport(): Boolean {
+            if (lastBacktestReport == null) return false
+            runOnUiThread {
+                try { reportExportLauncher.launch("signalscope_binance_report_${System.currentTimeMillis()}.csv") }
+                catch (e: Exception) { Log.e(TAG, "report export launch failed", e) }
+            }
+            return true
+        }
+
+        // ── GERMANY (Xetra / T212) STRATEGY LAB — namespace "de", PAPER + optional
+        // T212 live mirror. Same engine/store/runner as US, but 15-min .DE candles
+        // and Xetra tickers. Mirrors the strategyLab* bridges with ns="de".
+        private val DE = "de"
+
+        @JavascriptInterface
+        fun deLabGetState(): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.load(applicationContext, DE)
+                val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, DE)
+                val closed = s.trades.filter { it.status == "CLOSED" }
+                val wins = closed.count { it.pctReturn > 0 }
+                val board = mapOf(
+                    "open" to s.trades.count { it.status == "OPEN" }, "closed" to closed.size,
+                    "wins" to wins, "losses" to closed.count { it.pctReturn < 0 },
+                    "totalPnl" to closed.sumOf { it.pnlNotional }, "totalPct" to closed.sumOf { it.pctReturn })
+                val t212Live = com.signalscope.app.data.T212LiveStore.load(applicationContext)
+                gson.toJson(mapOf(
+                    "enabled" to s.enabled, "source" to s.configSource, "summary" to cfg.summary(),
+                    "lastRunAt" to s.lastRunAt, "enrolled" to s.enrolled, "trades" to s.trades,
+                    "audit" to s.audit, "statuses" to s.statuses, "scoreboard" to board,
+                    "liveMirror" to mapOf(
+                        "broker" to "t212", "unit" to "",
+                        "enabled" to config.t212LiveMirrorEnabled,
+                        "frozen" to config.t212LiveFrozen,
+                        "configured" to config.hasT212Credentials,
+                        "quoteOrderSize" to config.t212LivePerTradeAmount,
+                        "open" to t212Live.trades.count { it.status == "OPEN" },
+                        "closed" to t212Live.trades.count { it.status == "CLOSED" },
+                        "errors" to t212Live.trades.count { it.status == "ERROR" || it.error.isNotBlank() },
+                        "pnlQuote" to 0.0, "trades" to t212Live.trades)))
+            } catch (e: Exception) {
+                Log.e(TAG, "deLabGetState failed", e)
+                "{\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
+            }
+        }
+
+        @JavascriptInterface
+        fun deLabSetEnabled(on: Boolean): Boolean {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.setEnabled(applicationContext, on, DE)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                if (on) com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, DE) {
+                    deliverAiCallback("window.onStrategyLabUpdate", "{}")
+                }
+                on
+            } catch (e: Exception) { Log.e(TAG, "deLabSetEnabled failed", e); false }
+        }
+
+        @JavascriptInterface
+        fun deLabEnroll(symbol: String, exchange: String): String {
+            return try {
+                val norm = symbol.trim().uppercase()
+                if (!Regex("^[A-Z0-9.\\-]{1,12}$").matches(norm)) {
+                    return gson.toJson(mapOf("ok" to false,
+                        "error" to "\"$symbol\" isn't a valid ticker — letters/digits only (e.g. SAP, SIE, ALV)."))
+                }
+                val s = com.signalscope.app.data.StrategyLabStore.enroll(applicationContext, norm, "DE", DE)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        @JavascriptInterface
+        fun deLabUnenroll(symbol: String): String {
+            return try {
+                val s = com.signalscope.app.data.StrategyLabStore.unenroll(applicationContext, symbol, DE)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "count" to s.enrolled.size))
+            } catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        @JavascriptInterface
+        fun deLabUploadConfig(jsonText: String, filename: String = "uploaded"): String {
+            return try {
+                when (val r = com.signalscope.app.trading.StrategyLabConfig.fromJson(jsonText, filename)) {
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Ok -> {
+                        com.signalscope.app.data.StrategyLabStore.setConfig(applicationContext, jsonText, filename, DE)
+                        gson.toJson(mapOf("ok" to true, "summary" to r.config.summary()))
+                    }
+                    is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Rejected ->
+                        gson.toJson(mapOf("ok" to false, "error" to r.reason))
+                }
+            } catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        @JavascriptInterface
+        fun deLabResetConfig(): String {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.resetToPreset(applicationContext, DE)
+                gson.toJson(mapOf("ok" to true, "summary" to com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, DE).summary()))
+            } catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        @JavascriptInterface
+        fun deLabResetPaper(): String {
+            return try {
+                com.signalscope.app.data.StrategyLabStore.resetPaperState(applicationContext, DE)
+                gson.toJson(mapOf("ok" to true))
+            } catch (e: Exception) { "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}" }
+        }
+
+        @JavascriptInterface
+        fun deLabRunNow() {
+            com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, DE) {
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        @JavascriptInterface
+        fun deLabBacktestPickCsv() {
+            backtestNs = DE
+            runOnUiThread {
+                try { backtestCsvPicker.launch(arrayOf("*/*")) }
+                catch (e: Exception) { Log.e(TAG, "csv picker launch failed", e) }
+            }
+        }
+
+        @JavascriptInterface
+        fun deLabPreview() {
+            thread(isDaemon = true) {
+                val out = try {
+                    gson.toJson(mapOf("ok" to true,
+                        "symbols" to com.signalscope.app.trading.StrategyLabRunner.preview(applicationContext, DE)))
+                } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "preview failed"))) }
+                deliverAiCallback("window.onStrategyLabPreview", out)
+            }
+        }
+
+        @JavascriptInterface
+        fun deLabBackfill() {
+            thread(isDaemon = true) {
+                try { com.signalscope.app.trading.StrategyLabRunner.backfill(applicationContext, DE) }
+                catch (e: Exception) { Log.e(TAG, "de backfill failed", e) }
+                deliverAiCallback("window.onStrategyLabUpdate", "{}")
+            }
+        }
+
+        @JavascriptInterface
+        fun deLabExportReport(): Boolean {
+            if (lastBacktestReport == null) return false
+            runOnUiThread {
+                try { reportExportLauncher.launch("signalscope_de_report_${System.currentTimeMillis()}.csv") }
+                catch (e: Exception) { Log.e(TAG, "report export launch failed", e) }
+            }
+            return true
+        }
+
         /** Re-fetch + re-score every watchlist entry. Result delivered async via
          *  window.onWatchlistRefreshed(json) — same pattern as scan callbacks. */
         @JavascriptInterface
         fun refreshWatchlist() {
+            refreshWatchlistInternal(null)
+        }
+
+        @JavascriptInterface
+        fun refreshWatchlistForSpace(space: String) {
+            refreshWatchlistInternal(space)
+        }
+
+        private fun refreshWatchlistInternal(space: String?) {
             thread(isDaemon = true) {
                 val resultJson: String = try {
-                    val entries = com.signalscope.app.data.WatchlistStore.load(applicationContext)
+                    val normalizedSpace = space?.trim()?.uppercase()
+                        ?.takeIf { it == "IN" || it == "US" || it == "DE" }
+                    val allEntries = com.signalscope.app.data.WatchlistStore.load(applicationContext)
+                    val entries = if (normalizedSpace == null) {
+                        allEntries
+                    } else {
+                        allEntries.filter { watchlistEntryMatchesSpace(it, normalizedSpace) }
+                    }
                     val weights = config.scoringWeights
                     val results = entries.map { e ->
                         try {
@@ -1685,27 +5913,30 @@ class MainActivity : AppCompatActivity() {
                                     ) / 20.0
                                     val snap = com.signalscope.app.data.WatchlistStore.Snapshot(
                                         ltp = a.price, support = a.support, resistance = a.resistance,
-                                        atr = a.atr, buyScore = a.buyScore, buySignal = a.buySignal,
+                                        atr = a.atr, cherryPoints = a.cherryPoints, cherrySignal = a.cherrySignal,
                                         pullbackScore = a.pullbackScore, pullbackSignal = a.pullbackSignal,
                                         momentumScore = a.momentumScore, momentumSignal = a.momentumSignal,
                                         entryMode = a.entryMode,
                                         proposedTrigger = trigger, capturedAt = System.currentTimeMillis()
                                     )
                                     com.signalscope.app.data.WatchlistStore.update(
-                                        applicationContext, e.symbol, lastSnapshot = snap
+                                        applicationContext,
+                                        e.symbol,
+                                        exchange = e.exchange,
+                                        lastSnapshot = snap
                                     )
-                                    mapOf("symbol" to e.symbol, "ok" to true, "snap" to snap)
+                                    mapOf("symbol" to e.symbol, "exchange" to e.exchange, "ok" to true, "snap" to snap)
                                 } else {
-                                    mapOf("symbol" to e.symbol, "ok" to false, "error" to "insufficient candles")
+                                    mapOf("symbol" to e.symbol, "exchange" to e.exchange, "ok" to false, "error" to "insufficient candles")
                                 }
                             } else {
-                                mapOf("symbol" to e.symbol, "ok" to false, "error" to "fetch failed")
+                                mapOf("symbol" to e.symbol, "exchange" to e.exchange, "ok" to false, "error" to "fetch failed")
                             }
                         } catch (ex: Exception) {
-                            mapOf("symbol" to e.symbol, "ok" to false, "error" to (ex.message ?: "unknown"))
+                            mapOf("symbol" to e.symbol, "exchange" to e.exchange, "ok" to false, "error" to (ex.message ?: "unknown"))
                         }
                     }
-                    com.google.gson.Gson().toJson(mapOf("ok" to true, "results" to results))
+                    com.google.gson.Gson().toJson(mapOf("ok" to true, "space" to normalizedSpace, "results" to results))
                 } catch (e: Exception) {
                     Log.e(TAG, "refreshWatchlist failed", e)
                     "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
@@ -1804,21 +6035,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** Called from detail modal — analyzes why a stock has pulled back */
+        @JvmOverloads
         @JavascriptInterface
         fun analyzePullback(symbol: String, price: Double, ema21PctDiff: Double,
                             macdPhase: String, profitScore: Int, protectScore: Int,
                             rsi: Double = 0.0, adx: Double = 0.0,
-                            support: Double = 0.0, resistance: Double = 0.0) {
+                            support: Double = 0.0, resistance: Double = 0.0,
+                            name: String = "") {
             thread(isDaemon = true) {
                 // Guard the ENTIRE body — any unexpected exception must still
                 // deliver a callback, otherwise the spinner spins forever.
                 val text: String = try {
+                    val aiCtx = StockAiClient.MarketContext.fromSpace(config.currentSpace)
                     val result = StockAiClient.analyzePullback(
                         config, symbol, price, ema21PctDiff, macdPhase, profitScore, protectScore,
                         if (rsi > 0) rsi else null,
                         if (adx > 0) adx else null,
                         if (support > 0) support else null,
-                        if (resistance > 0) resistance else null
+                        if (resistance > 0) resistance else null,
+                        ctx = aiCtx,
+                        name = name.ifBlank { null }
                     )
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text
@@ -1833,12 +6069,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** Follow-up question about company fundamentals after pullback analysis */
+        @JvmOverloads
         @JavascriptInterface
-        fun askAboutCompany(symbol: String, price: Double, userQuestion: String, previousAnalysis: String = "") {
+        fun askAboutCompany(symbol: String, price: Double, userQuestion: String, previousAnalysis: String = "", name: String = "") {
             thread(isDaemon = true) {
                 val text: String = try {
+                    val aiCtx = StockAiClient.MarketContext.fromSpace(config.currentSpace)
                     val result = StockAiClient.askFollowUpQuestion(
-                        config, symbol, userQuestion, price, previousAnalysis
+                        config, symbol, userQuestion, price, previousAnalysis,
+                        ctx = aiCtx,
+                        name = name.ifBlank { null }
                     )
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text
@@ -1855,18 +6095,21 @@ class MainActivity : AppCompatActivity() {
         /** Called from detail modal — full stock outlook analysis */
         @JvmOverloads
         @JavascriptInterface
-        fun analyzeOutlook(symbol: String, price: Double, buyScore: Int,
+        fun analyzeOutlook(symbol: String, price: Double, cherryPoints: Int,
                            profitScore: Int, protectScore: Int, sellIntent: String,
                            macdPhase: String, macdSlope: Double, rsi: Double,
                            sma200: Double, ema21PctDiff: Double, rrRatio: Double, priceVel: Double,
-                           isInPortfolio: Boolean = false) {
+                           isInPortfolio: Boolean = false, name: String = "") {
             thread(isDaemon = true) {
                 val text: String = try {
+                    val aiCtx = StockAiClient.MarketContext.fromSpace(config.currentSpace)
                     val result = StockAiClient.analyzeOutlook(
-                        config, symbol, price, buyScore, profitScore, protectScore, sellIntent,
+                        config, symbol, price, cherryPoints, profitScore, protectScore, sellIntent,
                         macdPhase, macdSlope, if (rsi == 0.0) null else rsi,
                         if (sma200 == 0.0) null else sma200,
-                        ema21PctDiff, rrRatio, priceVel, isInPortfolio
+                        ema21PctDiff, rrRatio, priceVel, isInPortfolio,
+                        ctx = aiCtx,
+                        name = name.ifBlank { null }
                     )
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text
@@ -1893,7 +6136,8 @@ class MainActivity : AppCompatActivity() {
         fun analyseDeepPullbacks(stocksJson: String) {
             thread(isDaemon = true) {
                 val text: String = try {
-                    val result = StockAiClient.analyseDeepPullbackBatch(config, stocksJson)
+                    val aiCtx = StockAiClient.MarketContext.fromSpace(config.currentSpace)
+                    val result = StockAiClient.analyseDeepPullbackBatch(config, stocksJson, ctx = aiCtx)
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text
                         is StockAiClient.AiResult.Error -> "⚠ ${result.message}"
@@ -1903,6 +6147,31 @@ class MainActivity : AppCompatActivity() {
                     "⚠ Analysis crashed: ${e.message ?: e.javaClass.simpleName}"
                 }
                 deliverAiCallback("window.onPullbackBatchResult", text)
+            }
+        }
+
+        /**
+         * Portfolio News Scan — batched criticality triage of the current
+         * space's holdings. Fetches recent news per holding + one LLM call
+         * that returns strict JSON ({summary, stocks:[{symbol,verdict,conclusion}]}).
+         * Delivered to window.onPortfolioNewsResult. Places no orders.
+         *   stocksJson: [{symbol, name}]
+         */
+        @JavascriptInterface
+        fun scanPortfolioNews(stocksJson: String) {
+            thread(isDaemon = true) {
+                val out: String = try {
+                    val aiCtx = StockAiClient.MarketContext.fromSpace(config.currentSpace)
+                    when (val r = StockAiClient.analysePortfolioNews(config, stocksJson, aiCtx)) {
+                        is StockAiClient.AiResult.Success -> r.text
+                        is StockAiClient.AiResult.Error ->
+                            "{\"error\":\"${r.message.replace("\"", "'")}\"}"
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "scanPortfolioNews crashed", e)
+                    "{\"error\":\"${(e.message ?: e.javaClass.simpleName).replace("\"", "'")}\"}"
+                }
+                deliverAiCallback("window.onPortfolioNewsResult", out)
             }
         }
 
@@ -1955,7 +6224,7 @@ class MainActivity : AppCompatActivity() {
                         "alertType" to a.alertType.name,
                         "message" to a.message,
                         "sellScore" to a.sellScore,
-                        "buyScore" to a.buyScore,
+                        "buyScore" to a.cherryPoints,
                         "price" to a.price,
                         "macdPhase" to a.macdPhase,
                         "source" to a.source
@@ -2010,6 +6279,13 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Throwable) {
                 Log.e(TAG, "getGttTriggersJson failed", e)
                 "{\"ok\":false,\"error\":\"${(e.message ?: "exception").replace("\"","")}\",\"triggers\":[]}"
+            }
+        }
+
+        @JavascriptInterface
+        fun fetchGttTriggersAsync() {
+            thread(isDaemon = true) {
+                deliverAiCallback("window.onGttTriggersResult", getGttTriggersJson())
             }
         }
 
@@ -2670,7 +6946,7 @@ class MainActivity : AppCompatActivity() {
                 "totalReturnPct" to h.totalReturnPct,
                 "source" to "zerodha",
                 "verdict" to h.verdict,
-                "buyScore" to (a?.buyScore ?: 0),
+                "buyScore" to (a?.cherryPoints ?: 0),
                 "pullbackScore" to (a?.pullbackScore ?: 0),
                 "pullbackSignal" to (a?.pullbackSignal ?: "—"),
                 "momentumScore" to (a?.momentumScore ?: 0),
@@ -2729,7 +7005,7 @@ class MainActivity : AppCompatActivity() {
                 "priceAccel" to (a?.priceAccel ?: 0.0),
                 "priceRoc3" to (a?.priceRoc3 ?: 0.0),
                 "upDays" to (a?.upDays ?: 0),
-                "buySignal" to (a?.buySignal ?: "—"),
+                "buySignal" to (a?.cherrySignal ?: "—"),
                 "sellSignal" to (a?.sellSignal ?: "—"),
                 "support" to (a?.support ?: 0.0),
                 "resistance" to (a?.resistance ?: 0.0),
@@ -2749,7 +7025,17 @@ class MainActivity : AppCompatActivity() {
                 "softSniperFiredToday" to softSniperFiredToday,
                 "obvDivergence" to (a?.obvDivergence ?: false),
                 "obvWeakness" to (a?.obvWeakness ?: false),
-                "buyScoreReport" to (a?.buyScoreReport ?: ""),
+                "divHistBullish" to (a?.divHistBullish ?: false),
+                "divHistBearish" to (a?.divHistBearish ?: false),
+                "divVolBullish" to (a?.divVolBullish ?: false),
+                "divVolBearish" to (a?.divVolBearish ?: false),
+                "divDetail" to (a?.divDetail ?: ""),
+                "volBullDryUp" to (a?.volBullDryUp ?: false),
+                "volBearDryUp" to (a?.volBearDryUp ?: false),
+                "volBullCapitulation" to (a?.volBullCapitulation ?: false),
+                "volBearChurning" to (a?.volBearChurning ?: false),
+                "volPatternDetail" to (a?.volPatternDetail ?: ""),
+                "buyScoreReport" to (a?.cherryPointsReport ?: ""),
                 "pullbackScoreReport" to (a?.pullbackScoreReport ?: ""),
                 "momentumScoreReport" to (a?.momentumScoreReport ?: ""),
                 "trailingPe" to (a?.trailingPe),
@@ -2876,6 +7162,25 @@ class MainActivity : AppCompatActivity() {
             .forEach { entry ->
                 symbols.add(YahooFinanceClient.toYahooSymbol(entry.symbol, entry.exchange))
             }
+        // Dummy GTT alert levels need live ticks so the monitor can fire.
+        symbols.addAll(com.signalscope.app.data.DummyGttStore.yahooSymbols(applicationContext))
+        // ALGO HOLDINGS. Without these an algo's open positions were priced only
+        // from the engine's closed bars, so their unrealised P&L stepped once every
+        // 2 hours on a 240/120 config (once a DAY on a daily one) — while a stock
+        // sitting in the portfolio or watchlist updated every second. Nothing about
+        // the strategy needs this: entries and exits stay on their own bar frames
+        // and never see a tick. It is purely valuation, so it cannot affect trading.
+        // Only OPEN positions are subscribed, not whole 106-name universes.
+        try {
+            val nss = (com.signalscope.app.data.BucketStore.allNamespaces(applicationContext) +
+                listOf("us", "de", "binance")).distinct()
+            for (n in nss) {
+                val ex = com.signalscope.app.trading.Spaces.exchangeOf(n)
+                com.signalscope.app.data.StrategyLabStore.load(applicationContext, n).trades
+                    .filter { it.status == "OPEN" }
+                    .forEach { symbols.add(YahooFinanceClient.toYahooSymbol(it.symbol, ex)) }
+            }
+        } catch (e: Exception) { Log.w(TAG, "algo live symbols failed", e) }
         return symbols
             .map { it.trim().uppercase() }
             .filter { it.isNotBlank() }
@@ -2941,8 +7246,99 @@ class MainActivity : AppCompatActivity() {
             message = liveStreamStatus.message
         )
         pushLiveStreamStateToWebView()
-        liveStreamClient.setSymbols(symbols)
+
+        // ── FEED ROUTING ──────────────────────────────────────────────────
+        // Indian names can come from Kite instead of Yahoo. The split is by
+        // symbol, not by which tab is open, because the mark-to-market pass
+        // values every space's positions continuously — routing by the visible
+        // tab would silently stop marking whatever you are not looking at.
+        //
+        // Both feeds emit the SAME Yahoo-style symbol, so nothing downstream
+        // knows or cares which one a price came from.
+        val useKite = try { config.useZerodhaLiveTicks } catch (e: Exception) { false }
+        val useFinnhub = try { config.useFinnhubLiveTicks } catch (e: Exception) { false }
+
+        // Partition by SYMBOL SHAPE, once, so each feed gets exactly the names it
+        // can serve and Yahoo keeps the remainder. Written as a partition rather
+        // than a chain of if/else because the failure that matters is a symbol
+        // falling through every branch and silently never being priced.
+        val indian = if (!useKite) emptyList()
+            else symbols.filter { it.endsWith(".NS", true) || it.endsWith(".BO", true) }
+        // US tickers carry no suffix. A dot means another exchange, a dash means
+        // a crypto pair — both belong to Yahoo, and treating either as US would
+        // subscribe Finnhub to a symbol it will never quote.
+        val american = if (!useFinnhub) emptyList()
+            else symbols.filter { !it.contains('.') && !it.contains('-') }
+        val routed = (indian + american).toSet()
+        val rest = symbols.filter { it !in routed }
+
+        if (useKite) {
+            if (zerodhaStreamClient == null) zerodhaStreamClient = buildZerodhaStream()
+            zerodhaStreamClient?.setSymbols(indian)
+        } else zerodhaStreamClient?.stop("Switched to Yahoo")
+
+        if (useFinnhub) {
+            if (finnhubStreamClient == null) finnhubStreamClient = buildFinnhubStream()
+            finnhubStreamClient?.setSymbols(american)
+        } else finnhubStreamClient?.stop("Switched to Yahoo")
+
+        // Yahoo keeps everything the others cannot serve. Stopping it outright
+        // would take unrelated spaces down with a switch labelled for one market.
+        liveStreamClient.setSymbols(rest)
     }
+
+    /** Same callbacks as the other feeds — see the routing note above. */
+    private fun buildFinnhubStream() = com.signalscope.app.network.FinnhubStreamClient(
+        config = config,
+        onQuote = { quote ->
+            com.signalscope.app.trading.MarkToMarket.onQuote(
+                quote.symbol, quote.price,
+                quote.time.takeIf { it > 0L } ?: System.currentTimeMillis())
+            val liveSignal = LivePortfolioBars.recordQuote(quote)
+            if (liveSignal != null) {
+                LiveSoftSniperEngine.onSignal(applicationContext, config, liveSignal)
+                LiveBuyTrackerEngine.onSignal(applicationContext, config, liveSignal)
+            }
+            com.signalscope.app.trading.DummyGttMonitor.onQuote(
+                applicationContext, quote.symbol, quote.price)
+            runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+        },
+        onStatus = { status ->
+            runOnUiThread {
+                liveStreamStatus = liveStreamStatus.copy(
+                    connected = status.connected || liveStreamStatus.connected,
+                    message = "Finnhub: ${status.message}")
+                pushLiveStreamStateToWebView()
+            }
+        })
+
+    /** Same callbacks as the Yahoo stream — see the routing note above. */
+    private fun buildZerodhaStream() = com.signalscope.app.network.ZerodhaStreamClient(
+        appContext = applicationContext,
+        config = config,
+        onQuote = { quote ->
+            com.signalscope.app.trading.MarkToMarket.onQuote(
+                quote.symbol, quote.price,
+                quote.time.takeIf { it > 0L } ?: System.currentTimeMillis())
+            val liveSignal = LivePortfolioBars.recordQuote(quote)
+            if (liveSignal != null) {
+                LiveSoftSniperEngine.onSignal(applicationContext, config, liveSignal)
+                LiveBuyTrackerEngine.onSignal(applicationContext, config, liveSignal)
+            }
+            com.signalscope.app.trading.DummyGttMonitor.onQuote(
+                applicationContext, quote.symbol, quote.price)
+            runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+        },
+        onStatus = { status ->
+            // Named so a stalled Indian feed is not mistaken for a stalled
+            // Yahoo one when both are running side by side.
+            runOnUiThread {
+                liveStreamStatus = liveStreamStatus.copy(
+                    connected = status.connected || liveStreamStatus.connected,
+                    message = "Kite: ${status.message}")
+                pushLiveStreamStateToWebView()
+            }
+        })
 
     private fun pushLiveStreamStateToWebView() {
         if (!::webView.isInitialized) return

@@ -1,0 +1,12 @@
+# Yahoo/Xetra examples for Germany.
+# Availability depends on Yahoo. Use .DE suffix for Xetra listings.
+SAP.DE
+SIE.DE
+ALV.DE
+AIR.DE
+DTE.DE
+MUV2.DE
+MBG.DE
+BMW.DE
+ADS.DE
+IFX.DE

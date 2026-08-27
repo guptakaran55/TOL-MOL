@@ -332,6 +332,28 @@ object YahooFinanceClient {
         }
     }
 
+    /** Fetch 60 days of 15-minute candles for intraday paper simulations. */
+    fun fetchCandles15m(symbol: String, exchange: String = "NSE"): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = "60d", interval = "15m")
+
+    /**
+     * Generic OHLCV fetch for the CONFIG-DRIVEN engine feed (FeedPlan). Yahoo
+     * serves less history the finer the interval, so the planner picks the
+     * coarsest interval that still tiles into the config's frames and asks for
+     * that interval's full cap — e.g. 60m/730d for a 240min/120min champion
+     * instead of 15m/60d, which could never clear a 240-bar warmup.
+     *
+     * RAW closes on purpose (ANDROID_ADAPTIVE_FETCH_INSTRUCTIONS §9 CORRECTION):
+     * the engine transacts at raw prices and the Python reference CSVs are raw
+     * (verified via DTE/ALV/MUV2/BAS ex-dividend gaps). Only the screener and the
+     * daily-MACD gate use the ADJUSTED feed (fetchDailyAdjusted), because ranking
+     * compares trailing returns ACROSS symbols where a dividend gap would make a
+     * payer look like it fell.
+     */
+    fun fetchCandlesAt(
+        symbol: String, exchange: String, interval: String, range: String
+    ): CandleResult = fetchCandlesInternal(symbol, exchange, range = range, interval = interval)
+
     /**
      * Fetch 2 years of daily candles for a stock.
      * For Indian stocks (NSE): appends ".NS" suffix automatically.
@@ -383,7 +405,9 @@ object YahooFinanceClient {
                         }
                         404 -> {
                             Log.w(TAG, "Symbol not found: $yahooSymbol")
-                            tryAlternateSuffix(symbol, exchange)
+                            val canTryIndianAlternate = !symbol.contains(".") &&
+                                exchange.uppercase() in setOf("NSE", "BSE")
+                            if (canTryIndianAlternate) tryAlternateSuffix(symbol, exchange) else CandleResult.NoData
                         }
                         200 -> {
                             val body = resp.body?.string() ?: return@use CandleResult.NoData
@@ -424,7 +448,238 @@ object YahooFinanceClient {
         return CandleResult.Error(lastError?.message ?: "Timeout after $maxAttempts retries")
     }
 
-    private fun tryAlternateSuffix(symbol: String, exchange: String): CandleResult {
+    /**
+     * Current market price from the chart endpoint's meta block. For US symbols
+     * this is real-time (measured ~0s lag); for Xetra it carries the exchange's
+     * ~15-minute delay — callers needing true DE real-time should prefer
+     * Tradegate and treat this as fallback. Returns null on any failure.
+     */
+    fun fetchLivePrice(yahooSymbol: String): Double? {
+        return try {
+            val url = HttpUrl.Builder()
+                .scheme("https").host("query1.finance.yahoo.com")
+                .addPathSegments("v8/finance/chart/$yahooSymbol")
+                .addQueryParameter("range", "1d")
+                .addQueryParameter("interval", "1m")
+                .addQueryParameter("includePrePost", "false")
+                .build()
+            val request = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (resp.code != 200) return null
+                val body = resp.body?.string() ?: return null
+                val meta = JSONObject(body).getJSONObject("chart")
+                    .getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+                val p = meta.optDouble("regularMarketPrice", Double.NaN)
+                if (p.isNaN() || p <= 0.0) null else p
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchLivePrice($yahooSymbol) failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Is the symbol's REGULAR trading session open right now? Uses the chart
+     * meta's currentTradingPeriod (exchange-reported session bounds), so it
+     * handles time zones and holidays for free. null = couldn't determine —
+     * callers should treat null as "unknown", not "closed".
+     */
+    fun fetchMarketOpen(yahooSymbol: String): Boolean? {
+        return try {
+            val url = HttpUrl.Builder()
+                .scheme("https").host("query1.finance.yahoo.com")
+                .addPathSegments("v8/finance/chart/$yahooSymbol")
+                .addQueryParameter("range", "1d")
+                .addQueryParameter("interval", "1m")
+                .build()
+            val request = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (resp.code != 200) return null
+                val body = resp.body?.string() ?: return null
+                val regular = JSONObject(body).getJSONObject("chart")
+                    .getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+                    .getJSONObject("currentTradingPeriod").getJSONObject("regular")
+                val now = System.currentTimeMillis() / 1000
+                now >= regular.getLong("start") && now < regular.getLong("end")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchMarketOpen($yahooSymbol) failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * SCREENER-ONLY daily feed using SPLIT/DIVIDEND-ADJUSTED closes.
+     *
+     * The momentum screener measures trailing return, volatility, and %>SMA50 —
+     * all of which a stock split would corrupt if computed on raw prices (a 2:1
+     * split looks like a −50% crash). Yahoo's chart API returns an `adjclose`
+     * series that already corrects splits/dividends; we read that instead of the
+     * raw `close`. The TRADING engine deliberately keeps raw prices (intraday
+     * entries need the actual traded price), so this is a separate path — only
+     * the screener is split-sensitive. Falls back to raw close if adjclose is
+     * absent (e.g. very new listings). ~2 years of history per the spec.
+     */
+    fun fetchDailyAdjusted(symbol: String, exchange: String): CandleResult {
+        val yahooSymbol = toYahooSymbol(symbol, exchange)
+        return try {
+            val url = HttpUrl.Builder()
+                .scheme("https").host("query1.finance.yahoo.com")
+                .addPathSegments("v8/finance/chart/$yahooSymbol")
+                .addQueryParameter("range", "2y")
+                .addQueryParameter("interval", "1d")
+                .addQueryParameter("includePrePost", "false")
+                .addQueryParameter("events", "div,splits")   // makes Yahoo return the adjclose series
+                .build()
+            val req = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.code == 429) return CandleResult.RateLimited
+                if (resp.code != 200) return CandleResult.NoData
+                val body = resp.body?.string() ?: return CandleResult.NoData
+                parseYahooAdjusted(body, yahooSymbol)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchDailyAdjusted($yahooSymbol) failed: ${e.message}")
+            CandleResult.Error("Adjusted fetch error: ${e.message}")
+        }
+    }
+
+    /** Parse the chart response reading adjclose (split-adjusted). Only the close
+     *  matters to the screener, so OHLC are all set to the adjusted close. */
+    private fun parseYahooAdjusted(body: String, symbol: String): CandleResult {
+        return try {
+            val result = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+            val timestamps = result.optJSONArray("timestamp") ?: return CandleResult.NoData
+            val indicators = result.getJSONObject("indicators")
+            val rawClose = indicators.optJSONArray("quote")?.optJSONObject(0)?.optJSONArray("close")
+            val adj = indicators.optJSONArray("adjclose")?.optJSONObject(0)?.optJSONArray("adjclose")
+            if (timestamps.length() < 10) return CandleResult.NoData
+            val candles = ArrayList<CandleData>()
+            for (i in 0 until timestamps.length()) {
+                // Prefer adjusted; fall back to raw when adjclose is null for a bar.
+                val v = when {
+                    adj != null && !adj.isNull(i) -> adj.optDouble(i)
+                    rawClose != null && !rawClose.isNull(i) -> rawClose.optDouble(i)
+                    else -> continue
+                }
+                if (v.isNaN() || v <= 0.0) continue
+                candles.add(CandleData(timestamps.getLong(i), v, v, v, v, 0L))
+            }
+            if (candles.size < 50) CandleResult.NoData
+            else CandleResult.Success(candles, null)
+        } catch (e: Exception) {
+            Log.e(TAG, "parseYahooAdjusted error for $symbol", e)
+            CandleResult.Error("Parse error: ${e.message}")
+        }
+    }
+
+    private fun fetchCandlesInternal(
+        symbol: String,
+        exchange: String,
+        range: String,
+        interval: String
+    ): CandleResult {
+        val yahooSymbol = toYahooSymbol(symbol, exchange)
+        val maxAttempts = 3
+
+        var lastError: Exception? = null
+        for (attempt in 1..maxAttempts) {
+            try {
+                if (attempt > 1) {
+                    Log.d(TAG, "Retry #$attempt for $yahooSymbol ($range/$interval)")
+                    Thread.sleep((500L * attempt).coerceAtMost(2000L))
+                } else {
+                    Log.d(TAG, "Fetching Yahoo Finance data for $yahooSymbol ($range/$interval)")
+                }
+
+                val url = HttpUrl.Builder()
+                    .scheme("https")
+                    .host("query1.finance.yahoo.com")
+                    .addPathSegments("v8/finance/chart/$yahooSymbol")
+                    .addQueryParameter("range", range)
+                    .addQueryParameter("interval", interval)
+                    .addQueryParameter("includePrePost", "false")
+                    .addQueryParameter("events", "")
+                    .build()
+
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0"
+                    )
+                    .addHeader("Accept", "application/json")
+                    .build()
+
+                val response = client.newCall(request).execute()
+
+                return response.use { resp ->
+                    when (resp.code) {
+                        429 -> {
+                            Log.w(TAG, "Yahoo Finance rate limited for $yahooSymbol")
+                            CandleResult.RateLimited
+                        }
+                        404 -> {
+                            Log.w(TAG, "Symbol not found: $yahooSymbol")
+                            val canTryIndianAlternate = !symbol.contains(".") &&
+                                exchange.uppercase() in setOf("NSE", "BSE")
+                            if (canTryIndianAlternate) {
+                                tryAlternateSuffix(symbol, exchange, range, interval)
+                            } else {
+                                CandleResult.NoData
+                            }
+                        }
+                        200 -> {
+                            val body = resp.body?.string() ?: return@use CandleResult.NoData
+                            parseYahooResponse(body, yahooSymbol)
+                        }
+                        else -> {
+                            Log.w(TAG, "Yahoo Finance HTTP ${resp.code} for $yahooSymbol")
+                            CandleResult.NoData
+                        }
+                    }
+                }
+            } catch (e: java.io.InterruptedIOException) {
+                lastError = e
+                Log.w(TAG, "Timeout on attempt $attempt for $yahooSymbol")
+                continue
+            } catch (e: java.net.SocketTimeoutException) {
+                lastError = e
+                Log.w(TAG, "SocketTimeout on attempt $attempt for $yahooSymbol")
+                continue
+            } catch (e: java.net.UnknownHostException) {
+                lastError = e
+                Log.w(TAG, "DNS failure on attempt $attempt for $yahooSymbol")
+                continue
+            } catch (e: Exception) {
+                val msg = e.message?.lowercase() ?: ""
+                if ("rate" in msg || "429" in msg || "too many" in msg) {
+                    return CandleResult.RateLimited
+                }
+                Log.e(TAG, "Yahoo Finance error for $yahooSymbol", e)
+                return CandleResult.Error(e.message ?: "Unknown error")
+            }
+        }
+
+        Log.e(TAG, "All $maxAttempts attempts failed for $yahooSymbol", lastError)
+        return CandleResult.Error(lastError?.message ?: "Timeout after $maxAttempts retries")
+    }
+
+    private fun tryAlternateSuffix(
+        symbol: String,
+        exchange: String,
+        range: String = "2y",
+        interval: String = "1d"
+    ): CandleResult {
         // If NSE didn't work, try BSE and vice versa
         val altSuffix = if (exchange == "NSE") ".BO" else ".NS"
         val altSymbol = "$symbol$altSuffix"
@@ -436,9 +691,10 @@ object YahooFinanceClient {
                 .scheme("https")
                 .host("query1.finance.yahoo.com")
                 .addPathSegments("v8/finance/chart/$altSymbol")
-                .addQueryParameter("range", "2y")
-                .addQueryParameter("interval", "1d")
+                .addQueryParameter("range", range)
+                .addQueryParameter("interval", interval)
                 .addQueryParameter("includePrePost", "false")
+                .addQueryParameter("events", "")
                 .build()
 
             val request = Request.Builder()
@@ -480,7 +736,7 @@ object YahooFinanceClient {
             }
             val displayName = metaName("longName") ?: metaName("shortName")
 
-            val timestamps = result.getJSONArray("timestamp")
+            val timestamps = result.optJSONArray("timestamp")
             val indicators = result.getJSONObject("indicators")
             val quoteArray = indicators.getJSONArray("quote")
             if (quoteArray.length() == 0) return CandleResult.NoData
@@ -492,7 +748,10 @@ object YahooFinanceClient {
             val closes = quote.optJSONArray("close")
             val volumes = quote.optJSONArray("volume")
 
-            if (closes == null || timestamps.length() < 10) return CandleResult.NoData
+            if (closes == null || timestamps == null || timestamps.length() < 10) {
+                Log.w(TAG, "Yahoo Finance: no usable timestamps for $symbol")
+                return CandleResult.NoData
+            }
 
             val candles = mutableListOf<CandleData>()
             for (i in 0 until timestamps.length()) {

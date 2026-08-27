@@ -10,6 +10,7 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import com.signalscope.app.data.ConfigManager
 import com.signalscope.app.data.ScoringWeights
@@ -24,6 +25,28 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var config: ConfigManager
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    // Bulk key-import file picker — reads a JSON template and fills every
+    // credential field at once. Registered as a field so it's ready before STARTED.
+    private val importKeysLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) handleKeyImport(uri)
+        }
+
+    private fun handleKeyImport(uri: android.net.Uri) {
+        try {
+            val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+            if (text.isBlank()) {
+                Toast.makeText(this, "That file was empty.", Toast.LENGTH_SHORT).show(); return
+            }
+            val (n, msg) = config.importCredentialsJson(text)
+            loadCurrentValues()   // reflect imported values in the fields
+            Toast.makeText(this, if (n > 0) "✓ $msg\nReview, then tap Save." else "No keys imported — $msg",
+                Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Import failed: ${e.message ?: "invalid JSON"}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     // ── Zerodha fields ──
     private lateinit var etZerodhaApiKey: EditText
     private lateinit var etZerodhaApiSecret: EditText
@@ -32,12 +55,66 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etZerodhaToken: EditText
     private lateinit var tvZerodhaStatus: TextView
     private lateinit var layoutZerodhaToken: View
+    private lateinit var switchPaperNotifications: Switch
+    private lateinit var etFinnhubKey: EditText
+    private lateinit var switchFinnhubLiveTicks: Switch
+    private lateinit var switchZerodhaLiveMirror: Switch
+    private lateinit var etFlatFeeUs: EditText
+    private lateinit var etFlatFeeDe: EditText
+    private lateinit var etFlatFeeIn: EditText
+    private lateinit var etFlatFeeBinance: EditText
+    private lateinit var switchZerodhaLiveTicks: Switch
+    private lateinit var switchZerodhaHistory: Switch
+    private lateinit var tvZerodhaSourceStatus: TextView
+
+    /**
+     * Says what the app is ACTUALLY using, not what the switches ask for. The
+     * two differ whenever the Zerodha session has lapsed or the historical
+     * add-on has expired, and that gap is precisely the thing worth showing: a
+     * switch that reads "on" while the feed silently comes from somewhere else
+     * is how you end up trusting the wrong prices.
+     */
+    private fun renderIndiaSourceStatus() {
+        val live = if (config.indiaLivePriceSource == "zerodha") {
+            if (config.isZerodhaConnected) "Live ticks: Zerodha (Kite socket)"
+            else "Live ticks: Yahoo — Zerodha selected but not logged in"
+        } else "Live ticks: Yahoo"
+
+        val refusedAt = config.zerodhaHistoryLastRefusalAt
+        val hist = if (config.indiaHistorySource == "zerodha") {
+            when {
+                !config.isZerodhaConnected -> "Candles: Yahoo — Zerodha selected but not logged in"
+                refusedAt > 0L -> {
+                    val mins = (System.currentTimeMillis() - refusedAt) / 60000
+                    val ago = if (mins < 60) "${mins}m ago"
+                              else if (mins < 1440) "${mins / 60}h ago" else "${mins / 1440}d ago"
+                    "Candles: Yahoo — Kite refused $ago (${config.zerodhaHistoryLastRefusal})"
+                }
+                else -> "Candles: Zerodha historical"
+            }
+        } else "Candles: Yahoo"
+
+        tvZerodhaSourceStatus.text = "$live\n$hist"
+        tvZerodhaSourceStatus.setTextColor(
+            android.graphics.Color.parseColor(
+                if (refusedAt > 0L && config.indiaHistorySource == "zerodha") "#b45309" else "#94a3b8"))
+    }
 
     // ── Trading 212 fields (US space) ──
     private lateinit var etT212ApiKey: EditText
     private lateinit var etT212ApiSecret: EditText
+    private lateinit var switchT212LiveMirror: Switch
+    private lateinit var etT212LiveAmount: EditText
     private lateinit var btnT212Test: Button
     private lateinit var tvT212Status: TextView
+
+    // ── Binance fields (Crypto space) ──
+    private lateinit var etBinanceApiKey: EditText
+    private lateinit var etBinanceApiSecret: EditText
+    private lateinit var switchBinanceLiveMirror: Switch
+    private lateinit var etBinanceLiveQuoteOrderSize: EditText
+    private lateinit var btnBinanceTest: Button
+    private lateinit var tvBinanceStatus: TextView
 
     // ── Config fields ──
     private lateinit var spinnerInterval: Spinner
@@ -60,6 +137,15 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etSlChandelierFixedAtrMultiple: EditText
     private lateinit var etSlTimeDecay10dFactor: EditText
     private lateinit var etSlTimeDecay20dFactor: EditText
+
+    // ── Per-broker T212 overrides (Option C divergent fields) ──
+    private lateinit var switchT212AutoCreateGtt: Switch
+    private lateinit var switchT212AutoTrailing: Switch
+    private lateinit var etT212SlLimitPct: EditText
+    private lateinit var etT212NewPositionHardStopPct: EditText
+    private lateinit var etT212SlChandelierFixedAtrMultiple: EditText
+    private lateinit var etT212SlTimeDecay10dFactor: EditText
+    private lateinit var etT212SlTimeDecay20dFactor: EditText
     private lateinit var switchAutoTrailingTarget: android.widget.Switch
     private lateinit var etTargetAtrMultiple: EditText
     private lateinit var etTargetMaxDailyStepPct: EditText
@@ -124,6 +210,16 @@ class SettingsActivity : AppCompatActivity() {
             sectionHeaders.add(header)
         }
 
+        fun addSubHeading(title: String) {
+            inner.addView(TextView(this).apply {
+                text = title
+                textSize = 13f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setPadding(0, 20, 0, 4)
+                setTextColor(android.graphics.Color.parseColor("#0ea5e9"))
+            })
+        }
+
         fun addLabel(text: String) {
             inner.addView(TextView(this).apply {
                 this.text = text
@@ -138,8 +234,14 @@ class SettingsActivity : AppCompatActivity() {
                 this.hint = hint
                 setTextColor(android.graphics.Color.BLACK)
                 setHintTextColor(android.graphics.Color.parseColor("#94a3b8"))
-                inputType = android.text.InputType.TYPE_CLASS_TEXT or
-                        android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                inputType = if (isPassword) {
+                    android.text.InputType.TYPE_CLASS_TEXT or
+                            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                            android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                } else {
+                    android.text.InputType.TYPE_CLASS_TEXT or
+                            android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                }
                 setPadding(24, 16, 24, 16)
                 setBackgroundResource(android.R.drawable.edit_text)
                 isLongClickable = true
@@ -174,8 +276,21 @@ class SettingsActivity : AppCompatActivity() {
             return btn
         }
 
+        // ── Bulk key import (fill every credential from one JSON file) ──
+        addSection("🔑 Bulk Key Import")
+        addLabel("Upload a JSON file containing your API keys to fill all credential " +
+                "fields below at once. Only non-empty values are applied; blanks keep " +
+                "the current value. Review the fields, then tap Save.")
+        addButton("📁 Import keys from JSON").setOnClickListener {
+            try {
+                importKeysLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+            } catch (e: Exception) {
+                Toast.makeText(this, "Couldn't open the file picker.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         // ── Zerodha section ──
-        addSection("Zerodha Credentials")
+        addSection("🇮🇳 India — Zerodha  (broker · data · algo orders)")
         addLabel("API Key (ZERODHA_API_KEY)")
         etZerodhaApiKey = addField("Enter Zerodha API Key")
         addLabel("API Secret (ZERODHA_API_SECRET)")
@@ -201,8 +316,72 @@ class SettingsActivity : AppCompatActivity() {
         btnZerodhaToken = addButton("✓ Submit Token")
         inner.addView(layoutZerodhaToken)
 
+        // ── India price source ──
+        // Two switches, not one, because live ticks and candles are billed
+        // separately and fail differently. Both default to Yahoo: a price feed
+        // is not something to change under someone by shipping a new default.
+        addSubHeading("Price source — live ticks & candles")
+        inner.addView(TextView(this).apply {
+            text = "India prices come from Yahoo by default. With a Kite subscription you can " +
+                   "take them from Zerodha instead — the same book your orders reach, so the " +
+                   "price a decision is made on and the price it fills at come from one place."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        switchZerodhaLiveTicks = Switch(this).apply {
+            text = "Live prices from the Kite streaming socket"
+        }
+        inner.addView(switchZerodhaLiveTicks)
+        inner.addView(TextView(this).apply {
+            text = "Included with the base Kite Connect subscription. Needs a Zerodha login, and " +
+                   "the session expires every morning — until you log in again the app says so " +
+                   "and keeps the last known prices rather than pretending they are current."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        switchZerodhaHistory = Switch(this).apply {
+            text = "Candles from Zerodha historical data"
+        }
+        inner.addView(switchZerodhaHistory)
+        inner.addView(TextView(this).apply {
+            text = "SEPARATE PAID ADD-ON. If it lapses, this switch does not break your algos — " +
+                   "Zerodha is asked first and Yahoo is used whenever Kite refuses. The status " +
+                   "line below reports the last refusal so a lapsed add-on is visible rather " +
+                   "than silent."
+            textSize = 10f
+            setPadding(0, 2, 0, 4)
+            setTextColor(android.graphics.Color.parseColor("#b45309"))
+        })
+        tvZerodhaSourceStatus = addStatus()
+
+        // ── Zerodha algo orders ──
+        addSubHeading("Algo orders — real money")
+        inner.addView(TextView(this).apply {
+            text = "Indian algos keep PAPER trades running regardless.\n" +
+                   "With this ON, a new paper BUY on the newest closed bar becomes a REAL Zerodha " +
+                   "market order for whole shares, protected by a GTT parked at the broker."
+            textSize = 11f
+            setPadding(0, 8, 0, 4)
+            setTextColor(android.graphics.Color.parseColor("#b45309"))
+        })
+        switchZerodhaLiveMirror = Switch(this).apply {
+            text = "Enable REAL Zerodha orders for Indian algos"
+        }
+        inner.addView(switchZerodhaLiveMirror)
+        inner.addView(TextView(this).apply {
+            text = "Real money. This is only one of four gates — the master freeze on the Algos " +
+                   "tab, each algo's own switch and its allowlist must all agree too. NSE has no " +
+                   "fractional shares, so a seat budget below one share places no order at all."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
+
         // ── Trading 212 section (US space) ──
-        addSection("🇺🇸 Trading 212 Credentials  (US space)")
+        addSection("🇺🇸🇩🇪 Trading 212 — US & Germany  (broker · US data)")
         inner.addView(TextView(this).apply {
             text = "Paste your Trading 212 API key from the live dashboard.\n" +
                    "T212 docs: settings → API → generate token.\n" +
@@ -226,7 +405,126 @@ class SettingsActivity : AppCompatActivity() {
         btnT212Test = addButton("🔌 Test connection")
         tvT212Status = addStatus()
 
+        // T212 live mirror for the US automated lab
+        inner.addView(TextView(this).apply {
+            text = "US Strategy Lab keeps PAPER trades running.\n" +
+                   "If live mirror is ON, NEW paper BUY/SELL signals on the newest closed bar are mirrored into REAL T212 market orders (tiny size). Older catch-up signals stay paper-only."
+            textSize = 11f
+            setPadding(0, 8, 0, 4)
+            setTextColor(android.graphics.Color.parseColor("#b45309"))
+        })
+        switchT212LiveMirror = Switch(this).apply {
+            text = "Enable LIVE mirror for US paper signals (real T212 orders)"
+        }
+        inner.addView(switchT212LiveMirror)
+        inner.addView(TextView(this).apply {
+            text = "Real money. Only the latest closed 15-min bar can place an order. T212 fills settle asynchronously — confirm actual fills in the T212 app. If a symbol also has a manual SL/target leg, the mirror's sell can be refused (shares reserved)."
+            textSize = 10f
+            setPadding(0, 2, 0, 6)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("Live BUY size per trade (account currency, 1–3000)")
+        etT212LiveAmount = EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setPadding(24, 16, 24, 16)
+            setBackgroundResource(android.R.drawable.edit_text)
+            setTextColor(android.graphics.Color.BLACK)
+        }
+        inner.addView(etT212LiveAmount)
+
+        // Binance section (Crypto space)
+        // ── US price source ──
+        addSubHeading("US market data — Finnhub")
+        inner.addView(TextView(this).apply {
+            text = "Yahoo's US quotes are redistributed and can lag noticeably. Finnhub streams " +
+                   "actual trades as they print. The same prices drive stop checks and entry " +
+                   "decisions, so the delay is not only cosmetic."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("Finnhub API key")
+        etFinnhubKey = addField("Paste your Finnhub API key", isPassword = true)
+        switchFinnhubLiveTicks = Switch(this).apply {
+            text = "Live US prices from Finnhub instead of Yahoo"
+        }
+        inner.addView(switchFinnhubLiveTicks)
+        inner.addView(TextView(this).apply {
+            text = "Affects US tickers only — German, Indian and crypto names keep their own " +
+                   "feeds. Finnhub sends a price only when a trade prints, so silence outside " +
+                   "market hours or on a thin name is normal, not a fault. Without a key the " +
+                   "toggle does nothing and Yahoo stays in use."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
+        addSection("Binance Credentials  (Crypto space)")
+        inner.addView(TextView(this).apply {
+            text = "Binance Strategy Lab always keeps PAPER trades running.\n" +
+                   "If live mirror is enabled, NEW Binance paper BUY/SELL signals are mirrored into live Spot MARKET orders.\n" +
+                   "Use a Spot-only API key with withdrawals DISABLED."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("API Key (BINANCE_API_KEY)")
+        etBinanceApiKey = addField("Paste Binance API key", isPassword = true)
+        addLabel("API Secret (BINANCE_API_SECRET)")
+        etBinanceApiSecret = addField("Paste Binance API secret", isPassword = true)
+
+        switchBinanceLiveMirror = Switch(this).apply {
+            text = "Enable LIVE mirror for Binance paper signals"
+            setPadding(0, 12, 0, 0)
+        }
+        inner.addView(switchBinanceLiveMirror)
+        inner.addView(TextView(this).apply {
+            text = "Paper never stops. When this is ON, only the latest closed Binance bar can place real Spot orders. Older catch-up/backfill signals remain paper-only."
+            textSize = 10f
+            setPadding(32, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#64748b"))
+        })
+        addLabel("Live quote order size per BUY (USDT) — default 10")
+        etBinanceLiveQuoteOrderSize = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "10.0"
+            textSize = 13f
+        }
+        inner.addView(etBinanceLiveQuoteOrderSize)
+        btnBinanceTest = addButton("Test Binance connection")
+        tvBinanceStatus = addStatus()
+
         // ── Scan config section ──
+        // ── Flat per-order fee ──
+        addSection("💸 Flat fee per order (all algos)")
+        inner.addView(TextView(this).apply {
+            text = "The slippage % already models the spread, which scales with the position. " +
+                   "Brokerage and exchange charges do not — they are a fixed amount per order, " +
+                   "so they barely matter on a large trade and can swallow the edge on a small " +
+                   "one. Charged twice per round trip: once buying, once selling.\n\n" +
+                   "Leave at 0 to keep every existing number unchanged. Change any of these and " +
+                   "re-run a replay to see the effect."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("🇺🇸 USA — fee per order in USD")
+        etFlatFeeUs = addField("0")
+        addLabel("🇩🇪 Germany — fee per order in EUR")
+        etFlatFeeDe = addField("0")
+        addLabel("🇮🇳 India — fee per order in INR")
+        etFlatFeeIn = addField("0")
+        addLabel("🪙 Crypto — fee per order in USDC")
+        etFlatFeeBinance = addField("0")
+        inner.addView(TextView(this).apply {
+            text = "Applied against each algo's own position size, so the same fee costs a " +
+                   "small-capital algo proportionally more — which is the whole reason to " +
+                   "model it separately from a percentage."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
         addSection("Scan Configuration")
 
         addLabel("Scan interval:")
@@ -249,19 +547,46 @@ class SettingsActivity : AppCompatActivity() {
         }
         inner.addView(switchVibrate)
 
+        switchPaperNotifications = Switch(this).apply {
+            text = "Notify on PAPER trades (all spaces)"
+            setPadding(0, 8, 0, 0)
+        }
+        inner.addView(switchPaperNotifications)
+        inner.addView(TextView(this).apply {
+            text = "Off = only REAL money interrupts you: broker fills, an unfilled ladder, a " +
+                   "ledger mismatch. Paper opens and closes stop notifying across every space — " +
+                   "they still happen and are still recorded on each algo's card.\n" +
+                   "Worth turning off once several algos are running: a steady drip of " +
+                   "notifications that never need action is how the ones that do get ignored."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
         // ── Automated GTT / Trailing SL section ──
         addSection("🤖 Automated GTT & Trailing SL  (15:20 IST daily tick)")
 
         inner.addView(TextView(this).apply {
-            text = "These run automatically at 15:20 IST on weekdays, 9 min before market close.\n" +
-                   "Ordered safest → hottest: create (server-side, conditional) → trail (nudges GTT up) → exit (live sell order)."
+            text = "Daily ticks run at 15:20 IST (Zerodha / NSE) and 17:45 Berlin + 16:20 NY (Trading 212).\n" +
+                   "Most parameters are SHARED across brokers — only the rows below are split, because\n" +
+                   "T212 has no Target leg (SL is sole exit) and home-currency trades have no fees,\n" +
+                   "so its SL must ride tighter than Zerodha's."
             textSize = 11f
             setPadding(0, 0, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
         })
 
+        // ── 🇮🇳 Zerodha (Indian space) sub-section ───────────────────────────
+        inner.addView(TextView(this).apply {
+            text = "🇮🇳 Zerodha (Indian space)"
+            textSize = 14f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, 20, 0, 6)
+            setTextColor(android.graphics.Color.parseColor("#059669"))
+        })
+
         switchAutoCreateGtt = Switch(this).apply {
-            text = "Auto-create OCO GTT for new holdings"
+            text = "Auto-create protection for new holdings"
             setPadding(0, 12, 0, 0)
         }
         inner.addView(switchAutoCreateGtt)
@@ -294,7 +619,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         inner.addView(switchAutoTrailing)
         inner.addView(TextView(this).apply {
-            text = "Raises your existing SL GTT using the Chandelier exit formula (ATR-based).\n" +
+            text = "Raises your existing SL GTT/order using the Chandelier exit formula (ATR-based).\n" +
                    "Monotonic — never lowers an SL. Skipped for the first 5 days after entry."
             textSize = 10f
             setPadding(32, 4, 0, 8)
@@ -360,6 +685,119 @@ class SettingsActivity : AppCompatActivity() {
             textSize = 13f
         }
         inner.addView(etSlTimeDecay20dFactor)
+
+        // ── 🇺🇸 Trading 212 (US / DE space) sub-section ──────────────────────
+        // T212 needs tighter defaults because:
+        //   - No Target leg: SL is sole exit, must trail closer to lock profits
+        //   - No per-trade fees on home-currency: cancel + replace is free,
+        //     so a tighter SL's whipsaw cost is lower than its give-back cost
+        //   - Higher daily ATR on most US large-caps: −15% floor breathes
+        //     where Zerodha's −10% would noise out
+        inner.addView(TextView(this).apply {
+            text = "🇺🇸 Trading 212 (US / DE space)"
+            textSize = 14f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, 32, 0, 6)
+            setTextColor(android.graphics.Color.parseColor("#2563eb"))
+        })
+        inner.addView(TextView(this).apply {
+            text = "Tighter defaults because the SL is the sole exit (no Target leg on T212)\n" +
+                   "and home-currency trades are fee-free, so frequent re-trading is cheap."
+            textSize = 11f
+            setPadding(0, 0, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
+        switchT212AutoCreateGtt = Switch(this).apply {
+            text = "Auto-create protective STOP for new T212 holdings"
+            setPadding(0, 12, 0, 0)
+        }
+        inner.addView(switchT212AutoCreateGtt)
+        inner.addView(TextView(this).apply {
+            text = "Default OFF — T212 reserves shares on the first pending sell, so the\n" +
+                   "engine refuses to auto-place anything unless you explicitly opt in."
+            textSize = 10f
+            setPadding(32, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#64748b"))
+        })
+
+        inner.addView(TextView(this).apply {
+            text = "T212 new-position hard SL (%) - default 15.0 (vs Zerodha 5.0)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etT212NewPositionHardStopPct = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "15.0"
+            textSize = 13f
+        }
+        inner.addView(etT212NewPositionHardStopPct)
+
+        switchT212AutoTrailing = Switch(this).apply {
+            text = "Auto-trail T212 SL upward as stock rises"
+            setPadding(0, 12, 0, 0)
+        }
+        inner.addView(switchT212AutoTrailing)
+        inner.addView(TextView(this).apply {
+            text = "Default ON — trailing IS the T212 profit-taking mechanism since there's\n" +
+                   "no Target leg. Cancel + place new costs nothing on home-currency trades."
+            textSize = 10f
+            setPadding(32, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#64748b"))
+        })
+
+        inner.addView(TextView(this).apply {
+            text = "T212 SL limit pad (%) - default 0.5 (vs Zerodha 2.0)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etT212SlLimitPct = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.5"
+            textSize = 13f
+        }
+        inner.addView(etT212SlLimitPct)
+
+        inner.addView(TextView(this).apply {
+            text = "T212 fixed chandelier ATR multiple (0 = tighter tiers: 2.5/1.8/1.2/0.8/0.5)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etT212SlChandelierFixedAtrMultiple = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.0"
+            textSize = 13f
+        }
+        inner.addView(etT212SlChandelierFixedAtrMultiple)
+
+        inner.addView(TextView(this).apply {
+            text = "T212 10-day plateau decay (default 0.65 — tighter than Zerodha 0.80)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etT212SlTimeDecay10dFactor = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.65"
+            textSize = 13f
+        }
+        inner.addView(etT212SlTimeDecay10dFactor)
+
+        inner.addView(TextView(this).apply {
+            text = "T212 20-day plateau decay (default 0.45 — tighter than Zerodha 0.60)"
+            textSize = 11f
+            setPadding(32, 8, 0, 2)
+            setTextColor(android.graphics.Color.parseColor("#374151"))
+        })
+        etT212SlTimeDecay20dFactor = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "0.45"
+            textSize = 13f
+        }
+        inner.addView(etT212SlTimeDecay20dFactor)
 
         inner.addView(TextView(this).apply {
             text = "Automatic tiers are 3.0 / 2.5 / 2.0 / 1.5 / 1.0 ATR as gains grow. Set a fixed ATR multiple only when you want one style across all holdings and all spaces."
@@ -541,7 +979,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // ── Trailing OCO Target (asymmetric upside trail) ──
         inner.addView(TextView(this).apply {
-            text = "Trailing OCO Target (upside)"
+            text = "Trailing Target (upside)"
             textSize = 12f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(16, 16, 0, 4)
@@ -549,7 +987,7 @@ class SettingsActivity : AppCompatActivity() {
         })
 
         switchAutoTrailingTarget = android.widget.Switch(this).apply {
-            text = "Trail OCO target up daily"
+            text = "Trail target up daily"
             textSize = 13f
             setPadding(16, 4, 0, 4)
         }
@@ -934,11 +1372,21 @@ class SettingsActivity : AppCompatActivity() {
 
         val momentumSection = addWeightSection("Momentum Points (trend continuation, max 100)", "#059669")
         addSchemaNote(momentumSection,
-            "Momentum Points identify strong uptrends that are still pushing higher.\n" +
-            "They do not require price to be below EMA21, but they still penalize overextension.")
-        addSubHeader(momentumSection, "Momentum Buckets")
-        addWeightRow(momentumSection, "momentumTrendStackPts", "Trend stack pts", defaults.momentumTrendStackPts)
-        addWeightRow(momentumSection, "momentumMacdPts", "MACD continuation pts", defaults.momentumMacdPts)
+            "Momentum Points now answer 'is this a quality buy-and-hold stock?'\n" +
+            "Long-term quality buckets (persistence, cascade, drawdown, return, Sharpe)\n" +
+            "are the primary axis. MACD / EMA21 / RSI / Not-overextended remain only\n" +
+            "as small confirmation weights — they're inherently pullback signals.")
+
+        addSubHeader(momentumSection, "Long-term Quality (PRIMARY ~70 pts)")
+        addWeightRow(momentumSection, "momentumTrendPersistencePts", "Trend persistence pts (% days >SMA200)", defaults.momentumTrendPersistencePts)
+        addWeightRow(momentumSection, "momentumEmaCascadePts", "EMA cascade pts (21>50>200 + slopes up)", defaults.momentumEmaCascadePts)
+        addWeightRow(momentumSection, "momentumDrawdownPts", "Low-drawdown pts (max DD over 1y)", defaults.momentumDrawdownPts)
+        addWeightRow(momentumSection, "momentumLongReturnPts", "Long-term return pts (6m + 12m)", defaults.momentumLongReturnPts)
+        addWeightRow(momentumSection, "momentumSharpePts", "Sharpe-like pts (risk-adjusted return)", defaults.momentumSharpePts)
+
+        addSubHeader(momentumSection, "Short-term Confirmation (REDUCED ~33 pts)")
+        addWeightRow(momentumSection, "momentumTrendStackPts", "Trend stack pts (today's slopes)", defaults.momentumTrendStackPts)
+        addWeightRow(momentumSection, "momentumMacdPts", "MACD continuation pts (inflection)", defaults.momentumMacdPts)
         addWeightRow(momentumSection, "momentumEma21SlopePts", "EMA21 rising pts", defaults.momentumEma21SlopePts)
         addWeightRow(momentumSection, "momentumNotOverextendedPts", "Not overextended pts", defaults.momentumNotOverextendedPts)
         addWeightRow(momentumSection, "momentumRsiRoomPts", "RSI room pts", defaults.momentumRsiRoomPts)
@@ -1196,7 +1644,7 @@ class SettingsActivity : AppCompatActivity() {
             // Trading 212 (second) and Scan Config (third) start expanded too.
             // Heavier weight sections (4+) start COLLAPSED so the menu is short
             // by default — user taps to expand the one they want to tune.
-            val startCollapsed = i >= 3
+            val startCollapsed = i >= 4
             if (startCollapsed) {
                 children.forEach { it.visibility = View.GONE }
                 header.text = "▶ $title"
@@ -1294,6 +1742,41 @@ class SettingsActivity : AppCompatActivity() {
                 }
             }
         }
+
+        btnBinanceTest.setOnClickListener {
+            config.binanceApiKey = etBinanceApiKey.text.toString().trim()
+            config.binanceApiSecret = etBinanceApiSecret.text.toString().trim()
+            if (!config.hasBinanceCredentials) {
+                tvBinanceStatus.text = "❌ Binance API key and secret are required"
+                tvBinanceStatus.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                tvBinanceStatus.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+            tvBinanceStatus.text = "⏳ Testing Binance Spot account…"
+            tvBinanceStatus.setTextColor(android.graphics.Color.parseColor("#475569"))
+            tvBinanceStatus.visibility = View.VISIBLE
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    com.signalscope.app.network.BinanceClient.fetchAccount(config)
+                }
+                when (result) {
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Success -> {
+                        val usdt = result.data.balances["USDT"]?.free ?: "0"
+                        tvBinanceStatus.text =
+                            "✅ Connected — ${result.data.accountType} · canTrade=${result.data.canTrade} · USDT free=$usdt"
+                        tvBinanceStatus.setTextColor(android.graphics.Color.parseColor("#059669"))
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.Failure -> {
+                        tvBinanceStatus.text = "❌ ${result.message}"
+                        tvBinanceStatus.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                    }
+                    is com.signalscope.app.network.BinanceClient.BinanceResult.NotConfigured -> {
+                        tvBinanceStatus.text = "❌ Binance API key missing"
+                        tvBinanceStatus.setTextColor(android.graphics.Color.parseColor("#dc2626"))
+                    }
+                }
+            }
+        }
     }
 
     private fun loadCurrentValues() {
@@ -1303,6 +1786,14 @@ class SettingsActivity : AppCompatActivity() {
         // T212 credentials (US space)
         etT212ApiKey.setText(config.t212ApiKey)
         etT212ApiSecret.setText(config.t212ApiSecret)
+        switchT212LiveMirror.isChecked = config.t212LiveMirrorEnabled
+        etT212LiveAmount.setText(config.t212LivePerTradeAmount.toString())
+
+        // Binance credentials + live mirror (Crypto space)
+        etBinanceApiKey.setText(config.binanceApiKey)
+        etBinanceApiSecret.setText(config.binanceApiSecret)
+        switchBinanceLiveMirror.isChecked = config.binanceLiveMirrorEnabled
+        etBinanceLiveQuoteOrderSize.setText("%.2f".format(config.binanceLiveQuoteOrderSize))
 
         // Interval spinner
         spinnerInterval.setSelection(when (config.portfolioScanIntervalMin) {
@@ -1334,7 +1825,27 @@ class SettingsActivity : AppCompatActivity() {
         etSlChandelierFixedAtrMultiple.setText("%.2f".format(config.slChandelierFixedAtrMultiple))
         etSlTimeDecay10dFactor.setText("%.2f".format(config.slTimeDecay10dFactor))
         etSlTimeDecay20dFactor.setText("%.2f".format(config.slTimeDecay20dFactor))
+
+        // T212 broker-overlay fields
+        switchT212AutoCreateGtt.isChecked = config.t212AutoCreateGtt
+        switchT212AutoTrailing.isChecked = config.t212AutoTrailingEnabled
+        etT212SlLimitPct.setText("%.2f".format(config.t212SlLimitPct * 100.0))
+        etT212NewPositionHardStopPct.setText("%.2f".format((1.0 - config.t212NewPositionHardStopFraction) * 100.0))
+        etT212SlChandelierFixedAtrMultiple.setText("%.2f".format(config.t212SlChandelierFixedAtrMultiple))
+        etT212SlTimeDecay10dFactor.setText("%.2f".format(config.t212SlTimeDecay10dFactor))
+        etT212SlTimeDecay20dFactor.setText("%.2f".format(config.t212SlTimeDecay20dFactor))
         switchAutoTrailingTarget.isChecked = config.autoTrailingTargetEnabled
+        switchPaperNotifications.isChecked = config.paperTradeNotifications
+        etFinnhubKey.setText(config.finnhubApiKey)
+        switchFinnhubLiveTicks.isChecked = config.usLivePriceSource == "finnhub"
+        switchZerodhaLiveMirror.isChecked = config.zerodhaLiveMirrorEnabled
+        etFlatFeeUs.setText("%.2f".format(config.flatFeeUs))
+        etFlatFeeDe.setText("%.2f".format(config.flatFeeDe))
+        etFlatFeeIn.setText("%.2f".format(config.flatFeeIn))
+        etFlatFeeBinance.setText("%.2f".format(config.flatFeeBinance))
+        switchZerodhaLiveTicks.isChecked = config.indiaLivePriceSource == "zerodha"
+        switchZerodhaHistory.isChecked = config.indiaHistorySource == "zerodha"
+        renderIndiaSourceStatus()
         etTargetAtrMultiple.setText("%.2f".format(config.targetAtrMultiple))
         etTargetMaxDailyStepPct.setText("%.2f".format(config.targetMaxDailyStepPct * 100.0))
 
@@ -1376,13 +1887,18 @@ class SettingsActivity : AppCompatActivity() {
             "buyObvPts" to w.buyObvPts, "buyEmaMaxPts" to w.buyEmaMaxPts,
             "pullbackStrongThreshold" to w.pullbackStrongThreshold,
             "pullbackModerateThreshold" to w.pullbackModerateThreshold,
-            "buyStrongThreshold" to w.buyStrongThreshold, "buyModerateThreshold" to w.buyModerateThreshold,
+            "buyStrongThreshold" to w.cherryStrongThreshold, "buyModerateThreshold" to w.cherryModerateThreshold,
             "momentumTrendStackPts" to w.momentumTrendStackPts,
             "momentumMacdPts" to w.momentumMacdPts,
             "momentumEma21SlopePts" to w.momentumEma21SlopePts,
             "momentumNotOverextendedPts" to w.momentumNotOverextendedPts,
             "momentumRsiRoomPts" to w.momentumRsiRoomPts,
             "momentumObvPts" to w.momentumObvPts,
+            "momentumTrendPersistencePts" to w.momentumTrendPersistencePts,
+            "momentumEmaCascadePts" to w.momentumEmaCascadePts,
+            "momentumDrawdownPts" to w.momentumDrawdownPts,
+            "momentumLongReturnPts" to w.momentumLongReturnPts,
+            "momentumSharpePts" to w.momentumSharpePts,
             "momentumStrongThreshold" to w.momentumStrongThreshold,
             "momentumModerateThreshold" to w.momentumModerateThreshold,
             "minSlopeMagnitude" to w.minSlopeMagnitude, "goldenBuyMaxSlope" to w.goldenBuyMaxSlope,
@@ -1489,14 +2005,19 @@ class SettingsActivity : AppCompatActivity() {
             buyEmaMaxPts = readInt("buyEmaMaxPts", d.buyEmaMaxPts),
             pullbackStrongThreshold = readInt("pullbackStrongThreshold", d.pullbackStrongThreshold),
             pullbackModerateThreshold = readInt("pullbackModerateThreshold", d.pullbackModerateThreshold),
-            buyStrongThreshold = readInt("pullbackStrongThreshold", d.buyStrongThreshold),
-            buyModerateThreshold = readInt("pullbackModerateThreshold", d.buyModerateThreshold),
+            cherryStrongThreshold = readInt("pullbackStrongThreshold", d.cherryStrongThreshold),
+            cherryModerateThreshold = readInt("pullbackModerateThreshold", d.cherryModerateThreshold),
             momentumTrendStackPts = readInt("momentumTrendStackPts", d.momentumTrendStackPts),
             momentumMacdPts = readInt("momentumMacdPts", d.momentumMacdPts),
             momentumEma21SlopePts = readInt("momentumEma21SlopePts", d.momentumEma21SlopePts),
             momentumNotOverextendedPts = readInt("momentumNotOverextendedPts", d.momentumNotOverextendedPts),
             momentumRsiRoomPts = readInt("momentumRsiRoomPts", d.momentumRsiRoomPts),
             momentumObvPts = readInt("momentumObvPts", d.momentumObvPts),
+            momentumTrendPersistencePts = readInt("momentumTrendPersistencePts", d.momentumTrendPersistencePts),
+            momentumEmaCascadePts = readInt("momentumEmaCascadePts", d.momentumEmaCascadePts),
+            momentumDrawdownPts = readInt("momentumDrawdownPts", d.momentumDrawdownPts),
+            momentumLongReturnPts = readInt("momentumLongReturnPts", d.momentumLongReturnPts),
+            momentumSharpePts = readInt("momentumSharpePts", d.momentumSharpePts),
             momentumStrongThreshold = readInt("momentumStrongThreshold", d.momentumStrongThreshold),
             momentumModerateThreshold = readInt("momentumModerateThreshold", d.momentumModerateThreshold),
             minSlopeMagnitude = readDouble("minSlopeMagnitude", d.minSlopeMagnitude).coerceIn(-89.0, 89.0),
@@ -1596,6 +2117,18 @@ class SettingsActivity : AppCompatActivity() {
         config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
         config.t212SimulateOnly = false
 
+        // Binance (Crypto space)
+        config.binanceApiKey = etBinanceApiKey.text.toString().trim()
+        config.binanceApiSecret = etBinanceApiSecret.text.toString().trim()
+        config.t212LiveMirrorEnabled = switchT212LiveMirror.isChecked
+        config.t212LivePerTradeAmount =
+            (etT212LiveAmount.text.toString().toDoubleOrNull() ?: 20.0).coerceIn(1.0, 3000.0)
+
+        config.binanceLiveMirrorEnabled = switchBinanceLiveMirror.isChecked
+        config.binanceLiveQuoteOrderSize =
+            (etBinanceLiveQuoteOrderSize.text.toString().toDoubleOrNull() ?: 10.0)
+                .coerceIn(5.0, 10_000.0)
+
         // Scan config
         config.portfolioScanIntervalMin = when (spinnerInterval.selectedItemPosition) {
             0    -> 5
@@ -1650,7 +2183,43 @@ class SettingsActivity : AppCompatActivity() {
         config.slTimeDecay10dFactor = slDecay10.coerceIn(0.10, 1.00)
         config.slTimeDecay20dFactor = slDecay20.coerceIn(0.10, 1.00)
 
+        // ── T212 broker-overlay save (paired with 🇺🇸 UI section) ──
+        config.t212AutoCreateGtt = switchT212AutoCreateGtt.isChecked
+        config.t212AutoTrailingEnabled = switchT212AutoTrailing.isChecked
+        val t212SlLimitPadPct = etT212SlLimitPct.text.toString().toDoubleOrNull() ?: 0.5
+        val t212NewHardStopPct = etT212NewPositionHardStopPct.text.toString().toDoubleOrNull() ?: 15.0
+        val t212FixedSlAtr = etT212SlChandelierFixedAtrMultiple.text.toString().toDoubleOrNull() ?: 0.0
+        val t212Decay10 = etT212SlTimeDecay10dFactor.text.toString().toDoubleOrNull() ?: 0.65
+        val t212Decay20 = etT212SlTimeDecay20dFactor.text.toString().toDoubleOrNull() ?: 0.45
+        config.t212SlLimitPct = (t212SlLimitPadPct / 100.0).coerceIn(0.0, 0.05)
+        // Hard floor is stored as a FRACTION (e.g. 0.85 = −15%), but the UI
+        // shows the loss %. Convert here.
+        config.t212NewPositionHardStopFraction =
+            (1.0 - (t212NewHardStopPct / 100.0)).coerceIn(0.50, 0.99)
+        config.t212SlChandelierFixedAtrMultiple = t212FixedSlAtr.coerceIn(0.0, 8.0)
+        config.t212SlTimeDecay10dFactor = t212Decay10.coerceIn(0.10, 1.00)
+        config.t212SlTimeDecay20dFactor = t212Decay20.coerceIn(0.10, 1.00)
+
         config.autoTrailingTargetEnabled = switchAutoTrailingTarget.isChecked
+        // A fee cannot be negative, and a blank box means "no fee" rather than
+        // "keep whatever was there" — the setter clamps at zero either way.
+        config.paperTradeNotifications = switchPaperNotifications.isChecked
+        config.finnhubApiKey = etFinnhubKey.text.toString()
+        config.usLivePriceSource = if (switchFinnhubLiveTicks.isChecked) "finnhub" else "yahoo"
+        config.zerodhaLiveMirrorEnabled = switchZerodhaLiveMirror.isChecked
+        config.flatFeeUs = etFlatFeeUs.text.toString().toDoubleOrNull() ?: 0.0
+        config.flatFeeDe = etFlatFeeDe.text.toString().toDoubleOrNull() ?: 0.0
+        config.flatFeeIn = etFlatFeeIn.text.toString().toDoubleOrNull() ?: 0.0
+        config.flatFeeBinance = etFlatFeeBinance.text.toString().toDoubleOrNull() ?: 0.0
+        config.indiaLivePriceSource = if (switchZerodhaLiveTicks.isChecked) "zerodha" else "yahoo"
+        config.indiaHistorySource = if (switchZerodhaHistory.isChecked) "zerodha" else "yahoo"
+        // Turning the historical switch back on is a fresh claim that the add-on
+        // works; clearing the old refusal stops a stale warning from outliving it.
+        if (switchZerodhaHistory.isChecked && config.zerodhaHistoryLastRefusalAt > 0L &&
+            config.indiaHistorySource == "zerodha") {
+            config.zerodhaHistoryLastRefusal = ""
+            config.zerodhaHistoryLastRefusalAt = 0L
+        }
         val tgtAtrMult = etTargetAtrMultiple.text.toString().toDoubleOrNull() ?: 2.0
         val tgtMaxStep = etTargetMaxDailyStepPct.text.toString().toDoubleOrNull() ?: 8.0
         config.targetAtrMultiple = tgtAtrMult.coerceIn(0.5, 5.0)

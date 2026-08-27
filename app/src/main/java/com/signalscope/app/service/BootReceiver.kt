@@ -23,6 +23,8 @@ class BootReceiver : BroadcastReceiver() {
                 // Even if portfolio monitoring isn't active, re-arm the auto-discovery
                 // alarm chain so scheduled scans survive reboots independently.
                 DiscoveryAutoScheduler.ensureScheduled(context)
+                T212DailyTrailScheduler.ensureScheduled(context)
+                StrategyLabScheduler.ensureScheduled(context)
             }
         }
     }

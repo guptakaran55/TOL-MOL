@@ -3,6 +3,7 @@ package com.signalscope.app.data
 import android.content.Context
 import android.util.Log
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import java.io.File
 
@@ -21,7 +22,7 @@ import java.io.File
  *   - symbol / exchange (canonical identifiers used by ZerodhaClient)
  *   - addedAt (epoch ms; used for "added 3d ago" labels)
  *   - notes (free-text reason — "bouncing off 200dma weekly", etc.)
- *   - qtyOverride (null → use risk-per-trade math; non-null → fixed qty)
+ *   - qtyOverride (null → prompt before live order; non-null → fixed qty)
  *   - lastSnapshot (cached LTP/score from last analyze pass — staleness label)
  */
 object WatchlistStore {
@@ -48,8 +49,10 @@ object WatchlistStore {
         val support: Double,
         val resistance: Double,
         val atr: Double,
-        val buyScore: Int,
-        val buySignal: String,
+        @SerializedName("buyScore")
+        val cherryPoints: Int,
+        @SerializedName("buySignal")
+        val cherrySignal: String,
         val pullbackScore: Int = 0,
         val pullbackSignal: String = "NO SIGNAL",
         val momentumScore: Int = 0,
@@ -60,6 +63,14 @@ object WatchlistStore {
     )
 
     private fun file(ctx: Context): File = File(ctx.filesDir, "watchlist.json")
+
+    private fun normSymbol(symbol: String): String = symbol.trim().uppercase()
+    private fun normExchange(exchange: String?): String = exchange?.trim()?.uppercase().orEmpty()
+    private fun sameKey(entry: Entry, symbol: String, exchange: String? = null): Boolean {
+        if (!entry.symbol.equals(symbol.trim(), ignoreCase = true)) return false
+        val ex = normExchange(exchange)
+        return ex.isBlank() || normExchange(entry.exchange) == ex
+    }
 
     /** @return immutable list — caller should treat as read-only and use add/remove/update for mutations. */
     fun load(ctx: Context): List<Entry> {
@@ -90,16 +101,16 @@ object WatchlistStore {
     /** Adds or no-ops if symbol already present. Returns the resulting list. */
     fun add(ctx: Context, entry: Entry): List<Entry> {
         val list = load(ctx).toMutableList()
-        if (list.any { it.symbol.equals(entry.symbol, ignoreCase = true) }) return list
+        if (list.any { sameKey(it, entry.symbol, entry.exchange) }) return list
         list.add(entry)
         saveAll(ctx, list)
         return list
     }
 
     /** Removes by symbol (case-insensitive). Returns the resulting list. */
-    fun remove(ctx: Context, symbol: String): List<Entry> {
+    fun remove(ctx: Context, symbol: String, exchange: String? = null): List<Entry> {
         val list = load(ctx).toMutableList()
-        list.removeAll { it.symbol.equals(symbol, ignoreCase = true) }
+        list.removeAll { sameKey(it, symbol, exchange) }
         saveAll(ctx, list)
         return list
     }
@@ -108,12 +119,13 @@ object WatchlistStore {
     fun update(
         ctx: Context,
         symbol: String,
+        exchange: String? = null,
         notes: String? = null,
         qtyOverride: Int? = null,
         lastSnapshot: Snapshot? = null
     ): List<Entry> {
         val list = load(ctx).toMutableList()
-        val idx = list.indexOfFirst { it.symbol.equals(symbol, ignoreCase = true) }
+        val idx = list.indexOfFirst { sameKey(it, symbol, exchange) }
         if (idx < 0) return list
         val cur = list[idx]
         list[idx] = cur.copy(
@@ -126,6 +138,6 @@ object WatchlistStore {
     }
 
     /** Convenience: contains-check used by the detail-modal button to flip its label. */
-    fun contains(ctx: Context, symbol: String): Boolean =
-        load(ctx).any { it.symbol.equals(symbol, ignoreCase = true) }
+    fun contains(ctx: Context, symbol: String, exchange: String? = null): Boolean =
+        load(ctx).any { sameKey(it, symbol, exchange) }
 }

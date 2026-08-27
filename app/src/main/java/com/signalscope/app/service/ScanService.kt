@@ -64,6 +64,8 @@ class ScanService : Service() {
         const val ACTION_DISCOVERY_NASDAQ100_AUTO = "com.signalscope.DISCOVERY_NASDAQ100_AUTO"
         const val ACTION_DISCOVERY_DAX_AUTO       = "com.signalscope.DISCOVERY_DAX_AUTO"
         const val ACTION_DISCOVERY_STOP           = "com.signalscope.DISCOVERY_STOP"
+        const val ACTION_T212_DAILY_TRAIL         = "com.signalscope.T212_DAILY_TRAIL"
+        const val ACTION_STRATEGY_LAB_TICK        = "com.signalscope.STRATEGY_LAB_TICK"
 
         // Broadcast events
         const val BROADCAST_SCAN_UPDATE      = "com.signalscope.SCAN_UPDATE"
@@ -165,11 +167,15 @@ class ScanService : Service() {
             ACTION_DISCOVERY_NASDAQ100_AUTO-> startDiscoveryScan("nasdaq100", robust = true)
             ACTION_DISCOVERY_DAX_AUTO      -> startDiscoveryScan("dax", robust = true)
             ACTION_DISCOVERY_STOP          -> stopDiscoveryScan()
+            ACTION_T212_DAILY_TRAIL        -> triggerT212DailyTrail("alarm")
+            ACTION_STRATEGY_LAB_TICK       -> triggerStrategyLabPaperTick("alarm")
             else                           -> startPortfolioMonitoring()
         }
         // After every command, make sure the auto-discovery alarm chain is armed.
         // No-op if already scheduled.
         DiscoveryAutoScheduler.ensureScheduled(this)
+        T212DailyTrailScheduler.ensureScheduled(this)
+        StrategyLabScheduler.ensureScheduled(this)
         return START_STICKY
     }
 
@@ -305,6 +311,136 @@ class ScanService : Service() {
      *                scans where they want results sooner). Still has the
      *                250ms candle/fundamentals gap and retry phase.
      */
+    private fun triggerT212DailyTrail(reason: String) {
+        val standalone = !config.serviceRunning && portfolioJob == null && discoveryJob == null
+        acquireScanLocks(durationMs = 30 * 60 * 1000L)
+        startForeground(NOTIFICATION_SCAN_ID, buildScanNotification("T212 trailing maintenance..."))
+        serviceScope.launch {
+            try {
+                runT212TrailingMaintenance(reason, respectRecentRunGate = true)
+            } catch (e: Exception) {
+                Log.e(TAG, "T212 trailing maintenance failed", e)
+                updateScanNotification("T212 trail failed: ${e.message}")
+            } finally {
+                if (standalone) {
+                    releaseScanLocks()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+    private suspend fun runT212TrailingMaintenance(
+        reason: String,
+        respectRecentRunGate: Boolean
+    ) {
+        if (!config.hasT212Credentials) {
+            Log.i(TAG, "T212 trail skipped ($reason): not configured")
+            updateScanNotification("T212 not configured")
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val last = config.lastT212DailyTickEpoch
+        if (respectRecentRunGate && last > 0L && now - last < 90 * 60 * 1000L) {
+            Log.i(TAG, "T212 trail skipped ($reason): ran ${(now - last) / 60000} min ago")
+            return
+        }
+
+        updateScanNotification("T212: trailing SL/targets...")
+        val summary = withContext(Dispatchers.IO) {
+            com.signalscope.app.trading.Trading212TrailingManager.run(
+                applicationContext,
+                config,
+                autoCreateOco = false
+            )
+        }
+        config.lastT212DailyTickEpoch = now
+        Log.i(TAG, "T212 trail ($reason): SL=${summary.slsRaised} target=${summary.targetsRaised} " +
+                "reconciled=${summary.reconciledFilled}/${summary.reconciledClosed} skipped=${summary.skipped} errors=${summary.errors.size}")
+        summary.log.forEach { Log.d(TAG, "  T212: $it") }
+        summary.errors.forEach { Log.w(TAG, "  T212 error: $it") }
+        updateScanNotification(
+            "T212 trail: SL ${summary.slsRaised}, target ${summary.targetsRaised}, errors ${summary.errors.size}"
+        )
+        broadcastUpdate()
+    }
+
+    private fun triggerStrategyLabPaperTick(reason: String) {
+        val standalone = !config.serviceRunning && portfolioJob == null && discoveryJob == null
+        acquireScanLocks(durationMs = 12 * 60 * 1000L)
+        startForeground(NOTIFICATION_SCAN_ID, buildScanNotification("Strategy Lab paper tick..."))
+        serviceScope.launch {
+            try {
+                runStrategyLabPaperTick(reason)
+            } catch (e: Exception) {
+                Log.e(TAG, "Strategy Lab paper tick failed", e)
+                updateScanNotification("Strategy Lab failed: ${e.message}")
+            } finally {
+                if (standalone) {
+                    releaseScanLocks()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+        }
+    }
+
+    private suspend fun runStrategyLabPaperTick(reason: String) {
+        // ACTIVITY CHECK OVER EVERY NAMESPACE, INCLUDING BUCKETS. This used to
+        // read only the three BARE legacy labs — but after the bucket migration
+        // those are empty shells, so the 15-min alarm fired, concluded "nothing
+        // enabled", and returned. Every background pass was a silent no-op and
+        // algos only advanced when the app was foregrounded or Run now pressed:
+        // positions sat unvalued for hours with the alarm chain working perfectly.
+        // A gate-armed lab counts as active even with 0 enrolled — under 3b the
+        // gate owns enrollment, and all seats sitting in cash (or a fresh arm)
+        // is a legitimate state that still needs the daily evaluation to run
+        // (same deadlock shape as the guard inside StrategyLabRunner.runAll).
+        val allNs = (listOf("us", "de", "binance") +
+            com.signalscope.app.data.BucketStore.allNamespaces(applicationContext)).distinct()
+        val anyActive = allNs.any { n ->
+            val s = StrategyLabStore.load(applicationContext, n)
+            val gateArmed = try {
+                com.signalscope.app.data.MacdGateStore.load(applicationContext, n).enabled
+            } catch (e: Exception) { false }
+            s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
+        }
+        if (!anyActive) {
+            Log.i(TAG, "Strategy Lab tick skipped ($reason): no enabled/enrolled paper labs")
+            updateScanNotification("Strategy Lab: nothing enabled")
+            return
+        }
+
+        updateScanNotification("Strategy Lab: paper tick...")
+        // Run the SAME list the activity check saw. runAll self-gates per
+        // namespace, so inactive ones no-op — no double-run, no divergence
+        // between "what we checked" and "what we run".
+        val nsList = allNs
+        val latch = java.util.concurrent.CountDownLatch(nsList.size)
+        for (n in nsList)
+            com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, n) { latch.countDown() }
+        val completed = withContext(Dispatchers.IO) {
+            latch.await(10, java.util.concurrent.TimeUnit.MINUTES)
+        }
+        // Log the namespaces actually swept, not three fixed booleans — the old
+        // us/de/binance flags were exactly what made bucket algos invisible here.
+        // Every namespace has now run, so any entries they queued are complete as
+        // a set — this is the moment siblings on the same name can be merged into
+        // one order. Placing here rather than waiting on the coalescing timer
+        // keeps a tick's entries close to the bar that produced them.
+        try { com.signalscope.app.trading.T212LiveMirror.flushEntryIntents(applicationContext) }
+        catch (e: Exception) { Log.w(TAG, "entry flush failed: ${e.message}") }
+        if (completed) {
+            Log.i(TAG, "Strategy Lab tick complete ($reason): ${nsList.size} ns [${nsList.joinToString(",")}]")
+            updateScanNotification("Strategy Lab paper tick complete")
+        } else {
+            Log.w(TAG, "Strategy Lab tick timed out ($reason): ${nsList.size} ns [${nsList.joinToString(",")}]")
+            updateScanNotification("Strategy Lab paper tick timed out")
+        }
+    }
+
     private fun startDiscoveryScan(market: String, robust: Boolean) {
         if (isDiscoveryRunning) {
             Log.w(TAG, "Discovery scan already running — ignoring")
@@ -401,6 +537,16 @@ class ScanService : Service() {
                 ScanServiceResultHolder.discoveryStatusText =
                     "NIFTY 500 universe: ${result.symbols.size} symbols"
                 ScanServiceResultHolder.discoveryVersion++
+                // Keep it. The algo screens want this list on the main thread,
+                // where a multi-second download is not an option — without a
+                // cached copy they would be stuck on the embedded fallback,
+                // which is a snapshot of the index as it stood when someone
+                // typed it out, not as it stands today.
+                try {
+                    val cfg = ConfigManager(applicationContext)
+                    cfg.nseUniverseCached = result.symbols.joinToString(" ")
+                    cfg.nseUniverseCachedAt = System.currentTimeMillis()
+                } catch (e: Exception) { Log.w(TAG, "universe cache write failed: ${e.message}") }
                 result.symbols
             }
             is YahooFinanceClient.NiftyUniverseResult.Failure -> {
@@ -475,7 +621,7 @@ class ScanService : Service() {
             alertType = AlertType.SMOOTH_BUY_TURN,
             message = "Smooth MACD turn Q$q: slope crossed positive today ($zeroSide). Check price/support for entry.",
             sellScore = 0,
-            buyScore = analysis.buyScore,
+            cherryPoints = analysis.cherryPoints,
             price = analysis.price,
             macdPhase = analysis.macdPhase,
             source = "discovery:$marketName"
@@ -535,17 +681,17 @@ class ScanService : Service() {
         if (marketName.contains("NIFTY", ignoreCase = true)) 0 else 50000
 
     private fun entryScore(analysis: StockAnalysis): Int =
-        maxOf(analysis.pullbackScore, analysis.momentumScore, analysis.buyScore)
+        maxOf(analysis.pullbackScore, analysis.momentumScore, analysis.cherryPoints)
 
     private fun isModerateEntry(analysis: StockAnalysis): Boolean =
         analysis.pullbackScore >= weights.pullbackModerateThreshold ||
                 analysis.momentumScore >= weights.momentumModerateThreshold ||
-                analysis.buyScore >= weights.buyModerateThreshold
+                analysis.cherryPoints >= weights.cherryModerateThreshold
 
     private fun isStrongEntry(analysis: StockAnalysis): Boolean =
         analysis.pullbackScore >= weights.pullbackStrongThreshold ||
                 analysis.momentumScore >= weights.momentumStrongThreshold ||
-                analysis.buyScore >= weights.buyStrongThreshold
+                analysis.cherryPoints >= weights.cherryStrongThreshold
 
     /**
      * Scan a list of symbols via Yahoo Finance with adaptive pacing & retry queue.
@@ -1401,7 +1547,7 @@ class ScanService : Service() {
                 symbol = holding.symbol, name = holding.symbol,
                 alertType = AlertType.STRONG_EXIT,
                 message = "Profit ${analysis.profitScore}/58 + Protect ${analysis.protectScore}/58 — sell all",
-                sellScore = analysis.sellScore, buyScore = analysis.buyScore,
+                sellScore = analysis.sellScore, cherryPoints = analysis.cherryPoints,
                 price = analysis.price, macdPhase = analysis.macdPhase, source = source))
 
             "BOOK PROFIT" -> {
@@ -1414,7 +1560,7 @@ class ScanService : Service() {
                         symbol = holding.symbol, name = holding.symbol,
                         alertType = AlertType.BOOK_PROFIT,
                         message = "Profit score ${analysis.profitScore}/58 — dual-score sell signal, consider booking 50-70%",
-                        sellScore = analysis.sellScore, buyScore = analysis.buyScore,
+                        sellScore = analysis.sellScore, cherryPoints = analysis.cherryPoints,
                         price = analysis.price, macdPhase = analysis.macdPhase, source = source))
                     // Tier 1.5 — opportunistic auto-GTT placement. Fire-and-forget: gates
                     // are checked inside, API call is on a daemon thread so the scan loop
@@ -1432,7 +1578,7 @@ class ScanService : Service() {
                 symbol = holding.symbol, name = holding.symbol,
                 alertType = AlertType.PROTECT_CAPITAL,
                 message = "Capital Protection ${analysis.protectScore}/58 — trend broken, exit position",
-                sellScore = analysis.sellScore, buyScore = analysis.buyScore,
+                sellScore = analysis.sellScore, cherryPoints = analysis.cherryPoints,
                 price = analysis.price, macdPhase = analysis.macdPhase, source = source))
         }
 
@@ -1443,7 +1589,7 @@ class ScanService : Service() {
                 symbol = holding.symbol, name = holding.symbol,
                 alertType = AlertType.PEAK_WARNING,
                 message = "MACD decelerating (EARLY SELL phase) — DPM watchdog monitoring; will auto-confirm at 15:20 if histogram sustains < 50% of peak",
-                sellScore = analysis.sellScore, buyScore = analysis.buyScore,
+                sellScore = analysis.sellScore, cherryPoints = analysis.cherryPoints,
                 price = analysis.price, macdPhase = analysis.macdPhase, source = source))
         }
 
@@ -1657,7 +1803,7 @@ class ScanService : Service() {
                             symbol = holding.symbol, name = holding.symbol,
                             alertType = AlertType.SOFT_SNIPER,
                             message = msg,
-                            sellScore = analysis.sellScore, buyScore = analysis.buyScore,
+                            sellScore = analysis.sellScore, cherryPoints = analysis.cherryPoints,
                             price = executionLtp, macdPhase = analysis.macdPhase, source = if (liveMode) "zerodha-live" else "zerodha"
                         ))
                         // Bump portfolioVersion so the dashboard re-renders and
@@ -1998,6 +2144,165 @@ val NIFTY_500_YAHOO_SYMBOLS = listOf(
 // so the chain self-heals across reboots / process death without needing
 // setRepeating's drift problems.
 // ═══════════════════════════════════════════════════════
+/**
+ * Schedule a wake-up that is actually ALLOWED to start a foreground service.
+ *
+ * THE BUG THIS FIXES: every scheduler here used inexact `setAndAllowWhileIdle`
+ * with a `getForegroundService` PendingIntent, on targetSdk 34. From Android 12
+ * onwards an app in the background may not start a foreground service — and the
+ * alarm exemption that would permit it is granted ONLY to EXACT alarms. An
+ * inexact alarm does not qualify, so when it fired with the app backgrounded the
+ * service start threw ForegroundServiceStartNotAllowedException and the tick
+ * simply never happened. It worked whenever the app was open (foreground apps are
+ * exempt anyway), which is exactly the "only Save & run advances anything"
+ * symptom: the alarm chain was alive and re-arming, every firing just died.
+ *
+ * SCHEDULE_EXACT_ALARM is already declared in the manifest, but on Android 13+ it
+ * can be revoked by the user, so the capability is checked at runtime and the old
+ * inexact call remains the fallback (better a delayed tick than a crash).
+ */
+private fun scheduleWakeupAlarm(
+    am: AlarmManager, triggerAtElapsed: Long, pi: android.app.PendingIntent, tag: String
+) {
+    val canExact = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S ||
+        am.canScheduleExactAlarms()
+    try {
+        if (canExact) am.setExactAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtElapsed, pi)
+        else {
+            Log.w(tag, "exact alarms not permitted — falling back to inexact; " +
+                "background ticks may be skipped by the OS")
+            am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtElapsed, pi)
+        }
+    } catch (e: SecurityException) {
+        Log.w(tag, "exact alarm refused (${e.message}) — using inexact")
+        am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAtElapsed, pi)
+    }
+}
+
+object StrategyLabScheduler {
+    private const val TAG = "StrategyLabSched"
+    private const val REQUEST_CODE = 0x51AB
+    private const val INTERVAL_MS = 15 * 60 * 1000L
+    private const val GRACE_MS = 90 * 1000L
+
+    fun ensureScheduled(ctx: Context) {
+        val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = paperTickPendingIntent(ctx)
+        if (!hasActivePaperLab(ctx)) {
+            am.cancel(pi)
+            Log.d(TAG, "No enabled/enrolled Strategy Lab namespace; paper tick alarm cancelled")
+            return
+        }
+
+        val nextFireWallMs = nextQuarterWithGraceMs()
+        val delay = (nextFireWallMs - System.currentTimeMillis()).coerceAtLeast(60_000L)
+        val triggerAt = SystemClock.elapsedRealtime() + delay
+        am.cancel(pi)
+        scheduleWakeupAlarm(am, triggerAt, pi, TAG)
+        Log.i(TAG, "Next Strategy Lab paper tick in ${delay / 60000} min")
+    }
+
+    private fun paperTickPendingIntent(ctx: Context): android.app.PendingIntent {
+        val intent = ScanService.createIntent(ctx, ScanService.ACTION_STRATEGY_LAB_TICK)
+        val flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            android.app.PendingIntent.getForegroundService(ctx, REQUEST_CODE, intent, flags)
+        } else {
+            android.app.PendingIntent.getService(ctx, REQUEST_CODE, intent, flags)
+        }
+    }
+
+    private fun hasActivePaperLab(ctx: Context): Boolean =
+        (listOf("us", "de", "binance") +
+            com.signalscope.app.data.BucketStore.allNamespaces(ctx)).distinct().any { ns ->
+            val s = StrategyLabStore.load(ctx, ns)
+            // Gate-armed counts even with 0 enrolled: under 3b all seats can sit
+            // in cash, and cancelling the alarm then would stop the daily gate
+            // evaluation that is the only way seats ever fill again.
+            val gateArmed = try {
+                com.signalscope.app.data.MacdGateStore.load(ctx, ns).enabled
+            } catch (e: Exception) { false }
+            s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
+        }
+
+    private fun nextQuarterWithGraceMs(): Long {
+        val now = System.currentTimeMillis()
+        val currentSlot = (now / INTERVAL_MS) * INTERVAL_MS + GRACE_MS
+        if (currentSlot - now >= 60_000L) return currentSlot
+        return ((now / INTERVAL_MS) + 1) * INTERVAL_MS + GRACE_MS
+    }
+}
+
+object T212DailyTrailScheduler {
+    private const val TAG = "T212DailyTrailSched"
+    private const val ACTION_FIRE = "com.signalscope.T212_DAILY_TRAIL_FIRE"
+    private const val REQUEST_CODE = 0x7212
+
+    private data class Slot(val label: String, val timeZoneId: String, val minuteOfDay: Int)
+
+    private val SLOTS = listOf(
+        Slot("xetra", "Europe/Berlin", 17 * 60 + 45),
+        Slot("us", "America/New_York", 16 * 60 + 20)
+    )
+
+    fun ensureScheduled(ctx: Context) {
+        val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = android.app.PendingIntent.getBroadcast(
+            ctx, REQUEST_CODE,
+            Intent(ctx, T212DailyTrailReceiver::class.java).setAction(ACTION_FIRE),
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val nextFireWallMs = nextSlotWallTimeMs()
+        val delay = (nextFireWallMs - System.currentTimeMillis()).coerceAtLeast(60_000L)
+        val triggerAt = SystemClock.elapsedRealtime() + delay
+        am.cancel(pi)
+        scheduleWakeupAlarm(am, triggerAt, pi, TAG)
+        Log.i(TAG, "Next T212 trail alarm in ${delay / 60000} min")
+    }
+
+    private fun nextSlotWallTimeMs(): Long {
+        return SLOTS.minOf { nextSlotFor(it) }
+    }
+
+    private fun nextSlotFor(slot: Slot): Long {
+        val tz = TimeZone.getTimeZone(slot.timeZoneId)
+        val cal = Calendar.getInstance(tz)
+        val nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        cal.set(Calendar.SECOND, 0)
+        cal.set(Calendar.MILLISECOND, 0)
+        if (isWeekday(cal) && slot.minuteOfDay > nowMin) {
+            cal.set(Calendar.HOUR_OF_DAY, slot.minuteOfDay / 60)
+            cal.set(Calendar.MINUTE, slot.minuteOfDay % 60)
+            return cal.timeInMillis
+        }
+        do {
+            cal.add(Calendar.DAY_OF_MONTH, 1)
+        } while (!isWeekday(cal))
+        cal.set(Calendar.HOUR_OF_DAY, slot.minuteOfDay / 60)
+        cal.set(Calendar.MINUTE, slot.minuteOfDay % 60)
+        return cal.timeInMillis
+    }
+
+    private fun isWeekday(cal: Calendar): Boolean {
+        val d = cal.get(Calendar.DAY_OF_WEEK)
+        return d != Calendar.SATURDAY && d != Calendar.SUNDAY
+    }
+}
+
+class T212DailyTrailReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        Log.i("T212DailyTrailRecv", "T212 trailing alarm fired")
+        T212DailyTrailScheduler.ensureScheduled(context)
+        val svc = ScanService.createIntent(context, ScanService.ACTION_T212_DAILY_TRAIL)
+        try {
+            context.startForegroundService(svc)
+        } catch (e: Exception) {
+            Log.e("T212DailyTrailRecv", "Failed to start ScanService for T212 trail", e)
+        }
+    }
+}
+
 object DiscoveryAutoScheduler {
     private const val TAG = "DiscoveryAutoSched"
     private const val ACTION_FIRE = "com.signalscope.AUTO_DISCOVERY_FIRE"
@@ -2021,7 +2326,7 @@ object DiscoveryAutoScheduler {
         // ELAPSED_REALTIME so phone-clock changes don't surprise us.
         // setAndAllowWhileIdle so Doze doesn't suppress it (still inexact,
         // OS may delay by a few minutes — fine for a scheduled discovery).
-        am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+        scheduleWakeupAlarm(am, triggerAt, pi, TAG)
         Log.i(TAG, "Next auto-discovery in ${delay / 60000} min")
     }
 
@@ -2091,27 +2396,29 @@ val NASDAQ_100_SYMBOLS = listOf(
     "XEL","ZS"
 )
 
-// ── DAX 40 + selected MDAX components (German equity universe) ──
-// Yahoo uses the `.DE` suffix for Deutsche Börse Xetra listings. Includes
-// the 40 DAX blue chips (Adidas, SAP, Allianz, …) plus a handful of liquid
-// MDAX names that round out the German large-cap landscape — same ~50-stock
-// shape as Nifty 50 / NASDAQ 100, fast enough to scan in one pass.
+// ── German equity universe — USER-CURATED, VERIFIED list (103 names) ──
+// This exact list was hand-picked by the user as their "DAX top ~100" and every
+// symbol was verified against Yahoo on 2026-07-17: all 103 resolve to the
+// correct company with a live price (e.g. PUM.DE → PUMA SE — the bare "PUM"
+// without .DE is ProUroCare Medical, a US OTC penny stock; always keep the
+// suffix). Single source of truth: Discovery scans this AND the momentum
+// screener screens this — do not let the two drift.
 val DAX_SYMBOLS = listOf(
-    // DAX 40
-    "ADS.DE","AIR.DE","ALV.DE","BAS.DE","BAYN.DE","BEI.DE","BMW.DE","BNR.DE",
-    "CBK.DE","CON.DE","1COV.DE","DBK.DE","DB1.DE","DHL.DE","DTE.DE","DTG.DE",
-    "ENR.DE","EOAN.DE","FRE.DE","HEI.DE","HEN3.DE","HFG.DE","HNR1.DE","IFX.DE",
-    "MBG.DE","MRK.DE","MTX.DE","MUV2.DE","P911.DE","PAH3.DE","QIA.DE","RHM.DE",
-    "RWE.DE","SAP.DE","SHL.DE","SIE.DE","SY1.DE","VNA.DE","VOW3.DE","ZAL.DE",
-    // MDAX additions
-    "AIXA.DE","AT1.DE","NDA.DE","AG1.DE","BC8.DE","GBF.DE","EVD.DE","DHER.DE",
-    "DEZ.DE","DWS.DE","EVK.DE","FTK.DE","FRA.DE","FNTN.DE","FPE3.DE","HAG.DE",
-    "HOT.DE","BOSS.DE","IOS.DE","JEN.DE","JUN3.DE","SDF.DE","KGX.DE","KBX.DE",
-    "KRN.DE","LXS.DE","LEG.DE","LHA.DE","NEM.DE","NDX1.DE","PUM.DE","RAA.DE",
-    "RDC.DE","R3NK.DE","RRTL.DE","SZG.DE","SRT3.DE","SHA.DE","SAX.DE","TEG.DE",
-    "TLX.DE","TKA.DE","8TRA.DE","TUI1.DE","UTDI.DE","WCH.DE",
-    // TecDAX / additional liquid German tech names
-    "1U1.DE","AOF.DE","COK.DE","COP.DE","DRW3.DE","ELG.DE","EKT.DE","EVT.DE",
-    "KTN.DE","NA9.DE","PNE3.DE","F3C.DE","WAF.DE","S92.DE","TMV.DE","VBK.DE",
-    "EUZ.DE"
+    "1U1.DE","ADN1.DE","ADS.DE","AFX.DE","AG1.DE","AIR.DE","AIXA.DE","ALV.DE",
+    "AOF.DE","AT1.DE","BAS.DE","BAYN.DE","BC8.DE","BEI.DE","BMW.DE","BNR.DE",
+    "BOSS.DE","BVB.DE","CBK.DE","CEC.DE","COK.DE","CON.DE","DB1.DE","DBK.DE",
+    "DEZ.DE","DHER.DE","DHL.DE","DRW3.DE","DTE.DE","DTG.DE","DUE.DE","EKT.DE",
+    "ELG.DE","ENR.DE","EOAN.DE","EVK.DE","EVT.DE","FNTN.DE","FRA.DE","FRE.DE",
+    "FTK.DE","GFT.DE","GXI.DE","HAG.DE","HEI.DE","HEN3.DE","HFG.DE","HLAG.DE",
+    "HNR1.DE","HYQ.DE","IFX.DE","INH.DE","IOS.DE","JEN.DE","JST.DE","KGX.DE",
+    "KTN.DE","KWS.DE","LEG.DE","LHA.DE","LXS.DE","MBG.DE","MRK.DE","MTX.DE",
+    "MUV2.DE","MUX.DE","NA9.DE","NB2.DE","NDX1.DE","NEM.DE","P911.DE","PAH3.DE",
+    "PBB.DE","PNE3.DE","PUM.DE","QIA.DE","R3NK.DE","RAA.DE","RHM.DE","RWE.DE",
+    "S92.DE","SAP.DE","SDF.DE","SGL.DE","SHL.DE","SIE.DE","SIX2.DE","SMHN.DE",
+    "SRT3.DE","SY1.DE","SZG.DE","SZU.DE","TKA.DE","TMV.DE","TUI1.DE","UTDI.DE",
+    "VBK.DE","VNA.DE","VOS.DE","VOW3.DE","WAF.DE","WCH.DE","ZAL.DE",
+    // Re-added on top of the curated 103: stocks the user currently HOLDS on
+    // T212, kept here so Discovery/screener coverage continues while held
+    // (8TRA = Traton, TEG = TAG Immobilien, NDA = Aurubis).
+    "8TRA.DE","TEG.DE","NDA.DE"
 ).distinct()

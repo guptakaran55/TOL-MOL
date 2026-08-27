@@ -39,6 +39,20 @@ android {
     }
 }
 
+// Some IDE/test runners ask for the JVM-style `:app:testClasses` task. The
+// Android Gradle plugin does not create that task for application modules; its
+// equivalent work is variant-specific (`compileDebugUnitTestKotlin`,
+// `compileDebugUnitTestJavaWithJavac`, `testDebugUnitTest`, etc.). This small
+// alias keeps those runners happy without changing the Android build lifecycle.
+tasks.register("testClasses") {
+    group = "verification"
+    description = "Compatibility alias for JVM test runners in this Android app module."
+    dependsOn(tasks.matching {
+        it.name == "compileDebugUnitTestKotlin" ||
+            it.name == "compileDebugUnitTestJavaWithJavac"
+    })
+}
+
 dependencies {
     // AndroidX
     implementation("androidx.core:core-ktx:1.12.0")
