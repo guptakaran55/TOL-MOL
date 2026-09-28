@@ -120,15 +120,32 @@ object Trading212TrailingManager {
             if (h.quantity <= 0) continue
             try {
                 var analysis: com.signalscope.app.data.StockAnalysis? = null
-                for (candidate in client.t212ToYahooCandidates(h.ticker, null)) {
+                fun priceUnder(candidate: String): com.signalscope.app.data.StockAnalysis? {
                     val exchange = if (candidate.endsWith(".DE", ignoreCase = true)) "DE" else "NASDAQ"
                     val cr = YahooFinanceClient.fetchCandles(candidate, exchange)
-                    if (cr is YahooFinanceClient.CandleResult.Success) {
-                        analysis = StockAnalyzer.analyze(
+                    return if (cr is YahooFinanceClient.CandleResult.Success)
+                        StockAnalyzer.analyze(
                             candles = cr.candles, symbol = candidate, name = candidate,
                             token = candidate, minAvgVolume = 0, w = weights
                         )
-                        if (analysis != null) break
+                    else null
+                }
+                for (candidate in client.t212ToYahooCandidates(h.ticker, null)) {
+                    analysis = priceUnder(candidate)
+                    if (analysis != null) break
+                }
+                // NOTHING SPELLED OUT OF THE BROKER CODE WORKED. Ask the ISIN.
+                //
+                // This is the branch where the missing answer costs real money:
+                // below, a holding with no analysis is SKIPPED, which means its
+                // stop never trails. It sits at whatever level it was first given
+                // while the price moves away from it — silently, with no error
+                // anywhere, for as long as the position is held.
+                if (analysis == null) {
+                    val byIsin = client.resolveFeedSymbolViaIsin(h.ticker)
+                    if (byIsin != null) {
+                        analysis = priceUnder(byIsin)
+                        if (analysis != null) log.add("${h.ticker}: priced as $byIsin (matched by ISIN)")
                     }
                 }
                 if (analysis == null) {

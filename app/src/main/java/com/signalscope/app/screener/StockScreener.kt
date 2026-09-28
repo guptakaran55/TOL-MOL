@@ -13,7 +13,31 @@ import kotlin.math.sqrt
 // checklist (§8) and test vectors (§3.7). Pure + deterministic — no I/O here.
 // ════════════════════════════════════════════════════════════════════════════
 
-data class DailyBar(val date: LocalDate, val close: Double)
+/**
+ * One trading day.
+ *
+ * THE RANGE IS CARRIED, not just the close. It always arrived from the provider
+ * and was thrown away in conversion, which quietly ruled out every indicator
+ * built on true range — Keltner channels, ATR, the squeeze. Defaulting high and
+ * low to the close keeps older callers compiling and makes a range-less bar
+ * obvious rather than silently flat: anything needing a range checks for one
+ * instead of computing zero volatility and believing it.
+ */
+data class DailyBar(
+    val date: LocalDate,
+    val close: Double,
+    val high: Double = close,
+    val low: Double = close,
+    /**
+     * Shares traded that day. 0 when the provider did not say.
+     *
+     * Carried purely so a universe can be filtered on how much a name actually
+     * trades — see [com.signalscope.app.screener.Liquidity]. Nothing scores on
+     * it, and nothing should: volume is a fact about tradability, not about
+     * whether a stock is going up.
+     */
+    val volume: Double = 0.0
+)
 
 data class ScreenerConfig(
     val lookbackDays: Long = 90,
@@ -109,6 +133,84 @@ object StockScreener {
         val out = DoubleArray(n)
         for ((rankPos, idx) in order.withIndex()) out[idx] = rankPos.toDouble() / (n - 1) * 100.0
         return out
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // PREPARED UNIVERSE — same numbers, without redoing the same work every day
+    // ════════════════════════════════════════════════════════════════════════
+    // [computeTraits] re-filters, re-groups, re-sorts and re-computes a full SMA series on EVERY
+    // call. In a walk-forward that call happens once per trading day, so a 400-symbol universe
+    // over ~640 days repeats ~250,000 sorts and allocates a HashMap per symbol per day. That is
+    // what made the 🧪 backtest look hung: not a loop, just O(days x symbols x bars log bars).
+    //
+    // The inputs do not change between days — only `asOf` moves, and it moves forward. So sort
+    // and compute the SMA ONCE per symbol, then answer each day by binary-searching two window
+    // edges. Same arithmetic on the same numbers, O(log n + window) instead of O(n log n).
+    //
+    // [screen] is kept as-is and now simply delegates, so every existing caller and the parity
+    // with the Python lab are untouched.
+    class Prepared(cfg: ScreenerConfig, universe: Map<String, List<DailyBar>>) {
+        class Series(val symbol: String, val days: LongArray, val closes: DoubleArray, val sma: DoubleArray)
+
+        val series: List<Series> = universe.map { (sym, bars) ->
+            val sorted = bars.asSequence()
+                .groupBy { it.date }.values.map { it.last() }
+                .sortedBy { it.date }
+            val days = LongArray(sorted.size) { sorted[it].date.toEpochDay() }
+            val closes = DoubleArray(sorted.size) { sorted[it].close }
+            Series(sym, days, closes, rollingMean(closes, cfg.smaPeriod, cfg.smaMinPeriods))
+        }
+
+        /** Count of entries strictly less than [day]; i.e. the first index with days[i] >= day. */
+        private fun lowerBound(days: LongArray, day: Long): Int {
+            var lo = 0; var hi = days.size
+            while (lo < hi) { val m = (lo + hi) ushr 1; if (days[m] < day) lo = m + 1 else hi = m }
+            return lo
+        }
+
+        fun traits(cfg: ScreenerConfig, s: Series, asOf: LocalDate): SymbolTraits? {
+            // end = one past the last bar with date <= asOf
+            val end = lowerBound(s.days, asOf.toEpochDay() + 1)
+            if (end < cfg.smaMinPeriods) return null
+            // window = dates STRICTLY AFTER the cutoff, matching computeTraits exactly
+            val start = lowerBound(s.days, asOf.minusDays(cfg.lookbackDays).toEpochDay() + 1)
+            val n = end - start
+            if (n < cfg.minBarsInWindow) return null
+
+            val trailingReturn = (s.closes[end - 1] / s.closes[start] - 1.0) * 100.0
+
+            var mean = 0.0
+            for (i in start + 1 until end) mean += (s.closes[i] - s.closes[i - 1]) / s.closes[i - 1]
+            val m = if (n > 1) mean / (n - 1) else 0.0
+            var varSum = 0.0
+            for (i in start + 1 until end) {
+                val r = (s.closes[i] - s.closes[i - 1]) / s.closes[i - 1]
+                varSum += (r - m) * (r - m)
+            }
+            val vol = if (n > 1) sqrt(varSum / (n - 1)) * sqrt(cfg.tradingDaysPerYear) * 100.0 else 0.0
+
+            var valid = 0; var above = 0
+            for (i in start until end) if (!s.sma[i].isNaN()) { valid++; if (s.closes[i] > s.sma[i]) above++ }
+            val pctAbove = if (valid > 0) above.toDouble() / valid * 100.0 else 0.0
+
+            return SymbolTraits(s.symbol, trailingReturn, vol, pctAbove, n)
+        }
+
+        fun screen(cfg: ScreenerConfig, asOf: LocalDate): List<RankedSymbol> =
+            rank(cfg, series.mapNotNull { traits(cfg, it, asOf) })
+    }
+
+    private fun rank(cfg: ScreenerConfig, traits: List<SymbolTraits>): List<RankedSymbol> {
+        if (traits.isEmpty()) return emptyList()
+        val pm = percentileRanks(DoubleArray(traits.size) { traits[it].trailingReturnPct })
+        val pv = percentileRanks(DoubleArray(traits.size) { traits[it].annualizedVolPct })
+        val pa = percentileRanks(DoubleArray(traits.size) { traits[it].pctDaysAboveSma })
+        val wsum = cfg.weightReturn + cfg.weightVol + cfg.weightAboveSma
+        return traits.indices.map { i ->
+            val score = (cfg.weightReturn * pm[i] + cfg.weightVol * pv[i] + cfg.weightAboveSma * pa[i]) / wsum
+            RankedSymbol(traits[i].symbol, 0, score, traits[i], pm[i], pv[i], pa[i])
+        }.sortedByDescending { it.score }
+            .mapIndexed { i, r -> r.copy(rank = i + 1) }
     }
 
     fun screen(cfg: ScreenerConfig, universe: Map<String, List<DailyBar>>, asOf: LocalDate): List<RankedSymbol> {

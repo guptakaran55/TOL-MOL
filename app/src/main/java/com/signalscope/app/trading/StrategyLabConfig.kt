@@ -94,6 +94,20 @@ data class StrategyLabConfig(
         val macdCrossDownEnabled: Boolean = false,
         val macdBelowZeroEnabled: Boolean = false,
         val accelNegativeEnabled: Boolean = false,
+        /**
+         * Sigma floor for the deceleration exit. DEFAULT 0.0 ON PURPOSE.
+         *
+         * 0.0 reproduces the historical bare rule (`exitAccel < 0`) byte for byte, so every
+         * config written before this field existed behaves exactly as it did. Note this is
+         * NOT the entry side's default of 1.0 — mirroring that here would silently re-tune
+         * any config that had already enabled accelNegative.
+         *
+         * k > 0 requires the deceleration to exceed k standard deviations of this symbol's
+         * OWN acceleration swing before it fires. The bare rule triggers on ~50% of bars,
+         * which is why every champion has kept it off; the scaled form is what made it
+         * usable. See RESULTS_MATRIX_decel_exit.md in the backtest repo.
+         */
+        val accelNegativeMinSigma: Double = 0.0,
         val velocityEnabled: Boolean = false,
         val velocityLookback: Int = 10,
         val velocityThreshold: Double = 0.0,
@@ -138,7 +152,8 @@ data class StrategyLabConfig(
             if (exit.slopeRetraceEnabled) add("slope retrace ${exit.slopeRetracePct}%")
             if (exit.macdCrossDownEnabled) add("MACD cross down")
             if (exit.macdBelowZeroEnabled) add("MACD<0")
-            if (exit.accelNegativeEnabled) add("accel<0")
+            if (exit.accelNegativeEnabled)
+                add(if (exit.accelNegativeMinSigma > 0) "decel<${exit.accelNegativeMinSigma}σ" else "accel<0")
             if (exit.velocityEnabled) add("velocity≤${exit.velocityThreshold}%")
             if (exit.stopLossEnabled) add("stop -${exit.stopLossPct}%")
             if (exit.takeProfitEnabled) add("target +${exit.takeProfitPct}%")
@@ -273,6 +288,7 @@ data class StrategyLabConfig(
                     macdCrossDownEnabled = bool(obj(exitO, "macdCrossDown"), "enabled", false),
                     macdBelowZeroEnabled = bool(obj(exitO, "macdBelowZero"), "enabled", false),
                     accelNegativeEnabled = bool(obj(exitO, "accelNegative"), "enabled", false),
+                    accelNegativeMinSigma = num(obj(exitO, "accelNegative"), "minSigma", 0.0),
                     velocityEnabled = bool(obj(exitO, "velocity"), "enabled", false),
                     velocityLookback = int(obj(exitO, "velocity"), "lookback", 10),
                     velocityThreshold = num(obj(exitO, "velocity"), "threshold", 0.0),

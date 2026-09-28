@@ -199,38 +199,54 @@ object StrategyLabStore {
             val cm = com.signalscope.app.data.ConfigManager(ctx)
             val bucket = try { BucketStore.get(ctx, ns) } catch (e: Exception) { null }
 
-            // A per-algo fee of 0.0 is a real answer ("this algo pays no flat
-            // fee"), so only a NULL falls through to the space setting.
-            val feeCash = bucket?.flatFeeOverride ?: cm.flatFeeFor(ns)
-
-            // THE FEE IS MEASURED AGAINST WHAT A SEAT ACTUALLY BUYS, not against
-            // the config file's notional. Those are different numbers whenever
-            // capital is split over seats — with 1000 over 5 seats a position is
-            // 200, and charging a flat fee against 1000 understates it fivefold.
-            // Getting this wrong makes a fee look survivable that in fact is not.
+            // THE CHARGES ARE MEASURED AGAINST WHAT ONE SEAT ACTUALLY BUYS, not
+            // against the algo's total capital. Those differ the moment money is
+            // split over seats — 1000 over 5 seats is a 200 position — and a fixed
+            // cash charge measured against the wrong one understates itself by the
+            // seat count. That is the whole weight of Zerodha's depository fee.
             val seats = (bucket?.holdN ?: 1).coerceAtLeast(1)
             val positionValue = when {
                 bucket != null && bucket.capital > 0.0 -> bucket.capital / seats
                 base.notional > 0.0 -> base.notional
                 else -> 0.0
             }
-            val feePct = if (feeCash > 0.0 && positionValue > 0.0)
-                (2.0 * feeCash / positionValue) * 100.0 else 0.0
 
-            // EXCLUSIVE, NOT CUMULATIVE. A flat fee and a percentage are two ways
-            // of describing the same friction, and charging both meant a config's
-            // 0.20% was silently added to a fee typed in to replace it — which is
-            // exactly how a small fee turned into a catastrophic-looking backtest.
-            // Whichever is set on the algo wins outright.
-            val slip = when {
-                bucket?.slippagePctOverride != null -> bucket.slippagePctOverride!!
-                feeCash > 0.0 -> 0.0
-                else -> base.slippagePct
-            }
-            val effFeePct = if (bucket?.slippagePctOverride != null) 0.0 else feePct
+            // ── WHAT THE BROKER TAKES ────────────────────────────────────────
+            // Modelled per broker from their published price list rather than
+            // approximated by a number typed into a box. A single "fee per order"
+            // could not express any of what Zerodha actually charges: a tax on one
+            // leg only, a flat cash depository fee on the sell alone, and GST
+            // levied on some of the others but not on the taxes.
+            val broker = com.signalscope.app.trading.TradingCosts.brokerCosts(
+                ns, cm.accountCurrency, cm.fxConversionPct)
+            val brokerPct = broker.totalPct(positionValue)
 
-            if (slip == base.slippagePct && effFeePct == 0.0) base
-            else base.copy(slippagePct = slip, flatFeeRoundTripPct = effFeePct)
+            // ── ANYTHING THE USER ADDS ON TOP ────────────────────────────────
+            // Still honoured, still per order, still charged on both legs — but it
+            // is now EXTRA rather than the whole model, and it defaults to nothing.
+            // A fee typed in to stand for charges the app now models itself would
+            // count them twice, which the algo card says out loud when it is set.
+            val extraCash = bucket?.flatFeeOverride ?: cm.flatFeeFor(ns)
+            val extraPct = if (extraCash > 0.0 && positionValue > 0.0)
+                (2.0 * extraCash / positionValue) * 100.0 else 0.0
+
+            // ── SPREAD ───────────────────────────────────────────────────────
+            // ADDED TO THE BROKER'S CHARGES, NOT TRADED AGAINST THEM. These used
+            // to be exclusive, on the reasoning that a flat fee and a percentage
+            // were two descriptions of one friction — which was true only while
+            // the "fee" was a hand-made stand-in for everything. Now that the
+            // price list is modelled properly they are plainly different things:
+            // STT is a tax and the spread is the market, and a trade pays both.
+            val slip = bucket?.slippagePctOverride ?: base.slippagePct
+
+            // THE ESCAPE HATCH, UNCHANGED IN MEANING. A percentage set on the algo
+            // card says "charge exactly this and nothing else" — the way to test a
+            // what-if, or to overrule the model entirely without editing anything.
+            val totalFeePct = if (bucket?.slippagePctOverride != null) 0.0
+                              else brokerPct + extraPct
+
+            if (slip == base.slippagePct && totalFeePct == 0.0) base
+            else base.copy(slippagePct = slip, flatFeeRoundTripPct = totalFeePct)
         } catch (e: Exception) { base }
     }
 

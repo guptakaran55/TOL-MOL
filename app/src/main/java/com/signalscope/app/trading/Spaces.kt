@@ -52,4 +52,29 @@ object Spaces {
     fun currencyOf(ns: String): String = when (baseOf(ns)) {
         "binance" -> "USDC"; "de" -> "EUR"; "in" -> "INR"; else -> "USD"
     }
+
+    /**
+     * Does this space's BROKER convert currency on every trade?
+     *
+     * Only Trading 212 does, and only because one account settles in one currency
+     * while its instruments do not: a euro account buying a Nasdaq share converts
+     * in on the buy and out on the sell, and is charged for each.
+     *
+     * Zerodha and Binance do not. Those accounts are funded in their own currency
+     * and hold it — whatever conversion happened did so ONCE, when money was moved
+     * in, and is not a cost any individual trade carries.
+     *
+     * THIS EXISTS BECAUSE THE DISTINCTION WAS MISSED. The account currency and the
+     * conversion rate are both documented as Trading 212 settings, and both are
+     * single global values — but the cost resolver applied them to any space whose
+     * instrument currency differed from the account's. A euro account therefore
+     * paid a 0.30% round-trip conversion on every INDIAN trade, on a rupee account
+     * funded from a rupee bank that converts nothing. On a config turning over
+     * hundreds of trades that was three quarters of the modelled Indian trading
+     * cost, invisible inside a single blended percentage.
+     */
+    fun brokerConvertsPerTrade(ns: String): Boolean = when (baseOf(ns)) {
+        "us", "de" -> true          // Trading 212
+        else -> false               // Zerodha (INR), Binance (own settlement)
+    }
 }

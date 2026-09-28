@@ -77,4 +77,14 @@ dependencies {
 
     // SharedPreferences encryption
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // ── JVM unit tests ────────────────────────────────────────────────────────
+    // The strategy engine is deliberately pure Kotlin — no Android, no network,
+    // no broker — so its behaviour can be pinned by a plain JVM test with no
+    // device and no emulator. That is what makes a parity gate on it practical.
+    testImplementation("junit:junit:4.13.2")
+    // TEST ONLY — never reaches the APK. android.jar stubs org.json in JVM unit tests
+    // (every call throws "not mocked"), so a real implementation is needed to exercise
+    // StrategyLabConfig.fromJson, which is the code path every uploaded config goes through.
+    testImplementation("org.json:json:20240303")
 }

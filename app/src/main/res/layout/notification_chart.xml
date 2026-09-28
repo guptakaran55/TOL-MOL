@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The expanded body of a watcher alert: the full text, then Discovery's MACD
+     chart. A picture notification would have cut the text to one line, and the
+     line it would have cut is the one saying nothing has been bought. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+
+    <TextView
+        android:id="@+id/nc_title"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:textAppearance="@style/TextAppearance.Compat.Notification.Title" />
+
+    <TextView
+        android:id="@+id/nc_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:maxLines="5"
+        android:ellipsize="end"
+        android:textAppearance="@style/TextAppearance.Compat.Notification" />
+
+    <ImageView
+        android:id="@+id/nc_chart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:adjustViewBounds="true"
+        android:scaleType="fitCenter"
+        android:contentDescription="Daily MACD, last 30 days" />
+</LinearLayout>

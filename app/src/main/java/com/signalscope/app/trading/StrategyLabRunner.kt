@@ -1,8 +1,9 @@
-package com.signalscope.app.trading
+﻿package com.signalscope.app.trading
 
 import android.content.Context
 import android.util.Log
 import com.signalscope.app.data.CandleData
+import com.signalscope.app.data.ManualWatchStore
 import com.signalscope.app.data.StrategyLabStore
 import com.signalscope.app.network.BinanceClient
 import com.signalscope.app.network.YahooFinanceClient
@@ -146,6 +147,46 @@ object StrategyLabRunner {
                 plan.targetBars.takeIf { it > 0 } ?: FeedPlan.BINANCE_TARGET_BARS)
         else YahooFinanceClient.fetchCandlesAt(symbol, exchange, plan.interval, plan.range)
 
+    /**
+     * Candles for one symbol, honouring the Indian feed choice.
+     *
+     * FALLS BACK RATHER THAN GOING DARK. Zerodha's history rides on a paid
+     * subscription that can lapse between months, and the cost of stopping is far
+     * higher than the cost of a second-best feed: no candles means no signal
+     * check, which looks exactly like a market where nothing is happening.
+     *
+     * The fallback is LOUD. A silent one would hide a lapsed subscription for
+     * weeks — the user would believe they were trading exchange bars while
+     * quietly running on Yahoo.
+     */
+    private fun fetchCandlesFor(
+        ctx: Context, ns: String, symbol: String, exchange: String, plan: FeedPlan.Plan
+    ): YahooFinanceClient.CandleResult {
+        val base = Spaces.baseOf(ns)
+        if (base != "in") return fetchCandlesRaw(ns, symbol, exchange, plan)
+        val cfg = com.signalscope.app.data.ConfigManager(ctx)
+        if (!cfg.indiaCandleSource.equals("kite", true))
+            return fetchCandlesRaw(ns, symbol, exchange, plan)
+        if (!com.signalscope.app.network.KiteHistoryClient.supports(plan.interval)) {
+            Log.w(TAG, "[$ns] Kite has no ${plan.interval} interval — using Yahoo for $symbol")
+            return fetchCandlesRaw(ns, symbol, exchange, plan)
+        }
+        val days = (plan.capCalendarDays.takeIf { it > 0 } ?: 400)
+        return when (val r = com.signalscope.app.network.KiteHistoryClient
+            .fetchCandles(ctx, symbol, plan.interval, days)) {
+            is com.signalscope.app.network.KiteHistoryClient.Result.Success ->
+                YahooFinanceClient.CandleResult.Success(r.candles)
+            is com.signalscope.app.network.KiteHistoryClient.Result.SessionExpired -> {
+                Log.w(TAG, "[$ns] Kite session expired — log in to Zerodha again; using Yahoo for $symbol")
+                fetchCandlesRaw(ns, symbol, exchange, plan)
+            }
+            is com.signalscope.app.network.KiteHistoryClient.Result.Unavailable -> {
+                Log.w(TAG, "[$ns] Kite history unavailable for $symbol (${r.why}) — using Yahoo")
+                fetchCandlesRaw(ns, symbol, exchange, plan)
+            }
+        }
+    }
+
     /** Kick a background pass over all enrolled symbols. No-ops if disabled,
      *  nothing to do, or a pass is already in flight for this namespace. */
     fun runAll(ctx: Context, minIntervalMs: Long = 0L, ns: String = "us", onDone: (() -> Unit)? = null) {
@@ -202,6 +243,12 @@ object StrategyLabRunner {
                         }
                     } catch (e: Exception) { Log.w(TAG, "position audit failed", e) }
                 }
+                // POSITIONS THE ENGINE HAS LOST, given their rules back. Runs after
+                // the fill reconcile above so a just-filled row has its real entry
+                // price, and before the symbol loop so a sell it decides on lands
+                // in the same pass rather than a tick later.
+                try { manageOrphanedLivePositions(ctx, ns) }
+                catch (e: Exception) { Log.w(TAG, "[$ns] orphan position sweep failed", e) }
                 if (Spaces.baseOf(ns) == "binance") {
                     // Per-ledger: resolve UNKNOWN buys + late orphan exits for THIS
                     // ns; converge (missed-exit self-heal + global unmanaged audit).
@@ -223,6 +270,20 @@ object StrategyLabRunner {
                 catch (e: Exception) { Log.w(TAG, "seat reconcile failed", e) }
                 try { MacdGateEngine.evaluate(ctx, ns) }
                 catch (e: Exception) { Log.w(TAG, "macd gate eval failed", e) }
+                // AND FILL ANYTHING THAT EMPTIED SINCE THAT RAN.
+                //
+                // The evaluation above refuses to run twice in one UTC day, so a
+                // seat freed after it — a name ejected flat, or one you sold by
+                // hand — used to hold cash until the day rolled over. On five
+                // seats that is a fifth of the algo idle for up to a day, and the
+                // gate's own log shows it happening most days.
+                //
+                // Re-uses the ranking that pass already computed and applies the
+                // same three rules to it, so this is the same decision arriving
+                // sooner rather than a different one. Costs no fetch, and seating
+                // a name does not buy it — the strategy still has to fire.
+                try { MacdGateEngine.refillFreeSeats(ctx, ns) }
+                catch (e: Exception) { Log.w(TAG, "seat refill failed", e) }
                 // Re-read AFTER the gate: a 3b evaluation may have just enrolled
                 // the names this pass is about to evaluate.
                 val roster = StrategyLabStore.load(ctx, ns).enrolled
@@ -301,13 +362,13 @@ object StrategyLabRunner {
             plan.sourceSec)
         val wmNow = StrategyLabStore.load(ctx, ns).watermarks[sym] ?: 0L
         if (wmNow > 0L && MarkToMarket.get(sym) != null) {
-            val nextClosedSec = wmNow + 2L * frameSec + GRACE_SEC
+            val nextClosedSec = wmNow + 2L * frameSec + GRACE_SEC + FeedDelay.secFor(ns)
             if (now / 1000L < nextClosedSec) {
                 Log.d(TAG, "[$ns] $sym no new ${frameSec / 60}min bar yet — skipping fetch")
                 return
             }
         }
-        val res = fetchCandlesRaw(ns, symbol, exchange, plan)
+        val res = fetchCandlesFor(ctx, ns, symbol, exchange, plan)
         if (res !is YahooFinanceClient.CandleResult.Success) {
             Log.w(TAG, "candle fetch for $symbol: ${res::class.simpleName}")
             StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
@@ -318,7 +379,12 @@ object StrategyLabRunner {
         // starts at ts closes at ts+900; require a small grace past that so a
         // partial bar can't fire a false signal that then gets watermarked away.
         val nowSec = now / 1000
-        val closedBars = res.candles.filter { it.timestamp + barSec + GRACE_SEC <= nowSec }
+        // AND BY THE DATA, NOT JUST THE CLOCK. See [FeedDelay]: a German bar is
+        // judged only once Yahoo has actually delivered its last minutes.
+        val feedDelay = FeedDelay.secFor(ns)
+        val closedBars = res.candles.filter {
+            FeedDelay.isComplete(it.timestamp, barSec, nowSec, GRACE_SEC, feedDelay)
+        }
         // Data-quality guard: drop corrupt bars and measure freshness/gaps so the
         // engine never trades on a Yahoo bad tick, and the user can SEE whether
         // the feed is healthy before trusting the signals (esp. delayed Xetra data).
@@ -341,7 +407,20 @@ object StrategyLabRunner {
             return
         }
 
-        val run = StrategyLabEngine.runLiveClosed(symbol, candles, cfg, barSec)
+        // FRESH START AT THE SEAT'S TRACKING BOUNDARY. Read BEFORE the engine runs,
+        // because it is now an input to it rather than a filter on its output.
+        //
+        // The old shape filtered the result — a replay that crossed the baseline
+        // holding a position had that trade dropped from the ledger while the engine
+        // stayed internally long, so the seat could open nothing until the phantom
+        // closed by itself. Suppressing pre-baseline entries removes the phantom at
+        // the source: the engine cannot be in a position it was never allowed to
+        // open, so it reaches the baseline flat.
+        //
+        // 0 on bootstrap (no baseline stamped yet), which is exactly the historical
+        // behaviour — and that pass records nothing anyway.
+        val baselineTs = StrategyLabStore.baselineFor(ctx, sym, ns)
+        val run = StrategyLabEngine.runLiveClosed(symbol, candles, cfg, barSec, baselineTs)
         if (run.error != null) {
             Log.w(TAG, "engine $symbol: ${run.error}")
             StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
@@ -368,11 +447,60 @@ object StrategyLabRunner {
             // just stamps "tracking begins at this bar" and records nothing —
             // so "Reset + Run now" is a genuine clean start from today. Only
             // entries on bars AFTER this baseline are counted from here on.
-            StrategyLabStore.applyRunResult(ctx, sym, emptyList(), emptyList(), wmBar, ns, baseline = wmBar)
+            // WATERMARK ONE TICK BEHIND THE BASELINE, deliberately.
+            //
+            // The baseline is the first bar this seat may trade ON. If the watermark
+            // were stamped at that same bar, an entry taken there would fail the
+            // "newer than anything already processed" test that guards live orders —
+            // so a brand-new algo's very first position would be booked on paper and
+            // be structurally incapable of ever becoming real. It would have to wait
+            // for that phantom-by-another-name to exit before real trading could
+            // start at all, which is the same trap the fresh-start rule was written
+            // to remove.
+            //
+            // One second earlier makes the bind bar itself eligible. Nothing is
+            // loosened by it: the staleness gate still refuses to act on an old feed,
+            // and now it RECORDS that refusal instead of the entry vanishing between
+            // two tests that each thought the other had handled it.
+            //
+            // ── BUT ONLY WHILE THE FEED IS ACTUALLY LIVE ────────────────────
+            //
+            // That concession assumed the newest bar is a bar that just closed. On
+            // a shut market it is not: the last US 240-minute bar closes at 22:00
+            // and stays "newest" until the following afternoon. Making it eligible
+            // meant every reset during those hours immediately re-adopted a
+            // position on a bar that had closed long before the reset — and reset
+            // again an hour later and it came straight back, because the bar had
+            // not moved. Observed twice on this account, fourteen hours after the
+            // close, which is the precise opposite of the clean start promised
+            // three paragraphs above.
+            //
+            // The concession existed so a brand-new algo's FIRST position could
+            // become real. On a stale feed it cannot anyway — the entry gate
+            // refuses — so all it bought was a paper position nobody asked for.
+            // Withdrawing it exactly where it pays nothing: with the market shut,
+            // tracking starts at the NEXT bar and the book stays genuinely flat.
+            val bindFresh = health.lastBarAgeMin <= STALE_ENTRY_MAX_MIN
+            if (!bindFresh)
+                Log.i(TAG, "[$ns] $sym bootstrap on a stale feed " +
+                    "(${health.lastBarAgeMin}m) — tracking starts at the NEXT bar, " +
+                    "so the book starts flat rather than adopting the last one")
+            StrategyLabStore.applyRunResult(ctx, sym, emptyList(), emptyList(),
+                if (bindFresh) (wmBar - 1L).coerceAtLeast(0L) else wmBar, ns,
+                baseline = if (bindFresh) wmBar else wmBar + 1L)
         } else {
-            // Ignore any trade whose ENTRY is at/before the baseline — including
-            // its eventual exit — so a pre-start position can never leak in later.
-            val baseline = StrategyLabStore.baselineFor(ctx, sym, ns)
+            // Ignore any trade whose ENTRY is before the baseline — including its
+            // eventual exit — so a pre-start position can never leak in later.
+            //
+            // STRICTLY BEFORE, not at-or-before. The engine is now told the same
+            // boundary and refuses to open anything earlier than it, so this is
+            // mostly a belt-and-braces check on output the engine should no longer
+            // produce. The two MUST agree on the boundary bar: if the engine may
+            // enter AT the baseline (it may) while this discarded that entry, the
+            // engine would stay long on a trade the ledger never saw — which is
+            // precisely the phantom this change removes, reintroduced one bar wide.
+            // Matches the desktop reference, which skips `entry < since`.
+            val baseline = baselineTs
             // WIND-DOWN (exit-only): symbols dropped by a rebalance while in a
             // trade take no NEW entries — the existing position rides to its algo
             // exit, then ReinvestEngine.onTradeClosed releases the capital.
@@ -382,7 +510,7 @@ object StrategyLabRunner {
             val newTrades = ArrayList<StrategyLabStore.LedgerTrade>()
             val newAudits = ArrayList<StrategyLabStore.Audit>()
             for (t in run.trades) {
-                if (t.entryTs <= baseline) continue   // entered before tracking began
+                if (t.entryTs < baseline) continue   // entered before tracking began
                 if (sym in windDown && t.entryTs > prevWm) continue  // exit-only: skip fresh entries entirely
                 val id = "$sym-${t.entryTs}"
                 val isOpen = t.status == "OPEN"
@@ -420,14 +548,20 @@ object StrategyLabRunner {
                 // sweep). Threshold = 3 source bars, lenient enough for Doze jitter.
                 val dataFresh = health.lastBarAgeMin <= STALE_ENTRY_MAX_MIN
                 if (!dataFresh) Log.w(TAG, "$sym feed stale (${health.lastBarAgeMin}m) — live entries suppressed this tick")
-                // Trade notifications (crypto): the user was blind to opens/closes
-                // unless the app happened to be on screen. Paper channel is
+                // Trade notifications: without them the user is blind to opens and
+                // closes unless the app happens to be on screen. Paper channel is
                 // default-importance; LIVE fills notify separately (high) from
-                // inside BinanceLiveMirror when real money actually moves.
-                if (Spaces.baseOf(ns) == "binance") {
-                    if (newEntry) LabNotifier.paperOpen(ctx, ns, sym, t.entryPrice)
-                    if (newExit) LabNotifier.paperClose(ctx, ns, sym, t.pctReturn, t.exitReason)
-                }
+                // inside each mirror when real money actually moves.
+                //
+                // EVERY SPACE, NOT JUST CRYPTO. This was `baseOf(ns) == "binance"`,
+                // which made the per-space and per-algo notification switches a lie
+                // everywhere else: India could be ticked on in Settings and ticked
+                // on again on the algo's own bell, and still never produce a single
+                // notification, because the only line that could raise one never ran
+                // outside crypto. Whether to notify is the switches' decision and it
+                // is taken inside the notifier — this line's job is only to ask.
+                if (newEntry) LabNotifier.paperOpen(ctx, ns, sym, t.entryPrice)
+                if (newExit) LabNotifier.paperClose(ctx, ns, sym, t.pctReturn, t.exitReason)
                 val base = Spaces.baseOf(ns)
                 // ASYMMETRIC GATING: entries stay newest-bar-only + fresh-data
                 // (adding risk = paranoid). Exits fire on ANY new exit, however
@@ -471,9 +605,57 @@ object StrategyLabRunner {
                                 "the price feed was stale on this pass — no real order placed"
                             else "signal came from an older bar, not the newest closed one — " +
                                  "catch-up entries stay on paper")
+                    } else if (isOpen &&
+                        com.signalscope.app.data.T212LiveStore.get(ctx, id, ns) == null) {
+                        // AN OPEN POSITION THAT NEVER REACHED THE MIRROR AT ALL.
+                        //
+                        // newEntry is `entryTs > prevWm`, and it is FALSE whenever the
+                        // entry bar sits behind the watermark. That is the normal shape
+                        // of a position the FRESH-START boundary just unblocked: the
+                        // seat was paralysed by a phantom for days while the watermark
+                        // kept advancing, so the entry the engine now finds is already
+                        // behind it. Such a trade enters the book through the isOpen
+                        // branch above and never touches either mirror arm — so without
+                        // this it shows as a held position with no order and NO STATED
+                        // REASON, which is the one combination that reads exactly like a
+                        // broken switch.
+                        //
+                        // Withholding the order is correct: buying a signal from days
+                        // ago at today's price is precisely what the newest-bar rule
+                        // exists to prevent. Only the silence was wrong.
+                        // THE WORDING NAMES THE LIKELY CAUSE FIRST. It used to lead
+                        // with a reset, and on a German position the user had not
+                        // reset at all it read as an accusation with nothing behind
+                        // it. The commonest cause was a bar judged on delayed prices
+                        // and re-judged once the full bar arrived — see [FeedDelay],
+                        // which now waits for the full bar and should make this rare.
+                        com.signalscope.app.data.LiveSkipStore.note(ctx, ns, id, t.symbol,
+                            "this signal was first seen AFTER its bar had already been " +
+                            "checked, so no real order was placed — buying then would mean " +
+                            "a price the signal no longer describes. Usually the price feed " +
+                            "delivered that bar late and the signal appeared only once the " +
+                            "full bar arrived; it also happens after a reset, or when a " +
+                            "blocked seat is freed, because the replay rebuilds from " +
+                            "history. Paper holds it, real money does not. It will trade " +
+                            "for real on its next fresh signal.")
                     }
                     if (newExit) {
-                        T212LiveMirror.mirrorExit(ctx, id, t, t212Space, ns)
+                        // A MANUAL position exits by its own route. The normal mirror
+                        // is gated on the ALGO live-orders toggle, which is off — and
+                        // rightly so, since it governs whether strategies may spend
+                        // money unattended. It must not govern whether a position the
+                        // user deliberately bought is allowed to be SOLD: that gate
+                        // would leave a real holding with a stop that can never act.
+                        // Exits reduce risk, so they are never withheld.
+                        if (Spaces.isBucket(ns) &&
+                            Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) {
+                            val out = T212LiveMirror.stopOutNow(ctx, ns, sym,
+                                t.exitReason.ifBlank { "strategy exit" },
+                                origin = "watchlist strategy exit")
+                            if (!out.ok) Log.w(TAG, "[$ns] manual exit for $sym failed: ${out.error}")
+                        } else {
+                            T212LiveMirror.mirrorExit(ctx, id, t, t212Space, ns)
+                        }
                     }
                 }
                 // INDIA: a plain order plus a broker-side GTT, rather than the
@@ -483,6 +665,17 @@ object StrategyLabRunner {
                 if (base == "in" && freshBar > 0L) {
                     if (newEntry && t.entryTs == freshBar && dataFresh) {
                         ZerodhaLiveMirror.mirrorEntry(ctx, id, t.symbol, t.entryPrice, ns)
+                    } else if (newEntry) {
+                        // INDIA DECLINED IN SILENCE UNTIL NOW. The T212 arm has
+                        // written its reason down for a while; this one simply did
+                        // nothing, so a withheld order was indistinguishable from a
+                        // broken switch — which is exactly the complaint that found
+                        // the market-order bug underneath it.
+                        com.signalscope.app.data.LiveSkipStore.note(ctx, ns, id, t.symbol,
+                            if (!dataFresh)
+                                "the price feed was stale on this pass — no real order placed"
+                            else "signal came from an older bar, not the newest closed one — " +
+                                 "catch-up entries stay on paper")
                     }
                     if (newExit) {
                         ZerodhaLiveMirror.mirrorExit(ctx, id, t.symbol, t.exitPrice ?: 0.0, ns)
@@ -509,11 +702,44 @@ object StrategyLabRunner {
             val windowStart = candles.first().timestamp
             val freshById = run.trades.filter { it.entryTs > baseline }
                 .associateBy { "$sym-${it.entryTs}" }
-            val liveOpenIds: Set<String> =
-                if (Spaces.baseOf(ns) == "binance")
-                    com.signalscope.app.data.BinanceLiveStore.load(ctx, ns).trades
+            // GUARD 2 APPLIED IN EVERY MARKET, which it was not.
+            //
+            // This read the crypto ledger and, for every other space, an EMPTY SET
+            // — so the one guard written to stop the app discarding a paper row
+            // with real money behind it did nothing at all outside Binance. The
+            // comment above described a protection that only a third of the app
+            // actually had.
+            //
+            // What that costs is not cosmetic. When the sliding window moves on, a
+            // borderline entry stops reproducing and its row is dropped as a
+            // phantom — and with the row goes every strategy exit for a position
+            // the broker is still holding. Two German positions were found in that
+            // state: real, open, worth about €800, with no target, no momentum
+            // exit and no holding-time limit. Only the stop survived, because that
+            // one reads the live ledger directly rather than the paper book.
+            //
+            // PENDING and EXITING count as well as OPEN. An order still filling or
+            // a sell in flight is real money committed, and a row dropped in that
+            // window strands it exactly the same way.
+            val liveOpenIds: Set<String> = try {
+                when (Spaces.baseOf(ns)) {
+                    "binance" -> com.signalscope.app.data.BinanceLiveStore.load(ctx, ns).trades
                         .filter { it.status == "OPEN" }.map { it.paperTradeId }.toHashSet()
-                else emptySet()
+                    "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                        .filter { it.ns == ns && it.isLive }
+                        .map { it.paperTradeId }.toHashSet()
+                    else -> com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                        .filter { it.ns == ns &&
+                            (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
+                        .map { it.paperTradeId }.toHashSet()
+                }
+            } catch (e: Exception) {
+                // UNREADABLE MEANS DROP NOTHING. The set is used only to protect
+                // rows, so failing to build it must not quietly remove that
+                // protection — an empty set here is precisely the bug above.
+                Log.w(TAG, "[$ns] live ledger unreadable — skipping the phantom sweep this pass", e)
+                null
+            } ?: st0.trades.map { it.id }.toHashSet()
             val staleIds = HashSet<String>()
             for (row in st0.trades) {
                 if (!row.symbol.equals(sym, true) || row.status != "OPEN") continue
@@ -539,6 +765,11 @@ object StrategyLabRunner {
             }
             StrategyLabStore.applyRunResult(ctx, sym, newTrades, newAudits, wmBar, ns, removeIds = staleIds)
         }
+
+        // REAL STOP — after the ledger write, on the same bar-close clock the paper
+        // stop uses. See [checkRealStop].
+        try { checkRealStop(ctx, ns, sym, cfg, candles.lastOrNull()?.close ?: 0.0, wmBar) }
+        catch (e: Exception) { Log.w(TAG, "[$ns] $sym real-stop check failed", e) }
 
         // PRE-DECIDED GAP POLICY (point 2): if a live position is found gapped
         // ≥2× through the configured stop (downtime slipped past the bar-based
@@ -643,7 +874,503 @@ object StrategyLabRunner {
         val res = fetchCandlesRaw(ns, symbol, exchange, plan)
         if (res !is YahooFinanceClient.CandleResult.Success) return emptyList()
         val nowSec = System.currentTimeMillis() / 1000
-        return res.candles.filter { it.timestamp + plan.sourceSec + GRACE_SEC <= nowSec }
+        return res.candles.filter {
+            FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+        }
+    }
+
+    /**
+     * THE REAL STOP — the config's stop percentage measured from the price actually
+     * PAID, alongside the paper stop measured from the signal price.
+     *
+     * WHY BOTH. Every price-anchored exit in the engine measures from `entryPrice`,
+     * which is the signal bar's close — not what the ladder filled at. A fill above
+     * the signal therefore shrinks the real protection silently: fill 3% high on a
+     * 4% stop and the actual cushion is 1%. The paper stop is left EXACTLY as it is,
+     * because it is the backtest-parity reference and the baseline every deviation
+     * measurement is taken against. This is the same policy applied to the correct
+     * price, not a new risk policy.
+     *
+     * ONLY THE STOP NEEDS THIS. The MACD-distance qualifier anchors to the MACD
+     * value at the entry BAR, the slope-flip exit is pure indicator state, and
+     * max-holding counts bars — none of them reference the entry price, so none are
+     * touched.
+     *
+     * THE FILL PRICE IS [T212LiveStore.LiveTrade.liveEntryPrice], NOT refEntryPrice.
+     * The latter is the anchor the ladder OPENED from, and a buy ladder concedes
+     * upward from its anchor — so using it would put the stop BELOW where it
+     * belongs, looser than reality, which is the exact failure this exists to fix.
+     * When the real fill has not settled yet liveEntryPrice is 0 and this does
+     * nothing: a missing measurement, never a guessed one.
+     *
+     * WHEN THE REAL STOP FIRES FIRST — which is the whole point, and happens
+     * whenever the fill landed above the signal — the paper trade is closed TOO,
+     * and the seat compounds by the REAL return. If paper stayed open the seat
+     * would still believe it holds something, never release its capital, and later
+     * compound by a gain nobody earned. The reinvest layer must follow real money.
+     *
+     * Evaluated on bar closes, deliberately NOT placed as a resting broker stop: a
+     * broker stop triggers on any intraday tick, and the 4% was validated on bar
+     * closes, so it would fire more often than the strategy was ever measured at.
+     */
+    /**
+     * MANAGE REAL POSITIONS THE ENGINE NO LONGER TRACKS.
+     *
+     * A live row whose paper trade has gone is a genuine holding with nobody
+     * running its exits. It happens when the sliding window moves on and a
+     * borderline entry stops reproducing: the ledger row is dropped, and with it
+     * the target, the momentum exit and the holding-time limit. Only the hard
+     * stop survives, because that one reads this ledger rather than the book.
+     *
+     * The guard against creating them is fixed. This is the repair for the ones
+     * already in that state, and for any future case the guard cannot cover —
+     * a ledger reset, a reinstall, a config swap that invalidates the book.
+     *
+     * SAME RULES, DIFFERENT ANCHOR. It does not try to make the engine believe in
+     * a trade it no longer reproduces. It asks the adopted-exit question instead —
+     * "given that this position was opened at THIS price at THIS time, what would
+     * the config do now?" — which is the same question, and the same code, the
+     * watchlist has always used for stock bought by hand.
+     *
+     * THREE STATES, AND ONLY ONE OF THEM IS OURS:
+     *   • paper row OPEN    — the strategy is managing it. Leave it alone.
+     *   • paper row CLOSED  — the exit sweep re-sells it. Leave it alone, or two
+     *                         sell orders race for the same shares.
+     *   • paper row MISSING — nobody is managing it. This.
+     */
+    private fun manageOrphanedLivePositions(ctx: Context, ns: String) {
+        val base = Spaces.baseOf(ns)
+        if (base != "de" && base != "us" && base != "in") return
+        val cfg = StrategyLabStore.activeConfig(ctx, ns)
+        val paper = try { StrategyLabStore.load(ctx, ns).trades } catch (e: Exception) { return }
+        val knownIds = paper.map { it.id }.toHashSet()
+        val engineHolds = paper.filter { it.status == "OPEN" }.map { it.symbol.uppercase() }.toHashSet()
+        // ── THE WATCHLIST MANAGES ITS OWN, AND MUST KEEP DOING SO ────────────
+        //
+        // The reserved watchlist namespace already runs this exact check, from a
+        // better anchor: its book records the signal bar the position was opened
+        // on, where a live row only knows when the order was sent. Two managers
+        // asking the same question of the same shares is how one sells and the
+        // other sells again into nothing.
+        //
+        // Skipped BY SYMBOL rather than by namespace, because the two do not
+        // overlap completely: a live row in that namespace with no book entry
+        // behind it — a hand-over that never landed — is covered by nobody, and
+        // excluding the whole namespace would leave it that way. On this account
+        // that was two real positions.
+        val bookOwns: Set<String> =
+            if (com.signalscope.app.trading.Spaces.bucketIdOf(ns) ==
+                com.signalscope.app.data.ManualWatchStore.ID)
+                try {
+                    com.signalscope.app.data.ManualWatchStore.load(ctx, base).entries
+                        .filter { it.status == "OPEN" || it.status == "PENDING" }
+                        .map { it.symbol.uppercase() }.toHashSet()
+                } catch (e: Exception) {
+                    // UNREADABLE MEANS STAND BACK. Failing to see the watchlist's
+                    // book is not evidence that it holds nothing, and acting on
+                    // that reading is what would double-sell.
+                    Log.w(TAG, "[$ns] watchlist book unreadable — orphan sweep stands down", e)
+                    return
+                }
+            else emptySet()
+
+        data class Orphan(val sym: String, val id: String, val paid: Double, val entryTs: Long)
+        val orphans: List<Orphan> = try {
+            if (base == "in")
+                com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                    .filter { it.ns == ns && it.status == "OPEN" && it.qty > 0 }
+                    .map { Orphan(it.symbol.uppercase(), it.paperTradeId,
+                        it.entryPrice, it.paperTradeId.substringAfterLast('-').toLongOrNull() ?: 0L) }
+            else
+                com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                    .filter { it.ns == ns && it.status == "OPEN" && it.qty > 0.0 }
+                    .map { Orphan(it.symbol.uppercase(), it.paperTradeId,
+                        it.liveEntryPrice, it.entryTs) }
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] live ledger unreadable — orphan sweep skipped", e); return
+        }
+
+        for (o in orphans) {
+            if (o.id in knownIds) continue            // the strategy still owns this trade
+            if (o.sym in engineHolds) continue        // it holds the NAME by another id
+            if (o.sym in bookOwns) continue           // the watchlist's own manager has it
+            // WITHOUT A REAL FILL PRICE THERE IS NOTHING HONEST TO MEASURE FROM.
+            // Every adopted rule is anchored on what was actually paid; guessing
+            // one would put a stop at a price nobody traded.
+            if (o.paid <= 0.0 || o.entryTs <= 0L) {
+                noteOrphan(ctx, ns, o.id, base,
+                    "no real fill price recorded yet, so the rules cannot be anchored")
+                continue
+            }
+            val v = try {
+                adoptedExitCheck(ctx, ns, o.sym, Spaces.exchangeOf(ns), o.paid, o.entryTs)
+            } catch (e: Exception) {
+                Log.w(TAG, "[$ns] ${o.sym} orphan exit check failed", e); continue
+            }
+            noteOrphan(ctx, ns, o.id, base,
+                if (v.ok) "" else v.note.ifBlank { "the exit rules could not be evaluated" })
+            if (!v.ok || !v.fires) continue
+            // SECOND LOCK ON THE SAME DOOR, for the same reason the watchlist has
+            // one: the engine already refuses a verdict when the entry bar is
+            // outside the window, but this is the line that spends real money and
+            // does not take that on trust. A sell placed under a partial rule set
+            // arrives wearing the name of a strategy that never specified it.
+            if (!v.entryMacdKnown) {
+                Log.w(TAG, "[$ns] ${o.sym} orphan exit SUPPRESSED — ${v.note}")
+                continue
+            }
+            Log.w(TAG, "[$ns] ${o.sym} orphan exit fires: ${v.reason} at ${"%.2f".format(v.price)}")
+            try {
+                if (base == "in") {
+                    ZerodhaLiveMirror.mirrorExit(ctx, o.id, o.sym, v.price, ns)
+                } else {
+                    val out = T212LiveMirror.stopOutNow(ctx, ns, o.sym, v.reason,
+                        origin = "the config's exit, applied to a position the strategy had lost")
+                    if (!out.ok) Log.w(TAG, "[$ns] ${o.sym} orphan exit failed: ${out.error}")
+                }
+            } catch (e: Exception) { Log.e(TAG, "[$ns] ${o.sym} orphan exit threw", e) }
+        }
+    }
+
+    /** Record why an orphan could or could not be judged, on the row itself. */
+    private fun noteOrphan(ctx: Context, ns: String, id: String, base: String, note: String) {
+        try {
+            if (base == "in") {
+                com.signalscope.app.data.ZerodhaLiveStore.forTrade(ctx, ns, id)?.let {
+                    if ((it.adoptedNote ?: "") != note)
+                        com.signalscope.app.data.ZerodhaLiveStore.upsert(ctx, it.copy(adoptedNote = note))
+                }
+            } else {
+                com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)?.let {
+                    if ((it.adoptedNote ?: "") != note)
+                        com.signalscope.app.data.T212LiveStore.upsert(ctx, it.copy(adoptedNote = note))
+                }
+            }
+        } catch (e: Exception) { Log.w(TAG, "[$ns] orphan note write failed", e) }
+    }
+
+    private fun checkRealStop(
+        ctx: Context, ns: String, sym: String, cfg: StrategyLabConfig,
+        lastClose: Double, barTs: Long
+    ) {
+        if (!cfg.exit.stopLossEnabled || lastClose <= 0.0) return
+        val base = Spaces.baseOf(ns)
+        if (base != "de" && base != "us") return
+        val row = com.signalscope.app.data.T212LiveStore.load(ctx).trades.firstOrNull {
+            it.ns == ns && it.symbol.equals(sym, true) && it.status == "OPEN" && it.qty > 0.0
+        } ?: return
+        val paid = row.liveEntryPrice
+        if (paid <= 0.0) return
+        val trigger = paid * (1 - cfg.exit.stopLossPct / 100.0)
+        if (lastClose > trigger) return
+
+        // The paper trade this position belongs to, captured BEFORE the sell so the
+        // deviation record can state what the simulation thought it was worth.
+        val paperOpen = StrategyLabStore.load(ctx, ns).trades
+            .lastOrNull { it.symbol.equals(sym, true) && it.status == "OPEN" }
+        val paperPct = paperOpen?.pctReturn ?: 0.0
+        val signalPx = paperOpen?.entryPrice ?: 0.0
+        val paperTrigger = if (signalPx > 0.0) signalPx * (1 - cfg.exit.stopLossPct / 100.0) else 0.0
+
+        Log.w(TAG, "[$ns] REAL STOP $sym: close $lastClose ≤ $trigger (paid $paid) — " +
+            "paper stop would be at $paperTrigger")
+        val r = T212LiveMirror.stopOutNow(ctx, ns, sym,
+            "real stop -${cfg.exit.stopLossPct}% from fill",
+            origin = "stop measured from what you actually paid")
+        if (!r.ok) return   // still open; retried on the next bar close
+
+        // ── close the paper side and compound the seat by the REAL return ──
+        val reason = "real stop (fill-anchored)"
+        if (paperOpen != null) {
+            StrategyLabStore.applyRunResult(ctx, sym,
+                listOf(paperOpen.copy(status = "CLOSED", exitTs = barTs,
+                    exitPrice = r.exitPrice, exitReason = reason, pctReturn = r.realPct)),
+                listOf(StrategyLabStore.Audit(
+                    id = "${paperOpen.id}-REALSTOP", symbol = sym, action = "SELL",
+                    price = r.exitPrice, reason = reason, barTs = barTs)),
+                // ADVANCE THE BASELINE, OR THE TRADE COMES BACK.
+                //
+                // This close happens OUT OF BAND: the engine still believes it is
+                // long, because nothing about the price history changed. Leaving
+                // the baseline where it was meant the very next pass replayed the
+                // same bars, re-derived the same entry, and — since rows merge by
+                // id — overwrote this CLOSED row back to OPEN. The position was
+                // resurrected, and when the paper exit eventually fired the seat
+                // compounded a second time on one real trade.
+                //
+                // Moving the boundary PAST the bar we stopped out on suppresses that
+                // entry at the point of evaluation, so the replay arrives flat here
+                // instead of holding a ghost.
+                //
+                // Past it, not onto it. The engine suppresses entries STRICTLY
+                // before the boundary, so a boundary of exactly this bar still lets
+                // the replay open a fresh position on the very candle the stop
+                // fired on — re-entering, on the same close, a trade just exited
+                // for falling too far. One second later excludes that bar and
+                // leaves the next one free, which is the intent.
+                barTs, ns, baseline = barTs + 1L)
+        }
+        try { MacdGateEngine.onTradeClosed(ctx, ns, sym, r.realPct) }
+        catch (e: Exception) { Log.w(TAG, "[$ns] real-stop gate hook failed", e) }
+        try { com.signalscope.app.screener.ReinvestEngine.onTradeClosed(
+            ctx, ns, sym, paperOpen?.entryTs ?: 0L, r.realPct) }
+        catch (e: Exception) { Log.w(TAG, "[$ns] real-stop reinvest hook failed", e) }
+
+        // ── the paper-vs-real record, written at close because it cannot be
+        //    reconstructed afterwards ──
+        try {
+            com.signalscope.app.data.StopDeviationStore.record(ctx,
+                com.signalscope.app.data.StopDeviationStore.Deviation(
+                    ns = ns, symbol = sym, at = System.currentTimeMillis(),
+                    signalPrice = signalPx, fillPrice = r.paidPrice,
+                    gapPct = if (signalPx > 0.0) (r.paidPrice / signalPx - 1.0) * 100.0 else 0.0,
+                    closedBy = "real", exitPrice = r.exitPrice,
+                    otherStopAt = paperTrigger,
+                    paperPct = paperPct, realPct = r.realPct))
+        } catch (e: Exception) { Log.w(TAG, "[$ns] deviation record failed", e) }
+    }
+
+    /** An entry the engine opened on the NEWEST closed bar — i.e. a signal that
+     *  is live right now rather than one from history. */
+    data class FreshEntry(
+        val symbol: String,
+        val entryTs: Long,          // epoch sec of the ENTRY bar (engine clock)
+        val entryPrice: Double,     // that bar's close — what the exit measures from
+        val entryReason: String,
+        val lastBarTs: Long,
+        val lastClose: Double,
+        val entryTfMin: Int,
+        val exitTfMin: Int
+    )
+
+    /**
+     * READ-ONLY entry check for ONE symbol under [ns]'s config.
+     *
+     * Deliberately shares [fetchCandlesRaw], the closed-bar filter and
+     * [sanitizeCandles] with the live loop instead of re-implementing them: a
+     * watcher that fetched or cleaned bars even slightly differently would
+     * disagree with the runner about whether a signal exists, and the whole point
+     * of it is to report what the strategy would do.
+     *
+     * Writes NOTHING — no ledger, no watermark, no baseline, no mark. The symbol
+     * does not need to be enrolled; the exchange falls back to the space default.
+     *
+     * Returns null when there is no data, not enough history, or the newest bar
+     * did not open a position.
+     */
+    /**
+     * What the replay is doing with a name right now — holding or flat, and if
+     * holding, whether it opened on the NEWEST bar (a fresh signal) or earlier.
+     *
+     * A candidate whose strategy is already long simply never alerts, and from the
+     * list that is indistinguishable from one nothing has ever happened to. The two
+     * mean opposite things: one is a setup that has already played out and is
+     * running, the other is still waiting. Worth telling apart on screen.
+     */
+    data class PosState(
+        val symbol: String, val holding: Boolean, val entryTs: Long,
+        val entryPrice: Double, val pctReturn: Double, val fresh: Boolean
+    )
+
+    /** Set as a side effect of the most recent [freshEntrySignal] call, read
+     *  immediately after by the watcher. Single-threaded per pass — the watcher
+     *  evaluates its candidates one at a time. */
+    @Volatile
+    var lastPositionState: PosState? = null
+        private set
+
+    /**
+     * The position the replay reaches over the FULL history, with no fresh-start
+     * boundary — "if this strategy had always been running on this name, would it
+     * be holding it right now, and since when?"
+     *
+     * Kept apart from [lastPositionState] because they answer different questions
+     * and routinely disagree. That one is what the watcher may ACT on; this one is
+     * context for a person deciding whether a candidate is worth a real order.
+     * Merging them would make a name the watcher cannot alert on look like one it
+     * is about to.
+     */
+    @Volatile
+    var lastHistoricalState: PosState? = null
+        private set
+
+    /** The newest bar the last [freshEntrySignal] evaluated, whatever it concluded.
+     *  The watcher needs it to know where "from now on" starts for a new name. */
+    @Volatile
+    var lastRunBarTs: Long = 0L
+
+    /**
+     * The local turning points on the bars the last check ran over.
+     *
+     * Another side channel, for the same reason as the two above: the candles are
+     * in hand for a fraction of a millisecond and re-fetching them to answer a
+     * second question would double the watcher's bandwidth for arithmetic that
+     * costs nothing. Read it exactly as the others are read — matched against the
+     * symbol you asked about, because another thread may have run since.
+     */
+    var lastLevels: ManualWatchStore.Levels? = null
+        private set
+
+    /**
+     * @param entriesFromTs the watcher's own FRESH-START boundary — no entry may
+     *   open before it, so the replay arrives flat at the moment the name joined
+     *   the watch list rather than inheriting a position from weeks of history.
+     *
+     *   Without it a candidate the strategy happened to be long on could stay mute
+     *   for weeks: the alert fires only on a position opened on the NEWEST bar, and
+     *   a trade opened in August is never that. The algos already work this way —
+     *   this is the same rule, applied to the same engine, for the same reason.
+     */
+    fun freshEntrySignal(
+        ctx: Context, ns: String, symbol: String, exchange: String = "",
+        entriesFromTs: Long = 0L
+    ): FreshEntry? {
+        lastPositionState = null
+        lastHistoricalState = null
+        lastLevels = null
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank()) return null
+        val cfg = StrategyLabStore.activeConfig(ctx, ns)
+        val plan = FeedPlan.plan(cfg, ns)
+        if (!plan.ok) { Log.w(TAG, "[$ns] $sym watcher feed unusable: ${plan.problem}"); return null }
+        val ex = exchange.trim().ifBlank { Spaces.exchangeOf(ns) }
+        val res = fetchCandlesFor(ctx, ns, sym, ex, plan)
+        if (res !is YahooFinanceClient.CandleResult.Success) return null
+        val nowSec = System.currentTimeMillis() / 1000
+        val closed = res.candles.filter {
+                FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+            }
+        val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+        if (candles.size < 50) return null
+        // BEFORE THE ENGINE RUNS, so it survives every early return below. The
+        // levels are a fact about the price history and do not depend on whether
+        // a signal fired — and every one of those returns is a case where the
+        // panel still has a row to draw.
+        lastLevels = try {
+            IntradayLevels.from(sym, candles, (plan.sourceSec / 60L).toInt())
+        } catch (e: Exception) { null }
+        val run = StrategyLabEngine.runLiveClosed(sym, candles, cfg, plan.sourceSec, entriesFromTs)
+        lastRunBarTs = run.lastBarTs
+
+        // ── WOULD IT BE IN THIS TRADE, HAD IT ALWAYS BEEN WATCHING? ─────────────
+        //
+        // A DIFFERENT QUESTION from the one above, and the answer often differs.
+        // The run above starts flat at the moment this name joined the watch list,
+        // deliberately — that is what stops a seat inheriting a phantom position.
+        // But it also means the app cannot say whether the strategy would be
+        // RIDING this name right now off the full history, which is the honest
+        // macro read on a candidate: a name the strategy would have been long in
+        // for weeks is a very different proposition from one it would be flat on.
+        //
+        // Costs no download. The candles are already fetched and sanitised; this
+        // is a second pass of pure arithmetic over the same array, and it is
+        // skipped entirely when there is no boundary to differ from.
+        lastHistoricalState = try {
+            val hr = if (entriesFromTs <= 0L) run
+                     else StrategyLabEngine.runLiveClosed(sym, candles, cfg, plan.sourceSec, 0L)
+            hr.trades.lastOrNull { it.status == "OPEN" }?.let {
+                PosState(sym, true, it.entryTs, it.entryPrice, it.pctReturn,
+                    fresh = (hr.lastBarTs > 0L && it.entryTs == hr.lastBarTs))
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym full-history check failed", e); null
+        }
+
+        if (run.error != null) return null
+        // FRESH means the position opened on the bar the engine just evaluated.
+        // An OPEN trade from an older bar is a signal that already came and went
+        // unacted-on; alerting on it every tick would be a standing nag, not news.
+        val t = run.trades.lastOrNull { it.status == "OPEN" } ?: return null
+        // NOT FRESH = the strategy is already long from an earlier bar, so there is
+        // no new entry to announce. Recorded rather than silently dropped — see
+        // [lastPositionState], which the watcher stores so the list can SHOW that a
+        // name is mid-position instead of leaving it looking inexplicably quiet.
+        lastPositionState = PosState(sym, true, t.entryTs, t.entryPrice, t.pctReturn,
+            fresh = (run.lastBarTs > 0L && t.entryTs == run.lastBarTs))
+        if (run.lastBarTs <= 0L || t.entryTs != run.lastBarTs) return null
+        return FreshEntry(
+            symbol = sym, entryTs = t.entryTs, entryPrice = t.entryPrice,
+            entryReason = t.entryReason, lastBarTs = run.lastBarTs,
+            lastClose = candles.last().close,
+            entryTfMin = plan.entryMin, exitTfMin = plan.exitMin)
+    }
+
+    data class LatestBar(val ts: Long, val close: Double,
+                        /** Computed from the same candles, because the sweep that
+                         *  asks for this bar already pays for them. */
+                        val levels: ManualWatchStore.Levels? = null)
+
+    /**
+     * The newest COMPLETED bar for a symbol on this config's feed.
+     *
+     * Exists for the forced buy, which has no signal to anchor to and therefore
+     * needs some honest reference point. Deliberately the last CLOSED bar rather
+     * than the live tick: every rule downstream is evaluated on completed bars,
+     * and anchoring a position to a half-formed one would make its very first
+     * exit check measure from a price that never finally existed.
+     */
+    fun latestClosedBar(ctx: Context, ns: String, symbol: String, exchange: String = ""): LatestBar? {
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank()) return null
+        return try {
+            val cfg = StrategyLabStore.activeConfig(ctx, ns)
+            val plan = FeedPlan.plan(cfg, ns)
+            if (!plan.ok) return null
+            val ex = exchange.trim().ifBlank { Spaces.exchangeOf(ns) }
+            val res = fetchCandlesFor(ctx, ns, sym, ex, plan)
+            if (res !is YahooFinanceClient.CandleResult.Success) return null
+            val nowSec = System.currentTimeMillis() / 1000
+            val closed = res.candles.filter {
+                FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+            }
+            val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+            val last = candles.lastOrNull() ?: return null
+            LatestBar(last.timestamp, last.close,
+                try { IntradayLevels.from(sym, candles, (plan.sourceSec / 60L).toInt()) }
+                catch (e: Exception) { null })
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym latest-bar lookup failed", e); null
+        }
+    }
+
+    /**
+     * Do this config's exit rules fire on a position the ENGINE did not open?
+     *
+     * The replay manages what it decided to buy. A stock bought by hand — because
+     * the seats were full, or because you simply wanted it — is invisible to that:
+     * the replay arrives flat, has nothing to exit, and the position keeps only
+     * its hard stop. This asks the same rules about your position instead, using
+     * your fill price and your entry time.
+     *
+     * Read-only. It reports a verdict; selling is the caller's decision, exactly
+     * as it is for every other exit in this file.
+     */
+    fun adoptedExitCheck(
+        ctx: Context, ns: String, symbol: String, exchange: String = "",
+        entryPrice: Double, entryTs: Long
+    ): StrategyLabEngine.AdoptedExit {
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank() || entryPrice <= 0.0 || entryTs <= 0L)
+            return StrategyLabEngine.AdoptedExit(false, note = "no position to judge")
+        return try {
+            val cfg = StrategyLabStore.activeConfig(ctx, ns)
+            val plan = FeedPlan.plan(cfg, ns)
+            if (!plan.ok) return StrategyLabEngine.AdoptedExit(false, note = "feed unusable")
+            val ex = exchange.trim().ifBlank { Spaces.exchangeOf(ns) }
+            val res = fetchCandlesFor(ctx, ns, sym, ex, plan)
+            if (res !is YahooFinanceClient.CandleResult.Success)
+                return StrategyLabEngine.AdoptedExit(false, note = "no price data")
+            val nowSec = System.currentTimeMillis() / 1000
+            val closed = res.candles.filter {
+                FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+            }
+            val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+            if (candles.size < 50) return StrategyLabEngine.AdoptedExit(false, note = "warming up")
+            StrategyLabEngine.adoptedExit(candles, cfg, entryPrice, entryTs, plan.sourceSec)
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym adopted exit check failed", e)
+            StrategyLabEngine.AdoptedExit(false, note = e.message ?: "check failed")
+        }
     }
 
     /** Build the per-bar "why did/didn't it trade" review for one enrolled symbol
@@ -660,7 +1387,168 @@ object StrategyLabRunner {
         // Wider window (was 220) so the review chart's zoom/pan has real history
         // to explore — the on-device SVG defaults to a recent sub-window and lets
         // the user zoom out toward the full span.
+        // Stamp the ledger's tracking start onto the payload. The engine cannot
+        // know it — it replays price history and nothing else — but the chart is
+        // misleading without it: a seated name can show a long unbroken green run
+        // while its book is empty, because every one of those trades entered before
+        // tracking began and was discarded. The line says which side of that
+        // boundary you are looking at.
+        // ── THE GATE'S SIDE OF THE STORY ────────────────────────────────────
+        //
+        // Recomputed here, not read from the gate's own records: it keeps a single
+        // latest slope per name, never a history, so the only way to show WHEN a
+        // name was admitted is to derive it the same way the gate does — the same
+        // daily resample, the same slope series, the same smoothing.
+        //
+        // That makes it a RECONSTRUCTION, consistent with everything else on this
+        // chart, and it is labelled as one rather than passed off as an audit.
+        val gate = gateVerdictSeries(ctx, ns, candles, symbol)
         return StrategyLabEngine.reviewPayload(symbol.uppercase(), candles, cfg, plan.sourceSec, maxBars = 700)
+            .copy(baselineTs = StrategyLabStore.baselineFor(ctx, symbol, ns),
+                  gateApplies = gate.applies, gateDays = gate.days,
+                  gateOpen = gate.open, gateState = gate.state, gateNote = gate.note,
+                  realFills = realFillsFor(ctx, ns, symbol.uppercase()))
+    }
+
+    /**
+     * The orders this algo actually placed for one name, from the broker ledger.
+     *
+     * Read per broker because each keeps its own, and deliberately NOT from the
+     * paper ledger: that records what the strategy decided, and the whole point of
+     * these markers is to separate a decision from a fill.
+     */
+    private fun realFillsFor(ctx: Context, ns: String, sym: String):
+            List<StrategyLabEngine.RealFill> = try {
+        val base = Spaces.baseOf(ns)
+        val out = ArrayList<StrategyLabEngine.RealFill>()
+        when (base) {
+            "binance" -> com.signalscope.app.data.BinanceLiveStore.load(ctx, ns).trades
+                .filter { it.symbol.equals(sym, true) && it.liveAvgBuyPrice > 0.0 }
+                .forEach {
+                    out.add(StrategyLabEngine.RealFill(
+                        entryTs = it.entryTs, entryPrice = it.liveAvgBuyPrice,
+                        exitTs = it.exitTs ?: 0L, exitPrice = it.liveAvgSellPrice,
+                        pnl = it.livePnlQuote, open = it.status == "OPEN"))
+                }
+            "de", "us" -> com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                .filter {
+                    Spaces.baseOf(it.ns) == base && it.ns == ns &&
+                        it.symbol.equals(sym, true) && it.liveEntryPrice > 0.0
+                }
+                .forEach {
+                    out.add(StrategyLabEngine.RealFill(
+                        entryTs = it.entryTs, entryPrice = it.liveEntryPrice,
+                        // The SELL time is when the order went, not a bar — good
+                        // enough to place a marker, and the only time there is.
+                        exitTs = if (it.liveExitPrice > 0.0) it.sellAt / 1000L else 0L,
+                        exitPrice = it.liveExitPrice,
+                        open = it.status == "OPEN"))
+                }
+            "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                .filter { it.ns == ns && it.symbol.equals(sym, true) && it.entryPrice > 0.0 }
+                .forEach {
+                    out.add(StrategyLabEngine.RealFill(
+                        entryTs = it.paperTradeId.substringAfterLast('-').toLongOrNull() ?: 0L,
+                        entryPrice = it.entryPrice,
+                        exitPrice = it.exitPrice,
+                        open = it.status == "OPEN"))
+                }
+        }
+        out.filter { it.entryTs > 0L }
+    } catch (e: Exception) {
+        Log.w(TAG, "[$ns] real fills for $sym failed", e); emptyList()
+    }
+
+    private data class GateSeries(val applies: Boolean, val days: List<Long>,
+                                  val state: List<Int>, val note: String) {
+        /** Kept for anything still reading a yes/no. */
+        val open: List<Boolean> get() = state.map { it == 2 }
+    }
+
+    /**
+     * Was this name admissible, day by day — and if not, WHY not?
+     *
+     * THE BAND USED TO BE WITHHELD FROM RANKED ALGOS, and the reason was sound:
+     * with ranking on, "not held" can mean "out-ranked" rather than "refused",
+     * and painting both red states the wrong reason with total confidence. But
+     * withholding it meant the one question the chart exists to answer — could
+     * this entry have been taken at all — went unanswered everywhere except the
+     * handful of algos that rank nothing.
+     *
+     * The fix is a third colour rather than silence. A ranked algo can say
+     * exactly which of the two it was, because the gate records WHEN each name
+     * held a seat: the spans are a fact about what happened, not a reconstruction.
+     *
+     *   SEATED      the name held a seat that day — entries were possible
+     *   OUT-RANKED  slope positive, but every seat was taken by a better name
+     *   REFUSED     slope at or below zero — no entry, whatever the rules said
+     *
+     * WHAT IS RECONSTRUCTED AND WHAT IS RECORDED, kept distinct because they
+     * deserve different trust. The slope is recomputed from today's prices, so it
+     * is a reconstruction and may differ slightly from the number the gate saw at
+     * the time. The seat spans are read from the gate's own enrollment history —
+     * that part is a record.
+     */
+    private fun gateVerdictSeries(ctx: Context, ns: String,
+                                  candles: List<CandleData>, symbol: String): GateSeries {
+        val none = GateSeries(false, emptyList(), emptyList(), "")
+        return try {
+            if (!Spaces.isBucket(ns)) return none
+            val b = com.signalscope.app.data.BucketStore.get(ctx, ns) ?: return none
+            if (b.mode != com.signalscope.app.data.BucketStore.Mode.GATE_3B) return none
+            val g = com.signalscope.app.data.MacdGateStore.load(ctx, ns)
+            if (!g.enabled) return none
+            val (days, closes) = GateBacktest.toDaily(candles)
+            if (days.size < 30) return none
+            val slopes = GateBacktest.slopeSeries(closes, g.smoothing)
+
+            if (!g.useScreenerSelection) {
+                // Every name owns a seat permanently, so the slope IS the whole
+                // answer and the middle state cannot arise.
+                return GateSeries(true, days.toList(), slopes.map { if (it > 0.0) 2 else 0 },
+                    "Green = the daily gate would admit this name; red = slope at or below zero, " +
+                    "so no entry could be taken however clearly the rules fired. " +
+                    "Recomputed from the latest data, and it steps once a day.")
+            }
+
+            // ── RANKED: the seat spans say what the slope alone cannot ────────
+            // Half-open intervals [from, to): a span that ended at noon did not
+            // hold the seat for the following day, and counting it would paint a
+            // green day on which nothing could have been bought.
+            val sym = symbol.trim().uppercase()
+            // orEmpty() DELIBERATELY: Gson builds this state through Unsafe and
+            // never runs a Kotlin default, so a gate file written before the spans
+            // existed arrives with them null however the type is declared. Reading
+            // it unguarded would throw on exactly the oldest algos — the ones with
+            // the most history worth drawing.
+            val enrollments = g.enrollments.orEmpty()
+            val spans = enrollments.filter { it.symbol.equals(sym, true) }
+                .map { it.fromMs to (it.toMs ?: Long.MAX_VALUE) }
+            val oldestSpanMs = enrollments.minOfOrNull { it.fromMs } ?: Long.MAX_VALUE
+            val state = days.indices.map { i ->
+                val dayStart = days[i] * 86400_000L
+                val dayEnd = dayStart + 86400_000L
+                val seated = spans.any { (f, t) -> f < dayEnd && t > dayStart }
+                when {
+                    seated -> 2
+                    slopes[i] > 0.0 -> 1
+                    else -> 0
+                }
+            }
+            // BEFORE THE RECORD BEGINS, SAY SO RATHER THAN PAINT IT. The spans are
+            // capped, so days older than the oldest retained one cannot be called
+            // out-ranked — nothing is known about them. They keep the slope's own
+            // verdict and the note carries the caveat.
+            val truncated = days.firstOrNull()?.let { it * 86400_000L < oldestSpanMs } == true
+            GateSeries(true, days.toList(), state,
+                "Green = this name held a seat, so its entries could be taken. " +
+                "Amber = the gate would have admitted it, but better-ranked names held every seat. " +
+                "Red = slope at or below zero, so no entry was possible however clearly the rules fired. " +
+                "Seat spans are the gate's own record; the slope is recomputed from the latest data." +
+                (if (truncated) " Days before the retained seat history cannot be told apart from out-ranked, so the earliest stretch shows the slope's verdict only." else ""))
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] gate verdict series failed", e); none
+        }
     }
 
     // ── Confidence tools ────────────────────────────────────────────────────
@@ -1210,12 +2098,14 @@ object StrategyLabRunner {
                 last = maxOf(last, candles.last().timestamp)
                 barsSource += candles.size
                 val ext = daily[sym.uppercase()]
+                // The screener's series gets the same split repair as the engine's — an unadjusted
+                // action corrupts trailing return, volatility and the daily-MACD kick-out slope.
                 val sd = if (ext != null && ext.size >= 10)
                     GateBacktest.buildWithDaily(sym,
                         LongArray(ext.size) { ext[it].date.toEpochDay() },
-                        DoubleArray(ext.size) { ext[it].close },
+                        StrategyLabEngine.backAdjustCloses(DoubleArray(ext.size) { ext[it].close }),
                         r.trades, smoothing)
-                else GateBacktest.build(sym, candles, r.trades, smoothing)
+                else GateBacktest.build(sym, StrategyLabEngine.backAdjust(candles), r.trades, smoothing)
                 barsDaily += sd.days.size
                 data.add(sd)
             } catch (e: Exception) { skipped++; budget.consecutiveFailures++ }
@@ -1663,12 +2553,33 @@ object StrategyLabRunner {
             val sym = en.symbol.uppercase()
             val candles = fetchClosed(ns, en.symbol, en.exchange, plan)
             if (candles.size < 50) continue
-            val r = StrategyLabEngine.runLiveClosed(en.symbol, candles, cfg, plan.sourceSec)
+            // THE SAME FRESH-START BOUNDARY THE LIVE LOOP USES.
+            //
+            // This writes to the ledger, so it has to respect the boundary or it
+            // is a second door into the very state the boundary exists to prevent
+            // — a seat holding trades it was never allowed to open.
+            //
+            // Both halves matter, exactly as in the live loop. Passing it to the
+            // engine stops the replay ever opening a pre-boundary position (so it
+            // arrives at the boundary flat, rather than long and unable to act);
+            // the ledger skip below is the guard on what gets RECORDED.
+            //
+            // The skip is not redundant belt-and-braces here. The reconcile sweep
+            // that repairs the live loop's mistakes only ever removes OPEN rows —
+            // a pre-boundary CLOSED trade written here would never be reconsidered
+            // by anything, and would sit in the record permanently.
+            //
+            // 0 when nothing is stamped yet (a symbol never tracked), which is the
+            // original full-history behaviour and is what a first backfill wants.
+            val baselineTs = StrategyLabStore.baselineFor(ctx, sym, ns)
+            val r = StrategyLabEngine.runLiveClosed(en.symbol, candles, cfg, plan.sourceSec, baselineTs)
             if (r.error != null) continue
             val lastBarTs = candles.last().timestamp
             val newTrades = ArrayList<StrategyLabStore.LedgerTrade>()
             val newAudits = ArrayList<StrategyLabStore.Audit>()
+            var suppressed = 0
             for (t in r.trades) {
+                if (t.entryTs < baselineTs) { suppressed++; continue }   // entered before tracking began
                 val id = "$sym-${t.entryTs}"
                 newTrades.add(ledgerOf(id, sym, t))
                 newAudits.add(StrategyLabStore.Audit("$id-BUY", symbol = sym, action = "BUY",
@@ -1684,7 +2595,12 @@ object StrategyLabRunner {
             StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
                 sym, System.currentTimeMillis(), ok = true, bars = candles.size, signals = r.signals,
                 gated = r.gates.values.sum(), inPosition = inPos,
-                note = "backfilled ${r.trades.count { it.status == "CLOSED" }} closed trades"), ns)
+                // COUNTED FROM WHAT WAS WRITTEN, not from what the replay produced.
+                // Those are no longer the same number once the boundary suppresses
+                // some, and a note that reports the larger one would quietly claim
+                // history the ledger does not contain.
+                note = "backfilled ${newTrades.count { it.status == "CLOSED" }} closed trades" +
+                    (if (suppressed > 0) " ($suppressed before tracking began, skipped)" else "")), ns)
             try { Thread.sleep(150) } catch (_: InterruptedException) {}
         }
         StrategyLabStore.markRun(ctx, ns)

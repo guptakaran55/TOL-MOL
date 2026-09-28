@@ -26,28 +26,35 @@ class ZerodhaClient(private val config: ConfigManager) {
         private const val TAG = "ZerodhaClient"
         private const val BASE_URL = "https://api.kite.trade"
         private const val JSON_TYPE = "application/json"
+
+        // Custom DNS — prefer IPv4 (MIUI has flaky IPv6)
+        private val ipv4PreferredDns = object : Dns {
+            override fun lookup(hostname: String): List<java.net.InetAddress> {
+                val all = Dns.SYSTEM.lookup(hostname)
+                val v4 = all.filter { it is java.net.Inet4Address }
+                val v6 = all.filter { it !is java.net.Inet4Address }
+                return v4 + v6
+            }
+        }
+
+        // ONE CONNECTION SETUP FOR THE WHOLE APP — a client object is created per
+        // request, and each used to build its own pool, so no connection to Kite
+        // was ever reused. Shared, repeated calls skip the handshake.
+        private val SHARED_HTTP by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .dns(ipv4PreferredDns)
+                .protocols(listOf(Protocol.HTTP_1_1))
+                .build()
+        }
     }
 
     private val gson = Gson()
 
-    // Custom DNS — prefer IPv4 (MIUI has flaky IPv6)
-    private val ipv4PreferredDns = object : Dns {
-        override fun lookup(hostname: String): List<java.net.InetAddress> {
-            val all = Dns.SYSTEM.lookup(hostname)
-            val v4 = all.filter { it is java.net.Inet4Address }
-            val v6 = all.filter { it !is java.net.Inet4Address }
-            return v4 + v6
-        }
-    }
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .dns(ipv4PreferredDns)
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .build()
+    private val client get() = SHARED_HTTP
 
     // ═══════════════════════════════════════════════════════
     // AUTH
@@ -180,6 +187,66 @@ class ZerodhaClient(private val config: ConfigManager) {
      * Returns holdings with quantity > 0, mapped to PortfolioHolding.
      * Mirrors Python's /api/zerodha/holdings endpoint logic.
      */
+    /**
+     * TODAY'S NET POSITIONS — what holdings cannot yet show you.
+     *
+     * On NSE a stock bought today does NOT appear in holdings. It settles on T+1
+     * and until then it lives only here, in positions. Anything that asks "do I
+     * still own this?" by reading holdings alone therefore concludes NO for every
+     * share bought today — which is how a position bought at 09:10 was written
+     * off as "closed outside the app" at 09:36.
+     *
+     * Returns the symbols with a non-zero net quantity. Null means the question
+     * could not be answered, which is not the same as an empty account and must
+     * never be treated as one.
+     */
+    fun fetchTodayPositionSymbols(): Set<String>? {
+        if (!isConnected) return null
+        return try {
+            val request = Request.Builder()
+                .url("$BASE_URL/portfolio/positions")
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return null
+                val json = JsonParser.parseString(body).asJsonObject
+                if (json.get("status")?.asString != "success") return null
+                val data = json.getAsJsonObject("data") ?: return null
+                val out = HashSet<String>()
+                // BOTH VIEWS, UNIONED — "net" is the day's netted position and
+                // "day" the raw legs.
+                //
+                // This used to stop after "net" whenever net produced ANY symbol,
+                // on the reasoning that a buy and a sell of the same size leaves
+                // nothing owned. True in the abstract, and the wrong trade-off for
+                // the only caller: it asks "might we still hold this?" in order to
+                // decide whether to CLOSE a position's record. A false yes costs a
+                // dead row lingering a few hours. A false no retires the record of
+                // a real holding — which takes its stop with it — and tells the
+                // user it was sold when nothing was sold at all. Two Indian
+                // positions were retired that way within half an hour of being
+                // bought, because a freshly filled delivery buy had not yet shown
+                // up in the netted view while other names had, so the loop broke
+                // out before it ever read the leg that contained it.
+                for (key in listOf("net", "day")) {
+                    val arr = data.getAsJsonArray(key) ?: continue
+                    for (el in arr) {
+                        try {
+                            val o = el.asJsonObject
+                            val q = o.get("quantity")?.takeIf { !it.isJsonNull }?.asInt ?: 0
+                            val sym = o.get("tradingsymbol")?.takeIf { !it.isJsonNull }?.asString ?: ""
+                            if (q > 0 && sym.isNotBlank()) out.add(sym.uppercase())
+                        } catch (_: Exception) {}
+                    }
+                }
+                out
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchTodayPositionSymbols error", e)
+            null
+        }
+    }
+
     fun fetchHoldings(): HoldingsResult {
         if (!isConnected) return HoldingsResult.Failure("Not connected to Zerodha")
 
@@ -863,7 +930,17 @@ class ZerodhaClient(private val config: ConfigManager) {
 
     sealed class OrderResult {
         data class Success(val orderId: String) : OrderResult()
-        data class Failure(val message: String) : OrderResult()
+        /**
+         * @param answered did Zerodha actually SAY no?
+         *
+         * TRUE for a real refusal and for anything rejected here before a request
+         * was sent — either way nothing reached the broker. FALSE when the reply
+         * never arrived or made no sense: a timeout, a dropped connection, an
+         * unreadable body. The order may well have been accepted in that case, so
+         * a caller must NOT respond by placing a second instruction — that is how
+         * one tap buys the same stock twice.
+         */
+        data class Failure(val message: String, val answered: Boolean = true) : OrderResult()
     }
 
     /**
@@ -877,12 +954,36 @@ class ZerodhaClient(private val config: ConfigManager) {
         transactionType: String,   // "BUY" / "SELL"
         quantity: Int,
         orderType: String,         // "LIMIT" / "MARKET"
-        price: Double?             // required for LIMIT; ignored for MARKET
+        price: Double?,            // required for LIMIT; ignored for MARKET
+        /**
+         * "regular" for live hours, "amo" to queue for the next open.
+         *
+         * After-market orders matter here beyond diagnostics: this phone's owner
+         * is in Europe, where the Indian open lands before breakfast. An order
+         * decided the previous evening can be parked at the broker instead of
+         * depending on the phone being awake, online and tunnelled at 05:45 local.
+         */
+        variety: String = "regular"
     ): OrderResult {
         if (!isConnected) return OrderResult.Failure("Not connected to Zerodha")
         if (quantity <= 0) return OrderResult.Failure("quantity must be > 0")
         if (orderType == "LIMIT" && (price == null || price <= 0)) {
             return OrderResult.Failure("LIMIT order requires price > 0")
+        }
+        // THE GATEWAY CHECK SITS HERE, not at the call sites, because there are
+        // a dozen of those and every future one would have to remember. Nothing
+        // has been sent at this point, so a refusal here is `answered` — callers
+        // may safely treat it as "the broker never saw this".
+        when (val gate = ExitAddressCheck.verify(config)) {
+            is ExitAddressCheck.Verdict.Mismatch ->
+                return OrderResult.Failure(
+                    "Blocked: this phone is reaching the internet as ${gate.seen}, " +
+                    "but Zerodha only accepts orders from ${gate.expected}. " +
+                    "The VPN tunnel is down.")
+            is ExitAddressCheck.Verdict.Unknown ->
+                // Deliberately not a block — see the note on the check itself.
+                Log.w(TAG, "Gateway address unverified (${gate.reason}); placing anyway")
+            ExitAddressCheck.Verdict.Ok -> Unit
         }
         return try {
             val builder = FormBody.Builder()
@@ -899,34 +1000,42 @@ class ZerodhaClient(private val config: ConfigManager) {
                 builder.add("price", rounded.toString())
             }
             val req = Request.Builder()
-                .url("$BASE_URL/orders/regular")
+                .url("$BASE_URL/orders/$variety")
                 .post(builder.build())
                 .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
                 .build()
             client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string() ?: return OrderResult.Failure("Empty response")
+                val body = resp.body?.string()
+                    ?: return OrderResult.Failure("no reply from Zerodha", answered = false)
                 val j = JsonParser.parseString(body).asJsonObject
                 if (j.get("status")?.asString != "success") {
-                    return OrderResult.Failure(j.get("message")?.asString ?: "Place order failed")
+                    return OrderResult.Failure(
+                        j.get("message")?.asString ?: "Place order failed")
                 }
+                // Accepted, but the id did not come back. The order is very likely
+                // live and unidentifiable — the worst possible thing to retry.
                 val id = j.getAsJsonObject("data")?.get("order_id")?.asString
-                    ?: return OrderResult.Failure("No order_id in response")
+                    ?: return OrderResult.Failure("accepted, but no order id came back",
+                        answered = false)
                 Log.i(TAG, "Order placed id=$id $transactionType $quantity $tradingsymbol $orderType" +
                         (if (price != null) " @ $price" else ""))
                 OrderResult.Success(id)
             }
         } catch (e: Exception) {
             Log.e(TAG, "placeOrder error", e)
-            OrderResult.Failure(e.message ?: "Unknown error")
+            OrderResult.Failure(e.message ?: "the request failed", answered = false)
         }
     }
 
     /** Cancel a regular order by id. Used by the exit ladder to re-price. */
-    fun cancelOrder(orderId: String): OrderResult {
+    fun cancelOrder(orderId: String, variety: String = "regular"): OrderResult {
         if (!isConnected) return OrderResult.Failure("Not connected to Zerodha")
         return try {
+            // Kite insists the variety on cancel matches the one it was placed
+            // with — cancelling an after-market order down the regular path just
+            // reports "order not found" and leaves it live.
             val req = Request.Builder()
-                .url("$BASE_URL/orders/regular/$orderId")
+                .url("$BASE_URL/orders/$variety/$orderId")
                 .delete()
                 .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
                 .build()
@@ -964,6 +1073,137 @@ class ZerodhaClient(private val config: ConfigManager) {
             }
         } catch (e: Exception) {
             Log.w(TAG, "fetchOrderStatus error", e)
+            null
+        }
+    }
+
+    /**
+     * What actually HAPPENED to a placed order: how much of it filled, and at
+     * what average price the broker really paid.
+     *
+     * [fetchOrderStatus] answers neither question, and an order sent to fill
+     * immediately needs both before the position it creates can be handed to the
+     * strategy. A limit priced through the market fills against whatever is
+     * actually resting on the book, which is normally BETTER than the number it
+     * was sent with — anchoring the trade to the sent price would measure every
+     * exit rule from a price nobody paid.
+     */
+    data class OrderFill(
+        /** "COMPLETE" · "OPEN" · "REJECTED" · "CANCELLED" · ... */
+        val status: String,
+        val filledQty: Int,
+        /** The broker's own average. 0.0 until something has actually filled. */
+        val avgPrice: Double,
+        /** The broker's reason, when it gives one. Empty otherwise. */
+        val message: String
+    )
+
+    fun fetchOrderFill(orderId: String): OrderFill? {
+        if (!isConnected) return null
+        return try {
+            val req = Request.Builder()
+                .url("$BASE_URL/orders/$orderId")
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return null
+                val j = JsonParser.parseString(body).asJsonObject
+                if (j.get("status")?.asString != "success") return null
+                // data[] is a list of revisions; the last one is the current state.
+                val arr = j.getAsJsonArray("data") ?: return null
+                if (arr.size() == 0) return null
+                val o = arr[arr.size() - 1].asJsonObject
+                fun str(k: String): String = try {
+                    o.get(k)?.takeIf { !it.isJsonNull }?.asString ?: ""
+                } catch (e: Exception) { "" }
+                fun num(k: String): Double = try {
+                    o.get(k)?.takeIf { !it.isJsonNull }?.asDouble ?: 0.0
+                } catch (e: Exception) { 0.0 }
+                OrderFill(
+                    status = str("status"),
+                    filledQty = num("filled_quantity").toInt(),
+                    avgPrice = num("average_price"),
+                    message = str("status_message")
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchOrderFill error", e)
+            null
+        }
+    }
+
+    /**
+     * One executed fill, as Kite reports it.
+     *
+     * A TRADE, NOT AN ORDER. An order that filled in three pieces is three trades
+     * here, each with its own price and time — which is exactly what a FIFO
+     * matcher needs and what an order summary cannot give it.
+     */
+    data class TradeFill(
+        val tradeId: String,
+        val orderId: String,
+        val symbol: String,
+        val exchange: String,
+        /** BUY / SELL. */
+        val side: String,
+        val qty: Double,
+        val price: Double,
+        /** Kite's "fill_timestamp", "yyyy-MM-dd HH:mm:ss" in IST. */
+        val filledAt: String,
+        val product: String
+    )
+
+    /**
+     * Every fill executed TODAY. There is no other window.
+     *
+     * KITE HAS NO HISTORICAL TRADE ENDPOINT — orders and trades are day-scoped and
+     * the list is emptied overnight. So a record of what this account has actually
+     * done can only be built by asking on each trading day and keeping the answer;
+     * see [com.signalscope.app.data.ZerodhaTradeStore], which is the other half of
+     * this method. Trading 212 hands over a paged history on demand and needs no
+     * such thing, which is why the two P&L panels are not built the same way.
+     */
+    fun fetchTodayTrades(): List<TradeFill>? {
+        if (!isConnected) return null
+        return try {
+            val req = Request.Builder()
+                .url("$BASE_URL/trades")
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return null
+                val j = JsonParser.parseString(body).asJsonObject
+                if (j.get("status")?.asString != "success") {
+                    Log.w(TAG, "fetchTodayTrades refused: ${j.get("message")?.asString}")
+                    return null
+                }
+                val arr = j.getAsJsonArray("data") ?: return emptyList()
+                arr.mapNotNull { el ->
+                    try {
+                        val o = el.asJsonObject
+                        fun str(k: String): String =
+                            o.get(k)?.takeIf { !it.isJsonNull }?.asString ?: ""
+                        fun num(k: String): Double =
+                            o.get(k)?.takeIf { !it.isJsonNull }?.asDouble ?: 0.0
+                        val sym = str("tradingsymbol")
+                        if (sym.isBlank()) null else TradeFill(
+                            // Kite calls it trade_id; it is the only stable key for
+                            // deduping one fill across repeated polls of the same day.
+                            tradeId = str("trade_id").ifBlank {
+                                str("order_id") + "-" + str("fill_timestamp") + "-" + num("quantity") },
+                            orderId = str("order_id"),
+                            symbol = sym,
+                            exchange = str("exchange"),
+                            side = str("transaction_type").uppercase(),
+                            qty = num("quantity"),
+                            price = num("average_price"),
+                            filledAt = str("fill_timestamp").ifBlank { str("exchange_timestamp") },
+                            product = str("product"))
+                    } catch (e: Exception) { null }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchTodayTrades error", e)
             null
         }
     }

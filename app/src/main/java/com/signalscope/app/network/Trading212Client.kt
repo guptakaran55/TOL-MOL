@@ -4,6 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.google.gson.JsonParser
 import com.signalscope.app.data.ConfigManager
+import com.signalscope.app.data.SymbolRenames
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -35,6 +36,14 @@ import java.util.concurrent.TimeUnit
 class Trading212Client(private val config: ConfigManager) {
 
     companion object {
+        private val SHARED_HTTP: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .writeTimeout(15, TimeUnit.SECONDS)
+                .build()
+        }
+
         private const val TAG = "Trading212Client"
         private const val OPEN_ORDERS_CACHE_MS = 2_500L
         @Volatile private var openOrdersCacheBaseUrl: String = ""
@@ -54,6 +63,39 @@ class Trading212Client(private val config: ConfigManager) {
         @Volatile private var reverseIdx: Map<String, String>? = null
         @Volatile private var reverseIdxAt: Long = 0L
         @Volatile private var reverseIdxSpace: String = ""
+        /** Learned broker-code → feed-symbol overrides, and the names the feed
+         *  could not place. Companion-level for the same reason the instrument
+         *  list is: callers build a throwaway client per call. */
+        @Volatile private var feedOverrideCache: MutableMap<String, String>? = null
+        private val feedMisses = HashMap<String, Long>()
+        private const val FEED_MISS_TTL_MS = 24 * 60 * 60 * 1000L
+        private const val FEED_MAP_FILE = "t212_feed_symbols.json"
+
+        /**
+         * WHICH LISTING THE BROKER MEANS, as the price feed spells its suffix.
+         * "" is a US listing (no suffix); null means the venue could not be told
+         * from the code, which is a refusal, not a default.
+         *
+         * A company trades in several places at once and the lines disagree on
+         * price and currency, so getting this wrong is not a near miss — it
+         * reprices a live position without saying anything.
+         *
+         * IN THE COMPANION, AND CASE-SENSITIVE ON PURPOSE. European instruments
+         * carry the venue as a LOWERCASE letter on the base ("SRT3d_EQ"), so an
+         * uppercased ticker reads as venue-unknown and every German holding
+         * falls through to whatever the feed happened to list first. That is a
+         * one-character mistake with a silent, expensive result, which is why it
+         * is out here where a test can reach it.
+         */
+        fun wantedFeedSuffix(t212Ticker: String): String? {
+            val raw = t212Ticker.trim()
+            if (raw.isBlank()) return null
+            if (raw.endsWith("_US_EQ")) return ""
+            if (raw.endsWith("_DE_EQ") || raw.endsWith("d_EQ")) return ".DE"
+            val base = raw.substringBefore("_")
+            if (base.length > 1 && base.last().isLowerCase() && base.last() == 'd') return ".DE"
+            return null
+        }
         /** Last good instrument list, persisted so resolution works from the
          *  first tap even after app restart + a rate-limited live fetch. */
         /**
@@ -67,8 +109,9 @@ class Trading212Client(private val config: ConfigManager) {
          *
          * Bump the suffix whenever a field is added to InstrumentMeta.
          */
-        private const val META_DISK_FILE = "t212_instruments_v2.json"
-        private const val META_DISK_FILE_OLD = "t212_instruments.json"
+        private const val META_DISK_FILE = "t212_instruments_v3.json"
+        private val META_DISK_FILES_OLD =
+            listOf("t212_instruments.json", "t212_instruments_v2.json")
 
         /**
          * T212's minimum, in CURRENCY — "one full unit (1.00 GBP, 1.00 EUR, 1.00
@@ -84,11 +127,12 @@ class Trading212Client(private val config: ConfigManager) {
         const val MIN_POSITION_VALUE = 1.0
     }
 
-    private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
-        .build()
+    // ONE CONNECTION SETUP FOR THE WHOLE APP. A client object is created for
+    // almost every request — each step of an order ladder makes its own — and
+    // each used to build its own connection pool, so no secure connection was
+    // ever reused: every call paid a fresh handshake (0.1–0.5 s) and left an idle
+    // connection behind. Shared, a ladder's steps ride one warm connection.
+    private val client: OkHttpClient get() = SHARED_HTTP
 
     /** Build the HTTP Basic auth header value: `Basic <base64(key:secret)>`.
      *  Uses NO_WRAP so the encoded string doesn't contain newlines (which
@@ -202,7 +246,18 @@ class Trading212Client(private val config: ConfigManager) {
         val minTradeQuantity: Double? = null,
         /** Largest position T212 will let you hold in this instrument. Same source,
          *  same nullability caveat — read together they describe the legal size band. */
-        val maxOpenQuantity: Double? = null
+        val maxOpenQuantity: Double? = null,
+        /**
+         * What kind of instrument this is — "STOCK", "ETF", "CRYPTOCURRENCY" and
+         * so on, verbatim from the broker.
+         *
+         * Read for one job: building a market universe out of the instrument
+         * list. Without it a German universe drawn from Xetra is roughly half
+         * tracker funds, and a screener that ranks momentum across a mix of
+         * companies and index trackers is not screening anything meaningful.
+         * Nullable for rows cached before the field was read.
+         */
+        val instrumentType: String? = null
     )
 
     /**
@@ -241,8 +296,10 @@ class Trading212Client(private val config: ConfigManager) {
         // Retire the pre-versioning snapshot rather than leaving ~10k stale
         // instruments on disk forever.
         try {
-            val old = java.io.File(config.appContext.filesDir, META_DISK_FILE_OLD)
-            if (old.exists()) old.delete()
+            for (name in META_DISK_FILES_OLD) {
+                val old = java.io.File(config.appContext.filesDir, name)
+                if (old.exists()) old.delete()
+            }
         } catch (e: Exception) { Log.w(TAG, "old meta cleanup failed", e) }
         val f = java.io.File(config.appContext.filesDir, META_DISK_FILE)
         if (!f.exists()) null
@@ -307,7 +364,9 @@ class Trading212Client(private val config: ConfigManager) {
                             minTradeQuantity = o.get("minTradeQuantity")
                                 ?.takeIf { !it.isJsonNull }?.asDouble,
                             maxOpenQuantity = o.get("maxOpenQuantity")
-                                ?.takeIf { !it.isJsonNull }?.asDouble
+                                ?.takeIf { !it.isJsonNull }?.asDouble,
+                            instrumentType = o.get("type")
+                                ?.takeIf { !it.isJsonNull }?.asString
                         )
                     } catch (e: Exception) { /* skip malformed */ }
                 }
@@ -348,12 +407,23 @@ class Trading212Client(private val config: ConfigManager) {
             // Prefer a ticker on the wanted venue; otherwise first-wins.
             if (existing == null || (!onWantedVenue(existing, space) && onWantedVenue(ticker, space))) idx[k] = ticker
         }
+        val de = space.uppercase() == "DE"
         for ((ticker, m) in meta) {
             val base = ticker.substringBefore("_")
             consider(base, ticker)
             // Strip the trailing lowercase venue letter so a bare Yahoo symbol
             // ("MUV2") resolves to the Xetra ticker ("MUV2d_EQ").
-            if (base.length > 1 && base.last().isLowerCase()) consider(base.dropLast(1), ticker)
+            val bare = if (base.length > 1 && base.last().isLowerCase()) base.dropLast(1) else base
+            if (bare != base) consider(bare, ticker)
+            // ALSO INDEX THE NAME THE COMPANY TRADES UNDER TODAY. The instrument
+            // list is the broker's, so a renamed company appears in it only under
+            // its retired ticker — index that alone and an order for the live
+            // symbol finds nothing, which reads to the user as "not offered" for
+            // a stock sitting in their own account.
+            if (de) {
+                val now = SymbolRenames.currentDe(bare)
+                if (!now.equals(bare, ignoreCase = true)) consider(now, ticker)
+            }
             consider(m.shortName, ticker)
         }
         return idx
@@ -368,7 +438,15 @@ class Trading212Client(private val config: ConfigManager) {
         val meta = (metaRes as? T212Result.Success)?.data ?: metaCache ?: return null
         val isUs = space.uppercase() == "US"
         // 1) Exact ticker present (with the FB↔META style alias applied).
-        val direct = if (space.uppercase() == "DE") listOf("${sym}d_EQ", "${sym}_DE_EQ")
+        // A renamed company is tried under BOTH names: the live one first, because
+        // that is what it is, and the retired one after, because that is what the
+        // broker's instrument list still calls it.
+        // Blank outside Xetra ON PURPOSE. A German rename says nothing about a US
+        // symbol that happens to be spelled the same, and letting it leak across
+        // venues is the reissued-ticker failure wearing a different hat.
+        val deLegacy = if (space.uppercase() == "DE") SymbolRenames.legacyDe(sym) else sym
+        val direct = if (space.uppercase() == "DE")
+                         listOf("${sym}d_EQ", "${sym}_DE_EQ", "${deLegacy}d_EQ", "${deLegacy}_DE_EQ").distinct()
                      else listOf("${aliasUsTicker(sym, isUs)}_US_EQ")
         for (d in direct) if (meta.containsKey(d)) return d
         // 2) Reverse index by base / shortName.
@@ -379,7 +457,8 @@ class Trading212Client(private val config: ConfigManager) {
         } ?: buildReverseIndex(meta, space).also {
             reverseIdx = it; reverseIdxAt = System.currentTimeMillis(); reverseIdxSpace = space.uppercase()
         }
-        for (c in listOf(sym, aliasUsTicker(sym, isUs))) idx[c.uppercase()]?.let { return it }
+        for (c in listOf(sym, aliasUsTicker(sym, isUs), deLegacy).distinct())
+            idx[c.uppercase()]?.let { return it }
         return null
     }
 
@@ -424,25 +503,55 @@ class Trading212Client(private val config: ConfigManager) {
         return n
     }
 
-    /** Convert a T212 ticker (e.g. "KO_US_EQ", "SAP_DE_EQ") to its Yahoo
-     *  Finance equivalent ("KO", "SAP.DE") so we can pull candles + run
-     *  StockAnalyzer on the position. Returns the bare ticker as fallback
-     *  for unknown markets. */
-    /** US tickers that changed symbol but which T212 still lists under the OLD
-     *  internal ticker. Without this, resolving the old symbol on Yahoo returns
-     *  a DIFFERENT security that reused the freed-up ticker.
-     *    FB  → META  : Meta renamed FB→META (Jun 2022); "FB" is now a ProShares ETF.
-     *  Extend cautiously — only for confirmed 1:1 US renames. */
-    private val US_TICKER_ALIASES = mapOf(
-        "FB" to "META"
-    )
-
+    /** Tickers that changed when the company renamed, but which T212 still lists
+     *  under the OLD internal code. The table itself — both venues, both
+     *  directions, and why each entry is in it — lives in [SymbolRenames]; it is
+     *  shared because the stored book needs the same answer this does, and two
+     *  copies of a rename table is how one of them goes stale.
+     *
+     *  This wrapper survives only because the US call sites read naturally with
+     *  a boolean. Anything German goes through [SymbolRenames] directly. */
     private fun aliasUsTicker(base: String, isUs: Boolean): String =
-        if (isUs) US_TICKER_ALIASES[base.uppercase()] ?: base else base
+        if (isUs) SymbolRenames.current(base, "US") else base
 
-    // Inverse of US_TICKER_ALIASES for building a T212 order ticker from a Yahoo
-    // symbol (e.g. our lab enrolls META → T212 still lists it as FB_US_EQ).
-    private val YAHOO_TO_T212_US = US_TICKER_ALIASES.entries.associate { (k, v) -> v to k }
+    /**
+     * THE GERMAN EQUITIES THIS ACCOUNT CAN ACTUALLY TRADE, as price-feed symbols.
+     *
+     * The live half of the German universe. It is deliberately the BROKER'S list
+     * rather than an index membership table, for three reasons:
+     *
+     *  • it is already downloaded and cached — no new network dependency, and
+     *    nothing new that can quietly start returning an empty list;
+     *  • index tables are published as web pages in a different shape per index,
+     *    so a parser for them breaks silently and looks like "no new names";
+     *  • membership of an index is not the question the app is asking. The
+     *    question is "what can this account buy in Germany", and this is the
+     *    only list that answers it exactly.
+     *
+     * Filtered hard, because Xetra lists far more than German companies: ordinary
+     * shares only (no trackers), priced in euro, issued in Germany. Without the
+     * type filter roughly half the result is index funds, and ranking momentum
+     * across a mix of companies and funds is not a screen of anything.
+     *
+     * Returns an empty list when the instrument list is unavailable — the caller
+     * then falls back to the curated list rather than screening nothing.
+     */
+    fun xetraEquitySymbols(): List<String> {
+        val meta = (fetchInstrumentMetadata() as? T212Result.Success)?.data
+            ?: metaCache
+            ?: loadMetaFromDisk()
+            ?: return emptyList()
+        return meta.values.asSequence()
+            .filter { onWantedVenue(it.ticker, "DE") }
+            .filter { it.instrumentType == null || it.instrumentType.equals("STOCK", ignoreCase = true) }
+            .filter { it.currencyCode.equals("EUR", ignoreCase = true) }
+            .filter { it.isin?.startsWith("DE", ignoreCase = true) == true }
+            .map { t212ToYahooSymbol(it.ticker).uppercase() }
+            .filter { it.endsWith(".DE") && it.length > 3 }
+            .distinct()
+            .sorted()
+            .toList()
+    }
 
     /** Best-effort Yahoo symbol → T212 instrument ticker (e.g. "AAPL" → "AAPL_US_EQ",
      *  "META" → "FB_US_EQ"). Heuristic — T212 may list a name differently; the
@@ -450,12 +559,156 @@ class Trading212Client(private val config: ConfigManager) {
     fun yahooToT212Ticker(symbol: String, space: String = "US"): String {
         val s = symbol.trim().uppercase().substringBefore(".")
         return when (space.uppercase()) {
-            "DE" -> "${s}_DE_EQ"
-            else -> "${YAHOO_TO_T212_US[s] ?: s}_US_EQ"
+            "DE" -> "${SymbolRenames.legacyDe(s)}_DE_EQ"
+            else -> "${SymbolRenames.legacy(s, "US")}_US_EQ"
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // WHEN THE BROKER'S CODE IS NOT THE MARKET'S TICKER
+    // ════════════════════════════════════════════════════════════════════
+    // Every conversion below this point spells the price-feed symbol out of the
+    // broker's instrument code: drop the venue letter, bolt on a suffix. That
+    // works because the two usually agree — and it fails silently when they do
+    // not, which happens more often than the tidy rule suggests.
+    //
+    // Ceconomy is the case that exposed it. Trading 212 files it as CECGd_EQ;
+    // Xetra and Yahoo both call it CEC. The spelling rule produces CECG.DE, a
+    // symbol that has never existed, so a real holding came back with no
+    // candles: no price, no support, no resistance, every score zero — and,
+    // worst of all, exit levels computed from a placeholder volatility figure
+    // instead of a measured one. A live stop resting on a made-up number.
+    //
+    // The buy still reached the right company, because the OUTGOING direction
+    // also matches on the broker's own short name ("CEC"). Only the return trip
+    // was spelling-only. That asymmetry is the whole bug.
+    //
+    // The fix does not guess harder. Every instrument carries an ISIN — a global
+    // identifier that means exactly one security and is nobody's ticker
+    // convention — and the price feed's own search resolves one to its listing.
+    // Ask once, remember the answer for ever, and the spelling rule never has to
+    // be right again.
+    //
+    // KEPT ON DISK on purpose. The lookup is a network round trip; without a
+    // durable answer every restart would re-ask for every awkward name, and the
+    // path that needs the symbol most — the trailing stop, which SKIPS a holding
+    // it cannot price — runs in the background where an extra request is least
+    // affordable.
+
+    /** Broker instrument code → the symbol the price feed actually knows, for
+     *  the cases where spelling one out of the other does not work. Learned,
+     *  never guessed: an entry exists only because an ISIN lookup confirmed it. */
+    private fun feedOverrides(): MutableMap<String, String> {
+        feedOverrideCache?.let { return it }
+        val loaded: MutableMap<String, String> = try {
+            val f = java.io.File(config.appContext.filesDir, FEED_MAP_FILE)
+            if (!f.exists()) HashMap()
+            else (gson.fromJson(f.readText(), Map::class.java) as? Map<*, *>)
+                ?.entries
+                ?.mapNotNull { e ->
+                    val k = (e.key as? String)?.trim()?.uppercase()
+                    val v = (e.value as? String)?.trim()?.uppercase()
+                    if (k.isNullOrBlank() || v.isNullOrBlank()) null else k to v
+                }
+                ?.toMap(HashMap())
+                ?: HashMap()
+        } catch (e: Exception) {
+            Log.w(TAG, "feed-symbol map load failed", e); HashMap()
+        }
+        feedOverrideCache = loaded
+        return loaded
+    }
+
+    /** The confirmed price-feed symbol for [t212Ticker], or null if nothing has
+     *  ever confirmed one. Cheap — memory, then one small file. Safe anywhere. */
+    fun learnedFeedSymbol(t212Ticker: String): String? =
+        feedOverrides()[t212Ticker.trim().uppercase()]?.takeIf { it.isNotBlank() }
+
+    private fun rememberFeedSymbol(t212Ticker: String, yahooSymbol: String) {
+        val k = t212Ticker.trim().uppercase()
+        val v = yahooSymbol.trim().uppercase()
+        if (k.isBlank() || v.isBlank()) return
+        val map = feedOverrides()
+        if (map[k] == v) return
+        map[k] = v
+        try {
+            java.io.File(config.appContext.filesDir, FEED_MAP_FILE).writeText(gson.toJson(map))
+            Log.i(TAG, "Learned feed symbol: $k -> $v")
+        } catch (e: Exception) { Log.w(TAG, "feed-symbol map save failed", e) }
+    }
+
+    /**
+     * Ask the price feed which listing an ISIN is, and remember the answer.
+     *
+     * NETWORK CALL — background threads only, never from a render. Everything
+     * else reads [learnedFeedSymbol], which is free.
+     *
+     * Returns null rather than a near-miss. A wrong symbol here attaches another
+     * company's candles to a real position, which is worse in every way than the
+     * blank the caller already has: a blank is visible, a plausible wrong price
+     * is not. So the venue is checked before the answer is accepted.
+     */
+    fun resolveFeedSymbolViaIsin(t212Ticker: String, isinHint: String? = null): String? {
+        // CASE MATTERS, so the raw ticker is kept alongside the map key. The venue
+        // tag on a European instrument is a LOWERCASE letter on the base
+        // ("SRT3d_EQ"); uppercase the ticker before testing it and every German
+        // instrument reads as venue-unknown, which is how a German holding ends up
+        // priced off a foreign line. Only the lookup key is uppercased.
+        val raw = t212Ticker.trim()
+        val key = raw.uppercase()
+        if (key.isBlank()) return null
+        learnedFeedSymbol(key)?.let { return it }
+        // Don't re-ask for a name the feed has already failed to place. A handful
+        // of the ~10k instruments will be things it genuinely does not carry, and
+        // re-asking on every background pass turns a known gap into steady traffic.
+        synchronized(feedMisses) {
+            val at = feedMisses[key]
+            if (at != null && System.currentTimeMillis() - at < FEED_MISS_TTL_MS) return null
+        }
+        val isin = isinHint?.trim()?.takeIf { it.isNotBlank() }
+            ?: (fetchInstrumentMetadata(setOf(key)) as? T212Result.Success)?.data?.get(key)?.isin
+            ?: metaCache?.get(key)?.isin
+        if (isin.isNullOrBlank()) return null
+
+        val wantedSuffix = wantedFeedSuffix(raw)
+        val hits = when (val r = YahooFinanceClient
+            .searchSymbols(isin, region = if (wantedSuffix == ".DE") "DE" else "US")) {
+            is YahooFinanceClient.SearchResult.Success -> r.hits
+            // Rate-limited is NOT a miss — it says nothing about the instrument.
+            // Recording it as one would blank the name for the whole miss window.
+            else -> return null
+        }.filter { it.quoteType == "EQUITY" }
+
+        val pick = when (wantedSuffix) {
+            // Xetra first, then any other German line the feed offers.
+            ".DE" -> hits.firstOrNull { it.symbol.endsWith(".DE", ignoreCase = true) }
+                ?: hits.firstOrNull { it.exchange.contains("XETRA", ignoreCase = true) }
+            "" -> hits.firstOrNull { !it.symbol.contains(".") }
+            // Venue not stated and not inferable. Taking "whatever came back
+            // first" here is how a London holding gets priced in the wrong
+            // currency, so this one stays unresolved on purpose.
+            null -> null
+            else -> hits.firstOrNull { it.symbol.endsWith(wantedSuffix, ignoreCase = true) }
+        }
+        if (pick == null) {
+            synchronized(feedMisses) { feedMisses[key] = System.currentTimeMillis() }
+            Log.w(TAG, "ISIN $isin ($key) resolved to no usable listing")
+            return null
+        }
+        rememberFeedSymbol(key, pick.symbol)
+        return pick.symbol.uppercase()
+    }
+
+    /** Convert a T212 ticker (e.g. "KO_US_EQ", "SAP_DE_EQ") to its Yahoo
+     *  Finance equivalent ("KO", "SAP.DE") so we can pull candles + run
+     *  StockAnalyzer on the position. Returns the bare ticker as fallback
+     *  for unknown markets. */
     fun t212ToYahooSymbol(t212Ticker: String): String {
+        // A CONFIRMED answer always beats a spelled-out one. This is the single
+        // place every other conversion funnels through, so putting the learned
+        // map here fixes the candidate list, the holdings read and the trailing
+        // stop at once — rather than each of them remembering to ask.
+        learnedFeedSymbol(t212Ticker)?.let { return it }
         val parts = t212Ticker.split("_")
         if (parts.size < 2) return t212Ticker
         // Modern T212 Xetra format tags the venue as a trailing LOWERCASE 'd' on
@@ -467,12 +720,12 @@ class Trading212Client(private val config: ConfigManager) {
         // lowercase 'd' tail is unambiguous.
         val rawBase = parts[0]
         if (rawBase.length > 1 && rawBase.last() == 'd') {
-            return aliasUsTicker(rawBase.dropLast(1), false).uppercase() + ".DE"
+            return SymbolRenames.currentDe(rawBase.dropLast(1)).uppercase() + ".DE"
         }
         val base = aliasUsTicker(parts[0], parts[1] == "US")
         return when (parts[1]) {
             "US"  -> base               // NASDAQ / NYSE — no suffix
-            "DE"  -> "$base.DE"         // Xetra
+            "DE"  -> "${SymbolRenames.currentDe(base)}.DE"  // Xetra
             "L"   -> "$base.L"          // LSE
             "MI"  -> "$base.MI"         // Borsa Italiana
             "PA"  -> "$base.PA"         // Euronext Paris
@@ -496,9 +749,17 @@ class Trading212Client(private val config: ConfigManager) {
         val base = aliasUsTicker(t212Ticker.substringBefore("_").trim(), parts.contains("US"))
         if (base.isEmpty()) return emptyList()
         val candidates = linkedSetOf<String>()
+        // EVERY ".DE" form this function builds passes through the rename table,
+        // rather than each construction remembering to. There are four of them —
+        // the primary conversion, the concatenated-short-form fix, the venue-tag
+        // branch and the EUR currency sweep — and a rename applied to three out
+        // of four is a bug that only shows up on whichever path the next holding
+        // happens to take.
         fun add(symbol: String) {
-            val s = symbol.trim().uppercase()
-            if (s.isNotBlank()) candidates.add(s)
+            var s = symbol.trim().uppercase()
+            if (s.isBlank()) return
+            if (s.endsWith(".DE")) s = SymbolRenames.currentDe(s.removeSuffix(".DE")) + ".DE"
+            candidates.add(s)
         }
 
         add(t212ToYahooSymbol(t212Ticker))
@@ -814,6 +1075,90 @@ class Trading212Client(private val config: ConfigManager) {
     }
 
     /**
+     * The WHOLE executed-order history, followed page by page.
+     *
+     * [fetchOrderHistory] returns one page of at most fifty, which is enough to
+     * reconcile the fills of a trade placed minutes ago and nowhere near enough to
+     * pair up buys and sells into completed round trips — a single ladder can
+     * spend six of those fifty on one entry. Anything that wants to say what a
+     * position actually MADE has to be able to reach back past that.
+     *
+     * Follows the cursor the broker gives back rather than guessing offsets, stops
+     * the moment a page repeats or runs dry, and is bounded — Trading 212 rate-
+     * limits this endpoint hard, and an unbounded walk over a long account history
+     * is how a rate limit turns into an app that appears to have frozen.
+     *
+     * Returns whatever it managed to read. A partial history produces a shorter
+     * list of round trips, never a wrong one: unmatched sells are reported as
+     * unmatched rather than paired with an invented buy.
+     */
+    fun fetchOrderHistoryPaged(maxPages: Int = 20): T212Result<List<HistoricalFill>> {
+        if (!config.hasT212Credentials) return T212Result.NotConfigured
+        val all = ArrayList<HistoricalFill>()
+        val seenCursors = HashSet<String>()
+        var cursor: String? = null
+        var pages = 0
+        var lastError = ""
+        while (pages < maxPages) {
+            val body = rawHistoryPage(cursor) ?: run {
+                lastError = "history page ${pages + 1} did not respond"; null
+            } ?: break
+            val fills = parseFills(body)
+            all.addAll(fills)
+            pages++
+            val next = parseNextCursor(body)
+            if (next.isNullOrBlank() || !seenCursors.add(next) || fills.isEmpty()) break
+            cursor = next
+            // Deliberate breath between pages. This endpoint is the one that
+            // rate-limits first, and being throttled mid-walk loses the rest of
+            // the history for no gain.
+            try { Thread.sleep(350) } catch (_: InterruptedException) { break }
+        }
+        if (all.isEmpty() && lastError.isNotBlank()) return T212Result.Failure(lastError)
+        // Oldest first: every downstream matcher pairs sells against buys in the
+        // order they happened, and a reversed list quietly pairs them backwards.
+        return T212Result.Success(all.sortedBy { it.dateExecuted })
+    }
+
+    /** One raw page, from whichever history path this account answers on. */
+    private fun rawHistoryPage(cursor: String?): String? {
+        val paths = listOf("/equity/history/orders", "/history/orders", "/equity/orders/history")
+        for (p in paths) {
+            val base = "${config.t212BaseUrl}$p".toHttpUrlOrNull() ?: continue
+            val url = base.newBuilder()
+                .addQueryParameter("limit", "50")
+                .apply { if (!cursor.isNullOrBlank()) addQueryParameter("cursor", cursor) }
+                .build()
+            try {
+                val req = Request.Builder().url(url)
+                    .addHeader("Authorization", authHeader())
+                    .addHeader("Accept", "application/json").build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    return resp.body?.string().orEmpty()
+                }
+            } catch (_: Exception) { }
+        }
+        return null
+    }
+
+    /**
+     * The cursor for the next page.
+     *
+     * Trading 212 has expressed this as a bare cursor field and as a full
+     * `nextPagePath` at different times, so both are read — a paginator that
+     * understands only today's shape stops working silently on the day it changes,
+     * and "one page of history" looks exactly like "a short trading history".
+     */
+    private fun parseNextCursor(body: String): String? = try {
+        val o = org.json.JSONObject(body.trimStart().let { if (it.startsWith("[")) "{}" else it })
+        val direct = listOf("nextCursor", "cursor", "next")
+            .firstNotNullOfOrNull { k -> o.optString(k, "").takeIf { it.isNotBlank() } }
+        direct ?: o.optString("nextPagePath", "").takeIf { it.isNotBlank() }
+            ?.substringAfter("cursor=", "")?.substringBefore("&")?.takeIf { it.isNotBlank() }
+    } catch (_: Exception) { null }
+
+    /**
      * The RAW history response, for diagnostics.
      *
      * "The endpoint responded but returned no executed orders" is ambiguous: it can
@@ -890,14 +1235,33 @@ class Trading212Client(private val config: ConfigManager) {
                 val order = row.optJSONObject("order") ?: row
                 val fill = row.optJSONObject("fill")
 
-                val qty = fill?.num("quantity", "filledQuantity")?.takeIf { it != 0.0 }
-                    ?: order.num("filledQuantity", "quantity", "filledQty")
+                // QUANTITY AND CASH MUST COME FROM THE SAME PLACE.
+                //
+                // The fill is one execution; the order can be many. Reading the
+                // quantity off the fill and the value off the ORDER pairs a part
+                // with a whole — and the per-share cash that falls out of that is
+                // the entire order's money divided by one rung's shares. On a
+                // ladder that filled a fraction of a share it made a 0.11 loss
+                // read as 203.66.
+                //
+                // So the source is decided once, here, and the value is taken from
+                // the same object or not at all.
+                val fromFill = (fill?.num("quantity", "filledQuantity") ?: 0.0) != 0.0
+                val qty = if (fromFill) fill!!.num("quantity", "filledQuantity")
+                          else order.num("filledQuantity", "quantity", "filledQty")
                 // Price must come from the FILL. order.limitPrice is what we ASKED
                 // for, not what we got — using it would silently report zero slippage.
                 var price = fill?.num("price", "fillPrice")?.takeIf { it > 0.0 }
                     ?: order.num("fillPrice", "averagePrice", "avgPrice", "executedPrice")
-                val value = fill?.optJSONObject("walletImpact")?.num("netValue")?.takeIf { it != 0.0 }
-                    ?: order.num("filledValue", "fillCost", "value", "total")
+                // Paired with whichever object the quantity came from. When the
+                // quantity is the fill's, only the fill's own money may describe
+                // it; an order-level total belongs to a different number of
+                // shares. Zero here is not a loss — the fallback below derives the
+                // cash from price × quantity, which is always self-consistent.
+                val value = if (fromFill)
+                    (fill?.optJSONObject("walletImpact")?.num("netValue")
+                        ?: fill?.num("value", "filledValue") ?: 0.0)
+                else order.num("filledValue", "fillCost", "value", "total")
                 // Some payloads carry only the total — derive the per-share price
                 // rather than dropping an otherwise usable fill.
                 if (price <= 0.0 && value > 0.0 && kotlin.math.abs(qty) > 0.0)

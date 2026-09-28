@@ -29,6 +29,20 @@ import java.util.concurrent.TimeUnit
  */
 object TradegateClient {
     private const val TAG = "TradegateClient"
+
+    /**
+     * THE VENUE MOVED HOUSE. tradegate.de now answers a permanent redirect to
+     * tradegatebsx.com, and this asks the new address directly.
+     *
+     * It worked before only because the HTTP client quietly followed that
+     * redirect — every quote paying an extra round trip, and the whole feature
+     * one configuration change at their end away from going dark. Which it would
+     * have done SILENTLY: a null here means "use Yahoo", by design, so a dead
+     * scrape and a merely unavailable quote look identical from the outside.
+     * That is the right failure mode and exactly why the address must not be
+     * left to chance.
+     */
+    private const val BASE = "https://www.tradegatebsx.com"
     private const val MAX_SPREAD_FRAC = 0.06      // 6% bid/ask spread cap — wider looks like a bad/halted quote
     private const val MAX_YAHOO_DEVIATION = 0.08  // 8% vs Yahoo's (stale) price — wider looks like wrong instrument/garbage
 
@@ -62,9 +76,9 @@ object TradegateClient {
         if (isin.isBlank()) return null
         return try {
             val req = Request.Builder()
-                .url("https://www.tradegate.de/refresh.php?isin=$isin")
+                .url("$BASE/refresh.php?isin=$isin")
                 .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .addHeader("Referer", "https://www.tradegate.de/orderbuch.php?isin=$isin")
+                .addHeader("Referer", "$BASE/orderbuch.php?isin=$isin")
                 .build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) { Log.d(TAG, "HTTP ${resp.code} for $isin"); return null }

@@ -40,6 +40,11 @@ class DailyPortfolioManager(
         private const val API_CALL_GAP_MS = 1000L
         private const val EXIT_LIMIT_SLIPPAGE_1 = 0.998   // first limit try: LTP × 0.998
         private const val EXIT_LIMIT_SLIPPAGE_2 = 0.995   // second limit try: LTP × 0.995
+        /** Last rung: far enough under the bid that the book takes it immediately,
+         *  which is what the market order it replaces was meant to achieve. It is a
+         *  floor on a thin book, not the price expected — a crossing sell is filled
+         *  at whatever is actually bid, normally well above this. */
+        private const val EXIT_LIMIT_SLIPPAGE_3 = 0.99    // final try: LTP × 0.99
         private const val EXIT_WAIT_FILL_MS = 60_000L     // 60s wait per limit attempt
         private const val ORDER_POLL_MS = 5_000L          // poll order status every 5s
         private const val MIN_HOLD_DAYS = 5               // don't tighten trailing SL in first 5 days
@@ -771,10 +776,19 @@ class DailyPortfolioManager(
         zc.cancelOrder(id2)
         delay(API_CALL_GAP_MS)
 
-        // Attempt 3: market order fallback
-        val r3 = zc.placeOrder(h.exchange, h.symbol, "SELL", h.quantity, "MARKET", null)
+        // Attempt 3: the last rung, priced far enough through the bid to be taken
+        // at once by whatever is actually there.
+        //
+        // NOT A MARKET ORDER, though it was one and read as the obvious choice.
+        // Zerodha's API refuses bare market orders — "market orders without market
+        // protection are not allowed via API" — so this rung could only ever fail,
+        // and it is the rung that runs when the position genuinely needs to be out.
+        // The same refusal silently blocked every algo entry and exit in the Indian
+        // space until it was traced; this is the last place it was still hiding.
+        val price3 = Math.round(h.ltp * EXIT_LIMIT_SLIPPAGE_3 * 20.0) / 20.0
+        val r3 = zc.placeOrder(h.exchange, h.symbol, "SELL", h.quantity, "LIMIT", price3)
         if (r3 is ZerodhaClient.OrderResult.Failure) {
-            return LadderResult(false, "none", null, "market fallback failed: ${r3.message}")
+            return LadderResult(false, "none", null, "final rung failed: ${r3.message}")
         }
         val id3 = (r3 as ZerodhaClient.OrderResult.Success).orderId
         // Market usually fills within a few seconds; still poll briefly

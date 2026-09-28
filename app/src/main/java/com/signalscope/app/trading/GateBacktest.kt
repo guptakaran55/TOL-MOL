@@ -256,7 +256,11 @@ object GateBacktest {
      * CSV backtest — which has one feed and is parity-verified against the Python
      * lab — is untouched.
      */
-    fun run(data: List<SymbolData>, p: Params, walkFrom: Long? = null): Report {
+    /** @param onProgress walked-day ticks (done, total). The walk is one blocking call over
+     *  hundreds of trading days; with no signal the UI cannot tell slow from hung, which is
+     *  exactly how the 400-symbol NSE run read. Optional, so every existing caller is unchanged. */
+    fun run(data: List<SymbolData>, p: Params, walkFrom: Long? = null,
+            onProgress: ((Int, Int) -> Unit)? = null): Report {
         // Two names are needed to RANK them against each other. They are not
         // needed to run the gate: with selection off every symbol owns a seat and
         // the ranking is never consulted, which is a legitimate way to study one
@@ -290,8 +294,15 @@ object GateBacktest {
         // screen() returns the FULL ranked list (only the topN() helper truncates),
         // so rank + score are available for the enrollment audit — the old
         // .map { it.symbol } threw them away.
+        // PREPARED ONCE, not per day. StockScreener.screen re-sorts every symbol's whole history
+        // and rebuilds its SMA on every call; called once per trading day over a few hundred
+        // symbols that is hundreds of thousands of redundant sorts, which is what made this look
+        // hung rather than slow. Prepared does the same arithmetic off pre-sorted arrays and is
+        // pinned to screen()'s exact output by StockScreenerPreparedTest.
+        val screenCfg = ScreenerConfig(topN = p.topN)
+        val prepared = StockScreener.Prepared(screenCfg, universe)
         fun rankedFullAsOf(day: Long): List<RankedSymbol> =
-            StockScreener.screen(ScreenerConfig(topN = p.topN), universe, LocalDate.ofEpochDay(day))
+            prepared.screen(screenCfg, LocalDate.ofEpochDay(day))
         fun rankedAsOf(day: Long): List<String> = rankedFullAsOf(day).map { it.symbol }
         fun slopeAsOf(sym: String, day: Long): Double? {
             val s = bySym[sym.uppercase()] ?: return null
@@ -437,8 +448,13 @@ object GateBacktest {
                 if (walkFrom != null && walkFrom > allDays.first() + lookbackDays)
                     "No overlap between the screener history and the engine's data window."
                 else "Dataset shorter than the ${lookbackDays}-day screener lookback — no T0.")
+        val walkDays = allDays.count { it >= t0Fixed }
+        var walked = 0
         for (day in allDays) {
             if (day < t0Fixed) continue
+            // Report every 10th day: frequent enough that a stall is obvious, rare enough that the
+            // JS bridge hop is not itself a cost in a tight loop.
+            if (onProgress != null && (++walked == 1 || walked % 10 == 0 || walked == walkDays)) onProgress(walked, walkDays)
             if (slots.isEmpty()) {
                 repeat(p.holdN) { slots.add(Slot(null, p.notional, day, 0, false)) }
                 injected = p.notional * p.holdN; t0Day = day

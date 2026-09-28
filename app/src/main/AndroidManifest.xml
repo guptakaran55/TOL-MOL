@@ -68,6 +68,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -82,6 +83,12 @@
              after Xetra and US regular-market closes. -->
         <receiver
             android:name=".service.T212DailyTrailReceiver"
+            android:exported="false" />
+
+        <!-- AlarmManager receiver: renews the daily Kite session before the Indian
+             open, so an owner in Europe never has to log in at 5am local time. -->
+        <receiver
+            android:name=".service.ZerodhaAutoLoginReceiver"
             android:exported="false" />
 
         <!-- FileProvider for sharing PDFs from cache -->

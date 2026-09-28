@@ -11,8 +11,13 @@ import com.signalscope.app.data.ConfigManager
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        // AND AFTER AN APP UPDATE. Without it an update stopped monitoring and
+        // nothing restarted it until the next reboot — while the top bar still
+        // showed it as on, and the Indian holdings' daily stop maintenance, which
+        // runs inside it, silently skipped the days in between.
         if (intent.action == Intent.ACTION_BOOT_COMPLETED ||
-            intent.action == "android.intent.action.QUICKBOOT_POWERON") {
+            intent.action == "android.intent.action.QUICKBOOT_POWERON" ||
+            intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
 
             val config = ConfigManager(context)
             if (config.serviceRunning && config.hasCredentials) {
@@ -25,6 +30,10 @@ class BootReceiver : BroadcastReceiver() {
                 DiscoveryAutoScheduler.ensureScheduled(context)
                 T212DailyTrailScheduler.ensureScheduled(context)
                 StrategyLabScheduler.ensureScheduled(context)
+                // Especially this one: a reboot overnight is exactly when the
+                // morning login would otherwise be lost, and nothing else in the
+                // app would notice until the Indian session was already over.
+                ZerodhaAutoLoginScheduler.ensureScheduled(context)
             }
         }
     }

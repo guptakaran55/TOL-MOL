@@ -168,7 +168,22 @@ object T212PositionAudit {
             }
         } catch (e: Exception) { Log.w(TAG, "free-cash read failed: ${e.message}") }
 
-        val open = T212LiveStore.load(ctx).trades.filter { it.status in LIVE_STATUSES && it.qty > 0.0 }
+        // ONLY ROWS THAT COULD BE AT TRADING 212 IN THE FIRST PLACE.
+        //
+        // This compared EVERY row in the store against a Trading 212 portfolio,
+        // including Indian positions that a missing guard elsewhere had written in
+        // here. Zerodha holdings can never appear in a Trading 212 account, so each
+        // one was reported as a position the broker had lost — thirteen of them,
+        // under a banner saying the ledger could not be trusted.
+        //
+        // Kept as a filter here as well as fixing the writer, because an audit that
+        // can be broken by a bad row elsewhere is not an audit. This one now
+        // answers a question it can actually answer: of the things claimed to be at
+        // Trading 212, what is missing.
+        val open = T212LiveStore.load(ctx).trades.filter {
+            it.status in LIVE_STATUSES && it.qty > 0.0 &&
+                com.signalscope.app.trading.Spaces.baseOf(it.ns).let { b -> b == "de" || b == "us" }
+        }
         // A leg that started and never reported: the ledger quantity is an ORDER
         // estimate, not a holding, so no quantity comparison can be trusted for it.
         // Reported on its own terms instead of being silently compared.
