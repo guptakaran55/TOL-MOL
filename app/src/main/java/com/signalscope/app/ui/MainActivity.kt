@@ -1801,6 +1801,50 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * RUN A CALL THAT WAITS ON THE INTERNET WITHOUT FREEZING THE PAGE.
+         *
+         * A call from the page answers on the page's own thread, so while one of
+         * these waited on Yahoo, Trading 212 or Zerodha — up to 30 seconds on a
+         * slow Kite reply — the whole dashboard sat frozen: no scrolling, no taps.
+         * Here the same call runs in the background and its answer is handed back
+         * to the page by request id when it arrives.
+         *
+         * ONLY THESE CALLS. The list is explicit on purpose: the page cannot name
+         * an arbitrary method, and every entry is a read — none of them places an
+         * order.
+         */
+        @JavascriptInterface
+        fun callAsync(method: String, argsJson: String, reqId: String) {
+            thread(isDaemon = true, name = "page-async-$method") {
+                val out = try {
+                    val a = com.google.gson.JsonParser.parseString(argsJson.ifBlank { "[]" }).asJsonArray
+                    when (method) {
+                        "searchSymbolsForSpace" -> searchSymbolsForSpace(a[0].asString, a[1].asString)
+                        "t212GermanRef" -> t212GermanRef(a[0].asString, a[1].asDouble)
+                        "t212Fills" -> t212Fills(a[0].asInt)
+                        "fetchGttExecutionData" -> fetchGttExecutionData()
+                        else -> "{\"error\":\"not callable in the background: $method\"}"
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "callAsync $method failed", e)
+                    "{\"error\":\"${(e.message ?: "failed").replace("\"", "")}\"}"
+                }
+                // Two rare line-break characters end a script string early; the
+                // broker's text is not ours to trust not to contain them.
+                val escaped = out.replace("\\", "\\\\").replace("'", "\\'")
+                    .replace("\n", "\\n").replace("\r", "")
+                    .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+                val id = reqId.replace(Regex("[^A-Za-z0-9_]"), "")
+                runOnUiThread {
+                    try {
+                        if (!isFinishing && !isDestroyed)
+                            webView.evaluateJavascript("window.onAsyncResult('$id','$escaped')", null)
+                    } catch (e: Throwable) { Log.e(TAG, "callAsync delivery failed", e) }
+                }
+            }
+        }
+
         @JavascriptInterface
         fun fetchT212OpenOrders(): String {
             return try {

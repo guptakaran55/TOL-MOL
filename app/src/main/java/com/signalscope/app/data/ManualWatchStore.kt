@@ -618,6 +618,39 @@ object ManualWatchStore {
     fun isDeadAttempt(e: Entry): Boolean =
         (e.status == "FAILED" || e.status == "CANCELLED") && e.filledQty <= 0.0
 
+    /**
+     * MAY A NEW BUY TAKE THIS SIGNAL'S PLACE IN THE BOOK?
+     *
+     * One row per company per signal bar — so a second buy on the same signal
+     * writes over the first. That used to happen unchecked: a repeat tap on
+     * Tata Steel was refused by the broker ("this entry already has an order"),
+     * and the refusal was written over the record of the live Zerodha trigger
+     * the first tap had placed. The book lost a real order.
+     *
+     * Only an attempt that bought nothing may be replaced. Anything else — a buy
+     * in flight, a position, a finished trade — is a record of real money and
+     * stays exactly as it is.
+     */
+    fun mayReplace(existing: Entry?): Boolean = existing == null || isDeadAttempt(existing)
+
+    /**
+     * Claim a signal for a new buy, in ONE step: look and write under the same
+     * lock, so two taps a moment apart cannot both see "free" and both buy.
+     *
+     * Returns null when the claim succeeded and [e] is written; otherwise the
+     * entry already standing on that signal, and nothing is written at all.
+     */
+    fun claim(ctx: Context, space: String, e: Entry): Entry? {
+        var standing: Entry? = null
+        mutate(ctx, space) { s ->
+            val same = { it: Entry -> it.symbol.equals(e.symbol, true) && it.signalBarTs == e.signalBarTs }
+            val cur = s.entries.lastOrNull(same)
+            if (!mayReplace(cur)) { standing = cur; s }
+            else s.copy(entries = (s.entries.filterNot(same) + e).takeLast(200))
+        }
+        return standing
+    }
+
     /** Cap on hand-added names per space. Each one costs a price download every
      *  pass exactly like a ranked candidate, so an unbounded list would quietly
      *  become the bandwidth problem the depth setting exists to control. */

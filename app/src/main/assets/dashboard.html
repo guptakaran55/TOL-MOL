@@ -202,6 +202,39 @@ function detailsKey(d){
   var s=d.querySelector('summary');
   return s?String(s.textContent||'').replace(/\s*\(\d+\)\s*$/,'').trim():'';
 }
+// ── CALLS THAT WAIT ON THE INTERNET, WITHOUT FREEZING THE PAGE ──────────────
+// The app runs the call in the background and hands the answer back by id. On
+// an older app without that route it falls back to the old waiting call, so the
+// page never breaks against a mismatched build.
+var ASYNC_CB={}, ASYNC_SEQ=0;
+function androidAsync(method,args,cb){
+  if(typeof Android==='undefined'){cb(null);return}
+  if(!Android.callAsync){
+    var raw=null;try{raw=Android[method].apply(Android,args)}catch(e){}
+    cb(raw);return;
+  }
+  var id='a'+(++ASYNC_SEQ);
+  ASYNC_CB[id]=cb;
+  try{Android.callAsync(method,JSON.stringify(args),id)}
+  catch(e){delete ASYNC_CB[id];cb(null)}
+}
+window.onAsyncResult=function(id,raw){
+  var cb=ASYNC_CB[id];delete ASYNC_CB[id];
+  if(cb){try{cb(raw)}catch(e){console.error('async callback',e)}}
+};
+// A small "working" line at the foot of the screen while a live price is fetched
+// for an order dialog — the dialog opens the moment it arrives.
+function refBusy(on,msg){
+  var el=document.getElementById('ref-busy');
+  if(!on){if(el&&el.parentNode)el.parentNode.removeChild(el);return}
+  if(!el){el=document.createElement('div');el.id='ref-busy';
+    el.style.cssText='position:fixed;left:50%;bottom:70px;transform:translateX(-50%);z-index:9998;background:var(--cd,#1b2432);color:var(--t2,#cbd5e1);border:1px solid var(--bd,#334155);border-radius:16px;padding:6px 14px;font-size:11px;box-shadow:0 4px 14px rgba(0,0,0,.25)';
+    document.body.appendChild(el);}
+  el.textContent=msg||'Working\u2026';
+}
+// Named scroll boxes to send back to the top on the next redraw — set when a
+// box's contents are re-ordered. Defined ahead of every redraw that reads it.
+var SCROLL_KEY_RESET={};
 function captureRenderState(){
   var st={x:window.pageXOffset||0,y:window.pageYOffset||0,scrollers:[],focus:null,details:[]};
   // Live quotes re-render the page every ~900ms; without this, any expanded
@@ -214,6 +247,13 @@ function captureRenderState(){
   var nodes=document.querySelectorAll('.tw,.tabs');
   for(var i=0;i<nodes.length;i++){
     st.scrollers.push({left:nodes[i].scrollLeft,top:nodes[i].scrollTop});
+  }
+  // NAMED SCROLL BOXES, matched by name rather than by position — a panel
+  // opening above one would otherwise hand it another box's scroll offset.
+  st.keyed={};
+  var kn=document.querySelectorAll('[data-scroll-key]');
+  for(var q=0;q<kn.length;q++){
+    st.keyed[kn[q].getAttribute('data-scroll-key')]={top:kn[q].scrollTop,left:kn[q].scrollLeft};
   }
   // UNSAVED EDITOR INPUT. Live quotes re-render roughly every 900ms, and each
   // render rebuilds the algo editor from STORED state — so picking "MACD gate 3b"
@@ -251,6 +291,14 @@ function restoreRenderState(st){
     for(var i=0;i<st.scrollers.length&&i<nodes.length;i++){
       nodes[i].scrollLeft=st.scrollers[i].left||0;
       nodes[i].scrollTop=st.scrollers[i].top||0;
+    }
+    var kn=document.querySelectorAll('[data-scroll-key]');
+    for(var q=0;q<kn.length;q++){
+      var key=kn[q].getAttribute('data-scroll-key');
+      // A box whose contents were just re-ordered starts again at the top.
+      if(SCROLL_KEY_RESET[key]){delete SCROLL_KEY_RESET[key];kn[q].scrollTop=0;continue}
+      var ks=st.keyed&&st.keyed[key];
+      if(ks){kn[q].scrollTop=ks.top||0;kn[q].scrollLeft=ks.left||0}
     }
     // Re-open any <details> that was open before this render (see captureRenderState).
     if(st.details&&st.details.length){
@@ -5958,9 +6006,13 @@ function onManualSearchInput(val){
   if(SEARCH_DEBOUNCE)clearTimeout(SEARCH_DEBOUNCE);
   resBox.innerHTML='<div style="padding:6px;color:var(--t3);font-size:10px;text-align:center">searching…</div>';
   SEARCH_DEBOUNCE=setTimeout(function(){
+    // In the background, and only the NEWEST search may write its results — a
+    // slow answer to "BA" must not land over the answer to "BAYN".
+    var sp=manualSearchSpace(), seq=++SEARCH_SEQ;
+    androidAsync('searchSymbolsForSpace',[q,sp],function(raw){
+    if(seq!==SEARCH_SEQ)return;
+    resBox=document.getElementById('ms-results');if(!resBox)return;
     try{
-      var sp=manualSearchSpace();
-      var raw=Android.searchSymbolsForSpace?Android.searchSymbolsForSpace(q,sp):Android.searchSymbols(q,sp==='US');
       var data=JSON.parse(raw||'[]');
       if(data.error){
         resBox.innerHTML='<div style="padding:8px;color:var(--rd);font-size:10px">Search error: '+escHtml(String(data.error))+'</div>';
@@ -5987,8 +6039,10 @@ function onManualSearchInput(val){
     }catch(e){
       resBox.innerHTML='<div style="padding:8px;color:var(--rd);font-size:10px">'+escHtml(String(e.message||e))+'</div>';
     }
+    });
   },300);
 }
+var SEARCH_SEQ=0, SL_SEARCH_SEQ=0;
 // User picks a result row → analyze that exact Yahoo symbol (no .NS rewrite,
 // since Yahoo already gave us its canonical form)
 function pickSearchResult(sym){
@@ -7081,6 +7135,54 @@ function closedAnalysisPanel(){
   if(!CLOSED_ANALYSIS_OPEN)return '<div style="'+box+'">'+head+'</div>';
   return '<div style="'+box+'">'+head+closedAnalysisBody(r)+'</div>';
 }
+// ── SORTING THE CLOSED TRADES ──────────────────────────────────────────────
+// Remembered on this phone between visits. Text sorts A to Z first; numbers sort
+// biggest first, because "which made the most" and "which cost the most" are the
+// questions this table gets asked. Ties keep the original order, newest sale
+// first, so a sort never shuffles rows it has no opinion about.
+var CLOSED_SORT=(function(){
+  try{var v=JSON.parse(localStorage.getItem('closedTripsSort')||'null');if(v&&typeof v.k==='string')return v}catch(e){}
+  return {k:'',d:0};
+})();
+function closedSortBy(k){
+  var first=(k==='symbol')?1:-1;
+  if(CLOSED_SORT.k!==k)CLOSED_SORT={k:k,d:first};
+  else if(CLOSED_SORT.d===first)CLOSED_SORT={k:k,d:-first};
+  else CLOSED_SORT={k:'',d:0};
+  try{localStorage.setItem('closedTripsSort',JSON.stringify(CLOSED_SORT))}catch(e){}
+  SCROLL_KEY_RESET['closed-trips']=true;
+  renderKeepScroll();
+}
+function closedSortValue(t,k,costed){
+  switch(k){
+    case 'symbol': return String(t.symbol||'').toUpperCase();
+    case 'qty': return Number(t.qty)||0;
+    case 'buy': return Number(t.buyPrice)||0;
+    case 'sell': return Number(t.sellPrice)||0;
+    case 'held': return Number(t.heldDays)||0;
+    case 'charges': return Number(t.charges)||0;
+    case 'pnl': return Number(costed?t.netPnl:t.pnl)||0;
+    case 'pct': return Number(costed?t.netPctReturn:t.pctReturn)||0;
+  }
+  return 0;
+}
+function closedSortedTrips(trips,costed){
+  var k=CLOSED_SORT.k, d=CLOSED_SORT.d;
+  if(!k||!d)return trips;
+  return trips.map(function(t,i){return {t:t,i:i,v:closedSortValue(t,k,costed)}})
+    .sort(function(a,b){
+      var c=(typeof a.v==='string')?a.v.localeCompare(b.v):(a.v-b.v);
+      return c?c*d:(a.i-b.i);
+    })
+    .map(function(x){return x.t});
+}
+function closedSortLabel(costed){
+  var names={symbol:'stock',qty:'quantity',buy:'buy price',sell:'sell price',held:'days held',
+             charges:'charges',pnl:(costed?'net P&amp;L':'P&amp;L'),pct:'% return'};
+  if(!CLOSED_SORT.k)return 'newest sale first \u00b7 tap a heading to sort';
+  var txt=(CLOSED_SORT.k==='symbol')?(CLOSED_SORT.d>0?'A to Z':'Z to A'):(CLOSED_SORT.d>0?'smallest first':'largest first');
+  return 'by '+names[CLOSED_SORT.k]+', '+txt;
+}
 function closedAnalysisBody(r){
   var h='<div style="padding:0 10px 10px">';
   h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">'+
@@ -7165,21 +7267,36 @@ function closedAnalysisBody(r){
   }
   if(!trips.length)return h+'<div style="font-size:10px;color:var(--t3)">No completed round trips in the history read.</div></div>';
 
-  h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:10px">'+
+  // ── SORTED BY TAPPING A HEADING, SCROLLED INSIDE ITS OWN BOX ─────────────
+  // A long history used to push everything below it off the page; it now sits
+  // in a box about half a screen tall with its headings pinned while it
+  // scrolls. Tap a heading to sort by it, again to reverse, a third time for the
+  // original order — newest sale first.
+  var sorted=closedSortedTrips(trips,costed);
+  var th=function(label,key,right){
+    var on=(CLOSED_SORT.k===key);
+    var arrow=on?(CLOSED_SORT.d>0?' \u25b2':' \u25bc'):'';
+    return '<th onclick="closedSortBy(\''+key+'\')" style="cursor:pointer;padding:5px 4px;position:sticky;top:0;z-index:1;background:var(--cd);border-bottom:1px solid var(--bd);'+
+      (right?'text-align:right;':'')+'white-space:nowrap;'+(on?'color:var(--pu);':'')+'">'+label+arrow+'</th>';
+  };
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;font-size:8px;color:var(--t3);margin:0 2px 4px">'+
+     '<span>'+trips.length+' round trip'+(trips.length===1?'':'s')+' \u00b7 '+closedSortLabel(costed)+'</span>'+
+     '<span onclick="closedSortBy(\'pct\')" style="cursor:pointer;font-weight:800;color:'+(CLOSED_SORT.k==='pct'?'var(--pu)':'var(--bl)')+'" title="Sort by percentage return instead of cash">% return'+
+       (CLOSED_SORT.k==='pct'?(CLOSED_SORT.d>0?' \u25b2':' \u25bc'):'')+'</span></div>';
+  h+='<div data-scroll-key="closed-trips" style="overflow:auto;max-height:55vh;border:1px solid var(--bd);border-radius:6px;-webkit-overflow-scrolling:touch">'+
+    '<table style="width:100%;border-collapse:separate;border-spacing:0;font-size:10px">'+
     '<thead><tr style="color:var(--t3);font-size:8px;text-align:left">'+
-    '<th style="padding:3px 4px">STOCK</th><th style="padding:3px 4px">QTY</th>'+
-    '<th style="padding:3px 4px">BOUGHT</th><th style="padding:3px 4px">SOLD</th>'+
-    '<th style="padding:3px 4px">HELD</th>'+
-    (costed?'<th style="padding:3px 4px;text-align:right">CHARGES</th>':'')+
-    '<th style="padding:3px 4px;text-align:right">'+(costed?'NET P&amp;L':'P&amp;L')+'</th>'+
+    th('STOCK','symbol')+th('QTY','qty')+th('BOUGHT','buy')+th('SOLD','sell')+th('HELD','held')+
+    (costed?th('CHARGES','charges',true):'')+
+    th(costed?'NET P&amp;L':'P&amp;L','pnl',true)+
     '</tr></thead><tbody>';
-  trips.forEach(function(t){
+  sorted.forEach(function(t){
     var c=(Number(t.pnl)>=0)?'var(--gn)':'var(--rd)';
     // A trade can be green before charges and red after — which is precisely the
     // thing this column exists to surface, so the colour follows the NET.
     var nc=(Number(t.netPnl)>=0)?'var(--gn)':'var(--rd)';
-    h+='<tr style="border-top:1px solid var(--bd)">'+
-      '<td style="padding:4px;font-weight:800;color:var(--t1)">'+escHtml(t.symbol||'')+'</td>'+
+    h+='<tr>'+
+      '<td style="padding:4px;border-top:1px solid var(--bd);font-weight:800;color:var(--t1)">'+escHtml(t.symbol||'')+'</td>'+
       '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.qty).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')+'</td>'+
       '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.buyPrice).toFixed(2)+'</td>'+
       '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.sellPrice).toFixed(2)+'</td>'+
@@ -7821,8 +7938,11 @@ function slSearchInput(val){
   if(SL_SEARCH_DEBOUNCE)clearTimeout(SL_SEARCH_DEBOUNCE);
   box.innerHTML='<div style="padding:6px;color:var(--t3);font-size:10px;text-align:center">searching…</div>';
   SL_SEARCH_DEBOUNCE=setTimeout(function(){
+    var seq=++SL_SEARCH_SEQ;
+    androidAsync('searchSymbolsForSpace',[q,'US'],function(raw){
+    if(seq!==SL_SEARCH_SEQ)return;
+    box=document.getElementById('sl-results');if(!box)return;
     try{
-      var raw=Android.searchSymbolsForSpace?Android.searchSymbolsForSpace(q,'US'):Android.searchSymbols(q,true);
       var data=JSON.parse(raw||'[]');
       if(data&&data.error){box.innerHTML='<div style="padding:8px;color:var(--rd);font-size:10px">Search error: '+escHtml(String(data.error))+'</div>';return}
       if(!Array.isArray(data)||!data.length){box.innerHTML='<div style="padding:8px;color:var(--t3);font-size:10px">No US matches for that.</div>';return}
@@ -7839,6 +7959,7 @@ function slSearchInput(val){
       });
       box.innerHTML=html;
     }catch(e){box.innerHTML='<div style="padding:8px;color:var(--rd);font-size:10px">'+escHtml(String(e.message||e))+'</div>'}
+    });
   },300);
 }
 function slPickEnroll(sym,ex){
@@ -11850,8 +11971,8 @@ function slipDeviationPanel(r){
 function t212FillsOpen(){
   if(typeof Android==='undefined'||!Android.t212Fills){uiAlert('Unavailable','Rebuild the APK for the T212 fills reader.');return}
   uiAlert('🧾 Reading T212 fills…','<div style="font-size:11px;color:var(--t2);line-height:1.6">Fetching your executed-order history from Trading 212.</div>');
-  setTimeout(function(){
-    var r;try{r=JSON.parse(Android.t212Fills(50)||'{}')}catch(e){uiAlert('Error',e.message);return}
+  androidAsync('t212Fills',[50],function(raw){
+    var r;try{r=JSON.parse(raw||'{}')}catch(e){uiAlert('Error',e.message);return}
     if(!r.ok){
       uiAlert('🧾 Could not read fills',
         '<div style="font-size:11px;color:var(--rd);line-height:1.6">'+escHtml(r.error||'unknown')+'</div>'+
@@ -11924,7 +12045,7 @@ function t212FillsOpen(){
       h+='<div style="font-size:9px;color:var(--t3);line-height:1.5;margin-top:7px">Rows marked <b>manual</b> were placed outside the app, so there is no paper price to compare them with — but their fill price is still real, and you can check it against that minute’s candle yourself.</div>';
     }
     uiAlert('🧾 Real T212 fills',h);
-  },50);
+  });
 }
 // "I SOLD THAT ONE MYSELF." Never inferred — a missing share has several possible
 // causes and only you can say which. Confirmed because it deletes a paper trade and
@@ -12734,17 +12855,27 @@ function t212ManualRef(sym,space){
 // it silently returns the Yahoo price as "source":"yahoo" — never an error to the user.
 // Yahoo's own DE price is ALWAYS returned alongside so the UI can show it as a reference
 // even when Tradegate is driving the actual order price.
-function t212RefInfo(sym,space,tickerHint){
+//
+// FETCHED IN THE BACKGROUND, THEN THE DIALOG OPENS. It used to be fetched while
+// the whole page waited — up to three calls one after another — so every German
+// order button froze the dashboard first. The price, and everything done with it,
+// is unchanged; only the waiting moved. One fetch at a time, so a double tap
+// cannot open two dialogs.
+var T212_REF_BUSY=false;
+function t212RefInfoAsync(sym,space,tickerHint,cb){
   var yahooPrice=t212ManualRef(sym,space);
-  if(space!=='DE'||!yahooPrice)return{price:yahooPrice,source:'yahoo',yahooPrice:yahooPrice};
-  try{
-    if(typeof Android!=='undefined'&&Android.t212GermanRef){
-      var raw=Android.t212GermanRef(tickerHint||sym,yahooPrice);
-      var r=JSON.parse(raw||'{}');
-      if(r&&Number(r.price)>0)return r;
-    }
-  }catch(e){}
-  return{price:yahooPrice,source:'yahoo',yahooPrice:yahooPrice};
+  var fallback={price:yahooPrice,source:'yahoo',yahooPrice:yahooPrice};
+  if(space!=='DE'||!yahooPrice||typeof Android==='undefined'||!Android.t212GermanRef){cb(fallback);return}
+  if(T212_REF_BUSY)return;
+  T212_REF_BUSY=true;
+  refBusy(true,'Getting a live price for '+sym+'\u2026');
+  androidAsync('t212GermanRef',[tickerHint||sym,yahooPrice],function(raw){
+    T212_REF_BUSY=false;
+    refBusy(false);
+    var info=fallback;
+    try{var r=JSON.parse(raw||'{}');if(r&&Number(r.price)>0)info=r}catch(e){}
+    cb(info);
+  });
 }
 // Small reference-source line for confirm dialogs — shows both prices, never alarming.
 function t212RefLine(cur,info){
@@ -12805,16 +12936,17 @@ function t212ManualBuyClick(space){
   if(!sym){uiAlert('Enter a ticker','e.g. '+(space==='DE'?'MUV2, SAP, SIE':'AAPL, MSFT, NVDA')+'.');return}
   if(!(amt>0)){uiAlert('Enter an amount','Amount to buy, e.g. 25.');return}
   var pos=t212FindPosition(sym), held=pos?pos.ticker:null;
-  var info=t212RefInfo(sym,space,held);
-  var ref=info.price;
-  if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+space+' scan (or wait for the live ticker) so the app has a fresh reference price to cap the limit order.');return}
-  var qty=Math.floor(amt/ref*100000)/100000, cap=ref*1.005;
-  uiConfirm('🛒 Buy '+sym+' on Trading 212','<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
-    '≈ '+qty+' shares for ~'+cur+amt.toFixed(2)+'<br/>limit cap '+cur+cap.toFixed(2)+' (+0.5%)<br/>'+t212RefLine(cur,info)+'<br/>'+
-    (held?'<span style="color:var(--gn);font-size:10px">✓ matched holding '+escHtml(held)+' — exact ticker</span>':'<span style="color:var(--t3);font-size:10px">resolving '+escHtml(sym)+' → T212 instrument</span>')+'<br/>'+
-    '<span style="color:var(--t3);font-size:10px">Marketable LIMIT, never market. If the '+cur+' pot lacks funds T212 converts from another currency (0.15% FX).</span></div>',function(ok){
-    if(!ok)return;
-    try{Android.t212ManualBuy(held||sym,amt,ref,space)}catch(e){uiAlert('Error',e.message)}
+  t212RefInfoAsync(sym,space,held,function(info){
+    var ref=info.price;
+    if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+space+' scan (or wait for the live ticker) so the app has a fresh reference price to cap the limit order.');return}
+    var qty=Math.floor(amt/ref*100000)/100000, cap=ref*1.005;
+    uiConfirm('🛒 Buy '+sym+' on Trading 212','<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
+      '≈ '+qty+' shares for ~'+cur+amt.toFixed(2)+'<br/>limit cap '+cur+cap.toFixed(2)+' (+0.5%)<br/>'+t212RefLine(cur,info)+'<br/>'+
+      (held?'<span style="color:var(--gn);font-size:10px">✓ matched holding '+escHtml(held)+' — exact ticker</span>':'<span style="color:var(--t3);font-size:10px">resolving '+escHtml(sym)+' → T212 instrument</span>')+'<br/>'+
+      '<span style="color:var(--t3);font-size:10px">Marketable LIMIT, never market. If the '+cur+' pot lacks funds T212 converts from another currency (0.15% FX).</span></div>',function(ok){
+      if(!ok)return;
+      try{Android.t212ManualBuy(held||sym,amt,ref,space)}catch(e){uiAlert('Error',e.message)}
+    });
   });
 }
 function t212ManualSellClick(space){
@@ -12825,16 +12957,17 @@ function t212ManualSellClick(space){
   var pos=t212FindPosition(sym);
   if(!pos){uiAlert('Not held','No open T212 position matches "'+sym+'". Refresh the portfolio (↻) and use the exact symbol.');return}
   var qty=Number(pos.quantity||0);
-  var info=t212RefInfo(sym,space,pos.ticker);
-  var ref=info.price||Number(pos.currentPrice||0);
-  if(!(qty>0)||!(ref>0)){uiAlert('Missing data','Quantity or price unavailable — refresh the portfolio first.');return}
-  var flr=ref*0.995;
-  uiConfirm('💸 Sell ALL '+sym+' → cash','<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
-    qty+' shares ≈ '+cur+(qty*ref).toFixed(2)+'<br/>limit floor '+cur+flr.toFixed(2)+' (−0.5%)<br/>'+t212RefLine(cur,info)+'<br/>'+
-    '<span style="color:#b45309;font-size:10px">⚠ Any resting SL/Target on '+escHtml(pos.ticker)+' is cancelled first — T212 reserves shares.</span><br/>'+
-    '<span style="color:var(--t3);font-size:10px">Proceeds land in your T212 '+cur+' cash. Fill settles async — confirm in the T212 app.</span></div>',function(ok){
-    if(!ok)return;
-    try{Android.t212ManualSell(pos.ticker,qty,ref)}catch(e){uiAlert('Error',e.message)}
+  t212RefInfoAsync(sym,space,pos.ticker,function(info){
+    var ref=info.price||Number(pos.currentPrice||0);
+    if(!(qty>0)||!(ref>0)){uiAlert('Missing data','Quantity or price unavailable — refresh the portfolio first.');return}
+    var flr=ref*0.995;
+    uiConfirm('💸 Sell ALL '+sym+' → cash','<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
+      qty+' shares ≈ '+cur+(qty*ref).toFixed(2)+'<br/>limit floor '+cur+flr.toFixed(2)+' (−0.5%)<br/>'+t212RefLine(cur,info)+'<br/>'+
+      '<span style="color:#b45309;font-size:10px">⚠ Any resting SL/Target on '+escHtml(pos.ticker)+' is cancelled first — T212 reserves shares.</span><br/>'+
+      '<span style="color:var(--t3);font-size:10px">Proceeds land in your T212 '+cur+' cash. Fill settles async — confirm in the T212 app.</span></div>',function(ok){
+      if(!ok)return;
+      try{Android.t212ManualSell(pos.ticker,qty,ref)}catch(e){uiAlert('Error',e.message)}
+    });
   });
 }
 function t212PatientSellClick(space){
@@ -12845,18 +12978,19 @@ function t212PatientSellClick(space){
   var pos=t212FindPosition(sym);
   if(!pos){uiAlert('Not held','No open T212 position matches "'+sym+'". Refresh the portfolio (↻) and use the exact symbol.');return}
   var qty=Number(pos.quantity||0);
-  var info=t212RefInfo(sym,space,pos.ticker);
-  var ref=info.price||Number(pos.currentPrice||0);
-  if(!(qty>0)||!(ref>0)){uiAlert('Missing data','Quantity or price unavailable — refresh the portfolio first.');return}
-  var yv=(space==='DE')?(sym.indexOf('.')<0?sym+'.DE':sym):sym;
-  var atrProx=ref*0.015, startApx=ref+0.30*atrProx, floorApx=ref-0.20*atrProx;
-  uiConfirm('⏳ Patient sell '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
-    qty+' shares<br/>Starts ≈ '+cur+startApx.toFixed(2)+' (above), floor ≈ '+cur+floorApx.toFixed(2)+' — steps DOWN every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
-    '<span style="color:var(--am);font-size:10px">Holds out for a better price, re-reading the LIVE price at every step — only the floor is locked at start. If nothing fills by the floor it cancels and notifies. Nothing is left resting; never a market order.</span><br/>'+
-    '<span style="color:var(--t3);font-size:10px">Quantity is re-checked from your live position after every step, so a fill mid-way can never double-sell.</span></div>',function(ok){
-    if(!ok)return;
-    uiAlert('⏳ Patient sell started','Working '+escHtml(sym)+' down the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
-    try{Android.t212PatientSell(pos.ticker,yv,space,qty,ref)}catch(e){uiAlert('Error',e.message)}
+  t212RefInfoAsync(sym,space,pos.ticker,function(info){
+    var ref=info.price||Number(pos.currentPrice||0);
+    if(!(qty>0)||!(ref>0)){uiAlert('Missing data','Quantity or price unavailable — refresh the portfolio first.');return}
+    var yv=(space==='DE')?(sym.indexOf('.')<0?sym+'.DE':sym):sym;
+    var atrProx=ref*0.015, startApx=ref+0.30*atrProx, floorApx=ref-0.20*atrProx;
+    uiConfirm('⏳ Patient sell '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
+      qty+' shares<br/>Starts ≈ '+cur+startApx.toFixed(2)+' (above), floor ≈ '+cur+floorApx.toFixed(2)+' — steps DOWN every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
+      '<span style="color:var(--am);font-size:10px">Holds out for a better price, re-reading the LIVE price at every step — only the floor is locked at start. If nothing fills by the floor it cancels and notifies. Nothing is left resting; never a market order.</span><br/>'+
+      '<span style="color:var(--t3);font-size:10px">Quantity is re-checked from your live position after every step, so a fill mid-way can never double-sell.</span></div>',function(ok){
+      if(!ok)return;
+      uiAlert('⏳ Patient sell started','Working '+escHtml(sym)+' down the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
+      try{Android.t212PatientSell(pos.ticker,yv,space,qty,ref)}catch(e){uiAlert('Error',e.message)}
+    });
   });
 }
 function t212PatientBuyClick(space){
@@ -12867,18 +13001,19 @@ function t212PatientBuyClick(space){
   if(!sym){uiAlert('Enter a ticker','e.g. '+(space==='DE'?'MUV2, SAP, SIE':'AAPL, MSFT, NVDA')+'.');return}
   if(!(amt>0)){uiAlert('Enter an amount','Amount to buy, e.g. 25.');return}
   var heldPos=t212FindPosition(sym);
-  var info=t212RefInfo(sym,space,heldPos?heldPos.ticker:null);
-  var ref=info.price;
-  if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+space+' scan (or wait for the live ticker) so the app has a fresh reference price.');return}
-  var yv=(space==='DE')?(sym.indexOf('.')<0&&sym.indexOf('_')<0?sym+'.DE':sym):sym;
-  var atrProxB=ref*0.015, capApx=ref+0.50*atrProxB;
-  uiConfirm('⏳ Patient buy '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
-    '~'+cur+amt.toFixed(2)+'<br/>Starts ≈ '+cur+ref.toFixed(2)+' (at the price), pays up to ≈ '+cur+capApx.toFixed(2)+' max — steps UP every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
-    '<span style="color:var(--am);font-size:10px">Tries to buy cheap first; only pays up if it must — re-reading the LIVE price at every step, so a moving market can’t strand it. Only the cap is locked at start; it is never exceeded, never a market order. If the market runs past the cap it cancels and notifies.</span><br/>'+
-    '<span style="color:var(--t3);font-size:10px">Amount already bought is re-checked from your live position after every step, so a fill mid-way can never double-buy.</span></div>',function(ok){
-    if(!ok)return;
-    uiAlert('⏳ Patient buy started','Working '+escHtml(sym)+' up the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
-    try{Android.t212PatientBuy(sym,yv,space,amt,ref)}catch(e){uiAlert('Error',e.message)}
+  t212RefInfoAsync(sym,space,heldPos?heldPos.ticker:null,function(info){
+    var ref=info.price;
+    if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+space+' scan (or wait for the live ticker) so the app has a fresh reference price.');return}
+    var yv=(space==='DE')?(sym.indexOf('.')<0&&sym.indexOf('_')<0?sym+'.DE':sym):sym;
+    var atrProxB=ref*0.015, capApx=ref+0.50*atrProxB;
+    uiConfirm('⏳ Patient buy '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
+      '~'+cur+amt.toFixed(2)+'<br/>Starts ≈ '+cur+ref.toFixed(2)+' (at the price), pays up to ≈ '+cur+capApx.toFixed(2)+' max — steps UP every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
+      '<span style="color:var(--am);font-size:10px">Tries to buy cheap first; only pays up if it must — re-reading the LIVE price at every step, so a moving market can’t strand it. Only the cap is locked at start; it is never exceeded, never a market order. If the market runs past the cap it cancels and notifies.</span><br/>'+
+      '<span style="color:var(--t3);font-size:10px">Amount already bought is re-checked from your live position after every step, so a fill mid-way can never double-buy.</span></div>',function(ok){
+      if(!ok)return;
+      uiAlert('⏳ Patient buy started','Working '+escHtml(sym)+' up the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
+      try{Android.t212PatientBuy(sym,yv,space,amt,ref)}catch(e){uiAlert('Error',e.message)}
+    });
   });
 }
 // Live progress from a patient ladder — renders a persistent status banner so you
@@ -14456,8 +14591,10 @@ function renderGttCal(){
 
   // Fetch GTT data from Kotlin
   if(typeof Android!=='undefined'&&Android.fetchGttExecutionData){
+    // In the background — a slow Zerodha reply used to freeze the whole page.
+    androidAsync('fetchGttExecutionData',[],function(dataJson){
+    if(!document.getElementById('gtt-result'))return;   // moved on meanwhile
     try{
-      var dataJson=Android.fetchGttExecutionData();
       var data=JSON.parse(dataJson);
       if(data.error){
         document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">'+data.error+'</div>';
@@ -14509,6 +14646,7 @@ function renderGttCal(){
     }catch(e){
       document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Error: '+e.message+'</div>';
     }
+    });
   }else{
     document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Android bridge not available</div>';
   }
@@ -14670,21 +14808,22 @@ function detailBuy(sym,px){
   // Germany and the US reuse the existing ladder, per symbol rather than per form.
   if(typeof Android==='undefined'||!Android.t212PatientBuy){uiAlert('Unavailable','Rebuild the APK for this.');return}
   var pos=(typeof t212FindPosition==='function')?t212FindPosition(sym):null;
-  var info=(typeof t212RefInfo==='function')?t212RefInfo(sym,SPACE,pos?pos.ticker:null):{price:Number(px||0)};
-  var ref=Number((info&&info.price)||px||0);
-  if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+SPACE+' scan, or wait for the live ticker, so there is a fresh reference price.');return}
-  var cur=SPACE==='DE'?'€':'$';
-  var cap=ref+0.50*(ref*0.015);
-  var yv=(SPACE==='DE')?((sym.indexOf('.')<0&&sym.indexOf('_')<0)?sym+'.DE':sym):sym;
-  uiConfirm('⏳ Patient buy '+escHtml(sym),
-    '<div style="font-family:monospace;font-size:11px;line-height:1.7">~'+cur+amt.toFixed(2)+'<br/>'+
-    'Starts ≈ '+cur+ref.toFixed(2)+', pays up to ≈ '+cur+cap.toFixed(2)+' — steps up every 40s.<br/>'+
-    '<span style="color:var(--am);font-size:10px">Buys cheap first and only pays up if it must, re-reading the live price at every step. Never a market order; if the market runs past the cap it cancels and tells you.</span></div>',
-    function(ok){
-      if(!ok)return;
-      uiAlert('⏳ Patient buy started','Working '+escHtml(sym)+' up the ladder. You can leave this screen — a notification reports the fill.');
-      try{Android.t212PatientBuy(sym,yv,SPACE,amt,ref)}catch(e){uiAlert('Error',e.message)}
-    });
+  t212RefInfoAsync(sym,SPACE,pos?pos.ticker:null,function(info){
+    var ref=Number((info&&info.price)||px||0);
+    if(!(ref>0)){uiAlert('No price for '+sym,'Run a '+SPACE+' scan, or wait for the live ticker, so there is a fresh reference price.');return}
+    var cur=SPACE==='DE'?'€':'$';
+    var cap=ref+0.50*(ref*0.015);
+    var yv=(SPACE==='DE')?((sym.indexOf('.')<0&&sym.indexOf('_')<0)?sym+'.DE':sym):sym;
+    uiConfirm('⏳ Patient buy '+escHtml(sym),
+      '<div style="font-family:monospace;font-size:11px;line-height:1.7">~'+cur+amt.toFixed(2)+'<br/>'+
+      'Starts ≈ '+cur+ref.toFixed(2)+', pays up to ≈ '+cur+cap.toFixed(2)+' — steps up every 40s.<br/>'+
+      '<span style="color:var(--am);font-size:10px">Buys cheap first and only pays up if it must, re-reading the live price at every step. Never a market order; if the market runs past the cap it cancels and tells you.</span></div>',
+      function(ok){
+        if(!ok)return;
+        uiAlert('⏳ Patient buy started','Working '+escHtml(sym)+' up the ladder. You can leave this screen — a notification reports the fill.');
+        try{Android.t212PatientBuy(sym,yv,SPACE,amt,ref)}catch(e){uiAlert('Error',e.message)}
+      });
+  });
 }
 function detailSell(sym,qty,px){
   qty=Number(qty||0);
@@ -14708,21 +14847,22 @@ function detailSell(sym,qty,px){
   if(typeof Android==='undefined'||!Android.t212PatientSell){uiAlert('Unavailable','Rebuild the APK for this.');return}
   var pos=(typeof t212FindPosition==='function')?t212FindPosition(sym):null;
   if(!pos){uiAlert('Not held','No open Trading 212 position matches '+escHtml(sym)+'. Refresh the portfolio and try again.');return}
-  var info=(typeof t212RefInfo==='function')?t212RefInfo(sym,SPACE,pos.ticker):{price:Number(px||0)};
-  var ref=Number((info&&info.price)||px||0);
-  if(!(ref>0)){uiAlert('Missing price','Refresh the portfolio so there is a live price to work from.');return}
-  var cur=SPACE==='DE'?'€':'$';
-  var floorApx=ref-0.20*(ref*0.015);
-  var yv=(SPACE==='DE')?(sym.indexOf('.')<0?sym+'.DE':sym):sym;
-  uiConfirm('⏳ Patient sell '+escHtml(sym),
-    '<div style="font-family:monospace;font-size:11px;line-height:1.7">'+qty+' shares<br/>'+
-    'Holds out above, floor ≈ '+cur+floorApx.toFixed(2)+' — steps down every 40s.<br/>'+
-    '<span style="color:var(--am);font-size:10px">Holds out for a better price and concedes slowly. Quantity is re-read from your live position at every step, so a fill part-way can never double-sell.</span></div>',
-    function(ok){
-      if(!ok)return;
-      uiAlert('⏳ Patient sell started','Working '+escHtml(sym)+' down the ladder. A notification reports the fill.');
-      try{Android.t212PatientSell(pos.ticker,yv,SPACE,qty,ref)}catch(e){uiAlert('Error',e.message)}
-    });
+  t212RefInfoAsync(sym,SPACE,pos.ticker,function(info){
+    var ref=Number((info&&info.price)||px||0);
+    if(!(ref>0)){uiAlert('Missing price','Refresh the portfolio so there is a live price to work from.');return}
+    var cur=SPACE==='DE'?'€':'$';
+    var floorApx=ref-0.20*(ref*0.015);
+    var yv=(SPACE==='DE')?(sym.indexOf('.')<0?sym+'.DE':sym):sym;
+    uiConfirm('⏳ Patient sell '+escHtml(sym),
+      '<div style="font-family:monospace;font-size:11px;line-height:1.7">'+qty+' shares<br/>'+
+      'Holds out above, floor ≈ '+cur+floorApx.toFixed(2)+' — steps down every 40s.<br/>'+
+      '<span style="color:var(--am);font-size:10px">Holds out for a better price and concedes slowly. Quantity is re-read from your live position at every step, so a fill part-way can never double-sell.</span></div>',
+      function(ok){
+        if(!ok)return;
+        uiAlert('⏳ Patient sell started','Working '+escHtml(sym)+' down the ladder. A notification reports the fill.');
+        try{Android.t212PatientSell(pos.ticker,yv,SPACE,qty,ref)}catch(e){uiAlert('Error',e.message)}
+      });
+  });
 }
 window.onDetailTrade=function(json){
   var r;try{r=JSON.parse(json||'{}')}catch(e){uiAlert('Error',e.message);return}

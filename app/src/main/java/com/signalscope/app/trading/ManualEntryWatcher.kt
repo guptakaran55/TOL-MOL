@@ -805,6 +805,7 @@ object ManualEntryWatcher {
         // Buy triggers that have since fired. Before the reconcile below would
         // ever see them, and before the config check, because a trigger that
         // filled is a real position whether or not a strategy is attached.
+        try { restoreLostTriggers(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] trigger restore failed", e) }
         try { settleWaitingBuys(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] buy settle failed", e) }
         // YOUR OWN FLOOR AND CEILING DO NOT DEPEND ON A STRATEGY. They sit ABOVE
         // the config check on purpose: both are rules the user set by hand, and
@@ -1166,10 +1167,15 @@ object ManualEntryWatcher {
         // Recorded BEFORE the ladder runs: a ladder can take minutes and the
         // process can die mid-way, and an order with no record of why it was
         // placed is worse than no order at all.
-        ManualWatchStore.upsert(ctx, base, com.signalscope.app.data.ManualWatchStore.Entry(
+        // CLAIMED, NOT OVERWRITTEN. A second tap on the same signal used to write
+        // a fresh PENDING row over the first — over a ladder still running, or over
+        // a position already bought — and then run a second ladder. See
+        // [ManualWatchStore.claim].
+        ManualWatchStore.claim(ctx, base, com.signalscope.app.data.ManualWatchStore.Entry(
             symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
             requestedCash = cash, t212Ticker = ticker, createdAt = System.currentTimeMillis(),
             status = "PENDING", note = fresh.entryReason, forced = forced))
+            ?.let { return alreadyOnSignal(sym, it) }
 
         val r = try {
             PatientExecutor.buy(config, ticker, yahooSym, t212Space, cash, fresh.lastClose) { p ->
@@ -1316,10 +1322,13 @@ object ManualEntryWatcher {
         val forced = signalled == null
 
         val paperTradeId = "$sym-${fresh.entryTs}"
-        ManualWatchStore.upsert(ctx, base, ManualWatchStore.Entry(
+        // CLAIMED, NOT OVERWRITTEN — the Tata Steel bug. A repeat tap was refused
+        // by the broker and that refusal was written over the live trigger's row.
+        ManualWatchStore.claim(ctx, base, ManualWatchStore.Entry(
             symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
             requestedCash = cash, createdAt = System.currentTimeMillis(),
             status = "PENDING", note = fresh.entryReason))
+            ?.let { return alreadyOnSignal(sym, it) }
 
         // AN ORDINARY ORDER FIRST, A TRIGGER ONLY IF THE BROKER REFUSES ONE.
         // The two produce entries in completely different states and the flag on
@@ -1569,6 +1578,50 @@ object ManualEntryWatcher {
      * a triggered limit fills wherever the book was at that instant — and every
      * exit rule measures from this number.
      */
+    /** The refusal a second buy on the same signal gets, saying what is already there. */
+    private fun alreadyOnSignal(sym: String, standing: ManualWatchStore.Entry): BuyResult {
+        val what = when {
+            standing.status == "PENDING" && standing.gttId > 0L ->
+                "a buy trigger is already resting at the broker"
+            standing.status == "PENDING" -> "a buy is already being placed"
+            standing.status == "OPEN" || standing.filledQty > 0.0 -> "it has already been bought"
+            else -> "this signal has already been traded"
+        }
+        Log.w(TAG, "$sym: second buy on the same signal refused — $what")
+        return BuyResult(false, sym, error = "Not bought again: on this signal for $sym, $what. " +
+            "Nothing was changed. To add more, wait for the next signal or use the broker's app.")
+    }
+
+    /**
+     * PUT BACK A WAITING ORDER THE BOOK HAD WRITTEN OFF.
+     *
+     * The repair half of the Tata Steel bug: the new claim stops it happening
+     * again, but a row already overwritten stays wrong on its own. Its trigger
+     * is still resting at Zerodha, and if it fills the shares would arrive with
+     * no row to settle into — no strategy handover, no protective stop.
+     *
+     * The order mirror still has the truth. So where the book shows an attempt
+     * that bought nothing but the mirror holds a live trigger for the same
+     * signal, the book row is restored to waiting, with that trigger's id — the
+     * exact state the settle step below looks for.
+     */
+    private fun restoreLostTriggers(ctx: Context, base: String) {
+        if (base != "in") return
+        val ns = ManualWatchStore.nsFor(base)
+        val dead = ManualWatchStore.load(ctx, base).entries.filter { ManualWatchStore.isDeadAttempt(it) }
+        for (e in dead) {
+            val row = com.signalscope.app.data.ZerodhaLiveStore
+                .forTrade(ctx, ns, "${e.symbol.uppercase()}-${e.signalBarTs}") ?: continue
+            val gtt = row.gttId ?: 0L
+            if (row.status != "PENDING" || gtt <= 0L) continue
+            ManualWatchStore.upsert(ctx, base, e.copy(status = "PENDING", gttId = gtt,
+                closedAt = 0L,
+                note = "restored — a later tap had overwritten this record while its " +
+                    "trigger was still waiting at Zerodha"))
+            Log.w(TAG, "[$base] ${e.symbol}: restored a waiting trigger (GTT $gtt) the book had written off")
+        }
+    }
+
     private fun settleWaitingBuys(ctx: Context, base: String) {
         if (base != "in") return
         val st = ManualWatchStore.load(ctx, base)
