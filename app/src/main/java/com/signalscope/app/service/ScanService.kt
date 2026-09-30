@@ -611,7 +611,7 @@ class ScanService : Service() {
                 com.signalscope.app.data.MacdGateStore.load(applicationContext, n).enabled
             } catch (e: Exception) { false }
             s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
-        }
+        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(applicationContext) } catch (e: Exception) { false }
         if (!anyActive) {
             Log.i(TAG, "Strategy Lab tick skipped ($reason): no enabled/enrolled paper labs")
             updateScanNotification("Strategy Lab: nothing enabled")
@@ -695,6 +695,12 @@ class ScanService : Service() {
                 }
             } catch (e: Exception) { Log.w(TAG, "manual watcher [$sp] failed: ${e.message}") }
         }
+        // FLOOR-ORDER ALGOS — paper only, last in the pass for the same reason as
+        // the watcher: nothing here holds real money, so it never goes ahead of
+        // anything that does.
+        val floorNote = try {
+            withContext(Dispatchers.IO) { com.signalscope.app.trading.FloorAlgoEngine.runAll(applicationContext) }
+        } catch (e: Exception) { Log.w(TAG, "floor algos failed: ${e.message}"); "" }
         if (completed) {
             Log.i(TAG, "Strategy Lab tick complete ($reason): ${nsList.size} ns [${nsList.joinToString(",")}]")
             // NAME WHAT IT DID. "Paper tick complete" told the user a thing had
@@ -712,6 +718,7 @@ class ScanService : Service() {
                 append("Checked ${nsList.size} algos")
                 if (open >= 0) append(" · $open open")
                 if (watchBits.isNotEmpty()) append(" · watcher ${watchBits.joinToString(", ")}")
+                if (floorNote.isNotEmpty()) append(" · $floorNote")
             }
             // Land on whatever the pass actually produced: the watch list when a
             // watcher raised something, the algos otherwise.
@@ -2924,7 +2931,7 @@ object StrategyLabScheduler {
                 com.signalscope.app.data.MacdGateStore.load(ctx, ns).enabled
             } catch (e: Exception) { false }
             s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
-        }
+        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(ctx) } catch (e: Exception) { false }
 
     private fun nextQuarterWithGraceMs(): Long {
         val now = System.currentTimeMillis()

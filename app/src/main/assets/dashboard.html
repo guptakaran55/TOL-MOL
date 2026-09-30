@@ -9642,6 +9642,7 @@ function renderAlgos(){
   var r;try{r=JSON.parse(Android.bucketsList(SPACE)||'{}')}catch(e){r={}}
   if(!r.ok){h+='<div class="empty">Algos unavailable: '+escHtml(r.error||'')+'</div></div>';document.getElementById('app').innerHTML=h;return;}
   var buckets=r.buckets||[];
+  var FL=floorAlgos();
   // Saved replay results, read ONCE per render and shared by every card and the
   // comparison table below — a per-card bridge call would be N reads of the same
   // file on every repaint.
@@ -9659,7 +9660,7 @@ function renderAlgos(){
   // compact balance strip (USDC free / can-trade) so setting an algo's live budget
   // has context, without duplicating the whole wallet panel across two tabs.
   if(SPACE==='BN'){ h+=renderBinanceWalletStrip(); }
-  h+='<div style="display:flex;align-items:center;gap:8px;margin:6px 2px 10px"><span style="font-size:15px;font-weight:900;color:var(--t1)">🤖 Algos</span><span style="font-size:9px;color:var(--t3)">'+buckets.length+' in '+spaceLabel()+'</span><span style="flex:1"></span><span onclick="algosCreate()" style="cursor:pointer;padding:6px 12px;background:rgba(124,58,237,.14);border:1px solid rgba(124,58,237,.5);color:var(--pu);border-radius:7px;font-size:12px;font-weight:800">＋ New algo</span></div>';
+  h+='<div style="display:flex;align-items:center;gap:8px;margin:6px 2px 10px"><span style="font-size:15px;font-weight:900;color:var(--t1)">🤖 Algos</span><span style="font-size:9px;color:var(--t3)">'+(buckets.length+FL.algos.length)+' in '+spaceLabel()+'</span><span style="flex:1"></span><span onclick="algosCreate()" style="cursor:pointer;padding:6px 12px;background:rgba(124,58,237,.14);border:1px solid rgba(124,58,237,.5);color:var(--pu);border-radius:7px;font-size:12px;font-weight:800">＋ New algo</span></div>';
   h+=fxCostStrip();
   h+='<div style="font-size:9px;color:var(--t3);margin:0 2px 12px;line-height:1.5">Each algo = a strategy config + a group of companies + capital + a mode. Runs independently on paper. '+(SPACE==='BN'?'<b style="color:#b45309">Crypto algos can place REAL Binance orders</b> — opt-in per algo. The 2-coin universe is too small to screen, but <b>MACD gate 3b still applies</b>: it runs gate-only, holding each coin only while its daily MACD slope is positive.':(SPACE==='IN'?'<b>Indian algos are paper-only.</b> The strategy, screener, gate, seats and replay all run exactly as they do elsewhere — there is no Zerodha order mirror behind them, so nothing here can place a real trade.':'Stock algos place real orders only when the algo itself is armed, funded and lists the name.'))+'</div>';
   // These three read the Trading 212 account. India runs the same algo machinery
@@ -9674,7 +9675,7 @@ function renderAlgos(){
   // to test: an entry is one plain order and a GTT, both of which either work or
   // report an error immediately.
   if(SPACE==='IN')h+=zerodhaGatesPanel();
-  if(!buckets.length){
+  if(!buckets.length&&!FL.algos.length){
     h+='<div class="empty" style="margin:24px 2px"><b>No algos yet.</b><br/><br/>Tap <b>＋ New algo</b> to create your first strategy.</div>';
   }else{
     // LIVE first, then ARMED, then paper — the algos that can move real money
@@ -9685,6 +9686,9 @@ function renderAlgos(){
     // slice() because `buckets` is read again below for the comparison table.
     buckets.slice().sort(function(x,y){return algoLiveRank(x)-algoLiveRank(y)})
       .forEach(function(b){h+=algosCard(b);});
+    // Floor-order algos after the config ones: paper only, so never above
+    // anything that can move real money.
+    FL.algos.forEach(function(x){h+=floorCard(x,FL.cur||spaceCurrency());});
   }
   // US/DE: the SCREENER lives here as a shared tool (rank the space's universe
   // to decide which companies to put in a bucket). Per-bucket charts, backtest,
@@ -12178,10 +12182,309 @@ function algoSoldByHand(ns,sym,mode){
 }
 function algosToggle(ns){ALGOS_STATE.openNs=(ALGOS_STATE.openNs===ns)?null:ns;render();}
 function algosCreate(){
-  uiConfirm('New algo','<div style="font-size:11px;color:var(--t2);margin-bottom:8px">Name this strategy for '+spaceLabel()+'.</div><input id="alg-newname" placeholder="e.g. Momentum, Value, Rockets" style="width:100%;padding:8px;font-size:12px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>',function(ok){
+  // TWO KINDS OF ALGO. The standard one takes its rules from a config file you
+  // attach. Floor orders have their rules built in (paper only), so they need no
+  // file — only a name, and their few numbers live on the card.
+  var floorOk=(SPACE==='DE'||SPACE==='US'||SPACE==='IN')&&typeof Android!=='undefined'&&!!Android.floorCreate;
+  var kind=!floorOk?'':
+    '<div style="font-size:10px;font-weight:800;color:var(--t2);margin:12px 0 5px">Kind</div>'+
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-bottom:7px;line-height:1.4"><input type="radio" name="alg-kind" value="std" checked style="margin-top:2px"/><span><b>Standard</b><br/><span style="font-size:10px;color:var(--t3)">Rules come from a config file you attach. Can be armed for real orders.</span></span></label>'+
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);line-height:1.4"><input type="radio" name="alg-kind" value="floor" style="margin-top:2px"/><span><b>Floor orders</b> <span style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px">PAPER ONLY</span><br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. On the top stocks by return on capital, whose monthly and daily MACD are both rising: two resting buy orders a day at the recent low. Can never place a real order.</span></span></label>';
+  uiConfirm('New algo','<div style="font-size:11px;color:var(--t2);margin-bottom:8px">Name this strategy for '+spaceLabel()+'.</div><input id="alg-newname" placeholder="e.g. Momentum, Value, Rockets" style="width:100%;padding:8px;font-size:12px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>'+kind,function(ok){
     if(!ok)return;
     var name=(document.getElementById('alg-newname')||{}).value||'';
+    var k=(document.querySelector('input[name="alg-kind"]:checked')||{}).value||'std';
+    if(k==='floor'){
+      try{
+        var f=JSON.parse(Android.floorCreate(SPACE,name)||'{}');
+        if(!f.ok){uiAlert('Could not create',escHtml(f.error||''));return}
+        ALGOS_STATE.openNs=f.ns;render();floorRun(f.id);
+      }catch(e){uiAlert('Error',e.message)}
+      return;
+    }
     try{var r=JSON.parse(Android.bucketCreate(SPACE,name)||'{}');if(!r.ok){uiAlert('Could not create',escHtml(r.error||''));return}ALGOS_STATE.openNs=r.ns;render();}catch(e){uiAlert('Error',e.message)}
+  });
+}
+// ── FLOOR-ORDER ALGOS (paper only) ─────────────────────────────────────────
+// Their own card, because the story is different from a config algo: no replay,
+// no arming, no broker — a daily plan of resting orders, the fills, and what the
+// price did after each one. That last part is the point of running it.
+var FLOOR_BUSY={};       // id → true while a check is running
+var FLOOR_TAB={};        // id → which list is showing
+function floorAlgos(){
+  if(typeof Android==='undefined'||!Android.floorList)return {algos:[],cur:spaceCurrency()};
+  try{var r=JSON.parse(Android.floorList(SPACE)||'{}');if(r.ok)return r}catch(e){}
+  return {algos:[],cur:spaceCurrency()};
+}
+function floorPx(v){v=Number(v||0);return v>=1000?v.toFixed(1):v.toFixed(2)}
+function floorPct(v,d){
+  if(v==null||!isFinite(Number(v)))return '<span style="color:var(--t3)">—</span>';
+  v=Number(v);return '<span style="color:'+(v>=0?'var(--gn)':'var(--rd)')+'">'+(v>=0?'+':'')+v.toFixed(d==null?2:d)+'%</span>';
+}
+var FLOOR_WD=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'],FLOOR_MO=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function floorDate(s){var p=String(s||'').split('-');return p.length===3?new Date(Date.UTC(+p[0],+p[1]-1,+p[2])):null}
+function floorDay(s){var d=floorDate(s);return d?FLOOR_WD[d.getUTCDay()]+' '+d.getUTCDate()+' '+FLOOR_MO[d.getUTCMonth()]:''}
+function floorClock(sec){if(!sec)return '';var d=new Date(Number(sec)*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}
+// The day a position is due to be sold, counting weekdays only. An estimate: a
+// market holiday on the way pushes it a day later, which the engine handles.
+function floorSellEstimate(day,n){
+  var d=floorDate(day);if(!d)return '';
+  while(n>0){d.setUTCDate(d.getUTCDate()+1);var w=d.getUTCDay();if(w!==0&&w!==6)n--;}
+  return FLOOR_WD[d.getUTCDay()]+' '+d.getUTCDate()+' '+FLOOR_MO[d.getUTCMonth()];
+}
+function floorDot(sign){
+  if(sign===1)return '<span style="color:var(--gn)" title="rising">●</span>';
+  if(sign===-1)return '<span style="color:var(--rd)" title="falling">●</span>';
+  if(sign===0)return '<span style="color:var(--t3)" title="flat">●</span>';
+  return '<span style="color:var(--t3)" title="not checked">○</span>';
+}
+function floorStats(a){
+  var T=a.trades||[],s=a.settings||{};
+  var open=T.filter(function(t){return t.status==='OPEN'});
+  var sold=T.filter(function(t){return t.status==='SOLD'});
+  var missed=T.filter(function(t){return t.status==='MISSED'});
+  var booked=0;sold.forEach(function(t){booked+=Number(t.pnl||0)});
+  var openPnl=0;open.forEach(function(t){openPnl+=Number(t.qty||0)*Number(t.lastPrice||0)-Number(t.cost||0)});
+  var wins=sold.filter(function(t){return Number(t.pnl)>0}).length;
+  function avg(k){
+    var v=T.map(function(t){return t[k]}).filter(function(x){return x!=null&&isFinite(Number(x))}).map(Number);
+    if(!v.length)return null;
+    var m=0;v.forEach(function(x){m+=x});
+    return {m:m/v.length,n:v.length,up:v.filter(function(x){return x>0}).length};
+  }
+  return {open:open,sold:sold,missed:missed,booked:booked,openPnl:openPnl,wins:wins,
+    r1:avg('ret1'),r3:avg('ret3'),r5:avg('ret5'),dip:avg('dip'),cap:Number(s.capital||1000),
+    resting:(a.orders||[]).filter(function(o){return o.status==='RESTING'}).length};
+}
+function floorCard(x,cur){
+  var a=x.a||{},ns=x.ns,id=a.id,s=a.settings||{},st=floorStats(a);
+  var opend=(ALGOS_STATE.openNs===ns);
+  var tot=(st.booked+st.openPnl)/st.cap*100;
+  var h='<div data-dk="alg-cost-'+ns+'" style="border:1px solid '+(opend?'rgba(13,148,136,.55)':'var(--bd)')+';border-radius:9px;margin-bottom:8px;overflow:hidden;background:'+(opend?'rgba(13,148,136,.05)':'var(--bg2)')+'">';
+  h+='<div onclick="floorToggle(\''+ns+'\')" style="cursor:pointer;padding:9px 11px 7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
+    '<span style="font-size:13px;font-weight:800;color:var(--t1)">'+escHtml(a.name||'')+'</span>'+
+    '<span onclick="event.stopPropagation();floorRename(\''+id+'\')" title="Rename" style="cursor:pointer;font-size:10px;color:var(--t3);padding:0 2px">✏️</span>'+
+    '<span title="Built-in rules, paper only — this algo cannot place a real order." style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px;border:1px solid rgba(13,148,136,.4)">PAPER · floor orders</span>'+
+    (a.enabled?'':'<span style="font-size:8px;font-weight:800;background:rgba(245,158,11,.18);color:#b45309;padding:1px 5px;border-radius:3px">PAUSED</span>')+
+    '<span onclick="event.stopPropagation();floorBell(\''+id+'\','+(a.notify!==false)+')" title="Notifications for this algo" style="cursor:pointer;padding:0 2px;font-size:11px;opacity:'+(a.notify!==false?'1':'.45')+'">'+(a.notify!==false?'🔔':'🔕')+'</span>'+
+    '<span style="flex:1"></span>'+
+    '<span style="font-size:7px;font-weight:800;color:var(--t3);letter-spacing:.5px">BOOK</span>'+
+    '<span style="font-family:monospace;font-size:11px;font-weight:800;color:'+(tot>=0?'var(--gn)':'var(--rd)')+'">'+(tot>=0?'+':'')+tot.toFixed(1)+'%</span>'+
+    '<span style="color:var(--t3);font-size:11px">'+(opend?'▲':'▼')+'</span></div>';
+  h+='<div onclick="floorToggle(\''+ns+'\')" style="cursor:pointer;padding:0 11px 8px;display:flex;gap:8px;flex-wrap:wrap;font-size:9px;color:var(--t3)">'+
+    '<span>'+(st.booked>=0?'+':'−')+cur+Math.abs(st.booked).toFixed(2)+' booked</span>'+
+    (st.open.length?'<span style="color:'+(st.openPnl>=0?'var(--gn)':'var(--rd)')+'">⊕'+(st.openPnl>=0?'+':'−')+cur+Math.abs(st.openPnl).toFixed(2)+' open</span>':'')+
+    '<span>'+st.open.length+'/'+(s.seats||5)+' seats</span>'+
+    (a.planDay&&st.resting?'<span>'+st.resting+' stocks with orders resting</span>':'')+
+    (FLOOR_BUSY[id]?'<span><span class="sp" style="width:8px;height:8px;display:inline-block;vertical-align:middle;margin:0"></span> checking…</span>':'')+
+    '</div>';
+  if(opend)h+=floorDetail(a,cur,st);
+  return h+'</div>';
+}
+function floorBtn(label,onclick,col){
+  return '<span onclick="'+onclick+'" style="cursor:pointer;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:800;background:var(--bg);border:1px solid '+(col||'var(--bd)')+';color:'+(col||'var(--t2)')+'">'+label+'</span>';
+}
+function floorDetail(a,cur,st){
+  var s=a.settings||{},id=a.id,half=Number(s.capital||1000)/Math.max(1,Number(s.seats||5))/2;
+  var h='<div style="padding:0 11px 11px;border-top:1px solid var(--bd)">';
+  // The rules, in words — there is no config file to read them from.
+  h+='<div style="font-size:10px;color:var(--t2);line-height:1.55;margin:9px 0 8px;padding:7px 9px;background:var(--bg);border:1px solid var(--bd);border-radius:6px">'+
+    'Universe: the top <b>'+(s.universeSize||30)+'</b> stocks by return on capital in Discovery.<br/>'+
+    'Only stocks whose <b>monthly and daily MACD slopes are both rising</b> get orders.<br/>'+
+    'Each trading day: half a seat ('+cur+half.toFixed(0)+') at the <b>lowest price of the last '+(s.lowDays||3)+' trading days</b>, half <b>'+Number(s.secondPct==null?2:s.secondPct).toFixed(1)+'% below</b> it.<br/>'+
+    'A half fills only if the price trades <b>below</b> it. What has not filled expires at the close.<br/>'+
+    'Sold at the close <b>'+(s.holdDays||3)+' trading days</b> after buying. '+(s.seats||5)+' seats, one stock each.<br/>'+
+    '<span style="color:var(--t3)">Paper only — no real orders. Prices as given: no fees, slippage or data delay.</span></div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">'+
+    floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
+    floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
+    floorBtn('⚙ Settings','floorSettingsDlg(\''+id+'\')')+
+    floorBtn('🗑 Delete','floorDelete(\''+id+'\')','var(--rd)')+'</div>';
+  if(a.lastNote)h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">'+escHtml(a.lastNote)+'</div>';
+  // Money and results.
+  var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
+  var sgn=function(v){return (v>=0?'+':'−')+cur+Math.abs(v).toFixed(2)};
+  h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
+    cell('BOOKED',sgn(st.booked),st.sold.length+' sold · '+st.wins+' won')+
+    cell('OPEN',sgn(st.openPnl),st.open.length+' of '+(s.seats||5)+' seats')+
+    cell('CAPITAL',cur+Number(s.capital||1000).toFixed(0),(s.seats||5)+' × '+cur+(half*2).toFixed(0))+
+    cell('MISSED',String(st.missed.length),'seats were full')+'</div>';
+  var oc=function(lab,o){return cell(lab,o?floorPct(o.m):'—',o?(o.n+' buys · '+Math.round(o.up*100/o.n)+'% up'):'none yet')};
+  h+='<div style="font-size:9px;color:var(--t3);margin:8px 0 4px">What the price did after each buy — every fill, including the missed ones:</div>';
+  h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:9px">'+
+    oc('1 DAY',st.r1)+oc('3 DAYS',st.r3)+oc('5 DAYS',st.r5)+
+    cell('DEEPEST DIP',st.dip?floorPct(st.dip.m):'—',st.dip?'average, within 5 days':'none yet')+'</div>';
+  // The lists.
+  var tab=FLOOR_TAB[id]||'orders';
+  var tabs=[['orders','Orders'],['held','Held ('+st.open.length+')'],['closed','Closed ('+(st.sold.length+st.missed.length)+')'],['universe','Universe'],['log','Log']];
+  h+='<div style="display:flex;gap:12px;border-bottom:1px solid var(--bd);margin-bottom:6px">';
+  tabs.forEach(function(t){
+    h+='<span onclick="FLOOR_TAB[\''+id+'\']=\''+t[0]+'\';renderKeepScroll()" style="cursor:pointer;padding:4px 0;font-size:10px;font-weight:800;color:'+(tab===t[0]?'#0d9488':'var(--t3)')+';border-bottom:2px solid '+(tab===t[0]?'#0d9488':'transparent')+'">'+t[1]+'</span>';
+  });
+  h+='</div>';
+  if(tab==='orders')h+=floorOrdersList(a,cur);
+  else if(tab==='held')h+=floorHeldList(a,cur);
+  else if(tab==='closed')h+=floorClosedList(a,cur);
+  else if(tab==='universe')h+=floorUniverseList(a);
+  else h+=floorLogList(a);
+  return h+'</div>';
+}
+var FLOOR_TH='padding:3px 4px;font-weight:800;color:var(--t3);text-align:right;white-space:nowrap';
+var FLOOR_TD='padding:4px;text-align:right;white-space:nowrap';
+function floorTable(head,rows){
+  return '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-family:monospace;font-size:9px">'+
+    '<tr>'+head.map(function(c,i){return '<th style="'+FLOOR_TH+(i===0?';text-align:left':'')+'">'+c+'</th>'}).join('')+'</tr>'+
+    rows.join('')+'</table></div>';
+}
+function floorStock(sym,name){
+  return '<td style="padding:4px;text-align:left;max-width:110px;overflow:hidden;text-overflow:ellipsis"><b style="color:var(--t1)">'+escHtml(sym)+'</b>'+
+    (name?'<br/><span style="font-family:system-ui;font-size:8px;color:var(--t3)">'+escHtml(String(name).slice(0,22))+'</span>':'')+'</td>';
+}
+function floorLegCell(leg,ended){
+  if(leg&&leg.filledSec>0)return '<td style="'+FLOOR_TD+';color:var(--gn);font-weight:800">✓ '+floorPx(leg.fillPrice)+'<br/><span style="font-weight:400;color:var(--t3)">'+floorClock(leg.filledSec)+'</span></td>';
+  return '<td style="'+FLOOR_TD+'">'+floorPx(leg&&leg.price)+'<br/><span style="color:var(--t3)">'+(ended?'expired':'resting')+'</span></td>';
+}
+function floorOrdersList(a,cur){
+  var O=(a.orders||[]).slice();
+  var today=a.planDay?floorDay(a.planDay):'';
+  if(!O.length){
+    var why=!a.enabled?'This algo is paused, so it places no orders.'
+      :!(a.universe||[]).length?'No universe yet — it comes from the Discovery scan of this market. Run one if there is none, then ↻ Check now.'
+      :a.planDay?'No stock in the universe is rising on both month and day, so no orders were placed for '+today+'.'
+      :'Orders are planned from 06:00 on each trading day, from the previous days’ prices.';
+    return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">'+why+'</div>';
+  }
+  var rank={};(a.universe||[]).forEach(function(m,i){rank[m.symbol]=i});
+  O.sort(function(x,y){
+    var fx=(x.first.filledSec>0?1:0)+(x.second.filledSec>0?1:0),fy=(y.first.filledSec>0?1:0)+(y.second.filledSec>0?1:0);
+    return fy-fx||((rank[x.symbol]||0)-(rank[y.symbol]||0));
+  });
+  var anyOpen=O.some(function(o){return o.status==='RESTING'});
+  var rows=O.map(function(o){
+    var ended=o.status!=='RESTING';
+    return '<tr style="border-top:1px solid var(--bd)">'+floorStock(o.symbol,o.name)+
+      '<td style="'+FLOOR_TD+';color:var(--t3)">'+floorPx(o.low)+'</td>'+floorLegCell(o.first,ended)+floorLegCell(o.second,ended)+'</tr>';
+  });
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px">'+(anyOpen?'Resting':'Ended')+' · orders for <b>'+today+'</b> · '+O.length+' stocks × 2 halves of '+cur+(Number((a.settings||{}).capital||1000)/Math.max(1,Number((a.settings||{}).seats||5))/2).toFixed(0)+'</div>'+
+    floorTable(['STOCK',((a.settings||{}).lowDays||3)+'-DAY LOW','1ST HALF','2ND HALF'],rows);
+}
+function floorHeldList(a,cur){
+  var s=a.settings||{};
+  var T=(a.trades||[]).filter(function(t){return t.status==='OPEN'});
+  if(!T.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">Nothing held.</div>';
+  var rows=T.map(function(t){
+    var entry=t.qty>0?t.cost/t.qty:0,pct=entry>0?(t.lastPrice/entry-1)*100:null;
+    return '<tr style="border-top:1px solid var(--bd)">'+floorStock(t.symbol,t.name)+
+      '<td style="'+FLOOR_TD+'">'+floorDay(t.day)+'<br/><span style="color:var(--t3)">'+(t.halves>=2?'full seat':'half seat')+'</span></td>'+
+      '<td style="'+FLOOR_TD+'">'+floorPx(entry)+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+floorPx(t.lastPrice)+'<br/><span style="color:var(--t3)">'+floorClock(t.lastSec)+'</span></td>'+
+      '<td style="'+FLOOR_TD+';font-weight:800">'+floorPct(pct)+'</td>'+
+      '<td style="'+FLOOR_TD+';color:var(--t3)">~'+floorSellEstimate(t.day,s.holdDays||3)+'</td></tr>';
+  });
+  return floorTable(['STOCK','BOUGHT','AVG','NOW','P&L','SELLS'],rows);
+}
+function floorClosedList(a,cur){
+  var T=(a.trades||[]).filter(function(t){return t.status!=='OPEN'}).slice().reverse();
+  if(!T.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">Nothing sold yet.</div>';
+  var rows=T.slice(0,60).map(function(t){
+    var entry=t.qty>0?t.cost/t.qty:0,missed=t.status==='MISSED';
+    var pl=missed?'<span style="color:var(--t3)">not bought</span>':floorPct(t.cost>0?t.pnl/t.cost*100:null);
+    return '<tr style="border-top:1px solid var(--bd)'+(missed?';opacity:.7':'')+'">'+floorStock(t.symbol,missed?'missed — seats full':'')+
+      '<td style="'+FLOOR_TD+'">'+floorDay(t.day)+'<br/><span style="color:var(--t3)">'+floorPx(entry)+'</span></td>'+
+      '<td style="'+FLOOR_TD+'">'+(t.sellDay?floorDay(t.sellDay)+'<br/><span style="color:var(--t3)">'+floorPx(t.sellPrice)+'</span>':'—')+'</td>'+
+      '<td style="'+FLOOR_TD+';font-weight:800">'+pl+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+floorPct(t.ret1,1)+'</td><td style="'+FLOOR_TD+'">'+floorPct(t.ret3,1)+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+floorPct(t.ret5,1)+'</td><td style="'+FLOOR_TD+'">'+floorPct(t.dip,1)+'</td></tr>';
+  });
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px">1D / 3D / 5D: the price that many trading days after buying. DIP: the deepest it fell below the buying price within 5 days.</div>'+
+    floorTable(['STOCK','BOUGHT','SOLD','P&L','1D','3D','5D','DIP'],rows);
+}
+function floorUniverseList(a){
+  var U=a.universe||[];
+  if(!U.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No universe yet. It is taken from this market’s Discovery scan, sorted by return on capital.</div>';
+  var rising=U.filter(function(m){return m.month===1&&m.day===1}).length;
+  var rows=U.map(function(m,i){
+    var up=m.month===1&&m.day===1;
+    return '<tr style="border-top:1px solid var(--bd)'+(up?';background:rgba(5,150,105,.06)':'')+'"><td style="'+FLOOR_TD+';text-align:left;color:var(--t3)">'+(i+1)+'</td>'+floorStock(m.symbol,m.name)+
+      '<td style="'+FLOOR_TD+'">'+(m.roce!=null?Number(m.roce).toFixed(1)+'%':'—')+'</td>'+
+      '<td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.month)+'</td><td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.day)+'</td>'+
+      '<td style="'+FLOOR_TD+';text-align:left;font-family:system-ui;color:'+(up?'var(--gn)':'var(--t3)')+'">'+escHtml(m.note||'')+'</td></tr>';
+  });
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">Top '+U.length+' by return on capital'+(a.universeFrom?' · Discovery scan of '+new Date(Number(a.universeFrom)).toLocaleDateString('en-GB',{day:'numeric',month:'short'}):'')+
+    (a.planDay?' · <b style="color:var(--gn)">'+rising+'</b> rising on month and day for '+floorDay(a.planDay):'')+'. ○ = not checked (the daily slope is checked first).</div>'+
+    floorTable(['#','STOCK','ROC','1M','1D','TODAY'],rows);
+}
+function floorLogList(a){
+  var L=a.log||[];
+  if(!L.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">Nothing yet.</div>';
+  return '<div style="font-family:monospace;font-size:9px;color:var(--t2);line-height:1.6;max-height:260px;overflow-y:auto">'+L.map(function(l){return '<div style="border-top:1px solid var(--bd);padding:2px 0">'+escHtml(l)+'</div>'}).join('')+'</div>';
+}
+function floorToggle(ns){ALGOS_STATE.openNs=(ALGOS_STATE.openNs===ns)?null:ns;renderKeepScroll();}
+function floorRun(id){
+  if(FLOOR_BUSY[id])return;
+  FLOOR_BUSY[id]=true;
+  if(STATE.tab==='algos')renderKeepScroll();
+  androidAsync('floorRunNow',[id],function(raw){
+    delete FLOOR_BUSY[id];
+    var r={};try{r=JSON.parse(raw||'{}')}catch(e){}
+    if(r&&r.ok===false&&r.error)uiAlert('Check failed',escHtml(r.error));
+    if(STATE.tab==='algos')renderKeepScroll();
+  });
+}
+function floorPause(id,on){
+  var go=function(){
+    try{var r=JSON.parse(Android.floorSetEnabled(id,on)||'{}');if(!r.ok){uiAlert('Could not change',escHtml(r.error||''));return}}catch(e){uiAlert('Error',e.message);return}
+    if(on)floorRun(id);else renderKeepScroll();
+  };
+  if(on){go();return}
+  uiConfirm('Pause this algo?','<div style="font-size:11px;line-height:1.5">Today’s resting orders are cancelled and no new ones are placed. Anything already held is still sold on schedule, and results keep being filled in.</div>',function(ok){if(ok)go()});
+}
+function floorBell(id,wasOn){
+  try{Android.floorSetNotify(id,!wasOn)}catch(e){}
+  renderKeepScroll();
+}
+function floorFind(id){var f=floorAlgos();for(var i=0;i<f.algos.length;i++)if(f.algos[i].a.id===id)return f.algos[i].a;return null}
+function floorRename(id){
+  var a=floorFind(id);if(!a)return;
+  uiConfirm('✏️ Rename algo','<input id="floor-rename" value="'+escHtml(a.name||'')+'" maxlength="40" style="width:100%;padding:8px;font-size:13px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>',function(ok){
+    if(!ok)return;
+    var v=((document.getElementById('floor-rename')||{}).value||'').trim();
+    try{var r=JSON.parse(Android.floorRename(id,v)||'{}');if(!r.ok){uiAlert('Rename failed',escHtml(r.error||''));return}}catch(e){uiAlert('Error',e.message);return}
+    renderKeepScroll();
+  });
+}
+function floorSettingsDlg(id){
+  var a=floorFind(id);if(!a)return;
+  var s=a.settings||{},cur=spaceCurrency();
+  var row=function(key,label,val,hint,step){
+    return '<div style="margin-bottom:9px"><div style="font-size:11px;font-weight:700;color:var(--t1)">'+label+'</div>'+
+      '<input id="fl-'+key+'" type="number" inputmode="decimal" step="'+(step||'1')+'" value="'+val+'" style="width:100%;padding:7px;font-size:13px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px;margin-top:3px"/>'+
+      '<div style="font-size:9px;color:var(--t3);margin-top:2px">'+hint+'</div></div>';
+  };
+  uiConfirm('⚙ '+escHtml(a.name||'Settings'),
+    '<div style="font-size:10px;color:var(--t3);margin-bottom:9px;line-height:1.5">New numbers apply to orders placed from now on. What is already resting or held keeps its size.</div>'+
+    row('cap','Capital ('+cur+')',Number(s.capital||1000),'Paper money for the whole algo.','10')+
+    row('seats','Seats',s.seats||5,'Stocks held at once. Each order is half a seat.')+
+    row('uni','Universe size',s.universeSize||30,'Top stocks by return on capital from Discovery.')+
+    row('low','Low of how many trading days',s.lowDays||3,'The first order rests at the lowest price of these days.')+
+    row('sec','Second order, % below the first',Number(s.secondPct==null?2:s.secondPct),'0 puts both halves at the low.','0.5')+
+    row('hold','Sell after how many trading days',s.holdDays||3,'Sold at that day’s close.'),
+    function(ok){
+      if(!ok)return;
+      var g=function(k){return Number(((document.getElementById('fl-'+k)||{}).value||'').replace(',','.'))};
+      try{
+        var r=JSON.parse(Android.floorSettings(id,g('cap'),Math.round(g('seats')),Math.round(g('uni')),Math.round(g('low')),g('sec'),Math.round(g('hold')))||'{}');
+        if(!r.ok){uiAlert('Not saved',escHtml(r.error||''));return}
+      }catch(e){uiAlert('Error',e.message);return}
+      renderKeepScroll();
+    });
+}
+function floorDelete(id){
+  var a=floorFind(id);if(!a)return;
+  uiConfirm('Delete '+escHtml(a.name||'this algo')+'?','<div style="font-size:11px;line-height:1.5">Its whole paper record — orders, trades and results — is removed. This cannot be undone. Nothing real is affected: it never placed a real order.</div>',function(ok){
+    if(!ok)return;
+    try{var r=JSON.parse(Android.floorDelete(id)||'{}');if(!r.ok){uiAlert('Could not delete',escHtml(r.error||''));return}}catch(e){uiAlert('Error',e.message);return}
+    ALGOS_STATE.openNs=null;renderKeepScroll();
   });
 }
 function algosAttachConfig(ns){try{Android.bucketPickConfigFile(ns)}catch(e){uiAlert('Error',e.message)}}

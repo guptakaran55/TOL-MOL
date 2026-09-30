@@ -30,6 +30,16 @@ object MarketHours {
         else -> null
     }
 
+    /** The exchange's own clock — its calendar day is the trading day. */
+    fun zoneOf(base: String): ZoneId? = sessionFor(base)?.zone
+
+    /** The regular session's opening time, on the exchange's clock. */
+    fun openOf(base: String): LocalTime? = sessionFor(base)?.open
+
+    /** When the session's LAST fifteen-minute bar starts. A day whose data holds
+     *  that bar has finished trading; one without it may still be going. */
+    fun lastBarStart(base: String): LocalTime? = sessionFor(base)?.close?.minusMinutes(15)
+
     /** Inside the regular session, weekdays, by the exchange's own clock. */
     fun isRegularSession(base: String, nowMs: Long): Boolean {
         val s = sessionFor(base) ?: return false

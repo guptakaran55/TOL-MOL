@@ -1825,6 +1825,7 @@ class MainActivity : AppCompatActivity() {
                         "t212Fills" -> t212Fills(a[0].asInt)
                         "fetchGttExecutionData" -> fetchGttExecutionData()
                         "macdLadder" -> macdLadderJson(a[0].asString, a[1].asString)
+                        "floorRunNow" -> floorRunNow(a[0].asString)
                         else -> "{\"error\":\"not callable in the background: $method\"}"
                     }
                 } catch (e: Exception) {
@@ -3912,6 +3913,106 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
             }
+        }
+
+        // ── FLOOR-ORDER ALGOS (paper only) ────────────────────────────────────
+        // Their own store and engine, never the bucket list — so no arming path,
+        // live mirror or broker audit can reach them. See FloorAlgoStore.
+
+        private fun floorErr(e: Exception) =
+            "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"", "")}\"}"
+
+        @JavascriptInterface
+        fun floorList(space: String): String = try {
+            val base = bucketBaseNs(space)
+            gson.toJson(mapOf("ok" to true,
+                "cur" to com.signalscope.app.trading.FloorAlgoEngine.currencyMark(base),
+                "algos" to com.signalscope.app.data.FloorAlgoStore.list(applicationContext, base)
+                    .map { it.copy(log = it.log.takeLast(30).reversed()) }
+                    .map { a -> mapOf("a" to a, "ns" to a.ns) }))
+        } catch (e: Exception) { floorErr(e) }
+
+        @JavascriptInterface
+        fun floorCreate(space: String, name: String): String = try {
+            val base = bucketBaseNs(space)
+            if (base !in com.signalscope.app.data.FloorAlgoStore.SPACES)
+                "{\"ok\":false,\"error\":\"Floor orders run on the stock markets only.\"}"
+            else {
+                val a = com.signalscope.app.data.FloorAlgoStore.create(applicationContext, base, name)
+                com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+                gson.toJson(mapOf("ok" to true, "id" to a.id, "ns" to a.ns))
+            }
+        } catch (e: Exception) { floorErr(e) }
+
+        /** Pausing cancels the day's resting orders at once. Resuming plans afresh,
+         *  counting only prices from that moment on. */
+        @JavascriptInterface
+        fun floorSetEnabled(id: String, on: Boolean): String = try {
+            val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
+                if (on) a.copy(enabled = true, planDay = if (a.orders.any { it.status == "RESTING" }) a.planDay else "",
+                    log = a.log + "$stamp · resumed")
+                else a.copy(enabled = false,
+                    orders = a.orders.map { if (it.status == "RESTING") it.copy(status = "ENDED") else it },
+                    log = a.log + "$stamp · paused — today's resting orders cancelled; anything held is still sold on schedule")
+            } ?: throw IllegalStateException("algo not found")
+            com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        @JavascriptInterface
+        fun floorSetNotify(id: String, on: Boolean): String = try {
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { it.copy(notify = on) }
+                ?: throw IllegalStateException("algo not found")
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        @JavascriptInterface
+        fun floorRename(id: String, name: String): String = try {
+            val n = name.trim().take(40)
+            if (n.isEmpty()) throw IllegalArgumentException("a name is needed")
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { it.copy(name = n) }
+                ?: throw IllegalStateException("algo not found")
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** New numbers apply to orders placed from now on; what is already resting
+         *  or held keeps the size it was placed with. */
+        @JavascriptInterface
+        fun floorSettings(id: String, capital: Double, seats: Int, universeSize: Int,
+                          lowDays: Int, secondPct: Double, holdDays: Int): String = try {
+            fun bad(what: String): Nothing = throw IllegalArgumentException(what)
+            if (!(capital >= 10.0 && capital <= 10_000_000.0)) bad("capital must be between 10 and 10,000,000")
+            if (seats !in 1..30) bad("seats must be 1 to 30")
+            if (universeSize !in 5..100) bad("universe must be 5 to 100 stocks")
+            if (lowDays !in 1..10) bad("the low must look back 1 to 10 days")
+            if (!(secondPct >= 0.0 && secondPct <= 10.0)) bad("the second order must be 0 to 10% below")
+            if (holdDays !in 1..20) bad("hold 1 to 20 days")
+            val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
+                val s = com.signalscope.app.data.FloorAlgoStore.Settings(capital, seats, universeSize, lowDays, secondPct, holdDays)
+                if (s == a.settings) a
+                else a.copy(settings = s,
+                    universeDay = if (universeSize != a.settings.universeSize) "" else a.universeDay,
+                    log = a.log + ("$stamp · settings: ${"%.0f".format(capital)} in $seats seats, top $universeSize, " +
+                        "low of $lowDays days, 2nd order ${"%.1f".format(secondPct)}% below, sell after $holdDays days"))
+            } ?: throw IllegalStateException("algo not found")
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        @JavascriptInterface
+        fun floorDelete(id: String): String = try {
+            com.signalscope.app.data.FloorAlgoStore.delete(applicationContext, id)
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** "Check now" — downloads prices, so only reached through [callAsync]. */
+        fun floorRunNow(id: String): String {
+            val a = com.signalscope.app.data.FloorAlgoStore.get(applicationContext, id)
+                ?: return "{\"ok\":false,\"error\":\"algo not found\"}"
+            val ran = com.signalscope.app.trading.FloorAlgoEngine.runOne(applicationContext, id)
+            if (!ran) return "{\"ok\":false,\"error\":\"another check is still running — try again in a minute\"}"
+            return floorList(com.signalscope.app.trading.Spaces.uiSpaceOf(a.space))
         }
 
         /**
@@ -6741,6 +6842,19 @@ class MainActivity : AppCompatActivity() {
                             openLive.joinToString(", ") { it.symbol } +
                             "). Resetting paper now would desync the live ledger — " +
                             "let them close (or sell manually) first."))
+                    }
+                } else if (com.signalscope.app.trading.Spaces.baseOf(ns) == "in") {
+                    // AND ON ZERODHA, which this used to skip: an Indian algo fell
+                    // through to the Trading 212 check, found nothing there, and
+                    // wiped the paper book from under real positions it had bought.
+                    val openLive = com.signalscope.app.data.ZerodhaLiveStore
+                        .load(applicationContext).trades.filter { it.ns == ns && it.isLive }
+                    if (openLive.isNotEmpty()) {
+                        return gson.toJson(mapOf("ok" to false, "error" to
+                            "Refused: ${openLive.size} REAL Zerodha position(s) still open (" +
+                            openLive.joinToString(", ") { it.symbol } +
+                            "). Resetting paper now would orphan them — close them first, " +
+                            "or mark them sold by hand if you already did."))
                     }
                 } else {
                     // Same hazard on the T212 side: a real mirrored position is tied

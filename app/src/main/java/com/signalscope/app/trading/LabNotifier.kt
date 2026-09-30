@@ -610,6 +610,29 @@ object LabNotifier {
             "np-$ns-$symbol-$day", openSymbol = symbol, openSpace = Spaces.uiSpaceOf(ns))
     }
 
+    /**
+     * A FLOOR-ORDER ALGO'S PAPER BUY. These algos cannot place real orders at all,
+     * so the text says so every time — the one misreading that matters is
+     * thinking money moved. Under the market's paper switch like any paper alert;
+     * the algo's own bell is checked by the caller.
+     */
+    fun floorBought(ctx: Context, algo: String, ns: String, symbol: String, price: Double, what: String) {
+        if (paperMuted(ctx, ns)) return
+        notify(ctx, CH_PAPER, NotificationManager.IMPORTANCE_DEFAULT, "Lab paper trades",
+            "📥 $algo bought $symbol (paper)",
+            "${spaceLabel(ns)} · $what. Paper only — nothing real was bought.",
+            "fb-$ns-$symbol-$price", openNs = ns)
+    }
+
+    fun floorSold(ctx: Context, algo: String, ns: String, symbol: String, price: Double,
+                  pct: Double, what: String) {
+        if (paperMuted(ctx, ns)) return
+        notify(ctx, CH_PAPER, NotificationManager.IMPORTANCE_DEFAULT, "Lab paper trades",
+            "📤 $algo sold $symbol (paper)  ${"%+.2f".format(pct)}%",
+            "${spaceLabel(ns)} · $what. Paper only — nothing real was sold.",
+            "fs-$ns-$symbol-$price", openNs = ns)
+    }
+
     fun paperOpen(ctx: Context, ns: String, symbol: String, price: Double) {
         if (paperMuted(ctx, ns)) return
         val prompt = promptsRatherThanReports(ctx, ns)

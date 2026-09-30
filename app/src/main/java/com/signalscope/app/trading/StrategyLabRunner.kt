@@ -390,6 +390,28 @@ object StrategyLabRunner {
         // the feed is healthy before trusting the signals (esp. delayed Xetra data).
         val health = sanitizeCandles(closedBars, nowSec, barSec)
         val candles = health.clean
+        // ── A DOWNLOAD THAT ENDS BEFORE WHAT WAS ALREADY PROCESSED ─────────────
+        //
+        // Ignored whole, rather than run. Running it moved the watermark BACK to
+        // wherever that download happened to stop — and the next complete download
+        // then found the day's trades "new" all over again: the alerts went out a
+        // second time hours later, and every exit was applied to its seat again.
+        // The Indian algos had nearly every closed trade compounded two to four
+        // times this way (Indian bars come from Zerodha with Yahoo behind it, and
+        // one of the two returned series missing the latest session). It also
+        // dropped still-open paper trades as "phantoms", because a series that
+        // ends yesterday cannot reproduce today's entries.
+        //
+        // Before the price mark, too: a short series would otherwise mark every
+        // position at an older close than the one already shown.
+        if (wmNow > 0L && candles.isNotEmpty() && candles.last().timestamp < wmNow) {
+            Log.w(TAG, "[$ns] $sym: the price download ends at ${candles.last().timestamp}, before " +
+                "bars already processed (to $wmNow) — a short feed, ignored this pass")
+            StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
+                sym, now, ok = false, bars = candles.size,
+                note = "price feed came back short — ignored this pass"), ns)
+            return
+        }
         // MARK FROM THE BARS WE JUST FETCHED — free, and always as fresh as the
         // engine itself. The separate 5-minute price poll was the wrong design: it
         // duplicated a request the pass had already made, and if it got rate-limited
@@ -440,6 +462,12 @@ object StrategyLabRunner {
         // false on every regular tick, the entry was never "new", and the live
         // mirror never fired (no error either — the block was simply skipped).
         val wmBar = if (run.lastBarTs > 0L) run.lastBarTs else lastBarTs
+        // The same rule on the engine's own bar clock: the watermark never moves
+        // backwards. See the short-feed check above.
+        if (!bootstrap && wmBar < prevWm) {
+            Log.w(TAG, "[$ns] $sym: engine's newest bar $wmBar is before the watermark $prevWm — ignored")
+            return
+        }
 
         if (bootstrap) {
             // FLAT START: the first run after enroll/reset does NOT adopt positions
@@ -509,12 +537,20 @@ object StrategyLabRunner {
             // Accumulate all changes, then commit in ONE atomic write (no torn state).
             val newTrades = ArrayList<StrategyLabStore.LedgerTrade>()
             val newAudits = ArrayList<StrategyLabStore.Audit>()
+            val known = st0.trades.associateBy { it.id }
             for (t in run.trades) {
                 if (t.entryTs < baseline) continue   // entered before tracking began
                 if (sym in windDown && t.entryTs > prevWm) continue  // exit-only: skip fresh entries entirely
                 val id = "$sym-${t.entryTs}"
+                // A TRADE THE BOOK HAS CLOSED IS FINAL. However the engine re-reads
+                // it — a replay, or two feeds disagreeing about one bar — it is
+                // never closed a second time (which re-applied its result to the
+                // seat and re-sent the alert) and never reopened.
+                val prior = known[id]
+                if (prior?.status == "CLOSED") continue
                 val isOpen = t.status == "OPEN"
-                val newEntry = t.entryTs > prevWm
+                // Already in the book means already announced, already mirrored.
+                val newEntry = t.entryTs > prevWm && prior == null
                 val newExit = t.status == "CLOSED" && (t.exitTs ?: 0L) > prevWm
                 if (newEntry) newAudits.add(StrategyLabStore.Audit(
                     id = "$id-BUY", symbol = sym, action = "BUY", price = t.entryPrice,
