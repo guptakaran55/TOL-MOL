@@ -758,6 +758,39 @@ class ZerodhaClient(private val config: ConfigManager) {
     }
 
     /** Cancel/delete a GTT trigger by id. */
+    /**
+     * What became of one GTT: "active", "triggered", "cancelled", "disabled",
+     * "expired", "deleted" or "rejected" as Zerodha reports it; "missing" when
+     * Zerodha no longer knows the id at all; null when the question could not
+     * be asked (not connected, network, an answer that could not be read).
+     *
+     * Null and "missing" are different on purpose: one is "we do not know", the
+     * other is "Zerodha says there is no such trigger".
+     */
+    fun fetchGttStatus(id: Long): String? {
+        if (!isConnected) return null
+        return try {
+            val req = Request.Builder()
+                .url("$BASE_URL/gtt/triggers/$id")
+                .get()
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (resp.code == 404) return "missing"
+                val j = try { JsonParser.parseString(body).asJsonObject } catch (e: Exception) { return null }
+                if (j.get("status")?.asString != "success") {
+                    val msg = j.get("message")?.asString.orEmpty().lowercase()
+                    return if (msg.contains("not found") || msg.contains("does not exist")) "missing" else null
+                }
+                j.getAsJsonObject("data")?.get("status")?.asString?.lowercase()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "GTT $id status lookup failed: ${e.message}")
+            null
+        }
+    }
+
     fun deleteGttTrigger(id: Long): GttDeleteResult {
         if (!isConnected) return GttDeleteResult.Failure("Not connected to Zerodha")
         return try {

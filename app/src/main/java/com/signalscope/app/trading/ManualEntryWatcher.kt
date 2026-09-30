@@ -225,12 +225,9 @@ object ManualEntryWatcher {
     }
 
     private fun latestSlope(closes: DoubleArray, smoothing: Int): Double? {
-        if (closes.size < 30) return null
-        val e12 = ema(closes, 12); val e26 = ema(closes, 26)
-        val macd = DoubleArray(closes.size) { e12[it] - e26[it] }
-        val raw = DoubleArray(closes.size); raw[0] = 0.0
-        for (i in 1 until macd.size) raw[i] = macd[i] - macd[i - 1]
-        return ema(raw, smoothing).last()
+        // One definition, shared with the five-timescale dots on the alerts, so
+        // the SLOPE column and the 1D dot can never disagree. See [MacdSlopes].
+        return MacdSlopes.latest(closes, smoothing)
     }
 
     /**
@@ -367,6 +364,11 @@ object ManualEntryWatcher {
                 illiquidCut = cut, turnoverFloor = floor,
                 eligible = rows.count { r -> r.slope > 0.0 })
         }
+
+        // WHAT THE TRACKED SIGNALS DID NEXT — filled in from the bars already in
+        // hand, once a day. See [SignalWatch.updateOutcomes].
+        try { SignalWatch.updateOutcomes(ctx, base, complete) }
+        catch (e: Exception) { Log.w(TAG, "[$base] signal outcome update failed", e) }
 
         // ── A YEAR OF SHAPE PER NAME ────────────────────────────────────────────
         // Built here because this pass already holds every symbol's daily bars, so
@@ -849,6 +851,8 @@ object ManualEntryWatcher {
         val exchange = Spaces.exchangeOf(base)
         val alerted = ArrayList<String>()
         var checked = 0
+        // The download allowance for the signal tracker this pass — see [SignalWatch].
+        val sigBudget = SignalWatch.newBudget()
 
         for (c in cands) {
             val s = ManualWatchStore.load(ctx, base)
@@ -942,21 +946,29 @@ object ManualEntryWatcher {
             // JUDGED ON THE LAST COMPLETED BAR, like every other rule here, and
             // on the levels that pass just computed. Costs nothing: both are
             // already in hand from the check above.
+            // What the floor check below works out, handed to the signal tracker
+            // after it rather than worked out a second time.
+            var sigPx = 0.0; var sigAtFloor = false; var sigFresh = false
             if (lv != null && lv.swingHigh > lv.swingLow) {
-                // THE SAME MARKET-SHUT GUARD THE ENTRY ALERT USES. A completed bar
-                // exists all night, so without this every name sitting near its
-                // low would be announced at three in the morning about a session
-                // that ended hours ago — and by the open the price has had all
-                // night to be somewhere else. Judged by the age of the newest bar
-                // rather than a clock: a venue that is open produces bars.
-                val barAge = if (StrategyLabRunner.lastRunBarTs > 0L)
-                    (System.currentTimeMillis() / 1000 - StrategyLabRunner.lastRunBarTs) / 60 else -1L
-                val limit = maxOf(90L, (fresh?.exitTfMin?.toLong() ?: 120L) + 30L)
+                // A MARKET-SHUT GUARD. A completed bar exists all night, so without
+                // this every name sitting near its low would be announced at three
+                // in the morning about a session that ended hours ago — and by the
+                // open the price has had all night to be somewhere else.
+                //
+                // It used to time the newest two-hour bar from its START, which
+                // passed only in a short window after each bar closed — a market
+                // open all afternoon read as shut most of the time. Now: is the
+                // exchange in session by its clock, AND is the newest bar we hold
+                // from today (which catches a holiday). See [MarketHours].
+                val marketLive = SignalWatch.liveDataFresh(base, k0)
                 val live = try { MarkToMarket.freshPrice(k0) } catch (ex: Exception) { 0.0 }
                 val px = if (live > 0.0) live else lv.price
                 val pos = IntradayLevels.positionInRange(px, lv.swingLow, lv.swingHigh)
+                sigPx = px
+                sigAtFloor = IntradayLevels.inSupportZone(pos)
+                sigFresh = marketLive
                 val st2 = ManualWatchStore.load(ctx, base)
-                if (barAge in 0..limit && px > 0.0 &&
+                if (marketLive && px > 0.0 &&
                     IntradayLevels.inSupportZone(pos) &&
                     !ManualWatchStore.alreadySupportAlerted(st2, c.symbol, day)) {
                     val cur = when (base) { "de" -> "\u20ac"; "in" -> "\u20b9"; else -> "$" }
@@ -973,6 +985,13 @@ object ManualEntryWatcher {
                     }
                 }
             }
+
+            // ── TURNING UP AT A FLOOR, and the "all five green" comparison ──────
+            // After the floor check, on the same prices and bars. Never allowed to
+            // break the pass: a failure leaves this one stock unjudged this time.
+            try {
+                SignalWatch.check(ctx, base, c.symbol, c.rank, sigPx, sigAtFloor, sigFresh, day, sigBudget)
+            } catch (e: Exception) { Log.w(TAG, "[$base] ${c.symbol} signal check failed", e) }
 
             if (fresh != null) {
                 // ONLY WHILE THE MARKET IS ACTUALLY TRADING.
@@ -992,7 +1011,11 @@ object ManualEntryWatcher {
                 // just ran, and it is right on half-days and unscheduled closures
                 // where a hardcoded session window would be wrong.
                 val barAgeMin = (System.currentTimeMillis() / 1000 - fresh.lastBarTs) / 60
-                val staleLimit = maxOf(90L, (fresh.exitTfMin.toLong()) + 30L)
+                // Plus the feed's own delay: German bars are judged fifteen minutes
+                // after they close (see [FeedDelay]), and without adding it back the
+                // margin for a late or skipped pass shrank from half an hour to a
+                // quarter — one missed pass and a real entry signal went unsent.
+                val staleLimit = maxOf(90L, (fresh.exitTfMin.toLong()) + 30L) + FeedDelay.secFor(base) / 60L
                 if (barAgeMin > staleLimit) {
                     // NOT marked as alerted, deliberately: the signal is real and may
                     // still stand when trading resumes. Suppressing it now and letting

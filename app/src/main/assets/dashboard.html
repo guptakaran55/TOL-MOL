@@ -8607,6 +8607,66 @@ function manualDeadAttempts(w,dead){
     (rows.length>SHOW?'<div style="font-size:8px;color:var(--t3);padding-top:3px">… and '+(rows.length-SHOW)+' older</div>':'')+
     '</details>';
 }
+// ── SIGNAL TRACKER ──────────────────────────────────────────────────────────
+// Every "turning up at a floor" alert and every plain "all five green" moment,
+// with what the price did one, three and five trading days later — measured
+// from the price at the moment it fired. This is how the new rule earns (or
+// fails to earn) the right to ever place an order.
+//
+// Read from a small file in the app, and at most once a minute: the watchlist
+// redraws every second while prices are live.
+var SIG_TRACK_CACHE={at:0,space:'',data:null};
+function signalTrackData(){
+  if(typeof Android==='undefined'||!Android.signalTrack)return null;
+  var now=Date.now();
+  if(SIG_TRACK_CACHE.space===SPACE&&SIG_TRACK_CACHE.data&&(now-SIG_TRACK_CACHE.at)<60000)return SIG_TRACK_CACHE.data;
+  var d=null;try{d=JSON.parse(Android.signalTrack(SPACE)||'{}')}catch(e){}
+  SIG_TRACK_CACHE={at:now,space:SPACE,data:(d&&d.ok)?d:null};
+  return SIG_TRACK_CACHE.data;
+}
+function sigPct(v){
+  if(v==null||!isFinite(Number(v)))return '<span style="color:var(--t3)">\u2014</span>';
+  v=Number(v);
+  return '<span style="color:'+(v>=0?'var(--gn)':'var(--rd)')+';font-weight:700">'+(v>=0?'+':'')+v.toFixed(2)+'%</span>';
+}
+function signalTrackerPanel(){
+  var d=signalTrackData();
+  if(!d)return '';
+  var ft=d.floorTurn||{}, ag=d.allGreen||{}, evs=d.events||[];
+  var cur=(SPACE==='DE')?'\u20ac':(SPACE==='IN'?'\u20b9':'$');
+  var line=function(label,sum,note){
+    return '<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:4px 0;border-top:1px dashed var(--bd);font-size:10px">'+
+      '<b style="flex:0 0 118px;color:var(--t1)">'+label+'</b>'+
+      '<span style="color:var(--t3)">'+(sum.n||0)+' fired</span>'+
+      '<span>1d '+sigPct(sum.avg1)+'</span><span>3d '+sigPct(sum.avg3)+'</span><span>5d '+sigPct(sum.avg5)+'</span>'+
+      (sum.up3!=null?'<span style="color:var(--t3)">\u00b7 up after 3d: <b>'+Math.round(sum.up3)+'%</b> of '+sum.n3+'</span>':'')+
+      (note?'<span style="flex:1 1 100%;font-size:8px;color:var(--t3)">'+note+'</span>':'')+
+      '</div>';
+  };
+  var rows=evs.slice(0,15).map(function(e){
+    var when=new Date(Number(e.atMs||0));
+    var t=('0'+when.getDate()).slice(-2)+'.'+('0'+(when.getMonth()+1)).slice(-2)+' '+('0'+when.getHours()).slice(-2)+':'+('0'+when.getMinutes()).slice(-2);
+    var tag=(e.rule==='floor_turn')
+      ?'<span style="font-size:8px;font-weight:800;color:var(--gn)">FLOOR TURN</span>'
+      :'<span style="font-size:8px;font-weight:800;color:var(--t3)">ALL GREEN</span>';
+    return '<div style="display:flex;gap:6px;align-items:baseline;flex-wrap:wrap;padding:3px 0;border-top:1px dashed var(--bd);font-size:9px">'+
+      '<span style="flex:0 0 66px;color:var(--t3)">'+t+'</span>'+
+      '<span onclick="watcherDetail(\''+escHtml(e.symbol)+'\')" style="cursor:pointer;flex:0 0 58px;font-family:monospace;font-weight:800;color:var(--t1)">'+escHtml(e.symbol)+'</span>'+
+      tag+
+      '<span style="font-family:monospace;color:var(--t2)">'+cur+Number(e.price||0).toFixed(2)+'</span>'+
+      '<span>1d '+sigPct(e.ret1)+'</span><span>3d '+sigPct(e.ret3)+'</span><span>5d '+sigPct(e.ret5)+'</span>'+
+      '</div>';
+  }).join('');
+  return '<details data-dk="sig-track" style="margin-top:8px">'+
+    '<summary style="cursor:pointer;font-size:9px;color:var(--t3);padding:2px 0">Signal tracker \u00b7 '+
+      (ft.n||0)+' floor turn'+((ft.n||0)===1?'':'s')+' \u00b7 '+(ag.n||0)+' all-green'+
+      (ft.avg3!=null?' \u00b7 floor turns avg '+(ft.avg3>=0?'+':'')+Number(ft.avg3).toFixed(2)+'% after 3d':'')+'</summary>'+
+    '<div style="font-size:8px;color:var(--t3);line-height:1.5;margin:4px 0">Returns are from the price at the moment each signal fired, one, three and five trading days later. Nothing here was bought. A few weeks of these is what shows whether a rule is worth trusting \u2014 a handful is not enough to judge.</div>'+
+    line('Turning up at a floor',ft,'Alerted. Month and day MACD rising, price at the bottom of its 3-day range, 15-minute and hourly MACD just turned up.')+
+    line('All five green',ag,'Logged only, for comparison: all five timescales newly rising.')+
+    (rows?('<div style="margin-top:6px">'+rows+'</div>'):'<div style="font-size:9px;color:var(--t3);padding:4px 0">Nothing has fired yet in this market.</div>')+
+    '</details>';
+}
 function manualAlertLog(w){
   var log=(w&&w.alertLog)||[];
   if(!log.length)return '';
@@ -9536,6 +9596,7 @@ function manualWatchPanel(){
     h+=manualDeadAttempts(w,deadEnts);
   }
   h+=manualAlertLog(w);
+  h+=signalTrackerPanel();
   h+=rankings;
   h+='</details>';
   return h;
@@ -14881,6 +14942,57 @@ window.onDetailTrade=function(json){
   else uiAlert('Not placed — '+escHtml(r.symbol||''),'<span style="color:var(--rd)">'+escHtml(r.error||'unknown error')+'</span>');
   render();
 };
+// ── MACD SLOPE ON FIVE TIMESCALES, in the detail view ─────────────────────
+// The same five dots as the watcher alerts — month, day, four hours, hour,
+// fifteen minutes — worked out by the same routine in the app, so a stock reads
+// the same in the notification and here. Loaded in the background (it needs
+// fresh prices) and remembered for five minutes, so the detail view's live
+// refresh does not keep downloading them.
+var MTF_CACHE={}, MTF_LOADING={};
+var MTF_TTL_MS=5*60*1000;
+function mtfSymFor(s){
+  return String((s&&(s.yahooSymbol||s.symbol))||'').toUpperCase().replace(/\.(NS|DE)$/,'');
+}
+function mtfRow(readings){
+  var names={'1M':'month','1D':'day','4H':'4 hours','1H':'hour','15m':'15 minutes'};
+  return readings.map(function(r){
+    var sg=(r.sign==null)?null:Number(r.sign);
+    var col=sg>0?'var(--gn)':(sg<0?'var(--rd)':'var(--t3)');
+    var word=sg>0?'rising':(sg<0?'falling':(sg===0?'flat':'not enough history'));
+    return '<span title="MACD on the '+(names[r.label]||r.label)+' chart: '+word+' on its last completed bar" style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:12px;border:1px solid var(--bd);background:var(--bg2)">'+
+      '<span style="width:9px;height:9px;border-radius:50%;background:'+col+';display:inline-block"></span>'+
+      '<b style="font-size:10px;color:var(--t2)">'+r.label+'</b></span>';
+  }).join('');
+}
+function mtfLadderHtml(s){
+  if(SPACE==='BN'||typeof Android==='undefined')return '';
+  var sym=mtfSymFor(s); if(!sym)return '';
+  var c=MTF_CACHE[sym], fresh=c&&(Date.now()-c.at)<MTF_TTL_MS;
+  var body=fresh
+    ? (c.readings?mtfRow(c.readings):'<span style="font-size:9px;color:var(--t3)">Could not read the timescales just now.</span>')
+    : mtfRow(['1M','1D','4H','1H','15m'].map(function(l){return {label:l,sign:null}}))+
+      '<span style="font-size:9px;color:var(--t3);margin-left:4px">loading\u2026</span>';
+  if(!fresh)setTimeout(function(){mtfLadderLoad(sym)},0);
+  return '<div style="margin-top:8px">'+
+    '<div style="font-size:7px;color:var(--t3);letter-spacing:.4px;margin-bottom:4px">MACD SLOPE BY TIMESCALE \u00b7 <span style="color:var(--gn)">\u25cf rising</span> <span style="color:var(--rd)">\u25cf falling</span> \u00b7 last completed bar on each</div>'+
+    '<div id="mtf-ladder" data-sym="'+escHtml(sym)+'" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">'+body+'</div></div>';
+}
+function mtfLadderLoad(sym){
+  if(MTF_LOADING[sym])return;
+  MTF_LOADING[sym]=true;
+  androidAsync('macdLadder',[sym,SPACE],function(raw){
+    delete MTF_LOADING[sym];
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    MTF_CACHE[sym]={at:Date.now(),readings:(r&&r.ok&&r.readings)?r.readings:null};
+    // Fill the row in place if the same stock is still open — never redraw the
+    // whole sheet for it, which would throw away where you had scrolled.
+    var el=document.getElementById('mtf-ladder');
+    if(el&&el.getAttribute('data-sym')===sym){
+      el.innerHTML=MTF_CACHE[sym].readings?mtfRow(MTF_CACHE[sym].readings)
+        :'<span style="font-size:9px;color:var(--t3)">Could not read the timescales just now.</span>';
+    }
+  });
+}
 function showDetail(idx,focus){
   // Accepts either an index into FILTERED (normal scan-row click) OR a full
   // stock object (manual-search result, watchlist-row click). The object form
@@ -15190,6 +15302,7 @@ function showDetail(idx,focus){
   b+='<div style="font-size:8px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:6px">MACD MOMENTUM ANALYSIS</div>';
   // Big MACD chart
   b+=macdBigSvg(s.macdCurve,s.macdPhase,300,80);
+  b+=mtfLadderHtml(s);
   b+='<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">';
   b+='<div style="padding:5px 12px;background:'+pc+'18;border-radius:5px;border:1px solid '+pc+'40"><div style="font-size:13px;font-weight:800;color:'+pc+'">'+s.macdPhase+'</div></div>';
   b+='<div><div style="font-size:7px;color:var(--t3)">d(MACD)/dt</div><div style="font-size:13px;font-weight:700;font-family:monospace;color:'+(s.macdSlope>0?'var(--gn)':s.macdSlope<0?'var(--rd)':'var(--t3)')+'">'+(s.macdSlope>0?'+':'')+fmt(s.macdSlope,4)+'</div></div>';

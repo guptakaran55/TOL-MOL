@@ -1824,6 +1824,7 @@ class MainActivity : AppCompatActivity() {
                         "t212GermanRef" -> t212GermanRef(a[0].asString, a[1].asDouble)
                         "t212Fills" -> t212Fills(a[0].asInt)
                         "fetchGttExecutionData" -> fetchGttExecutionData()
+                        "macdLadder" -> macdLadderJson(a[0].asString, a[1].asString)
                         else -> "{\"error\":\"not callable in the background: $method\"}"
                     }
                 } catch (e: Exception) {
@@ -1843,6 +1844,19 @@ class MainActivity : AppCompatActivity() {
                     } catch (e: Throwable) { Log.e(TAG, "callAsync delivery failed", e) }
                 }
             }
+        }
+
+        /** The five MACD-slope readings for the stock detail view — the same
+         *  routine as the watcher alerts. Only reached through [callAsync]: it
+         *  downloads prices, and the page must not wait on it. */
+        fun macdLadderJson(symbol: String, space: String): String {
+            val sp = space.lowercase().let { if (it == "bn") "binance" else it }
+            val base = com.signalscope.app.trading.Spaces.baseOf(sp)
+            if (base == "binance") return "{\"ok\":false,\"error\":\"not for crypto\"}"
+            val r = com.signalscope.app.trading.MacdLadder.readings(applicationContext, base, symbol)
+                ?: return "{\"ok\":false,\"error\":\"no data\"}"
+            return gson.toJson(mapOf("ok" to true,
+                "readings" to r.map { mapOf("label" to it.label, "sign" to it.sign) }))
         }
 
         @JavascriptInterface
@@ -6802,6 +6816,34 @@ class MainActivity : AppCompatActivity() {
             val ok = com.signalscope.app.trading.LabNotifier.previewChart(applicationContext, base, symbol)
             gson.toJson(mapOf("ok" to ok,
                 "error" to (if (ok) null else "no stored MACD curve for $symbol in $base")))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "failed")))
+        }
+
+        /**
+         * The signal tracker for one market: every "turning up at a floor" and
+         * "all five green" event, newest first, with what the price did 1, 3 and
+         * 5 trading days later, and a summary per rule. A local file — no network.
+         */
+        @JavascriptInterface
+        fun signalTrack(space: String): String = try {
+            val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+            val evs = com.signalscope.app.data.SignalTrackStore.load(applicationContext).events
+                .filter { it.space == base }.sortedByDescending { it.atMs }
+            fun summary(rule: String): Map<String, Any?> {
+                val r = evs.filter { it.rule == rule }
+                fun avg(xs: List<Double>) = if (xs.isEmpty()) null else xs.average()
+                val r3 = r.mapNotNull { it.ret3 }
+                return mapOf("n" to r.size,
+                    "avg1" to avg(r.mapNotNull { it.ret1 }), "n1" to r.count { it.ret1 != null },
+                    "avg3" to avg(r3), "n3" to r3.size,
+                    "avg5" to avg(r.mapNotNull { it.ret5 }), "n5" to r.count { it.ret5 != null },
+                    "up3" to (if (r3.isEmpty()) null else r3.count { it > 0.0 } * 100.0 / r3.size))
+            }
+            gson.toJson(mapOf("ok" to true,
+                "floorTurn" to summary(com.signalscope.app.data.SignalTrackStore.RULE_FLOOR_TURN),
+                "allGreen" to summary(com.signalscope.app.data.SignalTrackStore.RULE_ALL_GREEN),
+                "events" to evs.take(40)))
         } catch (e: Exception) {
             gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "failed")))
         }

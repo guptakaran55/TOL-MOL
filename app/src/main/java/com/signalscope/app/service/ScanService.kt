@@ -647,6 +647,10 @@ class ScanService : Service() {
         catch (e: Exception) { Log.w(TAG, "stranded-fill adoption failed", e) }
         try { com.signalscope.app.trading.T212LiveMirror.retryPendingEntries(applicationContext) }
         catch (e: Exception) { Log.w(TAG, "entry retry failed: ${e.message}") }
+        // Indian exits that could not go through — retried, or closed if the
+        // protective stop had already sold the shares. See the sweep itself.
+        try { com.signalscope.app.trading.ZerodhaLiveMirror.retryHeldExits(applicationContext) }
+        catch (e: Exception) { Log.w(TAG, "held-exit retry failed: ${e.message}") }
         // UNSOLD EXITS come first in importance: a position the book has closed but
         // the broker still holds is real money exposed with nothing managing it.
         // Unconditional — an exit is never withheld for a preference.

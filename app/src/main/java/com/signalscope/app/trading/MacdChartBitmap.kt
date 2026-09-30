@@ -38,8 +38,11 @@ object MacdChartBitmap {
      * 20:45" — so an evening reading of the close never passes for "now".
      */
     fun wide(ctx: Context, curve: List<Double>, phase: String?, days: Int,
-             velPct: Double? = null, velNote: String? = null): Bitmap? = try {
-        val w = 960; val h = 300
+             velPct: Double? = null, velNote: String? = null,
+             slopes: List<MacdSlopes.Reading>? = null): Bitmap? = try {
+        // A row for the five slope dots under the plot when there are any.
+        val rowH = if (slopes.isNullOrEmpty()) 0 else 64
+        val w = 960; val h = 300 + rowH
         val dark = isDark(ctx)
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
@@ -77,15 +80,34 @@ object MacdChartBitmap {
         // box and shifted down, so the zero line stays centred in the plot.
         c.save()
         c.translate(0f, captionH)
-        val ok = paintCurve(c, curve, col, w.toFloat(), h - captionH, 16f, 5f, 8f, 5f)
+        val ok = paintCurve(c, curve, col, w.toFloat(), h - rowH - captionH, 16f, 5f, 8f, 5f)
         c.restore()
+
+        // ── MACD SLOPE ON FIVE TIMESCALES, longest first ────────────────────
+        if (!slopes.isNullOrEmpty()) {
+            val y0 = (h - rowH).toFloat()
+            c.drawLine(22f, y0 + 4f, w - 22f, y0 + 4f, Paint().apply {
+                color = if (dark) 0xFF334155.toInt() else 0xFFE2E8F0.toInt(); strokeWidth = 2f })
+            val base = y0 + 44f
+            c.drawText("MACD slope", 22f, base, cap)
+            val left = 22f + cap.measureText("MACD slope") + 30f
+            val cell = (w - 22f - left) / slopes.size
+            val lab = Paint(cap).apply { typeface = Typeface.DEFAULT_BOLD
+                color = if (dark) 0xFFE2E8F0.toInt() else 0xFF334155.toInt() }
+            slopes.forEachIndexed { i, r ->
+                val x = left + i * cell
+                c.drawCircle(x + 13f, base - 10f, 13f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = MacdSlopes.color(r.sign) })
+                c.drawText(r.label, x + 34f, base, lab)
+            }
+        }
         if (ok) bmp else null
     } catch (e: Exception) { null }
 
     /** The small square beside the title while the notification is collapsed —
      *  with the price dot in its corner, so direction reads without expanding. */
     fun square(ctx: Context, curve: List<Double>, phase: String?,
-               velPct: Double? = null): Bitmap? = try {
+               velPct: Double? = null, slopes: List<MacdSlopes.Reading>? = null): Bitmap? = try {
         val s = 192
         val dark = isDark(ctx)
         val bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
@@ -96,7 +118,19 @@ object MacdChartBitmap {
             })
         val drawn = paintCurve(c, curve, MacdChartGeometry.phaseColor(phase),
                 s.toFloat(), s.toFloat(), 20f, 6f, 9f, 5f)
-        if (drawn && velPct != null) {
+        if (drawn && !slopes.isNullOrEmpty()) {
+            // FIVE DOTS ACROSS THE TOP, month on the left to fifteen minutes on
+            // the right — too small to label, so always in that order. Ringed in
+            // the background colour so the curve cannot run through them.
+            val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = if (dark) 0xFF1E293B.toInt() else 0xFFF1F5F9.toInt() }
+            val gap = (s - 2 * 26f) / (slopes.size - 1)
+            slopes.forEachIndexed { i, r ->
+                val cx = 26f + i * gap; val cy = 26f
+                c.drawCircle(cx, cy, 17f, ring)
+                c.drawCircle(cx, cy, 13f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = MacdSlopes.color(r.sign) })
+            }
+        } else if (drawn && velPct != null) {
             // Ringed in the background colour so it stays a distinct dot even
             // where the curve runs underneath it.
             val cx = s - 30f; val cy = 30f

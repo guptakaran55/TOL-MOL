@@ -62,6 +62,8 @@ object LabNotifier {
      * able to turn it down without losing the ones that say a strategy acted.
      */
     private const val CH_SUPPORT = "manual_near_support"
+    /** Its own channel, so the new, still-untested alert can be silenced alone. */
+    private const val CH_TURN = "manual_turning_up"
     /** Real STOCK fills, separate from crypto's channel so one can be silenced
      *  without the other — the two move at completely different rates. */
     private const val CH_T212 = "t212_live_trades"
@@ -91,11 +93,28 @@ object LabNotifier {
         val curve = s?.macdRecent.orEmpty()
         if (curve.size < 2) null
         else {
-            val v = velocity15m(space, sym)
-            MacdChartBitmap.wide(ctx, curve, s?.phase, curve.size, v?.pct, v?.let { note15m(it) })
-                ?.let { w -> ChartArt(w, MacdChartBitmap.square(ctx, curve, s?.phase, v?.pct)) }
+            val base = Spaces.baseOf(space.lowercase())
+            // Regular-session fifteen-minute candles, fetched once: they build the
+            // 15m, 1H and 4H dots, and are the price dot's candles too except in
+            // the US, where that dot reads the extended sessions.
+            val c15 = try {
+                (com.signalscope.app.network.YahooFinanceClient.fetchCandles15m(
+                    sym, Spaces.exchangeOf(base), includePrePost = false)
+                    as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles
+            } catch (e: Exception) { null }
+            val v = if (base == "us") velocity15m(space, sym)
+                    else c15?.let { PriceVelocity.last15m(it, System.currentTimeMillis() / 1000L, FeedDelay.secFor(base)) }
+            val slopes = macdSlopes(ctx, base, sym, s?.macdRecent.orEmpty(), c15)
+            MacdChartBitmap.wide(ctx, curve, s?.phase, curve.size, v?.pct, v?.let { note15m(it) }, slopes)
+                ?.let { w -> ChartArt(w, MacdChartBitmap.square(ctx, curve, s?.phase, v?.pct, slopes)) }
         }
     } catch (e: Exception) { Log.w(TAG, "chart for $symbol failed", e); null }
+
+    /** The five MACD-slope dots — the same routine the detail view uses, so an
+     *  alert and the app can never show one stock two ways. See [MacdLadder]. */
+    private fun macdSlopes(ctx: Context, base: String, sym: String, dailyMacd: List<Double>,
+                           c15: List<com.signalscope.app.data.CandleData>?): List<MacdSlopes.Reading>? =
+        MacdLadder.readings(ctx, base, sym, c15, dailyMacd)
 
     /**
      * The price dot's reading: the last completed 15-minute candle against the
@@ -332,6 +351,28 @@ object LabNotifier {
      * signal. False when the name has no stored curve — which is itself the
      * answer to "would its alerts carry a chart?".
      */
+    /**
+     * A WATCHLIST STOCK HAS TURNED UP AT ITS FLOOR — the month and day trend
+     * rising, the price at the bottom of its 3-day range, and the 15-minute and
+     * hourly MACD just turned up. See [SignalWatch].
+     *
+     * The wording says in plain words that nothing was bought and that the rule
+     * is still being tested: the one dangerous reading of any alert is that an
+     * order has already gone in.
+     */
+    fun turningUp(ctx: Context, space: String, symbol: String, rank: Int, price: Double) {
+        val cur = when (Spaces.baseOf(space.lowercase())) { "de" -> "€"; "in" -> "₹"; else -> "$" }
+        notify(ctx, CH_TURN, NotificationManager.IMPORTANCE_DEFAULT, "Turning up at a floor",
+            "🟢 $symbol — turning up at its floor" + (if (rank > 0) " (#$rank)" else ""),
+            "${spaceLabel(space)} · $cur${"%.2f".format(price)}, at the bottom of its 3-day range, with the " +
+                "month and day trend rising and the 15-minute and hourly MACD just turned up. " +
+                "Nothing has been bought. This rule is new and being tracked — its record builds up " +
+                "in the watcher panel.",
+            "tu-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
+            openWatchSymbol = symbol, openSpace = space,
+            chart = macdArt(ctx, space, symbol))
+    }
+
     fun previewChart(ctx: Context, space: String, symbol: String): Boolean {
         val art = macdArt(ctx, space, symbol) ?: return false
         notify(ctx, CH_SUPPORT, NotificationManager.IMPORTANCE_DEFAULT, "Near support",

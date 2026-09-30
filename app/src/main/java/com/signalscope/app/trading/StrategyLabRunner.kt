@@ -1212,6 +1212,16 @@ object StrategyLabRunner {
         private set
 
     /**
+     * The closed candles the last [freshEntrySignal] ran on, with their bar
+     * length. Another side channel for the same reason as the ones above: the
+     * signal tracker needs this stock's hourly MACD and would otherwise download
+     * the very same bars a second time, every pass, for every stock.
+     */
+    @Volatile
+    var lastCandles: Triple<String, Long, List<CandleData>>? = null
+        private set
+
+    /**
      * @param entriesFromTs the watcher's own FRESH-START boundary — no entry may
      *   open before it, so the replay arrives flat at the moment the name joined
      *   the watch list rather than inheriting a position from weeks of history.
@@ -1228,6 +1238,7 @@ object StrategyLabRunner {
         lastPositionState = null
         lastHistoricalState = null
         lastLevels = null
+        lastCandles = null
         val sym = symbol.trim().uppercase()
         if (sym.isBlank()) return null
         val cfg = StrategyLabStore.activeConfig(ctx, ns)
@@ -1241,6 +1252,7 @@ object StrategyLabRunner {
                 FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
             }
         val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+        lastCandles = Triple(sym, plan.sourceSec, candles)
         if (candles.size < 50) return null
         // BEFORE THE ENGINE RUNS, so it survives every early return below. The
         // levels are a fact about the price history and do not depend on whether

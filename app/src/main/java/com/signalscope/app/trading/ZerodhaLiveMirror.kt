@@ -1171,11 +1171,16 @@ object ZerodhaLiveMirror {
             row.gttId?.let { id ->
                 val del = client.deleteGttTrigger(id)
                 if (del !is ZerodhaClient.GttDeleteResult.Success) {
-                    ZerodhaLiveStore.upsert(ctx, row.copy(
-                        error = "Exit held back: could not cancel GTT $id, " +
-                                "selling now would double up. The trigger still protects it."))
-                    Log.e(TAG, "[$ns] GTT $id delete failed — exit aborted for $sym")
-                    return
+                    // THE DELETE FAILED — BUT WHY? It used to stop here for good,
+                    // and one reason it fails is that the trigger already FIRED and
+                    // sold the shares: Shoppers Stop's stop sold all 28, and the book
+                    // went on believing it held them, trying to cancel a trigger that
+                    // no longer existed. So ask Zerodha what became of it.
+                    val why = (del as ZerodhaClient.GttDeleteResult.Failure).message
+                    when (resolveUncancellable(ctx, client, row, id, why)) {
+                        ExitPath.SELL -> Unit          // nothing rests: safe to sell below
+                        else -> return                 // closed as already sold, or held back
+                    }
                 }
             }
             // Never sell more than this algo owns: one account, several algos,
@@ -1207,7 +1212,7 @@ object ZerodhaLiveMirror {
                     ZerodhaLiveStore.upsert(ctx, row.copy(
                         status = "CLOSED", gttId = null, sellOrderId = res.orderId,
                         exitPrice = paperExitPrice, paperExitPrice = paperExitPrice,
-                        sellAt = System.currentTimeMillis(), error = ""))
+                        sellAt = System.currentTimeMillis(), error = "", exitHeld = false))
                     Log.w(TAG, "[$ns] REAL SELL $qty $sym (order ${res.orderId})" +
                         if (others > 0) " · $others left for other algos" else "")
                 }
@@ -1222,8 +1227,11 @@ object ZerodhaLiveMirror {
                     // it was protected, and nothing would ever put one back. A
                     // failed exit is precisely when a stop matters most.
                     val hadStop = row.gttId != null
+                    // Held for a retry while the market is open — the strategy still
+                    // wants out, and a refusal (a shut market, no price) is usually
+                    // about the moment rather than the stock.
                     ZerodhaLiveStore.upsert(ctx, row.copy(
-                        status = "OPEN", gttId = null,
+                        status = "OPEN", gttId = null, exitHeld = true,
                         error = "Exit refused: ${res.message}" +
                             (if (hadStop) " · the protective stop was cancelled for the exit and is being replaced" else "")))
                     Log.e(TAG, "[$ns] SELL $sym refused: ${res.message}")
@@ -1240,6 +1248,179 @@ object ZerodhaLiveMirror {
             }
         } catch (e: Exception) {
             Log.e(TAG, "[$ns] mirrorExit $sym failed", e)
+        }
+    }
+
+    // ── EXITS THAT COULD NOT GO THROUGH ────────────────────────────────────────
+
+    enum class ExitPath { SELL, CLOSED, HOLD }
+
+    /** Retries allowed for one held-back exit before it is left for you. */
+    private const val MAX_EXIT_TRIES = 6
+
+    /**
+     * The protective trigger could not be cancelled. Decide from what Zerodha
+     * says became of it:
+     *
+     *   • TRIGGERED — the stop sold this position's shares. Close the row; sell
+     *     nothing, whatever else the account holds.
+     *   • ACTIVE, or unknown — it may still be resting. Selling now could sell
+     *     twice. Hold back and retry later.
+     *   • GONE WITHOUT FIRING (cancelled, expired, deleted…) — nothing rests, so
+     *     a sale cannot double up; but only if the account still holds at least
+     *     this position's shares. Holding none: close the row. Holding some but
+     *     fewer: hold back — the difference could be your own shares, and they
+     *     are not the app's to sell.
+     */
+    private fun resolveUncancellable(ctx: Context, client: ZerodhaClient,
+                                     row: ZerodhaLiveStore.Row, gttId: Long, why: String): ExitPath {
+        val state = client.fetchGttStatus(gttId)
+        // Holdings are read unless the trigger is known to have sold them.
+        val held = if (state == "triggered") null else heldQuantity(ctx, row.symbol)
+        if (held != null && held > 0 && row.goneSeenAt > 0L)
+            ZerodhaLiveStore.upsert(ctx, row.copy(goneSeenAt = 0L))   // back in the account: forget the sighting
+        return when (decideUncancellable(state, held, row.qty)) {
+            ExitPath.SELL -> ExitPath.SELL
+            ExitPath.CLOSED -> if (state == "triggered") closeAsSold(ctx, row,
+                    "the protective stop (GTT $gttId) had already fired and sold the shares before the strategy's exit")
+                else closeIfGoneConfirmed(ctx, ZerodhaLiveStore.forTrade(ctx, row.ns, row.paperTradeId) ?: row,
+                    "no longer held at Zerodha — the protective trigger (GTT $gttId) " +
+                        (if (state == null) "could not be described by Zerodha" else "is $state"))
+            ExitPath.HOLD -> {
+                val reason = when {
+                    state == null -> "could not cancel GTT $gttId ($why), and its state could not be read"
+                    state == "active" -> "could not cancel GTT $gttId ($why)"
+                    held == null -> "GTT $gttId is $state, but the holdings could not be read"
+                    else -> "GTT $gttId is $state and only $held of ${row.qty} shares are held — left for you to check"
+                }
+                ZerodhaLiveStore.upsert(ctx, row.copy(exitHeld = true,
+                    error = "Exit held back: $reason. The trigger still protects it; retried while the market is open."))
+                Log.e(TAG, "[${row.ns}] ${row.symbol} exit held back — $reason")
+                ExitPath.HOLD
+            }
+        }
+    }
+
+    /**
+     * The decision on its own, so it can be tested without a broker: what to do
+     * with an exit whose trigger would not cancel, given what Zerodha says became
+     * of that trigger ([state]) and how many shares the account holds ([held],
+     * null when unknown). See [resolveUncancellable] for the reasoning.
+     */
+    internal fun decideUncancellable(state: String?, held: Int?, qty: Int): ExitPath = when {
+        state == "triggered" -> ExitPath.CLOSED
+        // NOTHING HELD, NOTHING TO SELL — whatever the trigger's state. Zerodha
+        // can fail to describe a trigger at all (Shoppers Stop's answered "Error
+        // during internal conversion"), and "unknown" must not keep a row open
+        // over shares the account does not have. Closing places no order.
+        held != null && held <= 0 -> ExitPath.CLOSED
+        state == null || state == "active" -> ExitPath.HOLD
+        held == null -> ExitPath.HOLD
+        held >= qty -> ExitPath.SELL
+        else -> ExitPath.HOLD
+    }
+
+    /** How long a "none held" reading must stand before a second one may close the row. */
+    private const val GONE_CONFIRM_MS = 10 * 60_000L
+
+    /**
+     * Close for absence only on a SECOND reading, a pass later — the same
+     * two-reading rule the watcher uses before believing a holding is gone. A
+     * single bad read of the holdings must never retire a real position.
+     */
+    private fun closeIfGoneConfirmed(ctx: Context, row: ZerodhaLiveStore.Row, reason: String): ExitPath {
+        val now = System.currentTimeMillis()
+        if (row.goneSeenAt <= 0L) {
+            ZerodhaLiveStore.upsert(ctx, row.copy(goneSeenAt = now, exitHeld = true,
+                error = "Exit held back: not held at Zerodha — confirming on the next pass before closing."))
+            Log.w(TAG, "[${row.ns}] ${row.symbol} not held at Zerodha — confirming before closing")
+            return ExitPath.HOLD
+        }
+        if (now - row.goneSeenAt < GONE_CONFIRM_MS) return ExitPath.HOLD
+        return closeAsSold(ctx, row, reason)
+    }
+
+    private fun closeAsSold(ctx: Context, row: ZerodhaLiveStore.Row, reason: String): ExitPath {
+        ZerodhaLiveStore.upsert(ctx, row.copy(status = "MANUAL_CLOSED", gttId = null, exitHeld = false,
+            manualClosedAt = System.currentTimeMillis(), error = "Closed: $reason."))
+        Log.w(TAG, "[${row.ns}] ${row.symbol} closed — $reason")
+        return ExitPath.CLOSED
+    }
+
+    /**
+     * Shares of [symbol] the account holds — settled holdings. Null when that
+     * cannot be read, or when the name was traded TODAY (today's buys are not in
+     * holdings yet, so a count read then would be wrong in the dangerous
+     * direction). Null always means "do nothing".
+     */
+    private fun heldQuantity(ctx: Context, symbol: String): Int? {
+        val sym = symbol.uppercase()
+        val today = try { ZerodhaClient(ConfigManager(ctx)).fetchTodayPositionSymbols() } catch (e: Exception) { null }
+            ?: return null
+        if (sym in today.map { it.uppercase() }) return null
+        val h = (BrokerHoldings.zerodha(ctx) as? BrokerHoldings.Result.Ok)?.holdings ?: return null
+        return h.filter { it.symbol.equals(sym, true) }.sumOf { it.qty }.toInt()
+    }
+
+    /**
+     * RETRY EXITS THAT WERE HELD BACK — once per pass.
+     *
+     * The Trading 212 side has always retried an exit that did not go through;
+     * this side never did, so a strategy's decision to sell could be dropped
+     * after a single failed attempt and never tried again.
+     *
+     * First, whatever the time: is the position simply gone (the stop fired)?
+     * Then, only while the Indian market is open, and at most [MAX_EXIT_TRIES]
+     * times: run the exit again — the same careful path, trigger first.
+     */
+    fun retryHeldExits(ctx: Context) {
+        val cfg = ConfigManager(ctx)
+        if (!cfg.isZerodhaConnected) return
+        val rows = ZerodhaLiveStore.load(ctx).trades.filter {
+            it.status == "OPEN" && !it.isManual &&
+                (it.exitHeld || ((it.error as String?) ?: "").startsWith("Exit held back"))
+        }
+        if (rows.isEmpty()) return
+        val client = ZerodhaClient(cfg)
+        val open = IndianSession.isOpen(System.currentTimeMillis())
+        for (row in rows) {
+            try {
+                // 1. Gone already? A fact about the account — settled at any hour,
+                //    and for absence only on a second reading (see above).
+                val id = row.gttId
+                val state = id?.let { client.fetchGttStatus(it) }
+                if (state == "triggered") {
+                    closeAsSold(ctx, row, "the protective stop (GTT $id) had already fired and sold the shares")
+                    continue
+                }
+                val held = heldQuantity(ctx, row.symbol)
+                if (held != null && held <= 0) {
+                    closeIfGoneConfirmed(ctx, row, "no longer held at Zerodha" +
+                        (if (id != null) " — the protective trigger (GTT $id) " +
+                            (if (state == null) "could not be described by Zerodha" else "is $state") else ""))
+                    continue
+                }
+                if (held != null && held > 0 && row.goneSeenAt > 0L)
+                    ZerodhaLiveStore.upsert(ctx, row.copy(goneSeenAt = 0L))
+
+                // 2. Still held. Does the strategy still want out?
+                val paper = try {
+                    com.signalscope.app.data.StrategyLabStore.load(ctx, row.ns).trades
+                        .firstOrNull { it.id == row.paperTradeId }
+                } catch (e: Exception) { null }
+                if (paper != null && paper.status == "OPEN") {
+                    // The strategy is holding it again: the exit it wanted is void.
+                    ZerodhaLiveStore.upsert(ctx, row.copy(exitHeld = false, exitTries = 0, error = ""))
+                    continue
+                }
+                if (!open || row.exitTries >= MAX_EXIT_TRIES) continue
+                ZerodhaLiveStore.upsert(ctx, row.copy(exitTries = row.exitTries + 1))
+                Log.i(TAG, "[${row.ns}] ${row.symbol} retrying held-back exit (${row.exitTries + 1}/$MAX_EXIT_TRIES)")
+                mirrorExit(ctx, row.paperTradeId, row.symbol,
+                    paper?.exitPrice ?: row.paperExitPrice, row.ns)
+            } catch (e: Exception) {
+                Log.w(TAG, "[${row.ns}] ${row.symbol} held-exit retry failed", e)
+            }
         }
     }
 

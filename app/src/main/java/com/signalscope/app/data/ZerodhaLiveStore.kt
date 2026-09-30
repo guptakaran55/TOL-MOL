@@ -53,6 +53,15 @@ object ZerodhaLiveStore {
         val sellAt: Long = 0L,
         val manualClosedAt: Long = 0L,
         val error: String = "",
+        /** The strategy's exit could not go through and is waiting to be retried.
+         *  False on every row written before this existed — see the retry sweep. */
+        val exitHeld: Boolean = false,
+        /** Retries of that exit so far; capped so a stock that cannot be sold is
+         *  not churned every quarter hour. */
+        val exitTries: Int = 0,
+        /** When the account was first seen holding none of these shares; the row
+         *  is closed only when a SECOND reading, a pass later, agrees. 0 = not seen. */
+        val goneSeenAt: Long = 0L,
         /**
          * THE ADOPTED-EXIT VERDICT for a position the engine no longer tracks.
          *

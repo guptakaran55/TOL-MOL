@@ -342,6 +342,16 @@ object YahooFinanceClient {
      * was open, the order was allowed, and the trend check had no data to form
      * an opinion from, so it waited for a bar that was never going to arrive.
      */
+    /** Ten years of monthly bars — for the monthly MACD dot on watcher alerts.
+     *  The month in progress arrives as its last bar; callers drop it. */
+    fun fetchCandlesMonthly(symbol: String, exchange: String = "NSE"): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = "10y", interval = "1mo")
+
+    /** Fifteen-minute bars over a SHORT range — ten days is enough for the
+     *  15-minute and hourly MACD, at a sixth of the download of the usual 60. */
+    fun fetchCandles15mRange(symbol: String, exchange: String, range: String): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = range, interval = "15m", includePrePost = false)
+
     fun fetchCandles15m(symbol: String, exchange: String = "NSE",
                         includePrePost: Boolean = false): CandleResult =
         fetchCandlesInternal(symbol, exchange, range = "60d", interval = "15m",
