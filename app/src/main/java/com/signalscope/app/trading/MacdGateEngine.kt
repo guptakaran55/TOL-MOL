@@ -327,6 +327,14 @@ object MacdGateEngine {
         if (complete.isEmpty()) { progress(ns, "done", 0, 0); return }
         val asOf = complete.values.flatten().maxOfOrNull { it.date }
             ?: run { progress(ns, "done", 0, 0); return }
+        // NOT ON A SERIES THAT IS A DAY BEHIND. The day is left unevaluated and the
+        // next pass tries again, rather than deciding the seats on the close
+        // before last and locking that in until tomorrow.
+        if (!ScreenerRunner.dailyDataCurrent(spaceFor(ns), asOf)) {
+            Log.w(TAG, "[$ns] daily prices end at $asOf — the last session is missing; evaluation retried next pass")
+            progress(ns, "done", 0, 0)
+            return
+        }
 
         // 2. Rank (Part A) + slope per symbol from the SAME bars.
         // §10 — screenerLookbackDays from the config when present (config > default),

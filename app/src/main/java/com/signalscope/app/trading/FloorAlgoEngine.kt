@@ -226,6 +226,14 @@ object FloorAlgoEngine {
                 com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars(
                     Spaces.dataSpaceOf(space), a.universe.map { it.symbol }, minBars = MacdSlopes.MIN_BARS).first
             } catch (e: Exception) { LinkedHashMap() }
+            // The daily trend must include the last finished session. A series
+            // missing it is a day behind; the plan waits for the next pass.
+            val newest = daily.values.mapNotNull { b -> b.lastOrNull { it.date.isBefore(today) }?.date }.maxOrNull()
+            if (daily.isNotEmpty() &&
+                !com.signalscope.app.screener.ScreenerRunner.dailyDataCurrent(space, newest)) {
+                Log.w(TAG, "${a.name}: daily prices end at $newest — last session missing, plan retried next pass")
+                return
+            }
             val orders = ArrayList<Order>()
             val members = a.universe.map { m ->
                 if (m.symbol in held) return@map m.copy(month = null, day = null, note = "held — no new orders")

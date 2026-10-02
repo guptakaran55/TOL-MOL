@@ -36,6 +36,9 @@ object MarketHours {
     /** The regular session's opening time, on the exchange's clock. */
     fun openOf(base: String): LocalTime? = sessionFor(base)?.open
 
+    /** The regular session's closing time, on the exchange's clock. */
+    fun closeOf(base: String): LocalTime? = sessionFor(base)?.close
+
     /** When the session's LAST fifteen-minute bar starts. A day whose data holds
      *  that bar has finished trading; one without it may still be going. */
     fun lastBarStart(base: String): LocalTime? = sessionFor(base)?.close?.minusMinutes(15)

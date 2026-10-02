@@ -69,7 +69,9 @@ object ManualEntryWatcher {
     // makes it appear TODAY rather than tomorrow — every install already carries
     // today's date, so without it the guard skips the pass and the new artefact
     // simply never arrives, looking exactly like a market with nothing in it.
-    private const val DAILY_BUILD = 8
+    // 9: today's pass had ranked on a series missing the last session (see
+    // ScreenerRunner.dailyDataCurrent); the bump redoes it on corrected prices.
+    private const val DAILY_BUILD = 9
 
     /** Fallback depth when no context is available to read the setting from.
      *  The real value lives in settings — see [depthFor]. */
@@ -294,6 +296,13 @@ object ManualEntryWatcher {
             if (b.size >= 30) complete[sym] = b
         }
         if (complete.isEmpty()) return false
+        // A series missing the last session would rank — and colour every 1D dot —
+        // on the close before last, all day. Left unstamped, the next pass retries.
+        val newest = complete.values.mapNotNull { it.lastOrNull()?.date }.maxOrNull()
+        if (!ScreenerRunner.dailyDataCurrent(Spaces.dataSpaceOf(base), newest)) {
+            Log.w(TAG, "[$base] watcher screen: daily prices end at $newest — last session missing, retried next pass")
+            return false
+        }
 
         // ── THE LIQUIDITY FLOOR ─────────────────────────────────────────────
         //

@@ -762,6 +762,18 @@ object T212LiveMirror {
      *  the same thing. */
     private const val FINE_BAR_MS = 15 * 60_000L
 
+    /** A gate flag changes only at the daily evaluation, so a held-back retry
+     *  looks again hourly rather than every pass. */
+    private const val GATE_FLAG_RECHECK_MS = 60 * 60_000L
+
+    /** Has this algo's 3b gate flagged [symbol] exit-only? False when there is no
+     *  armed gate, no seat for the name, or the gate cannot be read — a failed
+     *  read must not quietly stop entries the strategy still wants. */
+    internal fun gateFlagged(ctx: Context, ns: String, symbol: String): Boolean = try {
+        val g = com.signalscope.app.data.MacdGateStore.load(ctx, ns)
+        g.enabled && g.slots.any { it.flagged && it.symbol.equals(symbol, ignoreCase = true) }
+    } catch (e: Exception) { false }
+
     /** How far past its close a 15-minute bar stops being evidence about now.
      *  Two bars' worth: enough slack for the feed to publish late, far short of
      *  the overnight gap that would let last night's final bar answer a question
@@ -1276,16 +1288,19 @@ object T212LiveMirror {
             // A closed exchange is not evidence that an entry is unwilling. It is
             // no evidence at all, so it buys no information and is charged for
             // none: park until the open and leave the budget for real attempts.
-            // US ENTRIES MAY USE THE EXTENDED SESSIONS; GERMANY IS UNCHANGED.
+            // RETRIES WAIT FOR THE REGULAR SESSION, US INCLUDED.
             //
-            // This is the second of the two gates that sent an evening US signal
-            // to sleep — the ladder had its own, and fixing only that one would
-            // have left the entry parked here instead, which looks identical from
-            // the outside. Xetra publishes no pre or post window, so asking for
-            // one there returns exactly the regular bounds.
+            // US retries used to count the pre- and after-market as open. The
+            // FIRST attempt still may (the ladder's own gate allows it, so an
+            // evening signal is not sent to sleep untried) — but a retry exists
+            // because that attempt did not fill, and the thin extended book is
+            // where it failed. Re-running the ladder there every quarter hour was
+            // pure churn: SMCI on 2 Oct walked six limit orders up and back out
+            // every 15–20 minutes from 05:30 New York time, filled nothing, and
+            // spent the broker's rate limit doing it.
             val session = try {
                 com.signalscope.app.network.YahooFinanceClient
-                    .fetchTradingWindow(ys, includeExtended = (space == "US"))
+                    .fetchTradingWindow(ys, includeExtended = false)
             } catch (e: Exception) { null }
             val nowSec = System.currentTimeMillis() / 1000
             // UNKNOWN IS NOT CLOSED. When the lookup fails, fall through and let
@@ -1359,6 +1374,23 @@ object T212LiveMirror {
                     error = "the strategy is no longer in this trade on paper (it exited, or the " +
                         "position was reset or sold by hand) — not bought"))
                 Log.i(TAG, "retry dropped for ${row.symbol}: paper no longer holds ${row.paperTradeId}")
+                continue
+            }
+            // ── NOT WHILE THE GATE SAYS "EXIT ONLY" ─────────────────────────────
+            //
+            // A 3b gate flags a held name when its daily MACD slope turns down: the
+            // position rides to its own exit, and nothing new is opened in it. A
+            // retry is opening something new — real money into a name the strategy
+            // has already decided to wind down. Held back, at no cost in attempts;
+            // if the slope recovers the flag clears and the retry resumes, and if
+            // it does not, the queue's own age limit ends it.
+            if (gateFlagged(ctx, row.ns, row.symbol)) {
+                T212LiveStore.upsert(ctx, row.copy(
+                    status = "RETRY", parkedForOpen = false,
+                    error = "held back: the 3b gate has flagged this name exit-only (daily MACD " +
+                        "falling) — no new money goes in while it is; no attempt spent",
+                    retryAfter = System.currentTimeMillis() + GATE_FLAG_RECHECK_MS))
+                Log.i(TAG, "[${row.ns}] ${row.symbol} retry held — gate flagged exit-only")
                 continue
             }
 

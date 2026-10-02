@@ -8461,6 +8461,18 @@ function mwSortCands(cands){
   //
   // Unranked sorts LAST. A rank of zero means "the screener never placed this",
   // not "first" — and first is the most valuable row on the screen.
+  // RETURN ON CAPITAL, highest first. A name with no figure goes last — and in
+  // India that is most of them, because Yahoo carries the fundamentals for only
+  // a minority of NSE names; ranked among themselves by the screener's order.
+  if(MW_SORT==='roce'){
+    return cands.slice().sort(function(a,b){
+      var va=roceFor(a.symbol), vb=roceFor(b.symbol);
+      if(va==null&&vb==null)return (Number(a.rank)||9999)-(Number(b.rank)||9999);
+      if(va==null)return 1;
+      if(vb==null)return -1;
+      return vb-va;
+    });
+  }
   if(MW_SORT!=='support'){
     return cands.slice().sort(function(a,b){
       var ra=Number(a.rank)||0, rb=Number(b.rank)||0;
@@ -8491,6 +8503,7 @@ function mwSortToggle(){
   return '<span style="display:inline-flex;gap:4px;margin-left:6px">'+
     bt('rank','rank','The screener\'s own order — best momentum first. How the list was chosen.')+
     bt('support','nearest support','Order by where each name sits inside its last few trading days, closest to the floor first. Names with no reading go last.')+
+    bt('roce','ROCE','Order by return on capital employed, highest first — the figure the Discovery scan carries. Names without one go last.')+
     '</span>';
 }
 // One strip, used by both row types. `pxNow` is whatever the caller believes the
@@ -8698,8 +8711,8 @@ function manualColHeader(withAction){
     '<span style="flex:0 0 38px;text-align:right" title="Return on capital employed, as a percentage \u2014 the same figure the Discovery valuation table shows, read from that scan rather than recomputed, so one company cannot read two ways on two screens. A dash means this market has not been scanned in Discovery yet, or that scan carried no fundamentals for the name.">ROCE</span>'+
     '<span style="flex:0 0 42px;text-align:right" title="Daily MACD slope. Positive is what passes the gate; the size says how strongly momentum is building.">SLOPE</span>'+
     '<span style="flex:0 0 10px;text-align:center" title="Filled = on the FULL price history this strategy would be holding this name right now. Hollow = it would be flat.">IN</span>'+
-    '<span style="flex:0 0 40px" title="Closing price over the last trading year.">1Y</span>'+
-    '<span style="flex:0 0 28px" title="The daily MACD line over the same year, with its zero line marked.">MACD</span>'+
+    // The 1Y and MACD charts moved under the row, into the space beside the
+    // support and resistance lines, where they can be drawn at a readable size.
     '<span style="flex:1 1 0;min-width:0"></span>'+
     (withAction?'<span style="min-width:74px;text-align:right">ACTION</span>':'<span style="min-width:46px">STATUS</span><span style="min-width:16px"></span>')+
     '</div>';
@@ -8714,15 +8727,27 @@ function manualColHeader(withAction){
 // NO ENTRY MARKER ON THESE. Where a trade opened belongs in the detail view
 // behind the lens, which has the room to show it properly; a dashed line across
 // an 18-pixel chart only costs the shape its legibility.
-function candPriceSpark(c,w,h){
+// STRETCHED TO THE SPACE IT IS GIVEN. The shared renderers draw at a fixed pixel
+// size; here the chart fills whatever width its cell has, so it uses the room
+// beside the support and resistance lines on any screen. Lines keep their
+// thickness however far the drawing is stretched.
+function mwFitSvg(svg){
+  return String(svg||'')
+    .replace(/<svg width="[^"]*"/,'<svg width="100%" preserveAspectRatio="none"')
+    .replace('margin:4px auto 0','margin:0')
+    .replace(/<(polyline|line) /g,'<$1 vector-effect="non-scaling-stroke" ');
+}
+function candPriceSpark(c,w,h,fit){
   if(!c.sparkPx||c.sparkPx.length<2)
-    return '<span style="display:inline-block;width:'+w+'px"></span>';
+    return '<span style="display:inline-block;width:'+(fit?'100%':w+'px')+'"></span>';
   var a=Number(c.sparkPx[0]), z=Number(c.sparkPx[c.sparkPx.length-1]);
   var col=(z>=a)?'#16a34a':'#dc2626';
   var chg=(a>0)?((z/a-1)*100):0;
+  var tip=escHtml('Last '+(c.sparkDays||0)+' trading days · '+(chg>=0?'+':'')+chg.toFixed(1)+'%');
+  if(fit)return '<div title="'+tip+'" style="line-height:0">'+mwFitSvg(sectorSparkSvg(c.sparkPx,col,w,h))+'</div>';
   // The shared renderer nudges itself down 4px for the sector cards; pulled back
   // up here so it sits on the row's own baseline rather than below it.
-  return '<span title="'+escHtml('Last '+(c.sparkDays||0)+' trading days · '+(chg>=0?'+':'')+chg.toFixed(1)+'%')+
+  return '<span title="'+tip+
     '" style="display:inline-block;line-height:0;vertical-align:middle;margin-top:-4px">'+
     sectorSparkSvg(c.sparkPx,col,w,h)+'</span>';
 }
@@ -8750,7 +8775,7 @@ function discoveryMacdFor(sym){
   }catch(e){}
   return null;
 }
-function candMacdSpark(c,w,h){
+function candMacdSpark(c,w,h,fit){
   // The shared renderer colours by PHASE. This screen has no phase string of its
   // own, so the gate's verdict stands in: a positive daily slope is what it passes.
   var fallbackPhase=(Number(c.slope||0)>0)?'BULLISH':'BEARISH';
@@ -8773,8 +8798,10 @@ function candMacdSpark(c,w,h){
     note='MACD, last '+curve.length+' days — the same curve Discovery draws';
   }
   if(!curve||curve.length<2)
-    return '<span style="display:inline-block;width:'+w+'px"></span>';
+    return '<span style="display:inline-block;width:'+(fit?'100%':w+'px')+'"></span>';
   var last=Number(curve[curve.length-1]);
+  if(fit)return '<div title="'+escHtml(note+' · now '+last.toFixed(3))+'" style="line-height:0">'+
+    mwFitSvg(macdSparkSvg(curve,phase,w,h))+'</div>';
   return '<span title="'+escHtml(note+' · now '+last.toFixed(3))+
     '" style="display:inline-block;line-height:0;vertical-align:middle">'+
     macdSparkSvg(curve,phase,w,h)+'</span>';
@@ -8842,10 +8869,6 @@ function manualCandRow(w,c,last){
           '. Open the lens to see exactly where it entered." '+
           'style="flex:0 0 10px;text-align:center;color:var(--gn);font-size:11px;line-height:1">●</span>'
       : '<span title="On the full price history this strategy would be FLAT on this name right now." style="flex:0 0 10px;text-align:center;color:var(--bd);font-size:11px;line-height:1">○</span>')+
-    // The charts are the only things allowed to give way under pressure. Anything
-    // else losing width takes information with it; a slightly narrower year does not.
-    '<span style="flex:0 1 auto;min-width:0;overflow:hidden">'+candPriceSpark(c,40,18)+'</span>'+
-    '<span style="flex:0 1 auto;min-width:0;overflow:hidden">'+candMacdSpark(c,28,18)+'</span>'+
     '<span style="flex:1 1 0;min-width:0"></span>'+
     // No Buy button is not the same as a broken Buy button. Say which it is, or
     // the absence reads as a bug in a panel that is otherwise offering to trade.
@@ -8865,8 +8888,17 @@ function manualCandRow(w,c,last){
   var pj=projStrip(w,c,c.px);
   var both=sw+(sw&&lvl?'<span style="color:var(--bd);margin:0 2px">|</span>':'')+lvl+
     ((sw||lvl)&&pj?'<span style="color:var(--bd);margin:0 2px">|</span>':'')+pj;
+  // THE CHARTS SIT BESIDE THE LEVELS, in the space those short lines leave empty
+  // on the right — drawn there at a readable size instead of squeezed between
+  // the numbers and the Buy button. They stretch to whatever width is left.
+  var cap=function(t){return '<div style="font-size:7px;color:var(--t3);text-align:center;margin-top:1px;letter-spacing:.03em">'+t+'</div>'};
+  var charts='<div style="flex:0 0 44%;max-width:220px;display:flex;gap:6px;align-items:flex-end">'+
+    '<div style="flex:1 1 0;min-width:0">'+candPriceSpark(c,72,32,true)+cap('1Y PRICE')+'</div>'+
+    '<div style="flex:1 1 0;min-width:0">'+candMacdSpark(c,72,32,true)+cap('MACD')+'</div></div>';
   return '<div data-mw="'+escHtml(String(c.symbol||'').toUpperCase())+'" style="padding:6px 8px;'+bd+(rang?'background:rgba(124,58,237,.07)':'')+'">'+row+
-    (both?'<div style="margin:3px 0 0 24px;font-size:9px;line-height:1.5;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'+both+'</div>':'')+
+    '<div style="margin:3px 0 0 24px;display:flex;gap:8px;align-items:center">'+
+      '<div style="flex:1 1 auto;min-width:0;font-size:9px;line-height:1.5;display:flex;gap:6px;align-items:center;flex-wrap:wrap">'+both+'</div>'+
+      charts+'</div>'+
     '</div>';
 }
 // ── BOOK vs ACCOUNT ─────────────────────────────────────────────────────────
@@ -9549,10 +9581,14 @@ function manualWatchPanel(){
       '<span>CANDIDATES'+
       (w.lastRunAt?' · last checked '+escHtml(new Date(Number(w.lastRunAt)).toLocaleString()):' · not checked yet')+'</span>'+
       mwSortToggle()+'</div>';
-    h+='<div style="'+box+'">'+manualColHeader(true);
+    // ITS OWN SCROLL BOX, so the panel's other parts (the book, the history)
+    // stay one flick away however long the list is. The headings stay pinned at
+    // the top while the rows move, and the position survives the 5-second redraw.
+    h+='<div style="'+box+'"><div data-scroll-key="mw-cands" style="overflow-y:auto;max-height:62vh;-webkit-overflow-scrolling:touch;overscroll-behavior:contain">'+
+      '<div style="position:sticky;top:0;z-index:1">'+manualColHeader(true)+'</div>';
     var ordered=mwSortCands(cands);
     ordered.forEach(function(c,i){h+=manualCandRow(w,c,i===ordered.length-1);});
-    h+='</div>';
+    h+='</div></div>';
   }
   if(ents.length){
     // LIVE POSITIONS AND HISTORY ARE DIFFERENT KINDS OF THING and no longer share

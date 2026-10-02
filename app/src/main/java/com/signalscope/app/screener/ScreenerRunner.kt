@@ -119,7 +119,65 @@ object ScreenerRunner {
     // and all fetch, which is the exact problem this removes. Serialising the
     // misses is a bonus — it is gentler on Yahoo's rate limit than six parallel
     // sweeps ever was.
-    private data class BarCacheEntry(val day: String, val bars: List<DailyBar>)
+    // ── IS A DAILY SERIES UP TO DATE? ───────────────────────────────────────
+    //
+    // The once-a-day steps (the 3b gates, the watcher ranking, the floor-order
+    // plan) all run on the first pass of the UTC day — just after 02:00 in
+    // Germany. Yahoo's daily series for German and US stocks did not yet hold the
+    // previous session at that hour, so every one of those steps decided on the
+    // close before last, and the cache kept serving that series all day. Seen on
+    // 2 Oct 2026: both German gates and the US gate ranked on Wednesday's close
+    // instead of Thursday's; the Indian ones, whose market shut hours earlier,
+    // were current.
+    //
+    // CURRENT = the newest bar is from the last session that has already CLOSED,
+    // on the exchange's own clock: today once today's close has passed, else the
+    // weekday before. (Not simply "yesterday" — the US gate runs at about 20:00
+    // New York time, when that same day's session is already over.)
+    //
+    // A holiday has no bar at all, so a missing session is accepted once it is
+    // twelve hours past its close: a provider that is merely late has caught up
+    // long before that, and a day with no trading never will.
+
+    private const val HOLIDAY_GRACE_SEC = 12 * 3600L
+
+    private fun prevWeekday(d: LocalDate): LocalDate {
+        var x = d.minusDays(1)
+        while (x.dayOfWeek.value >= 6) x = x.minusDays(1)
+        return x
+    }
+
+    /** The last session that has closed by [now], on the exchange's calendar. */
+    fun lastClosedSession(now: java.time.ZonedDateTime, close: java.time.LocalTime): LocalDate {
+        val d = now.toLocalDate()
+        return if (d.dayOfWeek.value <= 5 && !now.toLocalTime().isBefore(close)) d else prevWeekday(d)
+    }
+
+    /** Pure form of [dailyDataCurrent], for tests. */
+    fun dailyDataCurrentAt(newest: LocalDate?, now: java.time.ZonedDateTime, close: java.time.LocalTime): Boolean {
+        if (newest == null) return false
+        val expected = lastClosedSession(now, close)
+        if (!newest.isBefore(expected)) return true
+        val closedAt = expected.atTime(close).atZone(now.zone).toEpochSecond()
+        return now.toEpochSecond() >= closedAt + HOLIDAY_GRACE_SEC
+    }
+
+    /** Does a daily series ending at [newest] hold the last finished session for
+     *  [space] ("DE"/"US"/"IN", or a namespace)? Always true for crypto. */
+    fun dailyDataCurrent(space: String, newest: LocalDate?,
+                         nowMs: Long = System.currentTimeMillis()): Boolean {
+        val base = when (space.uppercase()) { "BN" -> "binance"; else -> space.lowercase() }
+        val zone = com.signalscope.app.trading.MarketHours.zoneOf(base) ?: return newest != null
+        val close = com.signalscope.app.trading.MarketHours.closeOf(base) ?: return newest != null
+        return dailyDataCurrentAt(newest, Instant.ofEpochMilli(nowMs).atZone(zone), close)
+    }
+
+    /** A cached series that is NOT current is fetched again after this long, so
+     *  the retry finds the corrected data without hammering Yahoo every pass. */
+    private const val STALE_REFETCH_MS = 45 * 60 * 1000L
+
+    private data class BarCacheEntry(val day: String, val bars: List<DailyBar>,
+                                     val fetchedAt: Long = System.currentTimeMillis())
     private val barCache = java.util.concurrent.ConcurrentHashMap<String, BarCacheEntry>()
     private val barLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
     @Volatile private var barCacheDay: String = ""
@@ -142,15 +200,27 @@ object ScreenerRunner {
         val day = utcDay()
         pruneIfNewDay(day)
         val key = space.uppercase() + "|" + symbol.uppercase()
-        barCache[key]?.let { if (it.day == day) return Pair(it.bars, false) }
+        // A series cached before the provider had the last session is fetched
+        // again once it has had time to catch up — see [dailyDataCurrent].
+        fun usable(e: BarCacheEntry) = e.day == day &&
+            (dailyDataCurrent(space, e.bars.lastOrNull()?.date) ||
+                System.currentTimeMillis() - e.fetchedAt < STALE_REFETCH_MS)
+        barCache[key]?.let { if (usable(it)) return Pair(it.bars, false) }
         val lock = barLocks.getOrPut(key) { Any() }
         synchronized(lock) {
-            barCache[key]?.let { if (it.day == day) return Pair(it.bars, false) }
+            barCache[key]?.let { if (usable(it)) return Pair(it.bars, false) }
+            val old = barCache[key]?.takeIf { it.day == day }
             val bars = fetchDaily(space, symbol)
             // Only a NON-EMPTY result is cached. Caching an empty list would pin a
             // transient failure (rate limit, blip) for the rest of the day and make
             // the symbol invisible to every later caller.
             if (bars.isNotEmpty()) barCache[key] = BarCacheEntry(day, bars)
+            else if (old != null) {
+                // A re-check that failed keeps the older series rather than losing
+                // the symbol, and waits the full interval before trying again.
+                barCache[key] = old.copy(fetchedAt = System.currentTimeMillis())
+                return Pair(old.bars, true)
+            }
             return Pair(bars, true)
         }
     }

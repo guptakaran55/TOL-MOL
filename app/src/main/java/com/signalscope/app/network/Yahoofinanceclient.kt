@@ -712,7 +712,7 @@ object YahooFinanceClient {
                     maxOf(hi, v), minOf(lo, v), v, vol))
             }
             if (candles.size < 50) CandleResult.NoData
-            else CandleResult.Success(candles, null)
+            else CandleResult.Success(LatestSession.fill(candles, result.optJSONObject("meta")), null)
         } catch (e: Exception) {
             Log.e(TAG, "parseYahooAdjusted error for $symbol", e)
             CandleResult.Error("Parse error: ${e.message}")
@@ -924,7 +924,7 @@ object YahooFinanceClient {
             }
 
             Log.d(TAG, "Yahoo Finance: $symbol — ${candles.size} candles")
-            CandleResult.Success(candles, displayName)
+            CandleResult.Success(LatestSession.fill(candles, meta), displayName)
 
         } catch (e: Exception) {
             Log.e(TAG, "Yahoo Finance parse error for $symbol", e)
