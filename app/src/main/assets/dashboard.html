@@ -4390,7 +4390,33 @@ window.updateProgress=function(c,t,m){
   if(pb&&pt&&t>0){var pct=Math.round(c/t*100);pb.style.width=pct+'%';pt.textContent=(m||STATE.market)+': '+c+'/'+t+' ('+pct+'%)';}
   else{renderKeepScroll();}  // Full render only if progress bar doesn't exist yet
 };
-window.scanComplete=function(){STATE.scanning=false;STATE.progress=null;STATE.lastScanTime=new Date();renderKeepScroll()};
+window.scanComplete=function(){STATE.scanning=false;STATE.progress=null;STATE.scanEndNote='';STATE.lastScanTime=new Date();renderKeepScroll()};
+// ── A SPINNER THAT OUTLIVES ITS SCAN ────────────────────────────────────────
+// The app says "finished" only when it SEES a scan go from running to stopped
+// while this page is open. A scan that ends with the app in the background —
+// screen off, another app in front — is never announced, and on return the page
+// kept its spinner and "0/635" indefinitely while nothing was scanning at all.
+// So the page asks for itself: while it believes a scan is on, it checks every
+// few seconds, and two "not running" answers in a row end the spinner. (Two,
+// because a scan just tapped takes a moment to register as started.)
+var SCAN_IDLE_MISSES=0;
+setInterval(function(){
+  try{
+    if(!STATE.scanning||typeof Android==='undefined'||!Android.isDiscoveryRunning){SCAN_IDLE_MISSES=0;return}
+    if(Android.isDiscoveryRunning()){SCAN_IDLE_MISSES=0;return}
+    if(++SCAN_IDLE_MISSES<2)return;
+    SCAN_IDLE_MISSES=0;
+    STATE.scanning=false;STATE.progress=null;
+    var why='';try{why=Android.discoveryOutcome?String(Android.discoveryOutcome()||''):''}catch(e){}
+    // A scan that finished normally needs no note; anything else says why. A
+    // status still reading "x/y scanned" means it died mid-way without a word.
+    var mid=/(\d+)\/(\d+) scanned/.exec(why);
+    STATE.scanEndNote=/^Discovery done/.test(why)?'':
+      mid?('it stopped at '+mid[1]+' of '+mid[2]+' stocks, with no error reported.'):
+      why?(why.replace(/[.\s]*$/,'')+'.'):'it stopped with no reason reported.';
+    renderKeepScroll();
+  }catch(e){}
+},5000);
 window.updatePortfolioData=function(j){
   try{var d=typeof j==='string'?JSON.parse(j):j;
   PORTFOLIO.holdings=d.holdings||[];PORTFOLIO.summary=d.summary||null;
@@ -5074,6 +5100,12 @@ function render(){
   // Progress
   if(STATE.scanning&&STATE.progress){var p=STATE.progress;var pct=p.total>0?Math.round(p.current/p.total*100):0;
     h+='<div class="prog"><div class="sp" style="width:14px;height:14px;margin:0;border-width:2px;flex-shrink:0"></div><div class="pbar"><div class="pfill" style="width:'+pct+'%"></div></div><div class="ptxt">'+STATE.market+': '+p.current+'/'+p.total+' ('+pct+'%)</div></div>';}
+  // A scan that ended while the app was away, and did not finish.
+  if(!STATE.scanning&&STATE.scanEndNote){
+    h+='<div style="margin:0 8px 6px;padding:6px 10px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.4);border-radius:6px;font-size:10px;color:#b45309;display:flex;gap:8px;align-items:center">'+
+      '<span style="flex:1">The last scan ended without finishing: '+escHtml(STATE.scanEndNote)+' Start it again to finish the list.</span>'+
+      '<span onclick="STATE.scanEndNote=\'\';renderKeepScroll()" style="cursor:pointer;font-weight:800">✕</span></div>';
+  }
   // Scan status bar — errors/skipped summary
   if(STATE.errors>0||STATE.skipped>0){
     h+='<div style="margin:0 8px 6px;padding:6px 10px;background:rgba(220,38,38,.06);border:1px solid rgba(220,38,38,.15);border-radius:6px;font-size:10px;display:flex;justify-content:space-between;align-items:center">';

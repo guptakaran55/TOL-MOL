@@ -241,7 +241,10 @@ class MainActivity : AppCompatActivity() {
         thread(isDaemon = true, name = "gate-backtest") {
             val out: String = try {
                 val po = org.json.JSONObject(paramsJson)
+                // A backtest always runs on the space's correct bar grid, even while the live book
+                // is still finishing an open position on the grid it was opened under.
                 val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                    .copy(barAnchorSec = com.signalscope.app.data.StrategyLabStore.barAnchorFor(ns))
                 val params = com.signalscope.app.trading.GateBacktest.Params(
                     mode = po.optString("mode", "3B"),
                     holdN = po.optInt("holdN", 5),
@@ -1423,6 +1426,12 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun isDiscoveryRunning(): Boolean =
             ScanServiceResultHolder.isDiscoveryRunning
+
+        /** What the last Discovery scan said as it ended — "done", "stopped", or
+         *  the error that ended it — so the page can explain a scan it never saw
+         *  finish rather than spinning on it. */
+        @JavascriptInterface
+        fun discoveryOutcome(): String = ScanServiceResultHolder.discoveryStatusText
 
         @JavascriptInterface
         fun getCachedDiscoveryForSpace(space: String): String {
