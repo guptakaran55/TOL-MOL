@@ -45,8 +45,28 @@ import java.io.File
 object T212ClosedTrades {
 
     private const val TAG = "T212ClosedTrades"
-    private const val FILE = "t212_closed_trades.json"
+    /** The pre-split file, holding both markets in one report. Removed by the next history read. */
+    private const val LEGACY_FILE = "t212_closed_trades.json"
+    private fun fileFor(space: String) = "t212_closed_trades_${space.lowercase()}.json"
     private val gson = Gson()
+
+    /** The two spaces one Trading 212 account is shown as. */
+    val SPACES = listOf("US", "DE")
+
+    /**
+     * Which space a closed trade belongs to: "DE" for Xetra, "US" for the rest.
+     *
+     * ONE ACCOUNT, TWO TABS. Trading 212 keeps German and US shares in a single
+     * account and a single order history, but the app shows them as separate
+     * markets — so the history is split before it is matched, and each tab totals
+     * only its own trades. Matching is per ticker anyway, so splitting first
+     * changes no round trip, only which total it lands in.
+     *
+     * Uses the same venue rule the feed lookup does, so a stock can never be
+     * German on one screen and American on another.
+     */
+    fun spaceOf(ticker: String): String =
+        if (Trading212Client.wantedFeedSuffix(ticker) == ".DE") "DE" else "US"
 
     // THE SHAPES AND THE MATCHING NOW LIVE IN [ClosedTrades], shared with India.
     // Kept reachable under the old names so nothing that reads a report has to
@@ -74,48 +94,63 @@ object T212ClosedTrades {
     fun cashPerShare(cash: Double, qty: Double, price: Double): Double =
         ClosedTrades.cashPerShare(cash, qty, price)
 
-    /** Fetch, match, cache. Network — call it off the main thread. */
-    fun run(ctx: Context): ClosedTrades.Report {
+    /**
+     * Fetch once, split by market, match each, cache each. Network — call it off
+     * the main thread. Returns [space]'s report.
+     */
+    fun run(ctx: Context, space: String): ClosedTrades.Report {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials)
-            return ClosedTrades.Report(error = "No Trading 212 API key saved.").also { store(ctx, it) }
+            return storeAll(ctx, ClosedTrades.Report(error = "No Trading 212 API key saved."))
         val fills = when (val r = Trading212Client(config).fetchOrderHistoryPaged()) {
             is Trading212Client.T212Result.Success -> r.data
             is Trading212Client.T212Result.Failure ->
-                return ClosedTrades.Report(error = r.message).also { store(ctx, it) }
-            else -> return ClosedTrades.Report(error = "Trading 212 not configured").also { store(ctx, it) }
+                return storeAll(ctx, ClosedTrades.Report(error = r.message))
+            else -> return storeAll(ctx, ClosedTrades.Report(error = "Trading 212 not configured"))
         }
         if (fills.isEmpty())
-            return ClosedTrades.Report(ok = true, checkedAt = System.currentTimeMillis(),
-                error = "The history endpoint answered but reported no executed orders.")
-                .also { store(ctx, it) }
-        val (_, rep) = match(fills)
-        // DELIBERATELY NOT COSTED, unlike the Indian report.
-        //
-        // This walk is ACCOUNT-WIDE: one list holding German and US trades
-        // together. Their charges are not the same — a euro account buying euro
-        // stock converts nothing, while the same account buying a Nasdaq share
-        // pays 0.15% on each leg — and the fill rows carry no currency to tell
-        // them apart. Applying either rate to the whole list would be wrong for
-        // half of it, and a P&L "after charges" that is wrong for half the rows
-        // is worse than one that admits it has not costed them. The panel says
-        // so rather than showing a net figure it cannot stand behind.
-        val out = rep.copy(currency = config.accountCurrency)
-        store(ctx, out)
-        Log.i(TAG, "closed-trade scan: ${fills.size} fills → ${out.trips.size} round trips, " +
-            "net ${"%.2f".format(out.totalPnl)} ${out.currency}")
-        return out
+            return storeAll(ctx, ClosedTrades.Report(ok = true, checkedAt = System.currentTimeMillis(),
+                error = "The history endpoint answered but reported no executed orders."))
+        // COSTED BY MARKET. Trading 212's only per-trade charge is its 0.15%
+        // conversion fee, paid on each leg when the stock's currency is not the
+        // account's — US shares on a euro account pay it both ways, German shares
+        // on a euro account pay nothing. The pairing of market and account
+        // currency is exactly what [TradingCosts] already decides, so the closed
+        // trades are costed through it rather than by a second copy of the rule.
+        val bySpace = SPACES.associateWith { sp ->
+            val (_, rep) = match(fills.filter { spaceOf(it.ticker) == sp })
+            ClosedTrades.costed(rep, sp.lowercase(), config.accountCurrency)
+                .copy(currency = config.accountCurrency).also { store(ctx, sp, it) }
+        }
+        File(ctx.filesDir, LEGACY_FILE).delete()
+        Log.i(TAG, "closed-trade scan: ${fills.size} fills → " + bySpace.entries.joinToString { (sp, r) ->
+            "$sp ${r.trips.size} round trips, net ${"%.2f".format(r.totalPnl)} ${r.currency}" })
+        return bySpace.getValue(space.uppercase().takeIf { it in SPACES } ?: "US")
     }
 
-    /** The last report, for a panel that must render without hitting the network. */
-    fun last(ctx: Context): ClosedTrades.Report = try {
-        val f = File(ctx.filesDir, FILE)
+    /** The last report for [space], for a panel that must render without hitting the network. */
+    fun last(ctx: Context, space: String): ClosedTrades.Report = try {
+        val f = File(ctx.filesDir, fileFor(space))
         if (!f.exists()) ClosedTrades.Report(error = "not scanned yet")
-        else gson.fromJson(f.readText(), ClosedTrades.Report::class.java) ?: ClosedTrades.Report(error = "unreadable")
+        else {
+            val r = gson.fromJson(f.readText(), ClosedTrades.Report::class.java)
+                ?: ClosedTrades.Report(error = "unreadable")
+            // Costed on reading too, so a report saved before costing existed
+            // shows its fees without waiting for the next history read.
+            if (r.ok && r.trips.isNotEmpty())
+                ClosedTrades.costed(r, space.lowercase(), ConfigManager(ctx).accountCurrency)
+            else r
+        }
     } catch (e: Exception) { ClosedTrades.Report(error = e.message ?: "unreadable") }
 
-    private fun store(ctx: Context, r: ClosedTrades.Report) {
-        try { File(ctx.filesDir, FILE).writeText(gson.toJson(r)) }
+    /** An account-wide outcome (no key, fetch failed) is the same answer on both tabs. */
+    private fun storeAll(ctx: Context, r: ClosedTrades.Report): ClosedTrades.Report {
+        SPACES.forEach { store(ctx, it, r) }
+        return r
+    }
+
+    private fun store(ctx: Context, space: String, r: ClosedTrades.Report) {
+        try { File(ctx.filesDir, fileFor(space)).writeText(gson.toJson(r)) }
         catch (e: Exception) { Log.w(TAG, "closed-trade store failed", e) }
     }
 }

@@ -115,9 +115,20 @@ object Trading212TrailingManager {
         val pendingByTicker = pendingSellOrders.groupBy { it.ticker }
         val weights = config.scoringWeights
         val activePairs = T212OcoStore.loadAll(ctx).associateBy { it.ticker }
+        // 1-WEEK-HIGH TARGETS are kept by their own keeper at a price fixed at the
+        // buy. Raising one here would turn it into a different target; creating a
+        // stop beside one would be refused for reserved shares. A stock carrying
+        // one is left entirely to it.
+        val weekTargetIds = try { com.signalscope.app.data.T212TargetStore.restingIds(ctx) }
+                            catch (e: Exception) { emptySet<Long>() }
 
         for (h in holdings) {
             if (h.quantity <= 0) continue
+            if (pendingByTicker[h.ticker].orEmpty().any { it.id in weekTargetIds }) {
+                skipped++
+                log.add("${h.ticker}: 1-week-high target waiting — left to its own keeper")
+                continue
+            }
             try {
                 var analysis: com.signalscope.app.data.StockAnalysis? = null
                 fun priceUnder(candidate: String): com.signalscope.app.data.StockAnalysis? {

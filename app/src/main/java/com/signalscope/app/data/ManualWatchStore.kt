@@ -284,6 +284,18 @@ object ManualWatchStore {
         /** Separate returns to the bottom of the range, not bars spent there. */
         val swingVisits: Int = 0,
         val swingDays: Int = 0,
+        /** The same reading over the last WEEK (5 trading days) and MONTH (21):
+         *  a 3-day floor says where today's pullback might stop; these say whether
+         *  that floor is also the lowest the stock has been in a week or a month,
+         *  which is a different and rarer thing. 0 = not enough history. */
+        val weekLow: Double = 0.0,
+        val weekHigh: Double = 0.0,
+        val weekVisits: Int = 0,
+        val weekDays: Int = 0,
+        val monthLow: Double = 0.0,
+        val monthHigh: Double = 0.0,
+        val monthVisits: Int = 0,
+        val monthDays: Int = 0,
         /** The close these were measured against. */
         val price: Double = 0.0,
         /** Minutes per bar they were read off — 1440 when the watcher's feed is
@@ -325,6 +337,10 @@ object ManualWatchStore {
          * whichever fired first silence the other for the rest of the day.
          */
         val supportAlerted: Map<String, String> = emptyMap(),
+        /** "SYMBOL|1w" / "SYMBOL|1m" -> UTC day the weekly or monthly low was
+         *  flagged. Separate from the 3-day map so a deeper low reached later in
+         *  the day still gets through. Nullable: older files have no such field. */
+        val supportAlertedScales: Map<String, String>? = null,
         /**
          * A PLAIN PERCENTAGE TRAIL FOR HAND-MANAGED POSITIONS, 0 = off.
          *
@@ -585,6 +601,21 @@ object ManualWatchStore {
     fun markSupportAlerted(ctx: Context, space: String, symbol: String, day: String) =
         mutate(ctx, space) {
             it.copy(supportAlerted = it.supportAlerted + (symbol.uppercase() to day))
+        }
+
+    /** Has this stock's [scale] low ("3d", "1w", "1m") already been flagged [day]? */
+    fun floorAlerted(s: State, symbol: String, scale: String, day: String): Boolean =
+        if (scale == "3d") alreadySupportAlerted(s, symbol, day)
+        else s.supportAlertedScales?.get("${symbol.uppercase()}|$scale") == day
+
+    fun markFloorsAlerted(ctx: Context, space: String, symbol: String, scales: List<String>, day: String) =
+        mutate(ctx, space) { s ->
+            val sym = symbol.uppercase()
+            val wide = (s.supportAlertedScales ?: emptyMap()) +
+                scales.filter { it != "3d" }.map { "$sym|$it" to day }
+            s.copy(supportAlerted = if ("3d" in scales) s.supportAlerted + (sym to day) else s.supportAlerted,
+                // Yesterday's entries are dead weight; keep only today's.
+                supportAlertedScales = wide.filterValues { it == day })
         }
 
     /** The live (PENDING or OPEN) entry for a symbol, if any. Used to keep the

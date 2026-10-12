@@ -345,6 +345,34 @@ object LabNotifier {
     }
 
     /**
+     * NEAR ITS 3-DAY, 1-WEEK OR 1-MONTH LOW — one alert naming the DEEPEST of the
+     * lows it is sitting at, and mentioning the others, rather than one buzz per
+     * horizon. [hits] come shortest first (see [IntradayLevels.floorsHit]).
+     * Same channel and wording rules as [nearSupport]: a price observation, not
+     * a signal, and it says so.
+     */
+    fun nearLows(ctx: Context, space: String, symbol: String, rank: Int, price: Double,
+                 hits: List<IntradayLevels.Floor>, cur: String) {
+        val deep = hits.lastOrNull() ?: return
+        val offLow = if (deep.low > 0.0) (price / deep.low - 1.0) * 100.0 else 0.0
+        val others = hits.dropLast(1).map { it.label }
+        notify(ctx, CH_SUPPORT, NotificationManager.IMPORTANCE_DEFAULT, "Near support",
+            "🔵 $symbol — near its ${deep.label} low" + (if (rank > 0) " (#$rank)" else ""),
+            "${spaceLabel(space)} · $cur${"%.2f".format(price)} is " +
+                "${"%.1f".format(offLow)}% off its ${deep.label} low of $cur${"%.2f".format(deep.low)} " +
+                "(range to $cur${"%.2f".format(deep.high)})" +
+                (if (deep.visits > 1) " · price has come back to that floor ${deep.visits} separate times" else "") +
+                (if (others.isNotEmpty()) " · also at the bottom of its ${others.joinToString(" and ")} range" +
+                    (if (others.size > 1) "s" else "") else "") +
+                ". Nothing has been bought and no rule fired — this is where the stock is, not advice.",
+            // One per symbol, per day, per horizon: a deeper low later in the day
+            // is a new alert, the same one again replaces rather than stacks.
+            "ns-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}-${deep.scale}",
+            openWatchSymbol = symbol, openSpace = space,
+            chart = macdArt(ctx, space, symbol))
+    }
+
+    /**
      * WHAT A WATCHER ALERT LOOKS LIKE for one name, without anything having fired.
      *
      * Labelled PREVIEW in the title and the text, so it can never be read as a
@@ -446,6 +474,25 @@ object LabNotifier {
             paid = paid, realExit = realExit, broker = broker)
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             t.first, t.second, "t2s-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
+    }
+
+    /**
+     * A 1-week-high target is now waiting at Trading 212 for a position. Once per
+     * position, quietly: it is a standing instruction, not a trade, and the sale
+     * it may lead to gets its own loud alert when it happens.
+     */
+    fun weekTargetSet(ctx: Context, ns: String, symbol: String, price: Double, paid: Double,
+                      qty: Double, cur: String, tradeKey: String) {
+        val pct = if (paid > 0.0) (price / paid - 1.0) * 100.0 else null
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_LOW, "Stock LIVE trades",
+            "🎯 $symbol — target set at ${"%.2f".format(price)}" +
+                (pct?.let { " (${"%+.1f".format(it)}%)" } ?: ""),
+            "${algoLabel(ctx, ns)} · a sell for ${"%.4f".format(qty)} is waiting at Trading 212 " +
+                "at its 1-week high of ${"%.2f".format(price)} $cur" +
+                (if (paid > 0.0) ", against the ${"%.2f".format(paid)} you paid" else "") +
+                ". It sells there even with the phone off. The stop is still watched by the app, " +
+                "and any other sale clears this order first.",
+            "t2t-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
     }
 
     /**

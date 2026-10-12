@@ -36,6 +36,23 @@ object StrategyLabRunner {
     private fun guard(ns: String) = running.getOrPut(ns) { AtomicBoolean(false) }
 
     /**
+     * Run [block] while this algo's own pass is held off — for a hand action on
+     * its book (the take-profit button). Without it a pass already running
+     * could finish a moment later and write its older picture of a position
+     * over the one just closed. Waits up to [waitMs] for a running pass to end;
+     * null if it does not, and nothing is done.
+     */
+    fun <T> withAlgoHeld(ns: String, waitMs: Long, block: () -> T): T? {
+        val g = guard(ns)
+        val until = System.currentTimeMillis() + waitMs
+        while (!g.compareAndSet(false, true)) {
+            if (System.currentTimeMillis() > until) return null
+            try { Thread.sleep(500) } catch (_: InterruptedException) { return null }
+        }
+        try { return block() } finally { g.set(false) }
+    }
+
+    /**
      * Progress sink for one run pass, so "Run now" can show a busy state and a
      * real percentage instead of a fire-and-forget toast. Phases:
      *   "start"  — pass accepted, total = enrolled symbol count
@@ -1378,6 +1395,31 @@ object StrategyLabRunner {
                 catch (e: Exception) { null })
         } catch (e: Exception) {
             Log.w(TAG, "[$ns] $sym latest-bar lookup failed", e); null
+        }
+    }
+
+    /**
+     * The stock's 1-week high AS IT STOOD WHEN IT WAS BOUGHT, on this namespace's
+     * own feed — see [WeekTarget]. Bars that had not closed by [beforeSec] are
+     * left out, so nothing the stock did after the buy can move it.
+     *
+     * Null when the bars could not be fetched (worth asking again later); 0.0
+     * when they arrived but do not reach back a week before the buy.
+     */
+    fun weekHighBefore(ctx: Context, ns: String, symbol: String, beforeSec: Long): Double? {
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank() || beforeSec <= 0L) return null
+        return try {
+            val cfg = StrategyLabStore.activeConfig(ctx, ns)
+            val plan = FeedPlan.plan(cfg, ns)
+            if (!plan.ok) return null
+            val res = fetchCandlesFor(ctx, ns, sym, Spaces.exchangeOf(ns), plan)
+            if (res !is YahooFinanceClient.CandleResult.Success) return null
+            val nowSec = System.currentTimeMillis() / 1000
+            val candles = sanitizeCandles(res.candles, nowSec, plan.sourceSec).clean
+            WeekTarget.highBefore(candles, beforeSec, plan.sourceSec) ?: 0.0
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym week-high lookup failed", e); null
         }
     }
 

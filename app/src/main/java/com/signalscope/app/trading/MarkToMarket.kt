@@ -472,6 +472,12 @@ object MarkToMarket {
                               /** Came from a live venue rather than a delayed feed. */
                               val realtime: Boolean = false)
 
+    /** The latest regular-session price, fetched now — for an action taken at
+     *  this moment rather than a display that can wait for the next poll. */
+    fun priceNow(ctx: Context, ns: String, symbol: String): Double? = try {
+        lastPrice(ctx, ns, symbol)?.regular?.takeIf { it > 0.0 && it.isFinite() }
+    } catch (e: Exception) { null }
+
     private fun lastPrice(ctx: Context, ns: String, symbol: String): Polled? {
         if (Spaces.baseOf(ns) == "binance") {
             val r = BinanceClient.fetchKlines(symbol, "15m", 500)

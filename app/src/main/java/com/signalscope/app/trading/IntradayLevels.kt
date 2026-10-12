@@ -81,6 +81,10 @@ object IntradayLevels {
 
         if (support <= 0.0 && resistance <= 0.0 && pos < 0.0) return null
 
+        // The same window over a week and a month — on the bars already in hand.
+        val wk = window(candles, WEEK_DAYS, WEEK_MIN_DAYS)
+        val mo = window(candles, MONTH_DAYS, MONTH_MIN_DAYS)
+
         return ManualWatchStore.Levels(
             symbol = symbol.trim().uppercase(),
             support = support, resistance = resistance, price = price,
@@ -88,7 +92,52 @@ object IntradayLevels {
             resistanceTouches = if (resistance > 0.0) sr.resistanceTouches else 0,
             swingLow = lo, swingHigh = hi, swingPos = pos,
             swingVisits = visits, swingDays = swingDays,
+            weekLow = wk?.low ?: 0.0, weekHigh = wk?.high ?: 0.0,
+            weekVisits = wk?.visits ?: 0, weekDays = wk?.days ?: 0,
+            monthLow = mo?.low ?: 0.0, monthHigh = mo?.high ?: 0.0,
+            monthVisits = mo?.visits ?: 0, monthDays = mo?.days ?: 0,
             barMin = barMin, bars = candles.size, atMs = nowMs)
+    }
+
+    // ── WEEK AND MONTH ──────────────────────────────────────────────────────
+    // Same reading as the 3-day window, longer horizon. Counted in days that
+    // traded, like the 3-day one. A window short of most of its days (a young
+    // listing, a thin history) is left out rather than shown as a "month".
+    const val WEEK_DAYS = 5
+    const val MONTH_DAYS = 21
+    private const val WEEK_MIN_DAYS = 4
+    private const val MONTH_MIN_DAYS = 15
+
+    private class Window(val low: Double, val high: Double, val visits: Int, val days: Int)
+
+    private fun window(candles: List<CandleData>, days: Int, minDays: Int): Window? {
+        val recent = recentDays(candles, days)
+        val n = recent.map { it.timestamp / 86_400L }.distinct().size
+        if (n < minDays) return null
+        val lo = recent.minOfOrNull { it.low } ?: return null
+        val hi = recent.maxOfOrNull { it.high } ?: return null
+        if (!(lo > 0.0) || !(hi > lo)) return null
+        return Window(lo, hi, zoneVisits(recent, lo, hi), n)
+    }
+
+    /** One horizon's floor: "3d", "1w" or "1m", and its range. */
+    data class Floor(val scale: String, val label: String, val low: Double, val high: Double,
+                     val visits: Int, val days: Int)
+
+    /**
+     * WHICH OF ITS LOWS IS THIS PRICE SITTING AT — the 3-day, the week's, the
+     * month's — by the same rule for each: the bottom tenth of that window's own
+     * range (or below it). Shortest first. Pure, so it is tested on numbers.
+     */
+    fun floorsHit(lv: ManualWatchStore.Levels, price: Double): List<Floor> {
+        if (!(price > 0.0)) return emptyList()
+        val all = listOf(
+            Floor("3d", "${lv.swingDays.takeIf { it > 0 } ?: SWING_DAYS}-day", lv.swingLow, lv.swingHigh, lv.swingVisits, lv.swingDays),
+            Floor("1w", "1-week", lv.weekLow, lv.weekHigh, lv.weekVisits, lv.weekDays),
+            Floor("1m", "1-month", lv.monthLow, lv.monthHigh, lv.monthVisits, lv.monthDays))
+        return all.filter { f ->
+            f.low > 0.0 && f.high > f.low && inSupportZone(positionInRange(price, f.low, f.high))
+        }
     }
 
     /**

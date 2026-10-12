@@ -28,6 +28,17 @@ data class StrategyLabConfig(
      * it describes the broker rather than the strategy.
      */
     val flatFeeRoundTripPct: Double = 0.0,
+    /**
+     * Where the resample grid is anchored, in seconds east of UTC midnight. Not read from the
+     * strategy JSON — injected by StrategyLabStore.activeConfig from the space, like the fees.
+     *
+     * The desktop lab anchors every bucket at the exchange's local midnight. For UTC-stamped
+     * German data and New York's whole-hour offsets that grid coincides with the epoch one, but
+     * India's +5:30 does not: an epoch-anchored 240-min grid starts NSE blocks at 05:30, 09:30,
+     * 13:30 IST, so the day's first "4-hour" block holds the 09:15 hour alone. Its close then
+     * drives entries, fills and the stop as though it were a whole block. 0 = epoch grid.
+     */
+    val barAnchorSec: Long = 0L,
     val macdFast: Int = 12,
     val macdSlow: Int = 26,
     val macdSignal: Int = 9,

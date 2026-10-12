@@ -33,7 +33,7 @@ object MacdLadder {
     fun smoothingFor(ctx: Context, base: String): Int = try {
         com.signalscope.app.data.StrategyLabStore
             .activeConfig(ctx, com.signalscope.app.data.ManualWatchStore.nsFor(base)).slopeSmoothingOverride
-    } catch (e: Exception) { null } ?: if (base == "binance") 2 else 5
+    } catch (e: Exception) { null } ?: MacdSlopes.defaultSmoothing(base)
 
     // ── MONTHLY BARS, ONCE A DAY ──────────────────────────────────────────────
     // A monthly slope cannot change within a day, so asking Yahoo again is pure

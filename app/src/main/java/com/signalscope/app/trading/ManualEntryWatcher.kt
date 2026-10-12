@@ -71,7 +71,9 @@ object ManualEntryWatcher {
     // simply never arrives, looking exactly like a market with nothing in it.
     // 9: today's pass had ranked on a series missing the last session (see
     // ScreenerRunner.dailyDataCurrent); the bump redoes it on corrected prices.
-    private const val DAILY_BUILD = 9
+    // 10: the slope is no longer smoothed by default (see [MacdSlopes]); the bump
+    // re-ranks today on the unsmoothed figure instead of waiting for tomorrow.
+    private const val DAILY_BUILD = 10
 
     /** Fallback depth when no context is available to read the setting from.
      *  The real value lives in settings — see [depthFor]. */
@@ -280,7 +282,7 @@ object ManualEntryWatcher {
         if (!force && s0.lastDailyBuild == stamp) return false
 
         val cfg = StrategyLabStore.activeConfig(ctx, ns)
-        val smoothing = cfg.slopeSmoothingOverride ?: if (base == "binance") 2 else 5
+        val smoothing = cfg.slopeSmoothingOverride ?: MacdSlopes.defaultSmoothing(base)
         val scrCfg = cfg.screenerLookbackOverride
             ?.let { ScreenerConfig(lookbackDays = it.toLong()) } ?: ScreenerConfig()
 
@@ -976,19 +978,21 @@ object ManualEntryWatcher {
                 sigPx = px
                 sigAtFloor = IntradayLevels.inSupportZone(pos)
                 sigFresh = marketLive
+                // THE 3-DAY, WEEK AND MONTH LOWS, each by the same rule. One alert per
+                // pass names the deepest one it is sitting at; each horizon alerts
+                // at most once a day, so reaching the month's low later in a day that
+                // already flagged the 3-day one still gets through.
                 val st2 = ManualWatchStore.load(ctx, base)
-                if (marketLive && px > 0.0 &&
-                    IntradayLevels.inSupportZone(pos) &&
-                    !ManualWatchStore.alreadySupportAlerted(st2, c.symbol, day)) {
+                val hits = if (marketLive && px > 0.0) IntradayLevels.floorsHit(lv, px) else emptyList()
+                val news = hits.filter { !ManualWatchStore.floorAlerted(st2, c.symbol, it.scale, day) }
+                if (news.isNotEmpty()) {
                     val cur = when (base) { "de" -> "\u20ac"; "in" -> "\u20b9"; else -> "$" }
                     try {
-                        LabNotifier.nearSupport(ctx, base, c.symbol, c.rank, px,
-                            lv.swingLow, lv.swingHigh, lv.swingVisits,
-                            lv.swingDays.takeIf { it > 0 } ?: IntradayLevels.SWING_DAYS, cur)
-                        ManualWatchStore.markSupportAlerted(ctx, base, c.symbol, day)
-                        Log.i(TAG, "[$base] ${c.symbol} near its floor: " +
-                            "${"%.2f".format(px)} in ${"%.2f".format(lv.swingLow)}" +
-                            "-${"%.2f".format(lv.swingHigh)} (pos ${"%.2f".format(pos ?: -1.0)})")
+                        LabNotifier.nearLows(ctx, base, c.symbol, c.rank, px, hits, cur)
+                        ManualWatchStore.markFloorsAlerted(ctx, base, c.symbol, hits.map { it.scale }, day)
+                        Log.i(TAG, "[$base] ${c.symbol} near its ${hits.last().label} low: " +
+                            "${"%.2f".format(px)} vs ${"%.2f".format(hits.last().low)}" +
+                            " (${hits.joinToString(",") { it.scale }}, new ${news.joinToString(",") { it.scale }})")
                     } catch (ex: Exception) {
                         Log.w(TAG, "[$base] ${c.symbol} floor alert failed", ex)
                     }

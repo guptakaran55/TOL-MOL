@@ -362,6 +362,7 @@ class MainActivity : AppCompatActivity() {
                 if (text.isBlank()) gson.toJson(mapOf("error" to "Empty file"))
                 else {
                     val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, backtestNs)
+                        .copy(barAnchorSec = com.signalscope.app.data.StrategyLabStore.barAnchorFor(backtestNs))
                     val rawJson = com.signalscope.app.data.StrategyLabStore.load(applicationContext, backtestNs).configJson
                     val t0 = System.currentTimeMillis()
                     val result = com.signalscope.app.trading.StrategyLabBacktest.run(text, cfg)
@@ -1835,6 +1836,11 @@ class MainActivity : AppCompatActivity() {
                         "fetchGttExecutionData" -> fetchGttExecutionData()
                         "macdLadder" -> macdLadderJson(a[0].asString, a[1].asString)
                         "floorRunNow" -> floorRunNow(a[0].asString)
+                        "algoTakeProfit" -> gson.toJson(com.signalscope.app.trading.AlgoTakeProfit
+                            .takeNow(applicationContext, a[0].asString, a[1].asString))
+                        "weekTargetRemove" -> gson.toJson(mapOf("msg" to com.signalscope.app.trading.T212WeekTargets
+                            .remove(applicationContext, a[0].asString, a[1].asString)))
+                        "dailyMacd" -> dailyMacdJson(a[0].asString, a[1].asString)
                         else -> "{\"error\":\"not callable in the background: $method\"}"
                     }
                 } catch (e: Exception) {
@@ -1867,6 +1873,37 @@ class MainActivity : AppCompatActivity() {
                 ?: return "{\"ok\":false,\"error\":\"no data\"}"
             return gson.toJson(mapOf("ok" to true,
                 "readings" to r.map { mapOf("label" to it.label, "sign" to it.sign) }))
+        }
+
+        /**
+         * THE DAILY MACD, FRESH — for the stock sheet's chart.
+         *
+         * The sheet used to draw the 30 values stored on the Discovery scan, which
+         * are only as current as that scan: a US scan left from August drew
+         * August's MACD under today's name. This fetches the daily prices when
+         * the sheet opens and returns the standard 12/26/9 MACD, its signal line
+         * and the histogram for the last six months or so — the same picture a
+         * broker's chart shows. Today's bar is included while the session runs,
+         * as a broker's chart does.
+         */
+        fun dailyMacdJson(symbol: String, space: String): String {
+            val sp = space.uppercase().let { if (it == "BINANCE") "BN" else it }
+            val sym = symbol.trim().uppercase().removeSuffix(".NS").removeSuffix(".DE")
+            if (sym.isBlank()) return "{\"ok\":false,\"error\":\"no symbol\"}"
+            val bars = com.signalscope.app.screener.ScreenerRunner.fetchDailyBarsFor(sp, sym)
+                ?: return "{\"ok\":false,\"error\":\"the price feed is busy — try again in a minute\"}"
+            if (bars.size < 40) return "{\"ok\":false,\"error\":\"not enough daily prices\"}"
+            val closes = bars.map { it.close }
+            val m = com.signalscope.app.util.Indicators.macd(closes)
+            val keep = 130
+            val from = (bars.size - keep).coerceAtLeast(0)
+            fun r(x: Double) = Math.round(x * 10000.0) / 10000.0
+            return gson.toJson(mapOf("ok" to true, "symbol" to sym,
+                "d" to bars.subList(from, bars.size).map { it.date.toString() },
+                "c" to closes.subList(from, closes.size).map { r(it) },
+                "m" to m.macdLine.subList(from, closes.size).map { r(it) },
+                "s" to m.signalLine.subList(from, closes.size).map { r(it) },
+                "h" to m.histogram.subList(from, closes.size).map { r(it) }))
         }
 
         @JavascriptInterface
@@ -3883,7 +3920,17 @@ class MainActivity : AppCompatActivity() {
                                     // which reads the live ledger directly — is
                                     // still standing.
                                     "matched" to lab.trades.any { t ->
-                                        t.id == pid && t.status == "OPEN" })
+                                        t.id == pid && t.status == "OPEN" },
+                                    // NOT LOST — SOLD ON PAPER, WAITING TO SELL FOR REAL.
+                                    // The strategy decided to exit, usually on a bar
+                                    // judged after the close, and the exit retry sells
+                                    // it at the next tradeable moment. Shown as a lost
+                                    // position it invited "I sold this myself", which
+                                    // closes the record WITHOUT selling: AFX on 6 Oct
+                                    // was left held and unmanaged exactly that way.
+                                    "sellPending" to lab.trades.any { t ->
+                                        t.id == pid && t.status == "CLOSED" },
+                                    "paperExitTs" to (lab.trades.firstOrNull { it.id == pid }?.exitTs ?: 0L))
                             },
                         // Both the RESOLVED cost (what the engine will actually
                         // charge) and whether it came from an override, so the
@@ -3924,7 +3971,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ── FLOOR-ORDER ALGOS (paper only) ────────────────────────────────────
+        // ── BUILT-IN PAPER ALGOS: floor orders and MACD turns ─────────────────
         // Their own store and engine, never the bucket list — so no arming path,
         // live mirror or broker audit can reach them. See FloorAlgoStore.
 
@@ -3942,19 +3989,20 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { floorErr(e) }
 
         @JavascriptInterface
-        fun floorCreate(space: String, name: String): String = try {
+        fun floorCreate(space: String, name: String, kind: String): String = try {
             val base = bucketBaseNs(space)
             if (base !in com.signalscope.app.data.FloorAlgoStore.SPACES)
-                "{\"ok\":false,\"error\":\"Floor orders run on the stock markets only.\"}"
+                "{\"ok\":false,\"error\":\"These algos run on the stock markets only.\"}"
             else {
-                val a = com.signalscope.app.data.FloorAlgoStore.create(applicationContext, base, name)
+                val a = com.signalscope.app.data.FloorAlgoStore.create(applicationContext, base, name, kind)
                 com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
                 gson.toJson(mapOf("ok" to true, "id" to a.id, "ns" to a.ns))
             }
         } catch (e: Exception) { floorErr(e) }
 
-        /** Pausing cancels the day's resting orders at once. Resuming plans afresh,
-         *  counting only prices from that moment on. */
+        /** Pausing cancels the day's resting orders — and any MACD turn still
+         *  waiting for its price — at once. Resuming plans afresh, counting only
+         *  prices from that moment on. */
         @JavascriptInterface
         fun floorSetEnabled(id: String, on: Boolean): String = try {
             val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
@@ -3963,7 +4011,8 @@ class MainActivity : AppCompatActivity() {
                     log = a.log + "$stamp · resumed")
                 else a.copy(enabled = false,
                     orders = a.orders.map { if (it.status == "RESTING") it.copy(status = "ENDED") else it },
-                    log = a.log + "$stamp · paused — today's resting orders cancelled; anything held is still sold on schedule")
+                    trades = a.trades.filterNot { it.firstSec == 0L && it.signalSec > 0L },
+                    log = a.log + "$stamp · paused — nothing new is bought; anything held still sells on its stop, target, time or trend")
             } ?: throw IllegalStateException("algo not found")
             com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
             "{\"ok\":true}"
@@ -3985,11 +4034,14 @@ class MainActivity : AppCompatActivity() {
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
 
-        /** New numbers apply to orders placed from now on; what is already resting
-         *  or held keeps the size it was placed with. */
+        /** New sizes apply to orders placed from now on; what is already resting
+         *  or held keeps the size it was placed with. The stop, target and time
+         *  limit apply to what is held as well — they are read on every pass.
+         *  Switching the trend filter re-plans today straight away. */
         @JavascriptInterface
         fun floorSettings(id: String, capital: Double, seats: Int, universeSize: Int,
-                          lowDays: Int, secondPct: Double, holdDays: Int): String = try {
+                          lowDays: Int, secondPct: Double, holdDays: Int,
+                          stopPct: Double, targetPct: Double, trendFilter: Boolean): String = try {
             fun bad(what: String): Nothing = throw IllegalArgumentException(what)
             if (!(capital >= 10.0 && capital <= 10_000_000.0)) bad("capital must be between 10 and 10,000,000")
             if (seats !in 1..30) bad("seats must be 1 to 30")
@@ -3997,14 +4049,29 @@ class MainActivity : AppCompatActivity() {
             if (lowDays !in 1..10) bad("the low must look back 1 to 10 days")
             if (!(secondPct >= 0.0 && secondPct <= 10.0)) bad("the second order must be 0 to 10% below")
             if (holdDays !in 1..20) bad("hold 1 to 20 days")
+            if (!(stopPct >= 0.0 && stopPct <= 50.0)) bad("the stop must be 0 to 50% (0 = no stop)")
+            if (!(targetPct >= 0.0 && targetPct <= 100.0)) bad("the target must be 0 to 100% (0 = no target)")
             val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
             com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
-                val s = com.signalscope.app.data.FloorAlgoStore.Settings(capital, seats, universeSize, lowDays, secondPct, holdDays)
+                // The paper replay buys the second half before checking the stop
+                // in the same bar — true only if a falling price meets the second
+                // order first. See FloorOrders.walk.
+                if (a.kind == com.signalscope.app.data.FloorAlgoStore.KIND_FLOOR && stopPct > 0.0 && secondPct >= stopPct)
+                    bad("the second order must sit above the stop — keep it less than ${"%.1f".format(stopPct)}% below")
+                val s = com.signalscope.app.data.FloorAlgoStore.Settings(capital, seats, universeSize, lowDays,
+                    secondPct, holdDays, stopPct, targetPct, trendFilter)
+                // A changed trend filter re-plans today at the next check — the
+                // engine compares it with the filter today was planned under.
+                val filterChanged = trendFilter != a.settings.trendFilter
                 if (s == a.settings) a
                 else a.copy(settings = s,
                     universeDay = if (universeSize != a.settings.universeSize) "" else a.universeDay,
                     log = a.log + ("$stamp · settings: ${"%.0f".format(capital)} in $seats seats, top $universeSize, " +
-                        "low of $lowDays days, 2nd order ${"%.1f".format(secondPct)}% below, sell after $holdDays days"))
+                        (if (a.kind == com.signalscope.app.data.FloorAlgoStore.KIND_FLOOR)
+                            "low of $lowDays days, 2nd order ${"%.1f".format(secondPct)}% below, " else "") +
+                        "stop ${"%.1f".format(stopPct)}%, target ${"%.1f".format(targetPct)}%, sell after $holdDays days, " +
+                        "trend filter ${if (trendFilter) "on" else "off"}" +
+                        (if (filterChanged) " — today is re-planned at the next check" else "")))
             } ?: throw IllegalStateException("algo not found")
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
@@ -4013,6 +4080,42 @@ class MainActivity : AppCompatActivity() {
         fun floorDelete(id: String): String = try {
             com.signalscope.app.data.FloorAlgoStore.delete(applicationContext, id)
             "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** The scan journal's last [days] days, newest first, for the card's Journal tab. */
+        @JavascriptInterface
+        fun floorJournal(id: String, days: Int): String = try {
+            val rows = com.signalscope.app.data.FloorJournalStore.load(applicationContext, id).rows
+            val keep = rows.map { it.day }.distinct().sortedDescending().take(days.coerceIn(1, 160)).toSet()
+            gson.toJson(mapOf("ok" to true, "days" to rows.map { it.day }.distinct().size,
+                "rows" to rows.filter { it.day in keep }.sortedWith(
+                    compareByDescending<com.signalscope.app.data.FloorJournalStore.Row> { it.day }.thenBy { it.rank })))
+        } catch (e: Exception) { floorErr(e) }
+
+        /** The whole journal as a CSV, through the share sheet. */
+        @JavascriptInterface
+        fun floorExportJournal(id: String): String = try {
+            val a = com.signalscope.app.data.FloorAlgoStore.get(applicationContext, id)
+                ?: throw IllegalStateException("algo not found")
+            val rows = com.signalscope.app.data.FloorJournalStore.load(applicationContext, id).rows
+            if (rows.isEmpty()) throw IllegalStateException("the journal is empty — its first day is written the morning after a plan day")
+            val safe = a.name.replace(Regex("[^A-Za-z0-9]+"), "_").trim('_').ifEmpty { "algo" }
+            val f = java.io.File(cacheDir, "journal_${a.space}_${safe}_${java.time.LocalDate.now()}.csv")
+            f.writeText(com.signalscope.app.data.FloorJournalStore.csv(rows))
+            runOnUiThread {
+                try {
+                    val uri = androidx.core.content.FileProvider.getUriForFile(
+                        this@MainActivity, "$packageName.fileprovider", f)
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/csv"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        putExtra(Intent.EXTRA_SUBJECT, f.name)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(send, "Export scan journal"))
+                } catch (e: Exception) { Log.e(TAG, "share journal csv failed", e) }
+            }
+            gson.toJson(mapOf("ok" to true, "rows" to rows.size, "file" to f.name))
         } catch (e: Exception) { floorErr(e) }
 
         /** "Check now" — downloads prices, so only reached through [callAsync]. */
@@ -4412,6 +4515,8 @@ class MainActivity : AppCompatActivity() {
                               // The swing window — the reading an entry is timed
                               // off, and the one the list can be ordered by.
                               "swingLow" to it.swingLow, "swingHigh" to it.swingHigh,
+                              "weekLow" to it.weekLow, "weekHigh" to it.weekHigh, "weekDays" to it.weekDays,
+                              "monthLow" to it.monthLow, "monthHigh" to it.monthHigh, "monthDays" to it.monthDays,
                               "swingPos" to it.swingPos,
                               "swingVisits" to it.swingVisits,
                               "swingDays" to it.swingDays,
@@ -4495,6 +4600,11 @@ class MainActivity : AppCompatActivity() {
                 // same name later is a different trade and must not overwrite the
                 // first one's result.
                 val tradesById = lab.trades.associateBy { it.id }
+                // 1-week-high targets waiting at Trading 212 (Germany and the US only).
+                val weekTargets = if (base == "de" || base == "us")
+                    try { com.signalscope.app.trading.T212WeekTargets.views(applicationContext) }
+                    catch (ex: Exception) { emptyMap() }
+                else emptyMap()
                 // Live positions first, finished ones beneath. Both belong in the
                 // book — a trade that vanishes the moment it closes teaches nothing
                 // — but only one of the two can still need a decision from you.
@@ -4587,7 +4697,10 @@ class MainActivity : AppCompatActivity() {
                         // strategy's figure and says so, instead of passing a candle
                         // close off as money.
                         "realExitPct" to e.realPctReturn,
-                        "paperExitPct" to lt?.takeIf { it.status == "CLOSED" }?.pctReturn)
+                        "paperExitPct" to lt?.takeIf { it.status == "CLOSED" }?.pctReturn,
+                        "ns" to ns,
+                        "target" to weekTargets[com.signalscope.app.data.T212TargetStore.key(
+                            ns, "${e.symbol.uppercase()}-${e.signalBarTs}")])
                 }
                 // The watcher's OWN full ranking, with the reason each name is or
                 // is not a candidate. Held names are marked rather than dropped:
@@ -5660,6 +5773,120 @@ class MainActivity : AppCompatActivity() {
         }
 
         /**
+         * EVERY COMPLETED ALGO ROUND TRIP AT TRADING 212: the strategy's prices
+         * against what the broker filled. Built from the app's own records — no
+         * network — so the closed-trades table can show it on every row without a
+         * download. [space] "DE" / "US" keeps one market (by the instrument), null
+         * keeps the whole account.
+         *
+         * The comparison is per ROUND TRIP, built from the reconciled weighted
+         * averages — never from one rung of a ladder, which is not the trade's price
+         * — and only once both legs are complete: a buy whose sell is still filling
+         * has half a cost and would drag every average down.
+         */
+        private fun algoRoundTripLayer(space: String?): Map<String, Any?> {
+            val ctx = applicationContext
+            val sp = space?.uppercase()
+            val mirrored = com.signalscope.app.data.T212LiveStore.load(ctx).trades.filter {
+                sp == null || com.signalscope.app.trading.T212ClosedTrades.spaceOf(it.t212Ticker) == sp
+            }
+            val nameOf = HashMap<String, String>()
+            fun algoName(ns: String): String {
+                if (ns.isBlank()) return "—"
+                return nameOf.getOrPut(ns) {
+                    com.signalscope.app.data.BucketStore.get(ctx, ns)?.name
+                        ?: if (com.signalscope.app.data.ManualWatchStore.ID ==
+                                com.signalscope.app.trading.Spaces.bucketIdOf(ns)) "watchlist" else ns
+                }
+            }
+            // The constant the paper ledger CHARGES ITSELF, once per closed round
+            // trip — which is why the two legs are paired before measuring.
+            val assumedFor = HashMap<String, Double>()
+            fun assumedOf(ns: String): Double = assumedFor.getOrPut(ns) {
+                try { com.signalscope.app.data.StrategyLabStore.activeConfig(ctx, ns).slippagePct }
+                catch (e: Exception) { 0.0 }
+            }
+            fun day(ms: Long): String =
+                if (ms > 0L) java.time.Instant.ofEpochMilli(ms).toString().take(10) else ""
+            val roundTrips = mirrored.mapNotNull { t ->
+                if (!t.buyComplete() || !t.sellComplete()) return@mapNotNull null
+                val pe = t.paperEntryPrice
+                val px = t.paperExitPrice ?: 0.0
+                if (pe <= 0.0 || px <= 0.0 || t.liveEntryPrice <= 0.0 || t.liveExitPrice <= 0.0)
+                    return@mapNotNull null
+                val entrySlip = (t.liveEntryPrice - pe) / pe * 100.0   // + = paid more
+                val exitSlip = (px - t.liveExitPrice) / px * 100.0     // + = sold lower
+                val measured = entrySlip + exitSlip
+                val assumed = assumedOf(t.ns)
+                // THE ENTRY COST'S TWO CAUSES. Latency is the market moving between
+                // the signal bar's close and the order going out — fixed by ticking
+                // faster. Execution is the ladder's own cost from its anchor to the
+                // fill — fixed by changing the ladder.
+                val ref = t.refEntryPrice
+                val latency = if (ref > 0.0) (ref - pe) / pe * 100.0 else null
+                val exec = if (ref > 0.0) (t.liveEntryPrice - ref) / ref * 100.0 else null
+                // A BENCH row has no config, so its "assumed" is the 0.05% default,
+                // not what the algos charge — flagged so the panel can say so.
+                val isBench = t.ns == com.signalscope.app.trading.LiveTestBench.NS
+                mapOf("symbol" to t.symbol,
+                    "algo" to (if (isBench) "test bench" else algoName(t.ns)),
+                    "isBench" to isBench,
+                    "entrySlipPct" to entrySlip, "exitSlipPct" to exitSlip,
+                    "measuredPct" to measured, "assumedPct" to assumed,
+                    "deviationPct" to (measured - assumed),
+                    "latencyPct" to latency, "execPct" to exec,
+                    "rungs" to (t.allBuyIds().size + t.allSellIds().size),
+                    "paperEntry" to pe, "liveEntry" to t.liveEntryPrice,
+                    "paperExit" to px, "liveExit" to t.liveExitPrice,
+                    // When the two legs happened, so a closed-trade row (built from
+                    // the broker's fills) can find the algo trade behind it.
+                    "buyDay" to day(t.buyAt), "sellDay" to day(t.sellAt),
+                    "qty" to t.ownExitQty(),
+                    "closedAt" to (t.exitTs ?: 0L))
+            }.sortedBy { it["closedAt"] as? Long ?: 0L }
+            // Legs still filling — shown so a stuck ladder is visible rather than
+            // just absent from the averages.
+            val pendingLegs = mirrored.count {
+                (it.allBuyIds().isNotEmpty() && !it.buyComplete()) ||
+                (it.allSellIds().isNotEmpty() && !it.sellComplete())
+            }
+            val rtMeasured = roundTrips.mapNotNull { it["measuredPct"] as? Double }.sorted()
+            val rtAssumed = roundTrips.mapNotNull { it["assumedPct"] as? Double }
+            // Every eligible algo's assumed constant, so the panel can state what is
+            // being trusted even before a single real round trip exists.
+            val assumedByAlgo = (com.signalscope.app.data.BucketStore.allNamespaces(ctx) + listOf("us", "de"))
+                .filter { com.signalscope.app.trading.Spaces.baseOf(it).let { b ->
+                    (b == "us" || b == "de") && (sp == null || b == sp.lowercase()) } }
+                .distinct()
+                .mapNotNull { n ->
+                    val a = assumedOf(n)
+                    if (a <= 0.0) null else mapOf("algo" to algoName(n), "ns" to n, "assumedPct" to a)
+                }
+            // A true median: with an even count, the two middle values averaged.
+            fun medianOf(xs: List<Double>): Double? = when {
+                xs.isEmpty() -> null
+                xs.size % 2 == 1 -> xs[xs.size / 2]
+                else -> (xs[xs.size / 2 - 1] + xs[xs.size / 2]) / 2.0
+            }
+            return mapOf(
+                "roundTrips" to roundTrips,
+                "rtCount" to roundTrips.size,
+                "rtMeasuredMean" to (if (rtMeasured.isEmpty()) null else rtMeasured.average()),
+                "rtMeasuredMedian" to medianOf(rtMeasured),
+                "rtAssumedMean" to (if (rtAssumed.isEmpty()) null else rtAssumed.average()),
+                "assumedByAlgo" to assumedByAlgo,
+                "pendingLegs" to pendingLegs)
+        }
+
+        /** The algo trades behind this market's closed-trades table — local, instant. */
+        @JavascriptInterface
+        fun t212AlgoExecution(space: String): String = try {
+            gson.toJson(mapOf("ok" to true) + algoRoundTripLayer(space))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "failed")))
+        }
+
+        /**
          * Recent REAL T212 fills, each attributed to the algo that placed it.
          *
          * ATTRIBUTION IS BY ORDER ID, captured at placement time: the mirror stores
@@ -5762,66 +5989,6 @@ class MainActivity : AppCompatActivity() {
                         "rungIdx" to legIds?.indexOf(f.orderId)?.takeIf { it >= 0 }?.plus(1),
                         "rungTotal" to legIds?.size)
                 }
-                // ── ROUND TRIPS: assumed vs measured, the only fair comparison ──
-                // Built from the RECONCILED weighted averages, not from a single
-                // fill row: one rung of a six-rung ladder is not the trade's price.
-                // Both legs must be complete — a buy whose sell is still filling has
-                // half a cost and would drag every average down.
-                val roundTrips = mirrored.mapNotNull { t ->
-                    if (!t.buyComplete() || !t.sellComplete()) return@mapNotNull null
-                    val pe = t.paperEntryPrice
-                    val px = t.paperExitPrice ?: 0.0
-                    if (pe <= 0.0 || px <= 0.0 || t.liveEntryPrice <= 0.0 || t.liveExitPrice <= 0.0)
-                        return@mapNotNull null
-                    val entrySlip = (t.liveEntryPrice - pe) / pe * 100.0   // + = paid more
-                    val exitSlip = (px - t.liveExitPrice) / px * 100.0     // + = sold lower
-                    val measured = entrySlip + exitSlip
-                    val assumed = assumedOf(t.ns)
-                    // SPLIT THE ENTRY COST INTO ITS TWO CAUSES. Latency is the market
-                    // moving between the signal bar's close and the order going out —
-                    // fixed by ticking faster. Execution is the ladder's own cost from
-                    // its anchor to the fill — fixed by changing the ladder. Reported
-                    // as one number they are unactionable; the fix for one does
-                    // nothing for the other.
-                    val ref = t.refEntryPrice
-                    val latency = if (ref > 0.0) (ref - pe) / pe * 100.0 else null
-                    val exec = if (ref > 0.0) (t.liveEntryPrice - ref) / ref * 100.0 else null
-                    // A BENCH row has no config, so assumedOf() hands back the
-                    // StrategyLabConfig default (0.05%), NOT the 0.20% the German
-                    // algos actually charge themselves. Flagged so the panel can say
-                    // so — otherwise the reference line silently answers a different
-                    // question from the one being asked.
-                    val isBench = t.ns == com.signalscope.app.trading.LiveTestBench.NS
-                    mapOf("symbol" to t.symbol,
-                        "algo" to (if (isBench) "test bench" else algoName(t.ns)),
-                        "isBench" to isBench,
-                        "entrySlipPct" to entrySlip, "exitSlipPct" to exitSlip,
-                        "measuredPct" to measured, "assumedPct" to assumed,
-                        "deviationPct" to (measured - assumed),
-                        "latencyPct" to latency, "execPct" to exec,
-                        "rungs" to (t.allBuyIds().size + t.allSellIds().size),
-                        "paperEntry" to pe, "liveEntry" to t.liveEntryPrice,
-                        "paperExit" to px, "liveExit" to t.liveExitPrice,
-                        "closedAt" to (t.exitTs ?: 0L))
-                }.sortedBy { it["closedAt"] as? Long ?: 0L }
-                // Legs still filling — shown so a stuck ladder is visible rather than
-                // just absent from the averages.
-                val pendingLegs = mirrored.count {
-                    (it.allBuyIds().isNotEmpty() && !it.buyComplete()) ||
-                    (it.allSellIds().isNotEmpty() && !it.sellComplete())
-                }
-                val rtMeasured = roundTrips.mapNotNull { it["measuredPct"] as? Double }.sorted()
-                val rtAssumed = roundTrips.mapNotNull { it["assumedPct"] as? Double }
-                // Every T212-eligible algo's assumed constant, so the panel can state
-                // what is being trusted even before a single real round trip exists.
-                val assumedByAlgo = (com.signalscope.app.data.BucketStore.allNamespaces(applicationContext)
-                    + listOf("us", "de"))
-                    .filter { com.signalscope.app.trading.Spaces.baseOf(it).let { b -> b == "us" || b == "de" } }
-                    .distinct()
-                    .mapNotNull { n ->
-                        val a = assumedOf(n)
-                        if (a <= 0.0) null else mapOf("algo" to algoName(n), "ns" to n, "assumedPct" to a)
-                    }
                 // Nothing parsed → attach the raw payload. Otherwise "responded but
                 // returned no executed orders" is indistinguishable from an empty
                 // account, and there is no way to tell from the phone which it is.
@@ -5848,16 +6015,10 @@ class MainActivity : AppCompatActivity() {
                     "matchedCount" to rows.count { it["matched"] == true },
                     "slipSamples" to slips.size,
                     "slipMean" to (if (slips.isEmpty()) null else slips.average()),
-                    "slipMedian" to medianOf(slips),
+                    "slipMedian" to medianOf(slips)) +
                     // Round-trip layer: what the config ASSUMED vs what the broker
                     // actually charged, per completed trade and in aggregate.
-                    "roundTrips" to roundTrips,
-                    "rtCount" to roundTrips.size,
-                    "rtMeasuredMean" to (if (rtMeasured.isEmpty()) null else rtMeasured.average()),
-                    "rtMeasuredMedian" to medianOf(rtMeasured),
-                    "rtAssumedMean" to (if (rtAssumed.isEmpty()) null else rtAssumed.average()),
-                    "assumedByAlgo" to assumedByAlgo,
-                    "pendingLegs" to pendingLegs,
+                    algoRoundTripLayer(null) + mapOf(
                     "drag" to com.signalscope.app.trading.SlippageStats.toMap(
                         com.signalscope.app.trading.SlippageStats.compute(
                             com.signalscope.app.trading.T212LiveMirror.slippageSamples(applicationContext)))))
@@ -5881,15 +6042,18 @@ class MainActivity : AppCompatActivity() {
          * This builds both from the executed-order history — real fills only, no
          * strategy opinion anywhere in it.
          *
+         * [space] is "US" or "DE": one account, but each tab totals only its own
+         * market's trades.
+         *
          * [force] does the paged network walk; false returns the stored report so
          * the panel can open instantly and without touching a rate-limited
          * endpoint on every repaint.
          */
         @JavascriptInterface
-        fun t212ClosedTrades(force: Boolean): String {
+        fun t212ClosedTrades(force: Boolean, space: String): String {
             return try {
-                val r = if (force) com.signalscope.app.trading.T212ClosedTrades.run(applicationContext)
-                        else com.signalscope.app.trading.T212ClosedTrades.last(applicationContext)
+                val r = if (force) com.signalscope.app.trading.T212ClosedTrades.run(applicationContext, space)
+                        else com.signalscope.app.trading.T212ClosedTrades.last(applicationContext, space)
                 gson.toJson(mapOf(
                     "ok" to r.ok, "error" to r.error, "checkedAt" to r.checkedAt,
                     "fillsSeen" to r.fillsSeen, "currency" to r.currency,
@@ -5904,7 +6068,8 @@ class MainActivity : AppCompatActivity() {
                             "pnl" to t.pnl, "pctReturn" to t.pctReturn,
                             "heldDays" to t.heldDays,
                             "charges" to t.charges, "netPnl" to t.netPnl,
-                            "netPctReturn" to t.netPctReturn)
+                            "netPctReturn" to t.netPctReturn,
+                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay)
                     }))
             } catch (e: Exception) {
                 gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
@@ -5945,7 +6110,44 @@ class MainActivity : AppCompatActivity() {
                             // per-seat average — the charges on a trade that sold
                             // higher than it bought are genuinely larger.
                             "charges" to t.charges, "netPnl" to t.netPnl,
-                            "netPctReturn" to t.netPctReturn)
+                            "netPctReturn" to t.netPctReturn,
+                            // What the charges are made of, and whether the
+                            // trade was same-day — the panel's breakdown and its
+                            // intraday mark read these.
+                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay)
+                    }))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * The same analysis for crypto: the algos' real Binance round trips. Local
+         * records only — nothing to fetch — so [force] is accepted for a uniform
+         * panel and ignored. Fees are estimated at Binance's standard rate; see
+         * [com.signalscope.app.trading.BinanceClosedTrades].
+         */
+        @JavascriptInterface
+        fun binanceClosedTrades(force: Boolean): String {
+            return try {
+                val r = com.signalscope.app.trading.BinanceClosedTrades.report(applicationContext)
+                gson.toJson(mapOf(
+                    "ok" to r.ok, "error" to r.error, "checkedAt" to r.checkedAt,
+                    "fillsSeen" to r.fillsSeen, "currency" to r.currency,
+                    "totalPnl" to r.totalPnl, "wins" to r.wins, "losses" to r.losses,
+                    "stillOpen" to r.stillOpen, "unmatchedSells" to r.unmatchedSells,
+                    "totalCharges" to r.totalCharges, "costed" to r.costed,
+                    "feesEstimated" to true,
+                    "trips" to r.trips.map { t ->
+                        mapOf("ticker" to t.ticker, "symbol" to t.symbol, "qty" to t.qty,
+                            "buyPrice" to t.buyPrice, "sellPrice" to t.sellPrice,
+                            "boughtAt" to t.boughtAt, "soldAt" to t.soldAt,
+                            "cashIn" to t.cashIn, "cashOut" to t.cashOut,
+                            "pnl" to t.pnl, "pctReturn" to t.pctReturn,
+                            "heldDays" to t.heldDays,
+                            "charges" to t.charges, "netPnl" to t.netPnl,
+                            "netPctReturn" to t.netPctReturn,
+                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay)
                     }))
             } catch (e: Exception) {
                 gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
@@ -6995,14 +7197,35 @@ class MainActivity : AppCompatActivity() {
                 // exactly like one with shares behind it — Nemetschek sat on this
                 // card for three days, bought at 18:01 into a closed Xetra, with
                 // nothing on its row to say so.
+                // Every broker, not only Trading 212: the take-profit button needs to
+                // say plainly whether real shares will be sold, in every market.
                 val liveRows = try {
-                    com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
-                        .filter { it.ns == ns }
-                        .associate { r ->
-                            r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
-                                "qty" to r.qty, "retryAfter" to r.retryAfter,
-                                "parked" to r.parkedForOpen)
+                    when (com.signalscope.app.trading.Spaces.baseOf(ns)) {
+                        "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(applicationContext).trades
+                            .filter { it.ns == ns }
+                            .associate { r ->
+                                r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
+                                    "qty" to r.qty.toDouble())
+                            }
+                        "binance" -> com.signalscope.app.data.BinanceLiveStore.load(applicationContext, ns).trades
+                            .associate { r ->
+                                r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
+                                    "qty" to (r.executedQty.toDoubleOrNull() ?: 0.0))
+                            }
+                        else -> {
+                            // The 1-week-high target waiting at the broker, when there is one.
+                            val tg = try { com.signalscope.app.trading.T212WeekTargets.views(applicationContext) }
+                                     catch (e: Exception) { emptyMap() }
+                            com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
+                                .filter { it.ns == ns }
+                                .associate { r ->
+                                    r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
+                                        "qty" to r.qty, "retryAfter" to r.retryAfter,
+                                        "parked" to r.parkedForOpen,
+                                        "target" to tg[com.signalscope.app.data.T212TargetStore.key(ns, r.paperTradeId)])
+                                }
                         }
+                    }
                 } catch (e: Exception) { emptyMap<String, Any>() }
                 gson.toJson(mapOf("ok" to true, "skips" to skips,
                     "liveRows" to liveRows,

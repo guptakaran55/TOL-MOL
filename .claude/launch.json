@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8765", "--directory", "app/src/main/assets"],
+      "port": 8765
+    },
+    {
+      "name": "dashboard-preview-alt",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8766", "--directory", "app/src/main/assets"],
+      "port": 8766
+    }
+  ]
+}

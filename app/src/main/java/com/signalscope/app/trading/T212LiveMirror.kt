@@ -856,11 +856,14 @@ object T212LiveMirror {
      *   fill-anchored stop — so the alert and the ledger both record which.
      */
     fun stopOutNow(ctx: Context, ns: String, symbol: String, reason: String,
-                   origin: String = ""): StopOut {
+                   origin: String = "", paperTradeId: String? = null): StopOut {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return StopOut(false, error = "no T212 credentials")
+        // [paperTradeId] pins the exact position when the caller knows it — an algo
+        // can hold the same name twice, and a hand action is about one of them.
         val row = T212LiveStore.load(ctx).trades.firstOrNull {
-            it.ns == ns && it.symbol.equals(symbol, true) && it.status == "OPEN" && it.qty > 0.0
+            it.ns == ns && it.symbol.equals(symbol, true) && it.status == "OPEN" && it.qty > 0.0 &&
+                (paperTradeId == null || it.paperTradeId == paperTradeId)
         } ?: return StopOut(false, error = "no open live position")
         val paid = row.liveEntryPrice
         if (paid <= 0.0) return StopOut(false, error = "real fill price not settled — refusing to act on a guess")

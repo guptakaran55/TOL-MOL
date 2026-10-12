@@ -190,10 +190,12 @@ object StrategyLabEngine {
     fun clampTf(requestedSec: Long, baseSec: Long): Long =
         if (requestedSec in 1 until baseSec) baseSec else requestedSec
 
+    /** @param anchorSec grid origin in seconds east of UTC midnight (see StrategyLabConfig.barAnchorSec). */
     fun resample(
         candles: List<CandleData>,
         periodSec: Long,
-        completeThroughSec: Long? = null
+        completeThroughSec: Long? = null,
+        anchorSec: Long = 0L
     ): List<CandleData> {
         if (periodSec <= 0L || candles.isEmpty()) return candles
         val sorted = candles.sortedBy { it.timestamp }
@@ -203,7 +205,7 @@ object StrategyLabEngine {
         fun keepBucket(start: Long): Boolean =
             completeThroughSec == null || start + periodSec <= completeThroughSec
         for (cd in sorted) {
-            val bucket = (cd.timestamp / periodSec) * periodSec
+            val bucket = Math.floorDiv(cd.timestamp + anchorSec, periodSec) * periodSec - anchorSec
             if (bucket != bStart) {
                 if (bStart >= 0 && keepBucket(bStart)) out.add(CandleData(bStart, o, h, l, c, v))
                 bStart = bucket; o = cd.open; h = cd.high; l = cd.low; c = cd.close; v = cd.volume
@@ -296,6 +298,16 @@ object StrategyLabEngine {
         val lvlLen = maxOf(2, cfg.gates.smaLength)
         f.level = if (cfg.gates.smaKind.equals("ema", true)) ema(close, lvlLen) else rollingMean(close, lvlLen)
         f.adxArr = adx(f.high, f.low, f.close, maxOf(2, cfg.gates.adxPeriod))
+    }
+
+    /** The deceleration-exit chain on candles that are ALREADY on the entry frame (no
+     *  resampling). Exists so the desktop's golden vectors can be asserted directly. */
+    internal class ExitSeries(val macd: DoubleArray, val exitSlope: DoubleArray,
+                              val exitAccel: DoubleArray, val exitAccelSigma: DoubleArray)
+
+    internal fun exitSeries(candles: List<CandleData>, cfg: StrategyLabConfig): ExitSeries {
+        val f = Frame(candles, cfg); computeIndicators(f)
+        return ExitSeries(f.macd, f.exitSlope, f.exitAccel, f.exitAccelSigma)
     }
 
     // ── fast MACD exit (§3.7) — the ONE series computed on the FINE bars ──
@@ -783,7 +795,7 @@ object StrategyLabEngine {
         raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long,
         entryTf: Long, completeThroughSec: Long?
     ): AdoptedExit {
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         val f = Frame(cd, cfg)
         if (f.n < 3) return AdoptedExit(false, note = "not enough bars")
         computeIndicators(f)
@@ -829,8 +841,8 @@ object StrategyLabEngine {
         raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long,
         entryTf: Long, exitTf: Long, completeThroughSec: Long?
     ): AdoptedExit {
-        val fine = resample(raw, exitTf, completeThroughSec)
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val fine = resample(raw, exitTf, completeThroughSec, cfg.barAnchorSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         if (cd.size < 3 || fine.size < 10) return AdoptedExit(false, note = "not enough bars")
         val f = Frame(cd, cfg); computeIndicators(f)
 
@@ -889,7 +901,7 @@ object StrategyLabEngine {
         completeThroughSec: Long? = null,
         entriesFromTs: Long = 0L
     ): RunResult {
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         val f = Frame(cd, cfg); if (f.n < 3) return RunResult(symbol, emptyList(), 0, emptyMap(), 0, f.n)
         computeIndicators(f)
         val trades = ArrayList<Trade>(); val gates = HashMap<String, Int>(); var signals = 0
@@ -950,8 +962,8 @@ object StrategyLabEngine {
         completeThroughSec: Long? = null,
         entriesFromTs: Long = 0L
     ): RunResult {
-        val fine = resample(raw, exitTf, completeThroughSec)
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val fine = resample(raw, exitTf, completeThroughSec, cfg.barAnchorSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         val warm = maxOf(1, cfg.warmupBars)
         if (cd.size <= warm || fine.size < 10) return RunResult(symbol, emptyList(), 0, emptyMap(), 0, fine.size)
         val f = Frame(cd, cfg); computeIndicators(f)
@@ -1139,8 +1151,8 @@ object StrategyLabEngine {
             val mtf = cfg.multiTimeframe && exitTfClamped in 1 until entryTf
             val exitTf = if (mtf) exitTfClamped else entryTf
             val complete = raw.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
-            val fine = resample(raw, exitTf, complete)
-            val coarse = if (mtf) resample(raw, entryTf, complete) else fine
+            val fine = resample(raw, exitTf, complete, cfg.barAnchorSec)
+            val coarse = if (mtf) resample(raw, entryTf, complete, cfg.barAnchorSec) else fine
             if (fine.size < 5 || coarse.size < 5) return ReviewPayload(symbol, "not enough bars to review")
             val f = Frame(coarse, cfg); computeIndicators(f)
 

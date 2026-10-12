@@ -8,10 +8,16 @@ import java.time.ZoneOffset
  * WHICH WAY MACD IS TURNING, ON FIVE TIMESCALES AT ONCE — month, day, four
  * hours, hour and fifteen minutes — for the row of dots on a watcher alert.
  *
- * ONE DEFINITION OF "SLOPE", THE APP'S OWN: the MACD line (12/26 EMA) bar to
- * bar, smoothed over a few bars so one noisy bar cannot flip it. It is exactly
- * what the watcher's SLOPE column shows for the day, so the 1D dot and that
- * column can never disagree about a stock.
+ * ONE DEFINITION OF "SLOPE", THE APP'S OWN: how far the MACD line (12/26 EMA)
+ * moved over the last completed bar. It is exactly what the watcher's SLOPE
+ * column shows for the day, so the 1D dot and that column can never disagree.
+ *
+ * NOT SMOOTHED BY DEFAULT. It used to be averaged over about five bars, and
+ * that average lagged the line it described: a daily MACD that had fallen two
+ * days running still showed a green dot because of the rise the week before
+ * (Hensoldt, 8 Oct). The MACD is already an average, and reading it on five
+ * timescales at once is what filters the noise. A strategy file can still ask
+ * for smoothing, and crypto keeps its light one.
  *
  * COMPLETED BARS ONLY, on every timescale. A bar still forming would colour a
  * dot on a candle that has not closed — and on a German stock the feed's own
@@ -30,8 +36,13 @@ object MacdSlopes {
 
     val LABELS = listOf("1M", "1D", "4H", "1H", "15m")
 
+    /** The slope smoothing when no strategy file sets one: none for stocks (1 =
+     *  the last bar's move as it is), light for crypto. */
+    fun defaultSmoothing(base: String): Int = if (base == "binance") 2 else 1
+
+    /** Span 1 is no smoothing at all: the series comes back unchanged. */
     private fun ema(x: DoubleArray, span: Int): DoubleArray {
-        val s = if (span < 2) 2 else span
+        val s = if (span < 1) 1 else span
         val a = 2.0 / (s + 1.0)
         val out = DoubleArray(x.size)
         if (x.isEmpty()) return out

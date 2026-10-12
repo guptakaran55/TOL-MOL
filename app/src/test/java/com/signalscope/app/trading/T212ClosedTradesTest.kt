@@ -173,4 +173,30 @@ class T212ClosedTradesTest {
         assertEquals("no cash at all falls back to the price", 25.75,
             T212ClosedTrades.cashPerShare(cash = 0.0, qty = 8.0, price = 25.75), 1e-9)
     }
+
+    @Test fun `each trade lands on its own market's tab`() {
+        // One Trading 212 account, shown as a US tab and a German tab. Xetra lines
+        // carry a lowercase 'd' on the base; reading it after upper-casing would
+        // send every German trade to the US.
+        assertEquals("DE", T212ClosedTrades.spaceOf("SAPd_EQ"))
+        assertEquals("DE", T212ClosedTrades.spaceOf("MUV2d_EQ"))
+        assertEquals("US", T212ClosedTrades.spaceOf("AAPL_US_EQ"))
+        assertEquals("US", T212ClosedTrades.spaceOf("AMD_US_EQ"))
+    }
+
+    @Test fun `splitting by market changes no trade, only which total it is in`() {
+        val fills = listOf(
+            fill("SAPd_EQ", "BUY", 10.0, 100.0, 1),
+            fill("AAPL_US_EQ", "BUY", 5.0, 200.0, 2),
+            fill("SAPd_EQ", "SELL", 10.0, 110.0, 3),
+            fill("AAPL_US_EQ", "SELL", 5.0, 190.0, 4))
+        val (_, all) = T212ClosedTrades.match(fills)
+        val (_, de) = T212ClosedTrades.match(fills.filter { T212ClosedTrades.spaceOf(it.ticker) == "DE" })
+        val (_, us) = T212ClosedTrades.match(fills.filter { T212ClosedTrades.spaceOf(it.ticker) == "US" })
+        assertEquals(listOf("SAPd_EQ"), de.trips.map { it.ticker })
+        assertEquals(listOf("AAPL_US_EQ"), us.trips.map { it.ticker })
+        assertEquals(100.0, de.totalPnl, 1e-9)
+        assertEquals(-50.0, us.totalPnl, 1e-9)
+        assertEquals("the two tabs add up to the account", all.totalPnl, de.totalPnl + us.totalPnl, 1e-9)
+    }
 }

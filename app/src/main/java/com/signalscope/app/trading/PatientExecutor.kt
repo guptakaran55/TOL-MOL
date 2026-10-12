@@ -289,6 +289,20 @@ object PatientExecutor {
         onProgress: ((Map<String, Any?>) -> Unit)? = null,
         targetQty: Double? = null,
         claimedByOthers: Double = 0.0
+    ): Result =
+        // HELD FOR THE WHOLE LADDER, so a resting target cannot be put back on
+        // this stock halfway through the sale — see [SellGuard].
+        SellGuard.selling(ticker) {
+            sellLadder(config, ticker, yahooSymbol, space, quantity, refPrice,
+                onProgress, targetQty, claimedByOthers)
+        }
+
+    private fun sellLadder(
+        config: ConfigManager, ticker: String, yahooSymbol: String, space: String,
+        quantity: Double, refPrice: Double,
+        onProgress: ((Map<String, Any?>) -> Unit)?,
+        targetQty: Double?,
+        claimedByOthers: Double
     ): Result {
         val t = ticker.trim()
         return try {

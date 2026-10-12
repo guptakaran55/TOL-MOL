@@ -695,6 +695,14 @@ class ScanService : Service() {
                 }
             } catch (e: Exception) { Log.w(TAG, "manual watcher [$sp] failed: ${e.message}") }
         }
+        // 1-WEEK-HIGH TARGETS AT TRADING 212 — after every seller above has had its
+        // turn, so a target is never put back on a position this same pass sells.
+        try {
+            val tg = withContext(Dispatchers.IO) {
+                com.signalscope.app.trading.T212WeekTargets.keep(applicationContext)
+            }
+            if (tg.isNotBlank()) { Log.i(TAG, "Week targets: $tg"); watchBits.add(tg) }
+        } catch (e: Exception) { Log.w(TAG, "week targets failed: ${e.message}") }
         // FLOOR-ORDER ALGOS — paper only, last in the pass for the same reason as
         // the watcher: nothing here holds real money, so it never goes ahead of
         // anything that does.

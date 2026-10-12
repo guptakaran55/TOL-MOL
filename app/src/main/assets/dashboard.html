@@ -1702,11 +1702,20 @@ var CRYPTO_CORE=[
   {symbol:'BNBUSDC',base:'BNB',quote:'USDC',name:'BNB',why:'Large-cap Binance ecosystem token.'}
 ];
 var BINANCE_ACCOUNT={data:null,capturedAt:0,loading:false,error:null};
+// One Trading 212 account holds both markets, so each position is sorted into
+// the US or Germany space by its own ticker. Xetra lines are tagged with a
+// LOWERCASE 'd' on the base ("SAPd_EQ") — checked before upper-casing, since
+// real ticker letters are capitals. Anything else European and priced in euros
+// sits with Germany; the rest with the US.
 function t212PositionSpace(p){
-  var t=String((p&&p.ticker)||'').toUpperCase();
+  var raw=String((p&&p.ticker)||'');
+  var t=raw.toUpperCase();
   var y=String((p&&(p.yahooSymbol||p.symbol))||'').toUpperCase();
+  var base=raw.split('_')[0];
+  if(base.length>1&&base.charAt(base.length-1)==='d')return 'DE';
   if(t.indexOf('_DE_')>=0||y.endsWith('.DE'))return 'DE';
   if(t.indexOf('_US_')>=0)return 'US';
+  if(String((p&&p.currency)||'').toUpperCase()==='EUR')return 'DE';
   return 'US';
 }
 function t212PositionsForSpace(sp){
@@ -1714,7 +1723,7 @@ function t212PositionsForSpace(sp){
   return (T212_PORTFOLIO.positions||[]).filter(function(p){return t212PositionSpace(p)===target});
 }
 function portfolioTabCount(){
-  return isT212Space()?(T212_PORTFOLIO.positions||[]).length:PORTFOLIO.holdings.length;
+  return isT212Space()?t212PositionsForSpace(SPACE).length:PORTFOLIO.holdings.length;
 }
 // OCO pairs cache — refreshed each time the US Portfolio tab renders so per-card
 // badges show "🛡 SL+TGT live" vs "no OCO" without an extra bridge per card.
@@ -5130,8 +5139,12 @@ function render(){
   h+='<div style="margin:0 8px 8px;display:flex;align-items:center;justify-content:space-between;gap:6px">';
   // Timestamp
   if(STATE.lastScanTime){
+    // THE DATE, NOT ONLY THE TIME. "13:14" alone read as today's scan when it
+    // was August's, and every price and MACD figure on this tab came from it.
     var t=STATE.lastScanTime;var hh=('0'+t.getHours()).slice(-2);var mm=('0'+t.getMinutes()).slice(-2);
-    h+='<span style="font-size:10px;color:var(--t3);font-family:monospace">Last scan: '+hh+':'+mm+' \u00B7 '+STATE.market+'</span>';
+    var sa=scanAge();
+    h+='<span style="font-size:10px;color:'+(sa?'#b45309':'var(--t3)')+';font-family:monospace;'+(sa?'font-weight:700':'')+'">Last scan: '+
+      (sa?(sa.date+' '):'')+hh+':'+mm+' \u00B7 '+STATE.market+(sa?(' \u00B7 \u26A0 '+sa.days+' day'+(sa.days===1?'':'s')+' old'):'')+'</span>';
   }else if(nT>0){
     h+='<span style="font-size:10px;color:var(--t3);font-family:monospace">Cached results \u00B7 '+STATE.market+'</span>';
   }else{
@@ -5283,9 +5296,13 @@ function render(){
     h+='<div class="tw"><table><thead><tr>';
     // Columns: Stock, Price, Trend, Pullback, Momentum, Value, MACD, S/R, ROC, R/R, Chg%, Style, Risk.
     // Signal remains in the detail modal; Value opens the same breakdown previously reached from the Value tab.
+    // ROC is the app's own: room left to the nearest resistance, a price figure \u2014
+    // the same one the watchlist and the floor algo use.
     var cols=[['symbol','Stock'],['price','Price'],['trend','Trend'],['pullbackScore','Pull'],['momentumScore','Momo'],['valueScore','Value'],['macdSlope','MACD'],['zone','S/R'],['rocPct','ROC'],['rrRatio','R:R'],['priceVel','Chg%'],['swingScore','Style'],['riskInAtrs','Risk']];
     cols.forEach(function(c){
-      if(c[0]==='trend'){
+      if(c[0]==='rocPct'){
+        h+='<th onclick="doSort(\'rocPct\')" title="ROC: room to the nearest resistance, (resistance \u2212 price) \u00F7 price.">ROC'+(STATE.sortK==='rocPct'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
+      }else if(c[0]==='trend'){
         h+='<th onclick="doSort(\'trendStackScore\')" title="Trend Stack Score: 200S + 200E + 50E + 21E slopes">Trend'+(STATE.sortK==='trendStackScore'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
       }else{
         h+='<th onclick="doSort(\''+c[0]+'\')">'+c[1]+(STATE.sortK===c[0]?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
@@ -7124,13 +7141,15 @@ function t212Bare(t){ return String(t||'').split('_')[0].replace(/[dl]$/,'') || 
 // "what did my account actually make" is the same question in both markets and a
 // second copy of the answer is how two paths drift into disagreeing.
 function closedAnalysisBridge(){
-  return (SPACE==='IN')?'zerodhaClosedTrades':'t212ClosedTrades';
+  return (SPACE==='IN')?'zerodhaClosedTrades':(SPACE==='BN')?'binanceClosedTrades':'t212ClosedTrades';
 }
 function closedAnalysisRead(){
   try{
     var fn=closedAnalysisBridge();
     if(typeof Android==='undefined'||!Android[fn])return null;
-    return JSON.parse(Android[fn](false)||'{}');
+    // Trading 212 is one account shown as two tabs, so it is asked for this
+    // tab's market only; Zerodha's history is India's alone.
+    return JSON.parse(((SPACE==='IN'||SPACE==='BN')?Android[fn](false):Android[fn](false,SPACE))||'{}');
   }catch(e){ return null }
 }
 function closedAnalysisScan(){
@@ -7139,15 +7158,15 @@ function closedAnalysisScan(){
   if(typeof Android==='undefined'||!Android[fn]){uiAlert('Unavailable','Rebuild the APK for this.');return}
   CLOSED_ANALYSIS_BUSY=true; renderKeepScroll();
   setTimeout(function(){
-    try{ Android[fn](true) }catch(e){ uiAlert('Error',e.message) }
+    try{ if(SPACE==='IN'||SPACE==='BN')Android[fn](true);else Android[fn](true,SPACE) }catch(e){ uiAlert('Error',e.message) }
     CLOSED_ANALYSIS_BUSY=false; renderKeepScroll();
   },30);
 }
 function closedAnalysisPanel(){
-  if(!isT212Space()&&SPACE!=='IN')return '';
+  if(!isT212Space()&&SPACE!=='IN'&&SPACE!=='BN')return '';
   var head='<div onclick="closedAnalysisToggle()" style="cursor:pointer;display:flex;align-items:center;gap:7px;padding:8px 10px">'+
     '<span style="font-size:11px">'+(CLOSED_ANALYSIS_OPEN?'▾':'▸')+'</span>'+
-    '<span style="font-size:10px;font-weight:900;color:var(--t2);letter-spacing:.03em">📊 '+(SPACE==='IN'?'ZERODHA':'T212')+' ANALYSIS</span>'+
+    '<span style="font-size:10px;font-weight:900;color:var(--t2);letter-spacing:.03em">📊 '+(SPACE==='IN'?'ZERODHA':SPACE==='BN'?'BINANCE':SPACE==='DE'?'T212 GERMANY':'T212 USA')+' ANALYSIS</span>'+
     '<span style="font-size:9px;color:var(--t3)">closed trades &amp; realised P&amp;L</span>';
   var r=closedAnalysisRead();
   if(r&&r.ok&&r.trips&&r.trips.length){
@@ -7173,7 +7192,9 @@ function closedAnalysisPanel(){
 // questions this table gets asked. Ties keep the original order, newest sale
 // first, so a sort never shuffles rows it has no opinion about.
 var CLOSED_SORT=(function(){
-  try{var v=JSON.parse(localStorage.getItem('closedTripsSort')||'null');if(v&&typeof v.k==='string')return v}catch(e){}
+  // A sort this table no longer offers (quantity, charges) starts from the default.
+  try{var v=JSON.parse(localStorage.getItem('closedTripsSort')||'null');
+      if(v&&typeof v.k==='string'&&['qty','charges','buyPx','sellPx'].indexOf(v.k)<0)return v}catch(e){}
   return {k:'',d:0};
 })();
 function closedSortBy(k){
@@ -7185,12 +7206,218 @@ function closedSortBy(k){
   SCROLL_KEY_RESET['closed-trips']=true;
   renderKeepScroll();
 }
+// ── ONE ROW PER TRADE, NOT PER PIECE ───────────────────────────────────────
+// The matcher pairs every sell order with every buy order it closed, oldest
+// shares first. The order ladder buys and sells in several small orders, so a
+// single trade came out as one row per overlap — SRT3 showed four rows of
+// 0.08 to 0.81 shares, and the win count was counting pieces. Pieces bought the
+// same day and sold the same day are one trade, the way it was placed: their
+// shares and money are added up and the prices averaged by shares.
+function closedTripsByDay(trips){
+  var by={}, order=[];
+  (trips||[]).forEach(function(t){
+    var k=String(t.ticker||t.symbol)+'|'+String(t.boughtAt||'').slice(0,10)+'|'+String(t.soldAt||'').slice(0,10);
+    var g=by[k];
+    if(!g){g=by[k]={ticker:t.ticker,symbol:t.symbol,qty:0,bv:0,sv:0,cashIn:0,cashOut:0,pnl:0,charges:0,
+                    boughtAt:String(t.boughtAt||''),soldAt:String(t.soldAt||''),pieces:0,parts:{},sameDay:!!t.sameDay};order.push(g)}
+    var q=Number(t.qty)||0;
+    g.qty+=q; g.bv+=q*(Number(t.buyPrice)||0); g.sv+=q*(Number(t.sellPrice)||0);
+    g.cashIn+=Number(t.cashIn)||0; g.cashOut+=Number(t.cashOut)||0;
+    g.pnl+=Number(t.pnl)||0; g.charges+=Number(t.charges)||0;
+    var cp=t.chargeParts||{};
+    Object.keys(cp).forEach(function(n){g.parts[n]=(g.parts[n]||0)+(Number(cp[n])||0)});
+    if(String(t.boughtAt||'')<g.boughtAt)g.boughtAt=String(t.boughtAt);
+    if(String(t.soldAt||'')>g.soldAt)g.soldAt=String(t.soldAt);
+    g.pieces++;
+  });
+  // DAYS HELD BY THE CALENDAR: bought on the 8th and sold on the 9th is one day,
+  // even when fewer than 24 hours passed — it was held overnight, and overnight
+  // is what makes it a delivery trade rather than an intraday one.
+  var dayMs=function(s){var v=Date.parse(String(s).slice(0,10)+'T00:00:00Z');return isFinite(v)?v:0};
+  return order.map(function(g){
+    var held=(dayMs(g.soldAt)&&dayMs(g.boughtAt))?Math.max(0,Math.round((dayMs(g.soldAt)-dayMs(g.boughtAt))/86400000)):0;
+    return {ticker:g.ticker,symbol:g.symbol,qty:g.qty,
+      buyPrice:g.qty>0?g.bv/g.qty:0, sellPrice:g.qty>0?g.sv/g.qty:0,
+      boughtAt:g.boughtAt, soldAt:g.soldAt, cashIn:g.cashIn, cashOut:g.cashOut,
+      pnl:g.pnl, charges:g.charges, pieces:g.pieces, heldDays:held,
+      chargeParts:g.parts, sameDay:g.sameDay,
+      pctReturn:g.cashIn>0?(g.cashOut/g.cashIn-1)*100:0,
+      netPnl:g.pnl-g.charges, netPctReturn:g.cashIn>0?(g.pnl-g.charges)/g.cashIn*100:0};
+  });
+}
+// "8 Oct" from a fill time. Blank when there is none.
+function closedDay(iso){
+  var v=Date.parse(String(iso||'').slice(0,19)+'Z');
+  return isFinite(v)?new Date(v).toLocaleDateString('en-GB',{day:'numeric',month:'short'}):'';
+}
+// ── HOW THE ALGO TRADES FILLED, from the app's own records ─────────────────
+// Each completed algo round trip, with the strategy's prices beside what the
+// broker filled. Local and instant, read at most once a minute — this panel
+// repaints with the live prices.
+var ALGO_EXEC_CACHE={};
+function closedAlgoExec(){
+  if(SPACE!=='DE'&&SPACE!=='US')return null;
+  var c=ALGO_EXEC_CACHE[SPACE];
+  if(c&&Date.now()-c.at<60000)return c.r;
+  var r=null;
+  try{ if(typeof Android!=='undefined'&&Android.t212AlgoExecution)r=JSON.parse(Android.t212AlgoExecution(SPACE)||'{}') }catch(e){}
+  ALGO_EXEC_CACHE[SPACE]={at:Date.now(),r:(r&&r.ok)?r:null};
+  return ALGO_EXEC_CACHE[SPACE].r;
+}
+// The algo trades behind one closed row: same stock, bought and sold the same days.
+function closedAlgoFor(t,ex){
+  if(!ex||!ex.roundTrips)return [];
+  var bd=String(t.boughtAt||'').slice(0,10), sd=String(t.soldAt||'').slice(0,10);
+  var sym=String(t.symbol||'').toUpperCase();
+  return ex.roundTrips.filter(function(x){
+    return String(x.symbol||'').toUpperCase()===sym&&x.buyDay===bd&&x.sellDay===sd;
+  });
+}
+// One line under a row: how each leg filled against the strategy's own price.
+// These are COSTS: positive cost you, negative saved you — said in words too.
+function closedAlgoLine(xs){
+  if(!xs.length)return '';
+  var w=function(v){v=Number(v||0);return '<b style="color:'+(v>0?'var(--rd)':'var(--gn)')+'">'+Math.abs(v).toFixed(2)+'% '+(v>0?'worse':'better')+'</b>'};
+  return xs.map(function(x){
+    return '<div style="font-size:8px;color:var(--t3);margin-top:2px;line-height:1.5" title="The strategy’s own price is the one its backtest used; this is how the real fills compared. Positive = cost you, negative = saved you.">'+
+      '🤖 '+escHtml(x.algo||'algo')+' · buy '+w(x.entrySlipPct)+' than the signal · sell '+w(x.exitSlipPct)+' than paper · together '+w(x.measuredPct)+
+      '</div>';
+  }).join('');
+}
+// ── WHAT A TRADE'S CHARGES ARE MADE OF ─────────────────────────────────────
+// Tap a trade's charges and see each line of the contract note it stands for,
+// so a figure that looks too big can be checked rather than taken on trust.
+var CLOSED_ROWS=[];
+function closedChargesOpen(i){
+  var t=CLOSED_ROWS[i]; if(!t)return;
+  var p=t.chargeParts||{}, names=Object.keys(p).filter(function(n){return Number(p[n])>0.0049});
+  var order=['STT','stamp duty','exchange','SEBI','brokerage','DP charge','GST'];
+  names.sort(function(a,b){return ((order.indexOf(a)+1)||99)-((order.indexOf(b)+1)||99)});
+  var same=!!t.sameDay;
+  var what={
+    'STT':same?'Securities transaction tax: 0.025% of the sale (same-day rate)':'Securities transaction tax: 0.1% of the buy and 0.1% of the sale',
+    'stamp duty':same?'0.003% of the buy (same-day rate)':'0.015% of the buy',
+    'exchange':'NSE transaction charge, on both legs',
+    'SEBI':'₹10 per crore traded',
+    'brokerage':same?'Same-day trades only: 0.03% of each order, at most ₹20':'Free on delivery',
+    'DP charge':'Depository fee: ₹13.50 once per company per day sold, shared across that day’s sales',
+    'GST':'18% on brokerage, exchange, SEBI and the depository fee — never on the taxes',
+    'FX conversion':'Trading 212’s 0.15% currency-conversion fee, on the buy and on the sale — dollar shares on a euro account',
+    'Binance fee (buy)':'Binance’s standard 0.1% of the buy, taken out of the coins received — an estimate, the real fee was not recorded',
+    'Binance fee (sale)':'Binance’s standard 0.1% of the sale, taken out of the proceeds — an estimate, the real fee was not recorded'};
+  var pctOf=function(v){return Number(t.cashIn)>0?(' · '+(v/Number(t.cashIn)*100).toFixed(3)+'%'):''};
+  var sum=0, rows=names.map(function(n){
+    var v=Number(p[n]); sum+=v;
+    return '<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px dashed var(--bd)">'+
+      '<span style="flex:1"><b>'+escHtml(n)+'</b><br/><span style="font-size:10px;color:var(--t3)">'+escHtml(what[n]||'')+'</span></span>'+
+      '<span style="font-family:monospace;font-weight:800;text-align:right">'+v.toFixed(2)+'<br/><span style="font-size:9px;font-weight:400;color:var(--t3)">'+pctOf(v).replace(' · ','')+'</span></span></div>';
+  }).join('');
+  if(!names.length)rows='<div style="color:var(--t3)">No breakdown stored for this trade — tap “Re-read history” to rebuild it.</div>';
+  // Only India has a separate same-day card; elsewhere there is nothing to say.
+  var kind=(SPACE==='IN')?(same?' · <b style="color:var(--bl)">same day — charged as intraday</b>':' · held overnight — delivery charges'):'';
+  uiAlert('Fees · '+escHtml(t.symbol||''),
+    '<div style="font-size:11px;color:var(--t2);line-height:1.5">'+
+      '<div style="margin-bottom:6px;color:var(--t3)">Bought '+Number(t.cashIn||0).toFixed(2)+' · sold '+Number(t.cashOut||0).toFixed(2)+kind+'</div>'+
+      rows+
+      '<div style="display:flex;padding-top:6px;font-weight:800"><span style="flex:1">Total</span><span style="font-family:monospace;text-align:right">'+sum.toFixed(2)+
+        '<br/><span style="font-size:9px;color:var(--t3)">'+pctOf(sum).replace(' · ','')+' of the money put in</span></span></div>'+
+    '</div>');
+}
+// The whole picture for this market's algo trades: what the algos charge
+// themselves for slippage against what the fills actually cost, trade by trade.
+// Folded by default under a one-line summary.
+var CLOSED_EXEC_OPEN=false;
+function closedExecToggle(){CLOSED_EXEC_OPEN=!CLOSED_EXEC_OPEN;renderKeepScroll()}
+function closedExecBlock(ex){
+  var n=Number(ex.rtCount||0);
+  var med=Number(ex.rtMeasuredMedian||0), asum=Number(ex.rtAssumedMean||0), dev=med-asum;
+  var sum=n?('<b style="color:'+(dev>0?'var(--rd)':'var(--gn)')+'">'+med.toFixed(2)+'% real vs '+asum.toFixed(2)+'% assumed</b> per trade · '+n+' algo trade'+(n===1?'':'s'))
+           :'no completed algo trades in this market yet';
+  return '<div style="border:1px solid var(--bd);border-radius:6px;background:var(--bg2);margin-bottom:8px">'+
+    '<div onclick="closedExecToggle()" style="cursor:pointer;display:flex;flex-wrap:wrap;gap:3px 6px;align-items:center;padding:6px 8px;font-size:9px;color:var(--t2)">'+
+      '<span>'+(CLOSED_EXEC_OPEN?'▾':'▸')+'</span><b>🧾 Fills vs the strategy’s prices</b>'+
+      '<span style="flex:1 1 160px;text-align:right;color:var(--t3)">'+sum+'</span></div>'+
+    (CLOSED_EXEC_OPEN?('<div style="padding:0 6px 6px">'+closedLegToggle()+closedLegPanel(ex,CLOSED_EXEC_LEG)+'</div>'):'')+
+    '</div>';
+}
+// ── BUYING AND SELLING, SEPARATELY ─────────────────────────────────────────
+// The two legs go wrong for different reasons — a buy chases a market that is
+// running away, a sale gives way to one that is falling — so they are read one
+// at a time. The total per trade is still on every algo row in the table.
+var CLOSED_EXEC_LEG=(function(){try{return localStorage.getItem('closedExecLeg')==='sell'?'sell':'buy'}catch(e){return 'buy'}})();
+function closedExecLegSet(v){
+  CLOSED_EXEC_LEG=(v==='sell')?'sell':'buy';
+  try{localStorage.setItem('closedExecLeg',CLOSED_EXEC_LEG)}catch(e){}
+  renderKeepScroll();
+}
+function closedLegToggle(){
+  var b=function(v,label){
+    var on=(CLOSED_EXEC_LEG===v);
+    return '<span onclick="event.stopPropagation();closedExecLegSet(\''+v+'\')" style="cursor:pointer;flex:1;text-align:center;padding:4px 0;font-size:9px;font-weight:800;border-radius:5px;'+
+      (on?'background:rgba(37,99,235,.14);color:var(--bl);border:1px solid rgba(37,99,235,.45)':'color:var(--t3);border:1px solid var(--bd)')+'">'+label+'</span>';
+  };
+  return '<div style="display:flex;gap:6px;margin:2px 0 8px">'+b('buy','Buying')+b('sell','Selling')+'</div>';
+}
+function closedLegPanel(ex,leg){
+  var rt=(ex.roundTrips||[]);
+  if(!rt.length)return slipDeviationPanel(ex);   // its own "nothing measured yet" note
+  var sell=(leg==='sell'), key=sell?'exitSlipPct':'entrySlipPct';
+  var all=rt.map(function(x){return Number(x[key]||0)}).sort(function(a,b){return a-b});
+  var n=all.length, med=(n%2)?all[(n-1)/2]:(all[n/2-1]+all[n/2])/2;
+  var mean=all.reduce(function(a,v){return a+v},0)/n;
+  // The algos charge their slippage once per ROUND TRIP, so one side's share of
+  // it is half. Comparing a single leg against the whole figure would flatter it.
+  var ref=Number(ex.rtAssumedMean||0)/2;
+  var show=rt.slice(-24), vals=show.map(function(x){return Number(x[key]||0)});
+  var lo=Math.min(0,Math.min.apply(null,vals))*1.25;
+  var hi=Math.max.apply(null,vals.concat([ref,0.1]))*1.25;
+  if(hi-lo<0.05)hi=lo+0.05;
+  var W=300,L=54,R=288,PW=R-L,rowH=13,H=show.length*rowH+22;
+  var X=function(v){return L+((v-lo)/(hi-lo))*PW};
+  var zx=X(0),ax=X(ref);
+  var s='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="display:block;margin-top:7px">';
+  s+='<line x1="'+zx.toFixed(1)+'" y1="0" x2="'+zx.toFixed(1)+'" y2="'+(H-17)+'" style="stroke:var(--bd);stroke-width:1"/>';
+  s+='<line x1="'+ax.toFixed(1)+'" y1="0" x2="'+ax.toFixed(1)+'" y2="'+(H-17)+'" style="stroke:var(--bl);stroke-width:1;stroke-dasharray:2 2"/>';
+  show.forEach(function(x,i){
+    var m=vals[i],y=i*rowH+3,worse=m>0;
+    var x0=X(Math.min(m,0)),x1=X(Math.max(m,0));
+    s+='<text x="0" y="'+(y+7)+'" style="font:700 8px monospace;fill:var(--t2)">'+escHtml(String(x.symbol||'').slice(0,7))+'</text>';
+    s+='<rect x="'+x0.toFixed(1)+'" y="'+y+'" width="'+Math.max(1,x1-x0).toFixed(1)+'" height="7" rx="1.5" style="fill:'+(worse?'var(--rd)':'var(--gn)')+';opacity:.85"/>';
+    var tEnd=(x1>228);
+    s+='<text x="'+(tEnd?(x0-3):(x1+3)).toFixed(1)+'" y="'+(y+7)+'" text-anchor="'+(tEnd?'end':'start')+'" style="font:8px monospace;fill:var(--t3)">'+(m>=0?'+':'')+m.toFixed(2)+'%</text>';
+  });
+  s+='<text x="'+ax.toFixed(1)+'" y="'+(H-5)+'" text-anchor="middle" style="font:700 8px monospace;fill:var(--bl)">assumed '+ref.toFixed(3)+'% a side</text>';
+  s+='</svg>';
+  var box='border:1px solid var(--bd);border-radius:7px;background:var(--cd);padding:8px 10px';
+  return '<div style="'+box+'">'+
+    '<div style="font-size:9px;font-weight:800;color:var(--t2)">'+(sell?'SELLING':'BUYING')+' · '+n+' algo trade'+(n===1?'':'s')+'</div>'+
+    '<div style="font-family:monospace;font-size:12px;font-weight:800;margin-top:3px;color:'+(med>ref?'var(--rd)':'var(--gn)')+'">median '+Math.abs(med).toFixed(3)+'% '+(med>0?'worse':'better')+
+      '<span style="font-size:10px"> · assumed '+ref.toFixed(3)+'% a side</span></div>'+
+    '<div style="font-size:9px;color:var(--t3);margin-top:2px">mean '+(mean>=0?'+':'')+mean.toFixed(3)+'% · '+
+      (sell?'each real sale against the price the strategy exited at'
+           :'each real buy against the strategy’s signal price')+'</div>'+
+    (sell?'':slipChainStrip(rt))+
+    s+
+    '<div style="font-size:9px;color:var(--t3);line-height:1.55;margin-top:5px">'+
+      (show.length<rt.length?('Showing the last '+show.length+' of '+rt.length+'. '):'')+
+      'One bar per algo trade. <span style="color:var(--rd)"><b>Red / right = cost you</b></span>'+
+      (sell?' (sold below the strategy’s price)':' (paid above the signal)')+
+      '; <span style="color:var(--gn)"><b>green / left = saved you</b></span>. The dashed line is half of what the algos charge themselves per trade.'+
+      (n<30?'<br/><b style="color:#b45309">'+n+' trades — too few to retune anything yet. Aim for ~30.</b>':'')+
+    '</div></div>';
+}
 function closedSortValue(t,k,costed){
   switch(k){
     case 'symbol': return String(t.symbol||'').toUpperCase();
-    case 'qty': return Number(t.qty)||0;
-    case 'buy': return Number(t.buyPrice)||0;
-    case 'sell': return Number(t.sellPrice)||0;
+    // What each leg MOVED in money — comparable across stocks, which a share
+    // count is not.
+    case 'bval': return Number(t.cashIn)||0;
+    case 'feepct': return (Number(t.cashIn)>0)?(Number(t.charges)||0)/Number(t.cashIn):0;
+    case 'sval': return Number(t.cashOut)||0;
+    // BY DATE, not by price: prices of different stocks cannot be compared, and
+    // when a trade was made is what a list of trades is read by.
+    case 'buy': return String(t.boughtAt||'');
+    case 'sell': return String(t.soldAt||'');
     case 'held': return Number(t.heldDays)||0;
     case 'charges': return Number(t.charges)||0;
     case 'pnl': return Number(costed?t.netPnl:t.pnl)||0;
@@ -7209,16 +7436,21 @@ function closedSortedTrips(trips,costed){
     .map(function(x){return x.t});
 }
 function closedSortLabel(costed){
-  var names={symbol:'stock',qty:'quantity',buy:'buy price',sell:'sell price',held:'days held',
+  var names={symbol:'stock',bval:'value bought',sval:'value sold',buy:'buy date',sell:'sale date',held:'days held',feepct:'fees %',
              charges:'charges',pnl:(costed?'net P&amp;L':'P&amp;L'),pct:'% return'};
   if(!CLOSED_SORT.k)return 'newest sale first \u00b7 tap a heading to sort';
-  var txt=(CLOSED_SORT.k==='symbol')?(CLOSED_SORT.d>0?'A to Z':'Z to A'):(CLOSED_SORT.d>0?'smallest first':'largest first');
+  var isDate=(CLOSED_SORT.k==='buy'||CLOSED_SORT.k==='sell');
+  var txt=(CLOSED_SORT.k==='symbol')?(CLOSED_SORT.d>0?'A to Z':'Z to A')
+         :isDate?(CLOSED_SORT.d>0?'oldest first':'newest first')
+         :(CLOSED_SORT.d>0?'smallest first':'largest first');
   return 'by '+names[CLOSED_SORT.k]+', '+txt;
 }
 function closedAnalysisBody(r){
   var h='<div style="padding:0 10px 10px">';
   h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">'+
-     '<span style="font-size:9px;color:var(--t3);line-height:1.5;flex:1">Built from executed fills only — nothing here comes from a strategy signal. Sells are matched to the buys they closed, oldest shares first.</span>'+
+     '<span style="font-size:9px;color:var(--t3);line-height:1.5;flex:1">'+(SPACE==='BN'
+        ? 'Built from the algos’ real Binance orders — every algo, including deleted ones. Each row is one bought-and-sold trade.'
+        : 'Built from executed fills only — nothing here comes from a strategy signal. Sells are matched to the buys they closed, oldest shares first.')+'</span>'+
      '<span onclick="closedAnalysisScan()" style="cursor:pointer;font-size:9px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.4);border-radius:5px;padding:3px 9px;white-space:nowrap">'+
        (CLOSED_ANALYSIS_BUSY?'⏳ reading…':'↻ Re-read history')+'</span></div>';
   if(!r||(!r.ok&&!r.trips)){
@@ -7239,8 +7471,12 @@ function closedAnalysisBody(r){
        (since?('everything since <b>'+escHtml(since)+'</b>'):'only the days the app has been running to see it')+
        ', not your whole account. Anything traded before that is invisible here and cannot be recovered.</div>';
   }
-  var trips=r.trips||[], cur=escHtml(r.currency||'');
-  var wins=Number(r.wins||0), losses=Number(r.losses||0);
+  // One row per trade as it was placed — see closedTripsByDay. Every count and
+  // rate below is per TRADE, not per matched piece.
+  var trips=closedTripsByDay(r.trips||[]), cur=escHtml(r.currency||'');
+  var costedR=!!r.costed;
+  var wins=trips.filter(function(t){return (costedR?t.netPnl:t.pnl)>0}).length;
+  var losses=trips.filter(function(t){return (costedR?t.netPnl:t.pnl)<0}).length;
   var winRate=(wins+losses)>0?Math.round(wins/(wins+losses)*100):0;
   var gross=trips.reduce(function(a,t){return a+Math.max(0,Number(t.pnl||0))},0);
   var bad=trips.reduce(function(a,t){return a+Math.min(0,Number(t.pnl||0))},0);
@@ -7266,9 +7502,9 @@ function closedAnalysisBody(r){
       ? card('NET AFTER CHARGES',(net>=0?'+':'')+net.toFixed(2)+' '+cur,ncol)+
         card('GROSS',(Number(r.totalPnl)>=0?'+':'')+Number(r.totalPnl).toFixed(2),pcol)+
         card('CHARGES','-'+chg.toFixed(2),'var(--rd)')+
-        card('ROUND TRIPS',String(trips.length))
+        card('TRADES',String(trips.length))
       : card('REALISED',(Number(r.totalPnl)>=0?'+':'')+Number(r.totalPnl).toFixed(2)+' '+cur,pcol)+
-        card('ROUND TRIPS',String(trips.length))+
+        card('TRADES',String(trips.length))+
         card('WIN RATE',winRate+'%')+
         card('WON / LOST',wins+' / '+losses))+
     '</div>';
@@ -7280,11 +7516,18 @@ function closedAnalysisBody(r){
        'Win rate '+winRate+'% &middot; '+wins+' won / '+losses+' lost &middot; gains '+gross.toFixed(2)+
        ' &middot; losses '+bad.toFixed(2)+' &middot; from '+Number(r.fillsSeen||0)+' fills<br/>'+
        'Charges took <b style="color:var(--rd)">'+bite.toFixed(1)+'%</b> of everything the winners made'+
-       (trips.length?(' &middot; '+(chg/trips.length).toFixed(2)+' '+cur+' a round trip on average'):'')+
+       (trips.length?(' &middot; '+(chg/trips.length).toFixed(2)+' '+cur+' a trade on average'):'')+
+       // FEES AS A SHARE OF THE MONEY PUT IN — the figure the Fees column shows
+       // per trade, here across all of them.
+       (function(){var inv=trips.reduce(function(a,t){return a+(Number(t.cashIn)||0)},0);
+         return inv>0?(' &middot; <b>'+(chg/inv*100).toFixed(2)+'%</b> of the money put in'):''})()+
+       (r.feesEstimated?'<br/><span style="color:#b45309">Fees estimated at Binance’s standard 0.1% a side.</span> Binance took the real fee out of the coins and the proceeds, so the net result is exact; only its split into gross and fee is an estimate.':'')+
        '</div>';
   }else{
     h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">Gains '+gross.toFixed(2)+' &middot; losses '+bad.toFixed(2)+' &middot; from '+Number(r.fillsSeen||0)+' fills<br/>'+
-       '<span style="color:#b45309">Charges are not deducted here.</span> This account holds instruments in more than one currency and the fill rows do not say which, so a conversion fee cannot be applied to the right half — a figure that is wrong for half the rows would be worse than none.</div>';
+       (SPACE==='DE'
+         ? '<span style="color:var(--gn)">No charges:</span> Trading 212 takes no commission, and these are euro shares on a euro account, so nothing is converted.</div>'
+         : '<span style="color:#b45309">Charges are not deducted here</span> — no price list is modelled for this market.</div>');
   }
 
   // ONLY CLOSED QUANTITY IS COUNTED, and the leftovers are named rather than
@@ -7297,52 +7540,96 @@ function closedAnalysisBody(r){
     if(usKeys.length)h+='<b>Sold, buy older than this history:</b> '+usKeys.map(function(k){return escHtml(t212Bare(k))+' '+Number(us[k]).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')}).join(' · ')+' — no honest entry price, so left out.';
     h+='</div>';
   }
-  if(!trips.length)return h+'<div style="font-size:10px;color:var(--t3)">No completed round trips in the history read.</div></div>';
+  if(!trips.length)return h+'<div style="font-size:10px;color:var(--t3)">No completed trades in the history read.</div></div>';
 
-  // ── SORTED BY TAPPING A HEADING, SCROLLED INSIDE ITS OWN BOX ─────────────
-  // A long history used to push everything below it off the page; it now sits
-  // in a box about half a screen tall with its headings pinned while it
-  // scrolls. Tap a heading to sort by it, again to reverse, a third time for the
-  // original order — newest sale first.
+  // ── THE ALGO TRADES' FILLS AGAINST THE STRATEGY'S PRICES ─────────────────
+  // What the separate "Real T212 fills" window used to show, here beside the
+  // trades it is about: per algo trade, how far the buy and the sell landed from
+  // the prices the strategy (and its backtest) used, and in total against the
+  // slippage the algos charge themselves. Each algo row below also says it.
+  var ex=closedAlgoExec();
+  if(ex)h+=closedExecBlock(ex);
+
+  // ── ONE SCREEN WIDE, SORTED BY WHAT A TRADE IS READ BY ───────────────────
+  // NO SIDEWAYS SCROLLING. The page's general table style forbids text from
+  // wrapping, so the algo line under a row pushed the P&L off the right edge.
+  // This table fixes its column widths and lets text wrap inside them.
+  //
+  // MONEY, NOT SHARE COUNTS. What each leg moved is the big figure on each side
+  // (price and date beneath it); the share count sits under the name.
+  //
+  // Sorted by the chips above it — when each leg happened, how much money each
+  // moved, or how it ended. Tap the active chip again to reverse it, a third time
+  // for the original order: newest sale first. The headings sort too.
   var sorted=closedSortedTrips(trips,costed);
+  CLOSED_ROWS=sorted;
+  var cs=(r.currency==='INR')?'₹':(r.currency==='EUR')?'€':(r.currency==='USD')?'$':'';
+  var money=function(v){v=Number(v)||0;return cs+(Math.abs(v)>=1000?v.toFixed(0):v.toFixed(2))};
+  var chip=function(key,label){
+    var on=(CLOSED_SORT.k===key);
+    var arrow=on?(CLOSED_SORT.d>0?' ▲':' ▼'):'';
+    return '<span onclick="closedSortBy(\''+key+'\')" style="cursor:pointer;white-space:nowrap;padding:2px 7px;border-radius:10px;font-size:8px;font-weight:800;'+
+      (on?'background:rgba(124,58,237,.14);color:var(--pu);border:1px solid rgba(124,58,237,.45)':'color:var(--t3);border:1px solid var(--bd)')+'">'+label+arrow+'</span>';
+  };
+  h+='<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:0 2px 5px">'+
+     '<span style="font-size:8px;color:var(--t3);margin-right:2px">Sort</span>'+
+     chip('sell','Sale date')+chip('buy','Buy date')+chip('bval','Value bought')+chip('sval','Value sold')+
+     chip('pnl',costed?'Net P&amp;L':'P&amp;L')+chip('pct','% return')+(costed?chip('feepct','Fees %'):'')+chip('held','Days held')+chip('symbol','Stock')+
+     '</div>';
+  h+='<div style="font-size:8px;color:var(--t3);margin:0 2px 4px">'+trips.length+' trade'+(trips.length===1?'':'s')+' · '+closedSortLabel(costed)+'</div>';
   var th=function(label,key,right){
     var on=(CLOSED_SORT.k===key);
-    var arrow=on?(CLOSED_SORT.d>0?' \u25b2':' \u25bc'):'';
-    return '<th onclick="closedSortBy(\''+key+'\')" style="cursor:pointer;padding:5px 4px;position:sticky;top:0;z-index:1;background:var(--cd);border-bottom:1px solid var(--bd);'+
-      (right?'text-align:right;':'')+'white-space:nowrap;'+(on?'color:var(--pu);':'')+'">'+label+arrow+'</th>';
+    var arrow=on?(CLOSED_SORT.d>0?' ▲':' ▼'):'';
+    return '<th onclick="closedSortBy(\''+key+'\')" style="cursor:pointer;padding:5px 3px;position:sticky;top:0;z-index:1;background:var(--cd);border-bottom:1px solid var(--bd);white-space:normal;'+
+      (right?'text-align:right;':'')+(on?'color:var(--pu);':'')+'">'+label+arrow+'</th>';
   };
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;font-size:8px;color:var(--t3);margin:0 2px 4px">'+
-     '<span>'+trips.length+' round trip'+(trips.length===1?'':'s')+' \u00b7 '+closedSortLabel(costed)+'</span>'+
-     '<span onclick="closedSortBy(\'pct\')" style="cursor:pointer;font-weight:800;color:'+(CLOSED_SORT.k==='pct'?'var(--pu)':'var(--bl)')+'" title="Sort by percentage return instead of cash">% return'+
-       (CLOSED_SORT.k==='pct'?(CLOSED_SORT.d>0?' \u25b2':' \u25bc'):'')+'</span></div>';
-  h+='<div data-scroll-key="closed-trips" style="overflow:auto;max-height:55vh;border:1px solid var(--bd);border-radius:6px;-webkit-overflow-scrolling:touch">'+
-    '<table style="width:100%;border-collapse:separate;border-spacing:0;font-size:10px">'+
+  var cell='padding:4px 3px;border-top:1px solid var(--bd);white-space:normal;vertical-align:top;overflow-wrap:anywhere;font-family:system-ui;';
+  var sub=function(x){return '<div style="font-size:8px;color:var(--t3);font-weight:400;font-family:system-ui">'+x+'</div>'};
+  h+='<div data-scroll-key="closed-trips" style="overflow-y:auto;overflow-x:hidden;max-height:55vh;border:1px solid var(--bd);border-radius:6px;-webkit-overflow-scrolling:touch">'+
+    '<table style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:10px">'+
+    // A FEES column wherever fees are costed: what the trade's charges came to
+    // as a share of the money put in, the amount beneath it, tap for the lines.
+    (costed
+      ? '<colgroup><col style="width:18%"/><col style="width:24%"/><col style="width:24%"/><col style="width:7%"/><col style="width:11%"/><col style="width:16%"/></colgroup>'
+      : '<colgroup><col style="width:21%"/><col style="width:27%"/><col style="width:27%"/><col style="width:8%"/><col style="width:17%"/></colgroup>')+
     '<thead><tr style="color:var(--t3);font-size:8px;text-align:left">'+
-    th('STOCK','symbol')+th('QTY','qty')+th('BOUGHT','buy')+th('SOLD','sell')+th('HELD','held')+
-    (costed?th('CHARGES','charges',true):'')+
-    th(costed?'NET P&amp;L':'P&amp;L','pnl',true)+
+    th('STOCK','symbol')+th('BOUGHT','buy')+th('SOLD','sell')+th('HELD','held')+
+    (costed?th('FEES','feepct',true):'')+
+    th(costed?'NET':'P&amp;L','pnl',true)+
     '</tr></thead><tbody>';
-  sorted.forEach(function(t){
+  sorted.forEach(function(t,i){
     var c=(Number(t.pnl)>=0)?'var(--gn)':'var(--rd)';
     // A trade can be green before charges and red after — which is precisely the
-    // thing this column exists to surface, so the colour follows the NET.
+    // thing worth surfacing, so on a costed market the colour follows the NET.
     var nc=(Number(t.netPnl)>=0)?'var(--gn)':'var(--rd)';
+    var leg=function(value,price,iso){
+      var d=closedDay(iso);
+      return '<td style="'+cell+'"><span style="font-family:monospace;font-weight:700;color:var(--t1)">'+money(value)+'</span>'+
+        sub('at '+Number(price).toFixed(2)+(d?(' · '+d):''))+'</td>';
+    };
+    var algo=closedAlgoFor(t,ex);
+    var q=Number(t.qty).toFixed(4).replace(/0+$/,'').replace(/\.$/,'');
     h+='<tr>'+
-      '<td style="padding:4px;border-top:1px solid var(--bd);font-weight:800;color:var(--t1)">'+escHtml(t.symbol||'')+'</td>'+
-      '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.qty).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')+'</td>'+
-      '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.buyPrice).toFixed(2)+'</td>'+
-      '<td style="padding:4px;font-family:monospace;color:var(--t2)">'+Number(t.sellPrice).toFixed(2)+'</td>'+
-      '<td style="padding:4px;color:var(--t3)">'+Number(t.heldDays)+'d</td>'+
-      (costed?('<td style="padding:4px;text-align:right;font-family:monospace;color:var(--t3)">-'+Number(t.charges||0).toFixed(2)+'</td>'):'')+
-      '<td style="padding:4px;text-align:right;font-weight:800;color:'+(costed?nc:c)+'">'+
+      '<td style="'+cell+'font-weight:800;color:var(--t1)" title="'+
+        (t.pieces>1?(t.pieces+' matched fills, added up into this one trade'):'one fill')+'">'+escHtml(t.symbol||'')+
+        sub(q+(SPACE==='BN'?'':' sh')+((t.sameDay&&SPACE==='IN')?' · <span style="color:var(--bl)">intraday</span>':''))+'</td>'+
+      leg(t.cashIn,t.buyPrice,t.boughtAt)+
+      leg(t.cashOut,t.sellPrice,t.soldAt)+
+      '<td style="'+cell+'color:var(--t3)">'+Number(t.heldDays)+'d</td>'+
+      (costed?('<td onclick="closedChargesOpen('+i+')" title="Tap for what these fees are made of" style="'+cell+'cursor:pointer;text-align:right;font-family:monospace;color:var(--t2)">'+
+        '<span style="text-decoration:underline dotted">'+(Number(t.cashIn)>0?(Number(t.charges||0)/Number(t.cashIn)*100).toFixed(2):'0.00')+'%</span>'+
+        sub(money(t.charges||0))+'</td>'):'')+
+      '<td style="'+cell+'text-align:right;font-weight:800;font-family:monospace;color:'+(costed?nc:c)+'">'+
         (costed
           ? ((Number(t.netPnl)>=0?'+':'')+Number(t.netPnl).toFixed(2)+
-             '<div style="font-size:8px;font-weight:600;color:var(--t3)">'+(Number(t.netPctReturn)>=0?'+':'')+Number(t.netPctReturn).toFixed(2)+'% net</div>'+
-             '<div style="font-size:8px;font-weight:600;color:var(--t3)">gross '+(Number(t.pnl)>=0?'+':'')+Number(t.pnl).toFixed(2)+'</div>')
+             sub((Number(t.netPctReturn)>=0?'+':'')+Number(t.netPctReturn).toFixed(2)+'% net')+
+             sub('gross '+(Number(t.pnl)>=0?'+':'')+Number(t.pnl).toFixed(2)))
           : ((Number(t.pnl)>=0?'+':'')+Number(t.pnl).toFixed(2)+
-             '<div style="font-size:8px;font-weight:600;color:var(--t3)">'+(Number(t.pctReturn)>=0?'+':'')+Number(t.pctReturn).toFixed(2)+'%</div>'))+
+             sub((Number(t.pctReturn)>=0?'+':'')+Number(t.pctReturn).toFixed(2)+'%')))+
         '</td>'+
-      '</tr>';
+      '</tr>'+
+      // An algo trade: its fills against the strategy's prices, across the row.
+      (algo.length?('<tr><td colspan="'+(costed?6:5)+'" style="padding:0 4px 5px;white-space:normal;font-family:system-ui">'+closedAlgoLine(algo)+'</td></tr>'):'');
   });
   h+='</tbody></table></div>';
   // The currency caveat is Trading 212's alone. A rupee account holding rupee
@@ -8362,7 +8649,23 @@ function swingStrip(w,lv,pxNow){
     lvlGauge(px,b.lo,b.hi)+
     (offLow!=null?'<b style="color:'+col+'">'+offLow.toFixed(1)+'% off low</b>':'')+
     (b.visits>1?'<span style="color:var(--t3);font-size:8px">\u00d7'+b.visits+'</span>':'')+
-    '</span>';
+    '</span>'+wideLows(lv,px,cur);
+}
+// THE WEEK'S AND THE MONTH'S LOWS, beside the 3-day one: how far above each it
+// trades. Green when it is in the bottom tenth of that window's range \u2014 the same
+// rule that sends the "near its low" notification.
+function wideLows(lv,px,cur){
+  if(!lv||!(px>0))return '';
+  var one=function(tag,lo,hi,days){
+    lo=Number(lo||0);hi=Number(hi||0);
+    if(!(lo>0)||!(hi>lo))return '';
+    var off=(px/lo-1)*100, pos=(px-lo)/(hi-lo), at=pos<=0.10;
+    return '<span title="'+escHtml(tag+': lowest '+cur+lo.toFixed(2)+', highest '+cur+hi.toFixed(2)+' over the last '+days+' trading days.'+(at?' Trading at the bottom of that range now.':''))+
+      '" style="white-space:nowrap"><b style="color:var(--t3);font-size:8px">'+tag+'</b> <b style="color:'+(at?'var(--gn)':'var(--t2)')+'">'+off.toFixed(1)+'%</b></span>';
+  };
+  var w=one('1W',lv.weekLow,lv.weekHigh,lv.weekDays||5), m=one('1M',lv.monthLow,lv.monthHigh,lv.monthDays||21);
+  if(!w&&!m)return '';
+  return '<span style="display:inline-flex;gap:6px;align-items:center;margin-left:6px">'+w+m+'</span>';
 }
 // ── THE PROJECTED CHANNEL — the only prediction on this panel ──────────────
 // Where the fifty-day trend line will be in twenty trading days, bracketed by
@@ -8401,42 +8704,40 @@ function projStrip(w,c,pxNow){
     (off!=null?'<span style="color:var(--t3)">'+(off>=0?'+':'')+off.toFixed(1)+'%</span>':'')+
     '</span>';
 }
-// ── RETURN ON CAPITAL, BORROWED FROM THE DISCOVERY SCAN ────────────────────
-// A fundamental, not a price metric — so unlike everything else on this row it
-// cannot be derived from the bars the watcher already holds. Fetching it per
-// candidate would be one request per name per day for a number that barely
-// moves between quarters.
+// ── ROC, BORROWED FROM THE DISCOVERY SCAN ──────────────────────────────────
+// The app's own ROC: room left to the nearest resistance on the daily chart,
+// (resistance − price) ÷ price — the same number as the Discovery table's ROC
+// column. Read from the scan already in memory rather than recomputed, so one
+// company cannot read two ways on two screens.
 //
-// So it is READ FROM THE SCAN ALREADY IN MEMORY rather than recomputed. That
-// also settles which value is correct: there is only one, the one the valuation
-// table shows, and a company cannot read two ways on two screens.
-//
-// A DASH IS AN HONEST ANSWER and appears in two cases: Discovery has not scanned
-// THIS market yet (its results are per space), or the scan carried no
-// fundamentals for that name. Neither is worth inventing a number for.
-function roceFor(sym){
-  var k=String(sym||'').toUpperCase().replace('.NS','');
+// A DASH IS AN HONEST ANSWER and appears when Discovery has not scanned THIS
+// market yet (its results are per space), or the scan found no resistance above
+// the price for that name. Neither is worth inventing a number for.
+function rocFor(sym){
+  // BOTH EXCHANGE ENDINGS. Discovery lists German names as "WAF.DE" and the
+  // watcher as "WAF"; stripping only the Indian ".NS" left every German row
+  // unmatched, so the whole German column read "—" and sorting by it did nothing.
+  var k=String(sym||'').toUpperCase().replace(/\.(NS|DE)$/,'');
   if(!k)return null;
   var pool=[];
   try{pool=(typeof STATE!=='undefined'&&STATE.data)?STATE.data:[]}catch(e){return null}
   for(var i=0;i<pool.length;i++){
-    var t=String(pool[i].symbol||'').toUpperCase().replace('.NS','');
+    var t=String(pool[i].symbol||'').toUpperCase().replace(/\.(NS|DE)$/,'');
     if(t===k){
-      var v=pool[i].roce;
-      return (v==null||!isFinite(Number(v)))?null:Number(v);
+      var v=Number(pool[i].rocPct);
+      return (isFinite(v)&&v>0)?v:null;
     }
   }
   return null;
 }
-function watcherRoceCell(sym){
-  var v=roceFor(sym);
+function watcherRocCell(sym){
+  var v=rocFor(sym);
   if(v==null)
-    return '<span style="flex:0 0 38px;text-align:right;color:var(--bd)" title="Not in the current Discovery scan for this market, so no return-on-capital figure is known. Run a Discovery scan here to fill this column.">\u2014</span>';
-  // Coloured on the sign only. Where a "good" ROCE sits varies so much by
-  // industry that a threshold painted green would be an opinion dressed as data.
+    return '<span style="flex:0 0 38px;text-align:right;color:var(--bd)" title="No ROC: this market has not been scanned in Discovery yet, or the scan found no resistance above the price.">—</span>';
+  // Same colours as the Discovery column, so a number looks the same on both screens.
   return '<span style="flex:0 0 38px;text-align:right;font-weight:700;color:'+
-    (v>=0?'var(--gn)':'var(--rd)')+'" title="Return on capital employed, from the Discovery scan">'+
-    (v>=0?'':'')+v.toFixed(1)+'%</span>';
+    (v>=10?'var(--gn)':v>=5?'var(--am)':'var(--t2)')+'" title="ROC: room to the nearest resistance, from the Discovery scan">'+
+    v.toFixed(1)+'%</span>';
 }
 // ── THE FULL COMPANY SHEET, FROM A WATCHER ROW ─────────────────────────────
 // The lens on each row answers "where would this config enter and exit". That
@@ -8478,13 +8779,63 @@ function watcherDetail(sym){
 //
 // The screener's own order is kept as the default. This is a lens on the same
 // list, not a replacement for how it was chosen.
-var MW_SORT=(function(){try{return localStorage.getItem('mw_sort')||'rank'}catch(e){return 'rank'}})();
+var MW_SORT=(function(){try{var v=localStorage.getItem('mw_sort')||'rank';return v==='roce'?'roc':v}catch(e){return 'rank'}})();
 function mwSetSort(v){
   MW_SORT=v;
   try{localStorage.setItem('mw_sort',v)}catch(e){}
   renderKeepScroll();
 }
+// ── LATEST ENTRIES ─────────────────────────────────────────────────────────
+// When the strategy last entered a name: the bar its current position opened on,
+// or failing that the day it signalled. Newest first; a name with no entry has no
+// place in this order and goes last, by the screener's rank.
+function mwEntryMs(c){
+  var t=Number(c.holdingSince||0)*1000;
+  var d=c.alertedDay?Date.parse(String(c.alertedDay)+'T00:00:00Z'):0;
+  return Math.max(isFinite(t)?t:0, isFinite(d)?d:0);
+}
+// ── SEARCH ─────────────────────────────────────────────────────────────────
+// Narrows the candidates to names containing what is typed. Kept for the
+// session only — a filter left on from yesterday would hide today's names.
+//
+// FILTERED IN PLACE WHILE TYPING. Rebuilding the box on every key would replace
+// the input under the keyboard mid-word — on Android that drops or doubles
+// letters. So keys only hide and show the rows already drawn; the page's normal
+// redraw (which waits while a box has the cursor) applies the same filter.
+var MW_SEARCH='';
+function mwSearchKey(c){return (String(c.symbol||'')+' '+String(c.name||'')).toUpperCase()}
+function mwSearchMatch(c){
+  var q=MW_SEARCH.trim().toUpperCase();
+  return !q||mwSearchKey(c).indexOf(q)>=0;
+}
+function mwSearchSet(v){
+  MW_SEARCH=String(v||'');
+  var q=MW_SEARCH.trim().toUpperCase(), shown=0, tot=0;
+  var rows=document.querySelectorAll('[data-mw-key]');
+  for(var i=0;i<rows.length;i++){
+    tot++;
+    var ok=!q||String(rows[i].getAttribute('data-mw-key')).indexOf(q)>=0;
+    rows[i].style.display=ok?'':'none';
+    if(ok)shown++;
+  }
+  var cnt=document.getElementById('mw-search-count');
+  if(cnt)cnt.textContent=q?(shown+' of '+tot):'';
+  var none=document.getElementById('mw-search-none');
+  if(none)none.style.display=(q&&!shown)?'':'none';
+}
+function mwSearchClear(){
+  MW_SEARCH='';
+  var el=document.getElementById('mw-search'); if(el)el.value='';
+  mwSearchSet('');
+}
 function mwSortCands(cands){
+  if(MW_SORT==='latest'){
+    return cands.slice().sort(function(a,b){
+      var ea=mwEntryMs(a), eb=mwEntryMs(b);
+      if(ea!==eb)return eb-ea;
+      return (Number(a.rank)||9999)-(Number(b.rank)||9999);
+    });
+  }
   // RANK MEANS RANK. The backend emits pinned names first so they cannot be
   // lost to the depth cut, which is right for assembling the list and wrong for
   // reading it: a pin is typically a name far down the ranking, so the list
@@ -8493,12 +8844,11 @@ function mwSortCands(cands){
   //
   // Unranked sorts LAST. A rank of zero means "the screener never placed this",
   // not "first" — and first is the most valuable row on the screen.
-  // RETURN ON CAPITAL, highest first. A name with no figure goes last — and in
-  // India that is most of them, because Yahoo carries the fundamentals for only
-  // a minority of NSE names; ranked among themselves by the screener's order.
-  if(MW_SORT==='roce'){
+  // ROC — most room to resistance first. A name with no figure goes last,
+  // ranked among the others by the screener's order.
+  if(MW_SORT==='roc'||MW_SORT==='roce'){
     return cands.slice().sort(function(a,b){
-      var va=roceFor(a.symbol), vb=roceFor(b.symbol);
+      var va=rocFor(a.symbol), vb=rocFor(b.symbol);
       if(va==null&&vb==null)return (Number(a.rank)||9999)-(Number(b.rank)||9999);
       if(va==null)return 1;
       if(vb==null)return -1;
@@ -8535,7 +8885,8 @@ function mwSortToggle(){
   return '<span style="display:inline-flex;gap:4px;margin-left:6px">'+
     bt('rank','rank','The screener\'s own order — best momentum first. How the list was chosen.')+
     bt('support','nearest support','Order by where each name sits inside its last few trading days, closest to the floor first. Names with no reading go last.')+
-    bt('roce','ROCE','Order by return on capital employed, highest first — the figure the Discovery scan carries. Names without one go last.')+
+    bt('roc','ROC','Order by ROC — room to the nearest resistance, the same figure as the Discovery table — most room first. Names without one go last.')+
+    bt('latest','latest entries','Order by when the strategy last entered each name — the newest entry signal first. Names with no entry go last.')+
     '</span>';
 }
 // One strip, used by both row types. `pxNow` is whatever the caller believes the
@@ -8740,7 +9091,7 @@ function manualColHeader(withAction){
     '<span style="flex:0 0 20px" title="Position in the screener ranking">#</span>'+
     '<span style="flex:0 0 52px">COMPANY</span>'+
     '<span style="flex:0 0 30px" title="Whether the strategy is already holding this name since it joined the watch list. NOW means the entry fired on the newest bar.">HOLD</span>'+
-    '<span style="flex:0 0 38px;text-align:right" title="Return on capital employed, as a percentage \u2014 the same figure the Discovery valuation table shows, read from that scan rather than recomputed, so one company cannot read two ways on two screens. A dash means this market has not been scanned in Discovery yet, or that scan carried no fundamentals for the name.">ROCE</span>'+
+    '<span style="flex:0 0 38px;text-align:right" title="ROC: room to the nearest resistance, (resistance \u2212 price) \u00f7 price \u2014 the same figure as the Discovery table, read from that scan so one company cannot read two ways on two screens. A dash means this market has not been scanned in Discovery yet, or no resistance was found above the price.">ROC</span>'+
     '<span style="flex:0 0 42px;text-align:right" title="Daily MACD slope. Positive is what passes the gate; the size says how strongly momentum is building.">SLOPE</span>'+
     '<span style="flex:0 0 10px;text-align:center" title="Filled = on the FULL price history this strategy would be holding this name right now. Hollow = it would be flat.">IN</span>'+
     // The 1Y and MACD charts moved under the row, into the space beside the
@@ -8886,7 +9237,7 @@ function manualCandRow(w,c,last){
               (c.holdingPct!=null?'<span style="font-size:8px;font-weight:700;margin-left:1px">'+(Number(c.holdingPct)>=0?'+':'')+Number(c.holdingPct).toFixed(1)+'%</span>':'')+
               '</span>')
       : '')+'</span>'+
-    watcherRoceCell(c.symbol)+
+    watcherRocCell(c.symbol)+
     '<span style="flex:0 0 42px;text-align:right;color:var(--gn)" title="Daily MACD slope — the gate passes a name only while this is positive">'+Number(c.slope||0).toFixed(3)+'</span>'+
     // WOULD IT HAVE BEEN IN THIS TRADE, on the full year of candles?
     //
@@ -9294,6 +9645,7 @@ function manualEntryRow(w,e,last){
     ((eSw||eLv)&&ePj?'<span style="color:var(--bd);margin:0 4px">|</span>':'')+ePj;
   return '<div style="padding:8px;'+bd+'">'+head+
     '<div style="display:flex;gap:6px;flex-wrap:wrap">'+realCol+paperCol+'</div>'+dev+
+    (isClosed?'':weekTargetLine(e.target,e.ns||w.ns||'',String(e.symbol||'').toUpperCase()+'-'+String(e.signalBarTs||0),String(e.symbol||''),cur))+
     (lvl?'<div style="margin-top:5px;font-size:9px;line-height:1.6">'+lvl+'</div>':'')+
     '</div>';
 }
@@ -9613,13 +9965,27 @@ function manualWatchPanel(){
       '<span>CANDIDATES'+
       (w.lastRunAt?' · last checked '+escHtml(new Date(Number(w.lastRunAt)).toLocaleString()):' · not checked yet')+'</span>'+
       mwSortToggle()+'</div>';
+    var nShown=cands.filter(mwSearchMatch).length;
+    // The search box. Its id is what lets the page keep the cursor in it while
+    // live prices redraw everything around it.
+    h+='<div style="display:flex;gap:6px;align-items:center;margin:0 0 5px">'+
+      '<input id="mw-search" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Search a stock" value="'+escHtml(MW_SEARCH)+'" '+
+        'oninput="mwSearchSet(this.value)" style="flex:1;min-width:0;padding:5px 8px;font-size:11px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1)"/>'+
+      '<span onclick="mwSearchClear()" title="Clear the search" style="cursor:pointer;font-size:11px;color:var(--t3);padding:2px 6px">✕</span>'+
+      '<span id="mw-search-count" style="font-size:9px;color:var(--t3);white-space:nowrap">'+(MW_SEARCH.trim()?(nShown+' of '+cands.length):'')+'</span>'+
+      '</div>';
     // ITS OWN SCROLL BOX, so the panel's other parts (the book, the history)
     // stay one flick away however long the list is. The headings stay pinned at
     // the top while the rows move, and the position survives the 5-second redraw.
     h+='<div style="'+box+'"><div data-scroll-key="mw-cands" style="overflow-y:auto;max-height:62vh;-webkit-overflow-scrolling:touch;overscroll-behavior:contain">'+
       '<div style="position:sticky;top:0;z-index:1">'+manualColHeader(true)+'</div>';
     var ordered=mwSortCands(cands);
-    ordered.forEach(function(c,i){h+=manualCandRow(w,c,i===ordered.length-1);});
+    h+='<div id="mw-search-none" style="padding:10px;font-size:10px;color:var(--t3);'+((MW_SEARCH.trim()&&!nShown)?'':'display:none')+'">No candidate matches that search.</div>';
+    // Every row is drawn; the search only hides — see mwSearchSet.
+    ordered.forEach(function(c,i){
+      h+='<div data-mw-key="'+escHtml(mwSearchKey(c))+'"'+(mwSearchMatch(c)?'':' style="display:none"')+'>'+
+        manualCandRow(w,c,i===ordered.length-1)+'</div>';
+    });
     h+='</div></div>';
   }
   if(ents.length){
@@ -9767,8 +10133,8 @@ function renderAlgos(){
     h+='<div style="margin:16px 2px 4px;font-size:11px;font-weight:900;color:var(--t2);border-top:1px solid var(--bd);padding-top:12px">🔬 SHARED TOOLS</div>';
     h+='<div style="font-size:9px;color:var(--t3);margin:0 2px 8px;line-height:1.5">Rank the '+spaceLabel()+' universe to pick companies for an algo. Each algo above has its own paper ledger, candle/entry-exit charts (🔍), backtest and Run now.</div>';
     h+='<span onclick="openScreenerModal()" style="cursor:pointer;padding:7px 14px;background:rgba(124,58,237,.14);border:1px solid rgba(124,58,237,.5);color:var(--pu);border-radius:7px;font-size:11px;font-weight:800">🔎 Screen the universe</span>';
-    // Account-wide, not per-algo, so it belongs in shared tools rather than on a card.
-    h+='<span onclick="t212FillsOpen()" style="cursor:pointer;margin-left:8px;padding:7px 14px;background:var(--bg2);border:1px solid var(--bd);color:var(--bl);border-radius:7px;font-size:11px;font-weight:800">🧾 Real T212 fills</span>';
+    // The real-fills view now lives in the Portfolio tab's closed-trades analysis,
+    // beside the trades it is about — "Fills vs the strategy's prices".
   }
   h+='</div>';
   document.getElementById('app').innerHTML=h;
@@ -11682,10 +12048,27 @@ function algosHeldPanel(ns,ledger,b){
   // Listed rather than counted, and named as unmanaged rather than shown beside
   // the managed ones, because the two need completely different responses.
   var liveRows=(b&&b.liveRows)||[];
-  var unmatched=liveRows.filter(function(r){return !r.matched});
+  // SOLD ON PAPER, NOT YET FOR REAL — a separate case, and not a lost position.
+  // The strategy's exit was judged after the close (or the sale was refused), and
+  // the exit retry sells it at the next tradeable moment. Listing it under "the
+  // strategy lost" with "I sold this myself" beside it invited the one tap that
+  // closes the record WITHOUT selling — which is how AFX was left held and
+  // unmanaged on 6 Oct. No such button here.
+  var pendingSells=liveRows.filter(function(r){return !r.matched&&r.sellPending});
+  var unmatched=liveRows.filter(function(r){return !r.matched&&!r.sellPending});
   var orphanBlock='';
+  if(pendingSells.length){
+    orphanBlock+='<div style="margin-top:6px;border:1px solid rgba(245,158,11,.45);background:rgba(245,158,11,.07);border-radius:6px;padding:7px 9px">'+
+      '<div style="font-size:9px;font-weight:800;color:#b45309">⏳ '+pendingSells.length+' sale'+(pendingSells.length===1?'':'s')+' waiting for the market</div>'+
+      pendingSells.map(function(r){
+        var q=Number(r.qty)>0?(' · '+String(Number(r.qty).toFixed(4)).replace(/0+$/,'').replace(/\.$/,'')+' sh'):'';
+        var when=Number(r.paperExitTs)>0?(' on the '+hhmm(Number(r.paperExitTs)*1000)+' bar of '+dmy(Number(r.paperExitTs)*1000)):'';
+        return '<div style="font-size:9px;color:var(--t2);padding:2px 0"><b style="font-family:monospace">'+escHtml(r.symbol)+q+'</b> — the strategy sold'+when+'. The real shares are sold at the next chance; nothing for you to do.</div>';
+      }).join('')+
+      '<div style="font-size:8px;color:var(--t3);line-height:1.5;margin-top:3px">Usually an exit judged after the market closed. If you sell these yourself in the Trading 212 app before then, the next check sees they are gone and closes the record.</div></div>';
+  }
   if(unmatched.length){
-    orphanBlock='<div style="margin-top:6px;border:1px solid rgba(239,68,68,.45);background:rgba(239,68,68,.06);border-radius:6px;padding:7px 9px">'+
+    orphanBlock+='<div style="margin-top:6px;border:1px solid rgba(239,68,68,.45);background:rgba(239,68,68,.06);border-radius:6px;padding:7px 9px">'+
       '<div style="font-size:9px;font-weight:800;color:var(--rd)">⚠ '+unmatched.length+
       ' real position'+(unmatched.length===1?'':'s')+' the strategy lost — now managed from your fill</div>'+
       // ONE ROW PER NAME, EACH WITH ITS OWN WAY OUT. These are the only positions
@@ -11804,9 +12187,18 @@ function algosHeldPanel(ns,ledger,b){
        ((skipOf&&skipOf[String(t.id||'')])
          ? ('<div style="color:#b45309;font-size:8px;margin-top:2px">⊘ not mirrored — '+escHtml(skipOf[String(t.id||'')])+'</div>')
          : realOrderNote(liveOf&&liveOf[String(t.id||'')]))+
+       // The 1-week-high target resting at Trading 212 behind this position.
+       ((function(lr){return (lr&&lr.status==='OPEN')?weekTargetLine(lr.target,ns,String(t.id||''),String(t.symbol||''),''):''})(liveOf&&liveOf[String(t.id||'')]))+
        // Declare a hand-sale here, on the row that shows the position — the moment
        // you notice the algo still thinks it holds something you already sold.
-       '<div style="margin-top:3px"><span onclick="algoSoldByHand(\''+ns+'\',\''+escHtml(String(t.symbol||''))+'\')" style="cursor:pointer;font-size:8px;color:var(--t3);border:1px solid var(--bd);border-radius:4px;padding:1px 5px">✋ I sold this myself</span></div>'+
+       // TAKE PROFIT NOW — sells through the app and keeps the trade in the
+       // algo's record. Beside "I sold this myself", which is for a sale made
+       // outside the app and discards the trade instead.
+       '<div style="margin-top:3px;display:flex;gap:6px;flex-wrap:wrap">'+
+         '<span onclick="algoTakeProfit(\''+ns+'\',\''+escHtml(String(t.symbol||''))+'\','+
+           ((function(lr){return (lr&&lr.status==='OPEN'&&Number(lr.qty||0)>0)?1:0})(liveOf&&liveOf[String(t.id||'')]))+','+
+           Number(t.entryPrice||0)+')" style="cursor:pointer;font-size:8px;font-weight:800;color:var(--gn);border:1px solid rgba(5,150,105,.5);background:rgba(5,150,105,.08);border-radius:4px;padding:1px 6px">💰 Take profit</span>'+
+         '<span onclick="algoSoldByHand(\''+ns+'\',\''+escHtml(String(t.symbol||''))+'\')" style="cursor:pointer;font-size:8px;color:var(--t3);border:1px solid var(--bd);border-radius:4px;padding:1px 5px">✋ I sold this myself</span></div>'+
        '</div>';
   });
   h+='</div>'+orphanBlock+'</div>';
@@ -12101,84 +12493,84 @@ function slipDeviationPanel(r){
     '</div></div>';
   return h;
 }
-function t212FillsOpen(){
-  if(typeof Android==='undefined'||!Android.t212Fills){uiAlert('Unavailable','Rebuild the APK for the T212 fills reader.');return}
-  uiAlert('🧾 Reading T212 fills…','<div style="font-size:11px;color:var(--t2);line-height:1.6">Fetching your executed-order history from Trading 212.</div>');
-  androidAsync('t212Fills',[50],function(raw){
-    var r;try{r=JSON.parse(raw||'{}')}catch(e){uiAlert('Error',e.message);return}
-    if(!r.ok){
-      uiAlert('🧾 Could not read fills',
-        '<div style="font-size:11px;color:var(--rd);line-height:1.6">'+escHtml(r.error||'unknown')+'</div>'+
-        '<div style="font-size:10px;color:var(--t3);line-height:1.5;margin-top:8px">If this says no endpoint responded, the API path needs one adjustment — the paths tried are listed above. If it mentions 401/403, enable the <b>History – Orders</b> permission on the API key.</div>');
-      return;
-    }
-    var f=r.fills||[];
-    // Round-trip deviation first: it is the number that decides whether the
-    // backtest is honest. The per-leg median below is diagnostic detail.
-    var h=slipDeviationPanel(r);
-    if(r.slipSamples>0){
-      var mean=Number(r.slipMean||0),med=Number(r.slipMedian||0);
-      h+='<div style="border:1px solid var(--bd);border-radius:7px;background:var(--cd);padding:8px 10px;margin-bottom:8px">'+
-         '<div style="font-size:9px;font-weight:800;color:var(--t2)">PER-LEG SLIPPAGE · '+r.slipSamples+' fill'+(r.slipSamples===1?'':'s')+'</div>'+
-         '<div style="font-family:monospace;font-size:12px;font-weight:800;color:'+(med>0?'var(--rd)':'var(--gn)')+';margin-top:3px">median '+(med>=0?'+':'')+med.toFixed(3)+'% '+(med>0?'worse':'better')+' · mean '+(mean>=0?'+':'')+mean.toFixed(3)+'%</div>'+
-         '<div style="font-size:9px;color:var(--t3);line-height:1.5;margin-top:4px">One buy or one sell, not a round trip — <b>do not</b> compare this with the config constant, which is charged once per completed trade (the panel above does that correctly). Positive = worse than the paper price. Individual fills swing both ways; the persistent part is the spread.'+
-         (r.slipSamples<30?'<br/><b style="color:#b45309">Only '+r.slipSamples+' samples — too few to retune anything yet. Aim for ~30.</b>':'')+
-         '</div></div>';
-    }
-    if(!f.length){
-      h+='<div style="font-size:11px;color:var(--t2);line-height:1.6">The endpoint responded, but no executed orders could be read from it.</div>';
-      // Show what actually came back. "Responded but empty" has three very
-      // different causes — empty account, wrong path answering 200, or field names
-      // the parser doesn't recognise — and they are indistinguishable without this.
-      if(r.raw){
-        h+='<div style="font-size:10px;color:var(--t3);line-height:1.5;margin-top:8px">Raw response, so the shape can be checked:</div>'+
-           '<pre style="max-height:220px;overflow:auto;background:var(--cd);border:1px solid var(--bd);border-radius:5px;padding:7px;font-size:8px;line-height:1.45;white-space:pre-wrap;word-break:break-all;margin-top:4px">'+escHtml(String(r.raw))+'</pre>'+
-           '<div style="font-size:9px;color:var(--t3);line-height:1.5;margin-top:6px">If this shows <b>HTTP 200</b> with order data in it, the field names just need mapping — paste it to me and it is a one-line fix.</div>';
-      }
-    }else{
-      h+='<div style="font-size:9px;color:var(--t3);margin-bottom:4px">'+f.length+' recent fills · '+r.matchedCount+' matched to an algo</div>';
-      h+='<div style="max-height:320px;overflow-y:auto;border:1px solid var(--bd);border-radius:6px;background:var(--cd)">';
-      f.forEach(function(x,i){
-        var bd=(i===f.length-1)?'':'border-bottom:1px dashed var(--bd);';
-        var sp=(x.slipPct===null||x.slipPct===undefined)?null:Number(x.slipPct);
-        h+='<div style="padding:6px 8px;'+bd+'font-family:monospace;font-size:9px">';
-        h+='<div style="display:flex;gap:6px;align-items:baseline">'+
-           '<span style="font-weight:800;color:var(--t1);min-width:62px">'+escHtml(x.ticker||x.symbol||'?')+'</span>'+
-           '<span style="color:'+(String(x.side)==='BUY'?'var(--bl)':'var(--pu)')+';min-width:32px">'+escHtml(x.side||'')+'</span>'+
-           '<span style="color:var(--t2)">'+Number(x.price||0).toFixed(4)+'</span>'+
-           '<span style="color:var(--t3)">×'+Number(x.qty||0).toFixed(4)+'</span>'+
-           '<span style="flex:1"></span>'+
-           // WORD, NOT SIGN. These figures are COSTS, so "+" means it cost you and
-           // "−" means it saved you — the exact opposite of how a signed number
-           // reads at a glance, and the colour was left doing all the work. The
-           // sign stays (the medians must stay cost-signed to compare against the
-           // config constant) but it no longer has to be decoded: colour and word
-           // now say the same thing twice.
-           (sp===null?'<span style="color:var(--t3);font-size:8px">no paper ref</span>'
-                     :'<span style="font-weight:800;color:'+(sp>0?'var(--rd)':'var(--gn)')+'" title="Fill price vs the SIGNAL price your algo decided on. Not the trade\'s profit.">'+
-                       (sp>=0?'+':'')+sp.toFixed(3)+'% <span style="font-size:8px;font-weight:700">'+(sp>0?'worse':'better')+'</span></span>')+
-           '</div>';
-        // Asked-vs-got: the ladder's own scorecard, present even on manual orders.
-        var imp=(x.improvedPct===null||x.improvedPct===undefined)?null:Number(x.improvedPct);
-        // A six-rung ladder is ONE decision. Naming the rung stops six rows in the
-        // same ticker from reading as six trades.
-        var rung=(Number(x.rungTotal||0)>1&&x.rungIdx)?(' · rung '+x.rungIdx+'/'+x.rungTotal):'';
-        h+='<div style="color:var(--t3);font-size:8px;margin-top:2px">'+
-           (x.matched?('↳ '+escHtml(x.algo)+(x.leg?(' · '+escHtml(x.leg)):'')+rung+' · paper '+Number(x.paperPrice||0).toFixed(4))
-                     :'↳ manual / unmatched order')+
-           ' · '+escHtml(String(x.time||'').slice(0,19))+'</div>';
-        if(imp!==null&&Number(x.limitPrice||0)>0){
-          h+='<div style="font-size:8px;margin-top:1px;color:'+(imp>=0?'var(--gn)':'var(--t3)')+'">'+
-             '↳ asked '+Number(x.limitPrice).toFixed(4)+' → got '+Number(x.price||0).toFixed(4)+
-             ' · '+(imp>=0?'better by ':'worse by ')+Math.abs(imp).toFixed(3)+'%</div>';
-        }
-        h+='</div>';
-      });
-      h+='</div>';
-      h+='<div style="font-size:9px;color:var(--t3);line-height:1.5;margin-top:7px">Rows marked <b>manual</b> were placed outside the app, so there is no paper price to compare them with — but their fill price is still real, and you can check it against that minute’s candle yourself.</div>';
-    }
-    uiAlert('🧾 Real T212 fills',h);
+// 💰 TAKE PROFIT NOW, from an algo's open position. Sells through the app — the
+// real position first, through the broker route the algo's own exits use — and
+// then closes the trade in the algo's record at that price, crediting the seat
+// like any other exit. Nothing is changed unless the sale goes through.
+var TP_BUSY=false;
+function algoTakeProfit(ns,sym,real,entry){
+  if(TP_BUSY)return;
+  if(typeof Android==='undefined'||!Android.callAsync){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  var base=String(ns).split('__')[0];
+  var broker=(base==='in')?'Zerodha':(base==='binance')?'Binance':'Trading 212';
+  var mk=((MARKS_BY_NS[ns]||{})[String(sym).toUpperCase()])||null;
+  var px=mk?Number(mk.price||0):0, pct=(px>0&&entry>0)?(px/entry-1)*100:null;
+  var body='<div style="font-size:11px;color:var(--t2);line-height:1.6">'+
+    (px>0?('Now about <b>'+px.toFixed(2)+'</b>'+(pct!=null?(' · <b style="color:'+(pct>=0?'var(--gn)':'var(--rd)')+'">'+(pct>=0?'+':'')+pct.toFixed(2)+'%</b> before costs'):'')+' (bought at '+Number(entry).toFixed(2)+').<br/><br/>'):'')+
+    (real
+      ? ('<b style="color:var(--rd)">This sells your real '+escHtml(sym)+' position at '+broker+' now</b>, through the same route the algo’s own exits use. If the market is shut or the order is refused, nothing is changed and you are told why.<br/><br/>')
+      : ('<b>Paper only</b> — no real position stands behind this one, so no order is placed. It closes at the latest price.<br/><br/>'))+
+    'The trade is then <b>closed in the algo’s paper record</b> at the price it sold for, net of the algo’s usual cost assumption, and the seat is credited with the result like any other exit. The algo keeps '+escHtml(sym)+' in its seat and may buy it again on its next fresh entry signal.</div>';
+  uiConfirm('💰 Take profit on '+escHtml(sym)+'?',body,function(ok){
+    if(!ok)return;
+    TP_BUSY=true;
+    refBusy(true,(real?'Selling ':'Closing ')+sym+'…');
+    androidAsync('algoTakeProfit',[ns,sym],function(raw){
+      TP_BUSY=false;refBusy(false);
+      var r={};try{r=JSON.parse(raw||'{}')}catch(e){}
+      if(!r.ok){uiAlert('Not taken',escHtml(r.error||'Something went wrong — nothing was changed.'));renderKeepScroll();return}
+      var p=Number(r.pctReturn||0);
+      uiAlert('💰 '+escHtml(sym)+' closed',
+        '<div style="font-size:11px;color:var(--t2);line-height:1.7">'+
+        (r.real?('Sold at <b>'+escHtml(r.broker||broker)+'</b> · ')
+               :'Paper only · ')+'exit <b>'+Number(r.exitPrice||0).toFixed(2)+'</b><br/>'+
+        'Booked to the algo: <b style="color:'+(p>=0?'var(--gn)':'var(--rd)')+'">'+(p>=0?'+':'')+p.toFixed(2)+'%</b> after costs'+
+        (r.pnl?(' · '+(Number(r.pnl)>=0?'+':'')+Number(r.pnl).toFixed(2)+' on the paper stake'):'')+'<br/>'+
+        'Seat credited with the result.'+
+        (r.note?('<br/><span style="color:var(--t3)">'+escHtml(r.note)+'</span>'):'')+'</div>');
+      renderKeepScroll();
+    });
   });
+}
+// ── THE 1-WEEK-HIGH TARGET on a real Trading 212 position ──────────────────
+// One line: where it is, whether it is actually waiting at the broker right now,
+// and a way to take it off. Fixed at the buy from the week before it, so it does
+// not move — and it is the only sell that can wait there, because Trading 212
+// reserves the shares; the stop stays with the app.
+function weekTargetLine(tg,ns,pid,sym,cur){
+  if(!tg)return '';
+  cur=cur||'';
+  var px=Number(tg.price||0);
+  var off=(tg.removed||(!px&&!tg.note))?'':
+    ' <span onclick="weekTargetRemove(\''+escHtml(String(ns))+'\',\''+escHtml(String(pid))+'\',\''+escHtml(String(sym))+'\')" '+
+    'title="Cancel the waiting sell at Trading 212 and keep holding. The stop is not affected." '+
+    'style="cursor:pointer;font-size:8px;font-weight:800;color:var(--t3);border:1px solid var(--bd);border-radius:4px;padding:0 5px;margin-left:3px">✕ take off</span>';
+  var tip='The highest price of the five trading days before the buy, fixed at that moment. It waits at Trading 212 as a limit sell, so it fills there even with the phone off — at that price or better. Only one sell can wait at Trading 212 per position, so the stop stays watched by the app; any sale the app makes clears this order first.';
+  var head='🎯 1-week-high target';
+  if(tg.filled)return '<div style="color:var(--gn);font-size:8px;margin-top:2px">'+head+' sold it at '+cur+Number(tg.fillPrice||px).toFixed(2)+'</div>';
+  if(tg.removed)return tg.done?'':'<div style="color:var(--t3);font-size:8px;margin-top:2px">'+head+' — coming off at the next check</div>';
+  if(tg.done)return '';
+  if(!px)return tg.note?('<div style="color:var(--t3);font-size:8px;margin-top:2px" title="'+tip+'">'+head+': none — '+escHtml(String(tg.note))+'</div>'):'';
+  var pct=(tg.pct==null)?'':(' ('+(Number(tg.pct)>=0?'+':'')+Number(tg.pct).toFixed(1)+'% on what you paid)');
+  if(tg.resting)
+    return '<div style="color:var(--gn);font-size:8px;margin-top:2px" title="'+tip+'">'+head+' <b>'+cur+px.toFixed(2)+'</b>'+pct+' — waiting at Trading 212'+off+'</div>';
+  return '<div style="color:#b45309;font-size:8px;margin-top:2px" title="'+tip+'">'+head+' <b>'+cur+px.toFixed(2)+'</b>'+pct+' — not waiting at the broker yet: '+
+    escHtml(String(tg.note||'it goes in on the next check while the market is open'))+off+'</div>';
+}
+function weekTargetRemove(ns,pid,sym){
+  if(typeof Android==='undefined'||!Android.callAsync){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  uiConfirm('🎯 Take the target off '+escHtml(sym)+'?',
+    '<div style="font-size:11px;color:var(--t2);line-height:1.6">Cancels the sell waiting at Trading 212 at its 1-week high. The position stays open, the stop is still watched by the app, and the strategy’s own exits still apply.<br/><br/>It is not put back.</div>',
+    function(ok){
+      if(!ok)return;
+      refBusy(true,'Taking the target off '+sym+'…');
+      androidAsync('weekTargetRemove',[ns,pid],function(raw){
+        refBusy(false);
+        var r={};try{r=JSON.parse(raw||'{}')}catch(e){}
+        uiAlert('🎯 '+escHtml(sym),'<div style="font-size:11px;color:var(--t2);line-height:1.6">'+escHtml(r.msg||r.error||'Done.')+'</div>');
+        renderKeepScroll();
+      });
+    });
 }
 // "I SOLD THAT ONE MYSELF." Never inferred — a missing share has several possible
 // causes and only you can say which. Confirmed because it deletes a paper trade and
@@ -12250,21 +12642,23 @@ function algoSoldByHand(ns,sym,mode){
 }
 function algosToggle(ns){ALGOS_STATE.openNs=(ALGOS_STATE.openNs===ns)?null:ns;render();}
 function algosCreate(){
-  // TWO KINDS OF ALGO. The standard one takes its rules from a config file you
-  // attach. Floor orders have their rules built in (paper only), so they need no
-  // file — only a name, and their few numbers live on the card.
+  // THREE KINDS OF ALGO. The standard one takes its rules from a config file you
+  // attach. Floor orders and MACD turns have their rules built in (paper only),
+  // so they need no file — only a name, and their few numbers live on the card.
   var floorOk=(SPACE==='DE'||SPACE==='US'||SPACE==='IN')&&typeof Android!=='undefined'&&!!Android.floorCreate;
+  var paperTag=' <span style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px">PAPER ONLY</span>';
   var kind=!floorOk?'':
     '<div style="font-size:10px;font-weight:800;color:var(--t2);margin:12px 0 5px">Kind</div>'+
     '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-bottom:7px;line-height:1.4"><input type="radio" name="alg-kind" value="std" checked style="margin-top:2px"/><span><b>Standard</b><br/><span style="font-size:10px;color:var(--t3)">Rules come from a config file you attach. Can be armed for real orders.</span></span></label>'+
-    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);line-height:1.4"><input type="radio" name="alg-kind" value="floor" style="margin-top:2px"/><span><b>Floor orders</b> <span style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px">PAPER ONLY</span><br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. On the top stocks by return on capital, whose monthly and daily MACD are both rising: two resting buy orders a day at the recent low. Can never place a real order.</span></span></label>';
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-bottom:7px;line-height:1.4"><input type="radio" name="alg-kind" value="floor" style="margin-top:2px"/><span><b>Floor orders</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. On the top stocks by ROC (room to resistance): two resting buy orders a day at the recent low. A weekly-and-daily trend filter can be switched on in Settings. Can never place a real order.</span></span></label>'+
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);line-height:1.4"><input type="radio" name="alg-kind" value="macd" style="margin-top:2px"/><span><b>MACD turns</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. Same stocks: with the 4-hour MACD rising, buys at the next price when the 15-minute and hourly MACD turn up together. Same optional trend filter. Can never place a real order.</span></span></label>';
   uiConfirm('New algo','<div style="font-size:11px;color:var(--t2);margin-bottom:8px">Name this strategy for '+spaceLabel()+'.</div><input id="alg-newname" placeholder="e.g. Momentum, Value, Rockets" style="width:100%;padding:8px;font-size:12px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>'+kind,function(ok){
     if(!ok)return;
     var name=(document.getElementById('alg-newname')||{}).value||'';
     var k=(document.querySelector('input[name="alg-kind"]:checked')||{}).value||'std';
-    if(k==='floor'){
+    if(k==='floor'||k==='macd'){
       try{
-        var f=JSON.parse(Android.floorCreate(SPACE,name)||'{}');
+        var f=JSON.parse(Android.floorCreate(SPACE,name,k)||'{}');
         if(!f.ok){uiAlert('Could not create',escHtml(f.error||''));return}
         ALGOS_STATE.openNs=f.ns;render();floorRun(f.id);
       }catch(e){uiAlert('Error',e.message)}
@@ -12310,7 +12704,7 @@ function floorStats(a){
   var T=a.trades||[],s=a.settings||{};
   var open=T.filter(function(t){return t.status==='OPEN'});
   var sold=T.filter(function(t){return t.status==='SOLD'});
-  var missed=T.filter(function(t){return t.status==='MISSED'});
+  var missed=T.filter(function(t){return t.status==='MISSED'&&t.firstSec>0});
   var booked=0;sold.forEach(function(t){booked+=Number(t.pnl||0)});
   var openPnl=0;open.forEach(function(t){openPnl+=Number(t.qty||0)*Number(t.lastPrice||0)-Number(t.cost||0)});
   var wins=sold.filter(function(t){return Number(t.pnl)>0}).length;
@@ -12320,19 +12714,23 @@ function floorStats(a){
     var m=0;v.forEach(function(x){m+=x});
     return {m:m/v.length,n:v.length,up:v.filter(function(x){return x>0}).length};
   }
-  return {open:open,sold:sold,missed:missed,booked:booked,openPnl:openPnl,wins:wins,
+  // What sold each one — the question the stop and target were added to answer.
+  var why={stop:0,target:0,time:0,trend:0};
+  sold.forEach(function(t){if(why[t.exitReason]!=null)why[t.exitReason]++});
+  return {open:open,sold:sold,missed:missed,booked:booked,openPnl:openPnl,wins:wins,why:why,
     r1:avg('ret1'),r3:avg('ret3'),r5:avg('ret5'),dip:avg('dip'),cap:Number(s.capital||1000),
     resting:(a.orders||[]).filter(function(o){return o.status==='RESTING'}).length};
 }
+function floorIsMacd(a){return (a&&a.kind)==='macd'}
 function floorCard(x,cur){
-  var a=x.a||{},ns=x.ns,id=a.id,s=a.settings||{},st=floorStats(a);
+  var a=x.a||{},ns=x.ns,id=a.id,s=a.settings||{},st=floorStats(a),mc=floorIsMacd(a);
   var opend=(ALGOS_STATE.openNs===ns);
   var tot=(st.booked+st.openPnl)/st.cap*100;
   var h='<div data-dk="alg-cost-'+ns+'" style="border:1px solid '+(opend?'rgba(13,148,136,.55)':'var(--bd)')+';border-radius:9px;margin-bottom:8px;overflow:hidden;background:'+(opend?'rgba(13,148,136,.05)':'var(--bg2)')+'">';
   h+='<div onclick="floorToggle(\''+ns+'\')" style="cursor:pointer;padding:9px 11px 7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
     '<span style="font-size:13px;font-weight:800;color:var(--t1)">'+escHtml(a.name||'')+'</span>'+
     '<span onclick="event.stopPropagation();floorRename(\''+id+'\')" title="Rename" style="cursor:pointer;font-size:10px;color:var(--t3);padding:0 2px">✏️</span>'+
-    '<span title="Built-in rules, paper only — this algo cannot place a real order." style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px;border:1px solid rgba(13,148,136,.4)">PAPER · floor orders</span>'+
+    '<span title="Built-in rules, paper only — this algo cannot place a real order." style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px;border:1px solid rgba(13,148,136,.4)">PAPER · '+(mc?'MACD turns':'floor orders')+'</span>'+
     (a.enabled?'':'<span style="font-size:8px;font-weight:800;background:rgba(245,158,11,.18);color:#b45309;padding:1px 5px;border-radius:3px">PAUSED</span>')+
     '<span onclick="event.stopPropagation();floorBell(\''+id+'\','+(a.notify!==false)+')" title="Notifications for this algo" style="cursor:pointer;padding:0 2px;font-size:11px;opacity:'+(a.notify!==false?'1':'.45')+'">'+(a.notify!==false?'🔔':'🔕')+'</span>'+
     '<span style="flex:1"></span>'+
@@ -12343,7 +12741,7 @@ function floorCard(x,cur){
     '<span>'+(st.booked>=0?'+':'−')+cur+Math.abs(st.booked).toFixed(2)+' booked</span>'+
     (st.open.length?'<span style="color:'+(st.openPnl>=0?'var(--gn)':'var(--rd)')+'">⊕'+(st.openPnl>=0?'+':'−')+cur+Math.abs(st.openPnl).toFixed(2)+' open</span>':'')+
     '<span>'+st.open.length+'/'+(s.seats||5)+' seats</span>'+
-    (a.planDay&&st.resting?'<span>'+st.resting+' stocks with orders resting</span>':'')+
+    (!mc&&a.planDay&&st.resting?'<span>'+st.resting+' stocks with orders resting</span>':'')+
     (FLOOR_BUSY[id]?'<span><span class="sp" style="width:8px;height:8px;display:inline-block;vertical-align:middle;margin:0"></span> checking…</span>':'')+
     '</div>';
   if(opend)h+=floorDetail(a,cur,st);
@@ -12352,17 +12750,36 @@ function floorCard(x,cur){
 function floorBtn(label,onclick,col){
   return '<span onclick="'+onclick+'" style="cursor:pointer;padding:5px 10px;border-radius:6px;font-size:10px;font-weight:800;background:var(--bg);border:1px solid '+(col||'var(--bd)')+';color:'+(col||'var(--t2)')+'">'+label+'</span>';
 }
+// The sale rules in words, shared by both kinds.
+function floorExitWords(s){
+  var sp=Number(s.stopPct==null?4:s.stopPct),tp=Number(s.targetPct==null?7:s.targetPct),hd=s.holdDays||10;
+  var parts=[];
+  if(sp>0)parts.push('a <b>'+sp.toFixed(1)+'% stop</b>');
+  if(tp>0)parts.push('a <b>'+tp.toFixed(1)+'% target</b> (both from the average buying price)');
+  parts.push('the close <b>'+hd+' trading days</b> after buying');
+  if(s.trendFilter)parts.push('the close of a day the morning check finds the <b>weekly or daily MACD no longer rising</b>');
+  return 'Sold on whichever comes first: '+parts.join(', ')+'.<br/>';
+}
+// The trend filter in words: what it gates, or that it is off.
+function floorFilterWords(s,mc){
+  if(!s.trendFilter)return '<b>Trend filter off</b> — every stock in the universe is '+(mc?'watched':'given orders')+', whatever its weekly and daily MACD.<br/>';
+  return mc?'Watched only while their <b>weekly and daily MACD slopes are both rising</b>.<br/>'
+           :'Only stocks whose <b>weekly and daily MACD slopes are both rising</b> get orders.<br/>';
+}
 function floorDetail(a,cur,st){
-  var s=a.settings||{},id=a.id,half=Number(s.capital||1000)/Math.max(1,Number(s.seats||5))/2;
+  var s=a.settings||{},id=a.id,mc=floorIsMacd(a),seat=Number(s.capital||1000)/Math.max(1,Number(s.seats||5)),half=seat/2;
   var h='<div style="padding:0 11px 11px;border-top:1px solid var(--bd)">';
   // The rules, in words — there is no config file to read them from.
   h+='<div style="font-size:10px;color:var(--t2);line-height:1.55;margin:9px 0 8px;padding:7px 9px;background:var(--bg);border:1px solid var(--bd);border-radius:6px">'+
-    'Universe: the top <b>'+(s.universeSize||30)+'</b> stocks by return on capital in Discovery.<br/>'+
-    'Only stocks whose <b>monthly and daily MACD slopes are both rising</b> get orders.<br/>'+
-    'Each trading day: half a seat ('+cur+half.toFixed(0)+') at the <b>lowest price of the last '+(s.lowDays||3)+' trading days</b>, half <b>'+Number(s.secondPct==null?2:s.secondPct).toFixed(1)+'% below</b> it.<br/>'+
-    'A half fills only if the price trades <b>below</b> it. What has not filled expires at the close.<br/>'+
-    'Sold at the close <b>'+(s.holdDays||3)+' trading days</b> after buying. '+(s.seats||5)+' seats, one stock each.<br/>'+
-    '<span style="color:var(--t3)">Paper only — no real orders. Prices as given: no fees, slippage or data delay.</span></div>';
+    'Universe: the top <b>'+(s.universeSize||30)+'</b> stocks by ROC (room to resistance) in Discovery.<br/>'+
+    floorFilterWords(s,mc)+
+    (mc
+      ? 'Bought, a whole seat ('+cur+seat.toFixed(0)+'), when the <b>4-hour MACD is rising</b> and the <b>15-minute and hourly MACD turn up together</b> — at the next fifteen-minute price after the app sees it. One buy per stock per day.<br/>'
+      : 'Each trading day: half a seat ('+cur+half.toFixed(0)+') at the <b>lowest price of the last '+(s.lowDays||3)+' trading days</b>, half <b>'+Number(s.secondPct==null?2:s.secondPct).toFixed(1)+'% below</b> it.<br/>'+
+        'A half fills only if the price trades <b>below</b> it. What has not filled expires at the close.<br/>')+
+    floorExitWords(s)+
+    (s.seats||5)+' seats, one stock each. A seat frees up the trading day after its sale.<br/>'+
+    '<span style="color:var(--t3)">Paper only — no real orders. No fees or slippage'+(mc?'.':'; the feed\'s delay is ignored, as a resting order would not wait for it.')+'</span></div>';
   h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">'+
     floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
     floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
@@ -12375,8 +12792,9 @@ function floorDetail(a,cur,st){
   h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
     cell('BOOKED',sgn(st.booked),st.sold.length+' sold · '+st.wins+' won')+
     cell('OPEN',sgn(st.openPnl),st.open.length+' of '+(s.seats||5)+' seats')+
-    cell('CAPITAL',cur+Number(s.capital||1000).toFixed(0),(s.seats||5)+' × '+cur+(half*2).toFixed(0))+
+    cell('CAPITAL',cur+Number(s.capital||1000).toFixed(0),(s.seats||5)+' × '+cur+seat.toFixed(0))+
     cell('MISSED',String(st.missed.length),'seats were full')+'</div>';
+  if(st.sold.length)h+='<div style="font-size:9px;color:var(--t3);margin:0 0 6px">Sold by: <b style="color:var(--rd)">'+st.why.stop+'</b> stop · <b style="color:var(--gn)">'+st.why.target+'</b> target · <b>'+st.why.time+'</b> time · <b>'+st.why.trend+'</b> trend</div>';
   var oc=function(lab,o){return cell(lab,o?floorPct(o.m):'—',o?(o.n+' buys · '+Math.round(o.up*100/o.n)+'% up'):'none yet')};
   h+='<div style="font-size:9px;color:var(--t3);margin:8px 0 4px">What the price did after each buy — every fill, including the missed ones:</div>';
   h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:9px">'+
@@ -12384,15 +12802,16 @@ function floorDetail(a,cur,st){
     cell('DEEPEST DIP',st.dip?floorPct(st.dip.m):'—',st.dip?'average, within 5 days':'none yet')+'</div>';
   // The lists.
   var tab=FLOOR_TAB[id]||'orders';
-  var tabs=[['orders','Orders'],['held','Held ('+st.open.length+')'],['closed','Closed ('+(st.sold.length+st.missed.length)+')'],['universe','Universe'],['log','Log']];
+  var tabs=[['orders',mc?'Today':'Orders'],['held','Held ('+st.open.length+')'],['closed','Closed ('+(st.sold.length+st.missed.length)+')'],['journal','Journal'],['universe','Universe'],['log','Log']];
   h+='<div style="display:flex;gap:12px;border-bottom:1px solid var(--bd);margin-bottom:6px">';
   tabs.forEach(function(t){
     h+='<span onclick="FLOOR_TAB[\''+id+'\']=\''+t[0]+'\';renderKeepScroll()" style="cursor:pointer;padding:4px 0;font-size:10px;font-weight:800;color:'+(tab===t[0]?'#0d9488':'var(--t3)')+';border-bottom:2px solid '+(tab===t[0]?'#0d9488':'transparent')+'">'+t[1]+'</span>';
   });
   h+='</div>';
-  if(tab==='orders')h+=floorOrdersList(a,cur);
+  if(tab==='orders')h+=mc?floorTurnsList(a,cur):floorOrdersList(a,cur);
   else if(tab==='held')h+=floorHeldList(a,cur);
   else if(tab==='closed')h+=floorClosedList(a,cur);
+  else if(tab==='journal')h+=floorJournalList(a,cur);
   else if(tab==='universe')h+=floorUniverseList(a);
   else h+=floorLogList(a);
   return h+'</div>';
@@ -12418,7 +12837,7 @@ function floorOrdersList(a,cur){
   if(!O.length){
     var why=!a.enabled?'This algo is paused, so it places no orders.'
       :!(a.universe||[]).length?'No universe yet — it comes from the Discovery scan of this market. Run one if there is none, then ↻ Check now.'
-      :a.planDay?'No stock in the universe is rising on both month and day, so no orders were placed for '+today+'.'
+      :a.planDay?((a.settings||{}).trendFilter?'No stock in the universe is rising on both week and day, so no orders were placed for '+today+'.':'No orders could be placed for '+today+' — no recent prices came back. ↻ Check now to try again.')
       :'Orders are planned from 06:00 on each trading day, from the previous days’ prices.';
     return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">'+why+'</div>';
   }
@@ -12436,30 +12855,60 @@ function floorOrdersList(a,cur){
   return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px">'+(anyOpen?'Resting':'Ended')+' · orders for <b>'+today+'</b> · '+O.length+' stocks × 2 halves of '+cur+(Number((a.settings||{}).capital||1000)/Math.max(1,Number((a.settings||{}).seats||5))/2).toFixed(0)+'</div>'+
     floorTable(['STOCK',((a.settings||{}).lowDays||3)+'-DAY LOW','1ST HALF','2ND HALF'],rows);
 }
+// MACD TURNS' "TODAY": the stocks being watched, where each one stands, and the
+// turns seen. There are no resting orders to list — a turn buys at the next price.
+function floorTurnsList(a,cur){
+  var today=a.planDay?floorDay(a.planDay):'';
+  if(!a.enabled)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">This algo is paused, so it watches nothing and buys nothing.</div>';
+  if(!(a.universe||[]).length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No universe yet — it comes from the Discovery scan of this market. Run one if there is none, then ↻ Check now.</div>';
+  if(!a.planDay)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">The weekly and daily trend is read from 06:00 on each trading day, from the previous days’ prices.</div>';
+  var todayStr=a.planDay;
+  var byTrade={};(a.trades||[]).forEach(function(t){if(t.day===todayStr)byTrade[t.symbol]=t});
+  var tf=!!(a.settings||{}).trendFilter;
+  var W=(a.universe||[]).filter(function(m){return !tf||(m.week===1&&m.day===1)||byTrade[m.symbol]});
+  if(!W.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No stock in the universe is rising on both week and day, so nothing is being watched for '+today+'.</div>';
+  var rows=W.map(function(m){
+    var t=byTrade[m.symbol],what;
+    if(t&&t.firstSec>0)what='<span style="color:'+(t.status==='MISSED'?'var(--t3)':'var(--gn)')+';font-weight:800">'+(t.status==='MISSED'?'followed':'bought')+' '+floorPx(t.firstPrice||(t.qty>0?t.cost/t.qty:0))+'</span><br/><span style="color:var(--t3)">turned '+floorClock(t.signalSec)+'</span>';
+    else if(t)what='<span style="color:var(--am);font-weight:800">buying at next price</span><br/><span style="color:var(--t3)">turned '+floorClock(t.signalSec)+'</span>';
+    else what='<span style="font-family:system-ui;color:var(--t3)">'+escHtml(m.note||'')+'</span>';
+    return '<tr style="border-top:1px solid var(--bd)'+(t?';background:rgba(5,150,105,.06)':'')+'">'+floorStock(m.symbol,m.name)+
+      '<td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.h4)+'</td>'+
+      '<td style="'+FLOOR_TD+';text-align:left;white-space:normal">'+what+'</td></tr>';
+  });
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">Watching for <b>'+today+'</b> · '+(tf?'rising on week and day':'every stock (trend filter off)')+'. A buy needs the 4-hour rising and the 15-minute and hourly MACD to turn up together. ○ = not looked at yet today.</div>'+
+    floorTable(['STOCK','4H','NOW'],rows);
+}
 function floorHeldList(a,cur){
-  var s=a.settings||{};
+  var s=a.settings||{},mc=floorIsMacd(a);
   var T=(a.trades||[]).filter(function(t){return t.status==='OPEN'});
   if(!T.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">Nothing held.</div>';
   var rows=T.map(function(t){
     var entry=t.qty>0?t.cost/t.qty:0,pct=entry>0?(t.lastPrice/entry-1)*100:null;
+    if(!(t.firstSec>0))return '<tr style="border-top:1px solid var(--bd)">'+floorStock(t.symbol,t.name)+
+      '<td colspan="6" style="'+FLOOR_TD+';text-align:left;white-space:normal;color:var(--am)">turned up '+floorClock(t.signalSec)+' — buying at the next price</td></tr>';
+    var lv=(t.stop>0?'<span style="color:var(--rd)">'+floorPx(t.stop)+'</span>':'—')+'<br/>'+(t.target>0?'<span style="color:var(--gn)">'+floorPx(t.target)+'</span>':'—');
     return '<tr style="border-top:1px solid var(--bd)">'+floorStock(t.symbol,t.name)+
-      '<td style="'+FLOOR_TD+'">'+floorDay(t.day)+'<br/><span style="color:var(--t3)">'+(t.halves>=2?'full seat':'half seat')+'</span></td>'+
+      '<td style="'+FLOOR_TD+'">'+floorDay(t.day)+'<br/><span style="color:var(--t3)">'+(mc||t.halves>=2?'full seat':'half seat')+'</span></td>'+
       '<td style="'+FLOOR_TD+'">'+floorPx(entry)+'</td>'+
       '<td style="'+FLOOR_TD+'">'+floorPx(t.lastPrice)+'<br/><span style="color:var(--t3)">'+floorClock(t.lastSec)+'</span></td>'+
       '<td style="'+FLOOR_TD+';font-weight:800">'+floorPct(pct)+'</td>'+
-      '<td style="'+FLOOR_TD+';color:var(--t3)">~'+floorSellEstimate(t.day,s.holdDays||3)+'</td></tr>';
+      '<td style="'+FLOOR_TD+'">'+lv+'</td>'+
+      '<td style="'+FLOOR_TD+';color:var(--t3)">'+(t.trendDay?'<span style="color:var(--am)">'+floorDay(t.trendDay)+'<br/>trend</span>':'~'+floorSellEstimate(t.day,s.holdDays||10)+'<br/>time')+'</td></tr>';
   });
-  return floorTable(['STOCK','BOUGHT','AVG','NOW','P&L','SELLS'],rows);
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">STOP / TARGET: sells if the price reaches either. BY: the close it sells at otherwise — the time limit, or sooner if the weekly or daily trend broke.</div>'+
+    floorTable(['STOCK','BOUGHT','AVG','NOW','P&L','STOP<br/>TARGET','BY'],rows);
 }
+var FLOOR_WHY={stop:['stop','var(--rd)'],target:['target','var(--gn)'],time:['time','var(--t3)'],trend:['trend','var(--am)']};
 function floorClosedList(a,cur){
-  var T=(a.trades||[]).filter(function(t){return t.status!=='OPEN'}).slice().reverse();
+  var T=(a.trades||[]).filter(function(t){return t.status!=='OPEN'&&t.firstSec>0}).slice().reverse();
   if(!T.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">Nothing sold yet.</div>';
   var rows=T.slice(0,60).map(function(t){
-    var entry=t.qty>0?t.cost/t.qty:0,missed=t.status==='MISSED';
+    var entry=t.qty>0?t.cost/t.qty:0,missed=t.status==='MISSED',why=FLOOR_WHY[t.exitReason];
     var pl=missed?'<span style="color:var(--t3)">not bought</span>':floorPct(t.cost>0?t.pnl/t.cost*100:null);
     return '<tr style="border-top:1px solid var(--bd)'+(missed?';opacity:.7':'')+'">'+floorStock(t.symbol,missed?'missed — seats full':'')+
       '<td style="'+FLOOR_TD+'">'+floorDay(t.day)+'<br/><span style="color:var(--t3)">'+floorPx(entry)+'</span></td>'+
-      '<td style="'+FLOOR_TD+'">'+(t.sellDay?floorDay(t.sellDay)+'<br/><span style="color:var(--t3)">'+floorPx(t.sellPrice)+'</span>':'—')+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+(t.sellDay?floorDay(t.sellDay)+'<br/><span style="color:var(--t3)">'+floorPx(t.sellPrice)+'</span>'+(why?' <span style="font-family:system-ui;font-size:8px;font-weight:800;color:'+why[1]+'">'+why[0]+'</span>':''):'—')+'</td>'+
       '<td style="'+FLOOR_TD+';font-weight:800">'+pl+'</td>'+
       '<td style="'+FLOOR_TD+'">'+floorPct(t.ret1,1)+'</td><td style="'+FLOOR_TD+'">'+floorPct(t.ret3,1)+'</td>'+
       '<td style="'+FLOOR_TD+'">'+floorPct(t.ret5,1)+'</td><td style="'+FLOOR_TD+'">'+floorPct(t.dip,1)+'</td></tr>';
@@ -12467,20 +12916,117 @@ function floorClosedList(a,cur){
   return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px">1D / 3D / 5D: the price that many trading days after buying. DIP: the deepest it fell below the buying price within 5 days.</div>'+
     floorTable(['STOCK','BOUGHT','SOLD','P&L','1D','3D','5D','DIP'],rows);
 }
+// ── THE SCAN JOURNAL ──────────────────────────────────────────────────────
+// One row per stock per day, written each morning for the day before: what the
+// algo saw, not only what it did. The point is the days nothing happened — how
+// near the price came to an order, which dips the trend kept out, which MACD
+// turns the 4-hour blocked — and what the price did next in each case.
+var FLOOR_JOURNAL={};    // id → {at, d}: read at most once a minute
+var FLOOR_JALL={};       // id → true when every row is shown, not only the near misses
+var FLOOR_JDAYS=20;
+function floorJournalData(id){
+  var c=FLOOR_JOURNAL[id];
+  if(c&&Date.now()-c.at<60000)return c.d;
+  var d={ok:false,rows:[]};
+  try{if(typeof Android!=='undefined'&&Android.floorJournal)d=JSON.parse(Android.floorJournal(id,FLOOR_JDAYS)||'{}')}catch(e){}
+  FLOOR_JOURNAL[id]={at:Date.now(),d:d};
+  return d;
+}
+function floorJournalStat(R,k){
+  var v=R.map(function(r){return r[k]}).filter(function(x){return x!=null&&isFinite(Number(x))}).map(Number);
+  if(!v.length)return null;
+  var m=0;v.forEach(function(x){m+=x});
+  return {m:m/v.length,n:v.length};
+}
+var FLOOR_JRES={'bought':['bought','var(--gn)'],'seats full':['seats full','var(--t2)'],'no fill':['no fill','var(--t2)'],
+  'no turn':['no turn','var(--t3)'],'4h blocked':['4h blocked','var(--am)'],'trend blocked':['trend blocked','var(--t3)'],
+  'held':['held','var(--t3)'],'no data':['no data','var(--t3)']};
+function floorJournalList(a,cur){
+  var id=a.id,mc=floorIsMacd(a),d=floorJournalData(id),R=(d&&d.rows)||[];
+  if(!R.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">Nothing in the journal yet. Each morning, before the new plan, it records how the day before went for all '+((a.universe||[]).length||30)+' stocks — including the ones nothing happened to — and later fills in what the price did over the next 1, 3 and 5 days.</div>';
+  var days={};R.forEach(function(r){days[r.day]=1});var nd=Object.keys(days).length;
+  var is=function(r,res){return r.result===res};
+  var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
+  var after=function(G){var s=floorJournalStat(G,'ret3');return s?floorPct(s.m)+' <span style="font-weight:400;color:var(--t3)">3d ('+s.n+')</span>':'<span style="color:var(--t3)">3d —</span>'};
+  var h='<div style="font-size:9px;color:var(--t3);margin:2px 0 6px;line-height:1.5">Last <b>'+nd+'</b> trading day'+(nd===1?'':'s')+' · every stock, every day. Returns are from the price a buy had or would have had: '+
+    (mc?'the fill, or the price when a blocked turn was seen; otherwise the close.':'the fill; the floor where the price went below it; otherwise the day’s low — the nearest an order could have been and still filled.')+'</div>';
+  var G;
+  if(!mc){
+    var withOrd=R.filter(function(r){return is(r,'bought')||is(r,'seats full')||is(r,'no fill')});
+    var filled=R.filter(function(r){return is(r,'bought')||is(r,'seats full')});
+    var near1=R.filter(function(r){return is(r,'no fill')&&r.gap!=null&&r.gap<=1});
+    var near2=R.filter(function(r){return is(r,'no fill')&&r.gap!=null&&r.gap<=2});
+    var dips=R.filter(function(r){return is(r,'trend blocked')&&r.gap!=null&&r.gap<0});
+    var miss=R.filter(function(r){return is(r,'no fill')&&r.gap!=null});
+    var gm=floorJournalStat(miss,'gap');
+    h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
+      cell('ORDERS',withOrd.length+' → '+filled.length+' filled',after(filled))+
+      cell('WITHIN 1%',String(near1.length),near1.length?after(near1):'not filled, came this close')+
+      cell('WITHIN 2%',String(near2.length),gm?'missed by '+gm.m.toFixed(1)+'% on average':'')+
+      cell('TREND KEPT OUT',String(dips.length),dips.length?after(dips):'dipped below the floor')+'</div>';
+    G=FLOOR_JALL[id]?R:R.filter(function(r){return is(r,'bought')||is(r,'seats full')||is(r,'no fill')||(is(r,'trend blocked')&&r.gap!=null&&r.gap<0)});
+  }else{
+    var turns=R.filter(function(r){return is(r,'bought')||is(r,'seats full')});
+    var blocked=R.filter(function(r){return is(r,'4h blocked')});
+    var none=R.filter(function(r){return is(r,'no turn')});
+    var watched=turns.length+blocked.length+none.length;
+    h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
+      cell('WATCHED',String(watched),'stock-days checked for a turn')+
+      cell('TURNED UP',String(turns.length),turns.length?after(turns):'with the 4-hour rising')+
+      cell('4H BLOCKED',String(blocked.length),blocked.length?after(blocked):'turned, 4-hour not rising')+
+      cell('NO TURN',String(none.length),none.length?after(none):'from the close')+'</div>';
+    G=FLOOR_JALL[id]?R:R.filter(function(r){return is(r,'bought')||is(r,'seats full')||is(r,'4h blocked')||is(r,'no turn')});
+  }
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:2px 0 6px">'+
+    floorBtn(FLOOR_JALL[id]?'Show near misses only':'Show every row','FLOOR_JALL[\''+id+'\']='+(!FLOOR_JALL[id])+';renderKeepScroll()')+
+    floorBtn('⬇ Export CSV','floorJournalExport(\''+id+'\')')+
+    '<span style="font-size:9px;color:var(--t3)">'+G.length+' row'+(G.length===1?'':'s')+'</span></div>';
+  if(!G.length)return h+'<div style="font-size:10px;color:var(--t3);padding:6px 2px">'+(mc?'No stock was watched in these days.':'No orders and no dips below a floor in these days.')+'</div>';
+  if(!mc)G=G.slice().sort(function(x,y){return x.day<y.day?1:x.day>y.day?-1:((x.gap==null?99:x.gap)-(y.gap==null?99:y.gap))});
+  var rows=G.slice(0,120).map(function(r){
+    var res=FLOOR_JRES[r.result]||[r.result,'var(--t3)'];
+    var stock='<td style="padding:4px;text-align:left"><b style="color:var(--t1)">'+escHtml(r.symbol)+'</b><br/><span style="font-family:system-ui;font-size:8px;color:var(--t3)">'+floorDay(r.day)+'</span></td>';
+    var trend='<td style="'+FLOOR_TD+';text-align:center">'+floorDot(r.week)+floorDot(r.dayTrend)+(mc?floorDot(r.h4):'')+'</td>';
+    var tail='<td style="'+FLOOR_TD+';font-family:system-ui;font-size:8px;font-weight:800;color:'+res[1]+'">'+res[0]+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+floorPct(r.ret3,1)+'</td><td style="'+FLOOR_TD+'">'+floorPct(r.ret5,1)+'</td></tr>';
+    if(!mc){
+      var g=r.gap==null?'—':'<span style="font-weight:800;color:'+(r.gap<0?'var(--gn)':r.gap<=1?'var(--am)':'var(--t2)')+'">'+(r.gap>=0?'+':'')+Number(r.gap).toFixed(2)+'%</span>';
+      return '<tr style="border-top:1px solid var(--bd)">'+stock+trend+
+        '<td style="'+FLOOR_TD+'">'+(r.floor>0?floorPx(r.floor):'—')+'<br/><span style="color:var(--t3)">'+(r.low>0?floorPx(r.low):'—')+'</span></td>'+
+        '<td style="'+FLOOR_TD+'">'+g+'</td>'+tail;
+    }
+    return '<tr style="border-top:1px solid var(--bd)">'+stock+trend+
+      '<td style="'+FLOOR_TD+'">'+(r.h4Up||0)+'/'+(r.looks||0)+'<br/><span style="color:var(--t3)">'+(r.bothUp||0)+' both up</span></td>'+
+      '<td style="'+FLOOR_TD+'">'+(r.turnSec>0?floorClock(r.turnSec):'—')+'</td>'+tail;
+  });
+  return h+(mc
+    ? '<div style="font-size:9px;color:var(--t3);margin:0 0 4px;line-height:1.5">LOOKS: checks with the 4-hour rising / all checks that day, and how many had the 15-minute and hourly both rising. TURN: when they turned up together.</div>'+
+      floorTable(['STOCK','W D 4H','LOOKS','TURN','RESULT','3D','5D'],rows)
+    : '<div style="font-size:9px;color:var(--t3);margin:0 0 4px;line-height:1.5">CLOSEST: how near the day’s low came to the floor — below 0 means it traded under it. Amber: within 1%.</div>'+
+      floorTable(['STOCK','W D','FLOOR<br/>LOW','CLOSEST','RESULT','3D','5D'],rows));
+}
+function floorJournalExport(id){
+  try{
+    var r=JSON.parse(Android.floorExportJournal(id)||'{}');
+    if(!r.ok)uiAlert('Nothing to export',escHtml(r.error||''));
+  }catch(e){uiAlert('Error',e.message)}
+}
 function floorUniverseList(a){
   var U=a.universe||[];
-  if(!U.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No universe yet. It is taken from this market’s Discovery scan, sorted by return on capital.</div>';
-  var rising=U.filter(function(m){return m.month===1&&m.day===1}).length;
+  if(!U.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No universe yet. It is taken from this market’s Discovery scan, sorted by ROC (room to resistance).</div>';
+  var mc=floorIsMacd(a);
+  var rising=U.filter(function(m){return m.week===1&&m.day===1}).length;
   var rows=U.map(function(m,i){
-    var up=m.month===1&&m.day===1;
+    var up=m.week===1&&m.day===1;
     return '<tr style="border-top:1px solid var(--bd)'+(up?';background:rgba(5,150,105,.06)':'')+'"><td style="'+FLOOR_TD+';text-align:left;color:var(--t3)">'+(i+1)+'</td>'+floorStock(m.symbol,m.name)+
-      '<td style="'+FLOOR_TD+'">'+(m.roce!=null?Number(m.roce).toFixed(1)+'%':'—')+'</td>'+
-      '<td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.month)+'</td><td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.day)+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+(m.roc!=null?Number(m.roc).toFixed(1)+'%':'—')+'</td>'+
+      '<td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.week)+'</td><td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.day)+'</td>'+
+      (mc?'<td style="'+FLOOR_TD+';text-align:center">'+floorDot(m.h4)+'</td>':'')+
       '<td style="'+FLOOR_TD+';text-align:left;font-family:system-ui;color:'+(up?'var(--gn)':'var(--t3)')+'">'+escHtml(m.note||'')+'</td></tr>';
   });
-  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">Top '+U.length+' by return on capital'+(a.universeFrom?' · Discovery scan of '+new Date(Number(a.universeFrom)).toLocaleDateString('en-GB',{day:'numeric',month:'short'}):'')+
-    (a.planDay?' · <b style="color:var(--gn)">'+rising+'</b> rising on month and day for '+floorDay(a.planDay):'')+'. ○ = not checked (the daily slope is checked first).</div>'+
-    floorTable(['#','STOCK','ROC','1M','1D','TODAY'],rows);
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">Top '+U.length+' by ROC (room to resistance)'+(a.universeFrom?' · Discovery scan of '+new Date(Number(a.universeFrom)).toLocaleDateString('en-GB',{day:'numeric',month:'short'}):'')+
+    (a.planDay?' · <b style="color:var(--gn)">'+rising+'</b> rising on week and day for '+floorDay(a.planDay):'')+'. Weekly from finished weeks only. ○ = not checked yet.</div>'+
+    floorTable(mc?['#','STOCK','ROC','1W','1D','4H','TODAY']:['#','STOCK','ROC','1W','1D','TODAY'],rows);
 }
 function floorLogList(a){
   var L=a.log||[];
@@ -12505,7 +13051,7 @@ function floorPause(id,on){
     if(on)floorRun(id);else renderKeepScroll();
   };
   if(on){go();return}
-  uiConfirm('Pause this algo?','<div style="font-size:11px;line-height:1.5">Today’s resting orders are cancelled and no new ones are placed. Anything already held is still sold on schedule, and results keep being filled in.</div>',function(ok){if(ok)go()});
+  uiConfirm('Pause this algo?','<div style="font-size:11px;line-height:1.5">Nothing new is bought: today’s resting orders, and any turn still waiting for its price, are cancelled. Anything already held still sells on its stop, target, time limit or trend, and results keep being filled in.</div>',function(ok){if(ok)go()});
 }
 function floorBell(id,wasOn){
   try{Android.floorSetNotify(id,!wasOn)}catch(e){}
@@ -12523,25 +13069,33 @@ function floorRename(id){
 }
 function floorSettingsDlg(id){
   var a=floorFind(id);if(!a)return;
-  var s=a.settings||{},cur=spaceCurrency();
+  var s=a.settings||{},cur=spaceCurrency(),mc=floorIsMacd(a);
   var row=function(key,label,val,hint,step){
     return '<div style="margin-bottom:9px"><div style="font-size:11px;font-weight:700;color:var(--t1)">'+label+'</div>'+
       '<input id="fl-'+key+'" type="number" inputmode="decimal" step="'+(step||'1')+'" value="'+val+'" style="width:100%;padding:7px;font-size:13px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px;margin-top:3px"/>'+
       '<div style="font-size:9px;color:var(--t3);margin-top:2px">'+hint+'</div></div>';
   };
+  var low=s.lowDays||3,sec=Number(s.secondPct==null?2:s.secondPct);
   uiConfirm('⚙ '+escHtml(a.name||'Settings'),
-    '<div style="font-size:10px;color:var(--t3);margin-bottom:9px;line-height:1.5">New numbers apply to orders placed from now on. What is already resting or held keeps its size.</div>'+
+    '<div style="font-size:10px;color:var(--t3);margin-bottom:9px;line-height:1.5">New sizes apply to buys from now on. The stop, target and time limit apply to what is already held as well.</div>'+
     row('cap','Capital ('+cur+')',Number(s.capital||1000),'Paper money for the whole algo.','10')+
-    row('seats','Seats',s.seats||5,'Stocks held at once. Each order is half a seat.')+
-    row('uni','Universe size',s.universeSize||30,'Top stocks by return on capital from Discovery.')+
-    row('low','Low of how many trading days',s.lowDays||3,'The first order rests at the lowest price of these days.')+
-    row('sec','Second order, % below the first',Number(s.secondPct==null?2:s.secondPct),'0 puts both halves at the low.','0.5')+
-    row('hold','Sell after how many trading days',s.holdDays||3,'Sold at that day’s close.'),
+    row('seats','Seats',s.seats||5,mc?'Stocks held at once. Each buy is a whole seat.':'Stocks held at once. Each order is half a seat.')+
+    row('uni','Universe size',s.universeSize||30,'Top stocks by ROC (room to resistance) from Discovery.')+
+    (mc?'':row('low','Low of how many trading days',low,'The first order rests at the lowest price of these days.')+
+      row('sec','Second order, % below the first',sec,'0 puts both halves at the low. Must stay above the stop.','0.5'))+
+    row('stop','Stop-loss, % under the average buying price',Number(s.stopPct==null?4:s.stopPct),'0 = no stop.','0.5')+
+    row('tgt','Target, % over the average buying price',Number(s.targetPct==null?7:s.targetPct),'0 = no target.','0.5')+
+    row('hold','Sell after how many trading days',s.holdDays||10,'Sold at that day’s close, if the stop, target or trend has not sold it first.')+
+    '<label style="display:flex;gap:8px;align-items:flex-start;margin-top:4px;font-size:11px;color:var(--t1);line-height:1.4"><input id="fl-trend" type="checkbox" '+(s.trendFilter?'checked ':'')+'style="margin-top:2px"/>'+
+      '<span><b>Trend filter</b><br/><span style="font-size:9px;color:var(--t3)">On: only stocks with the weekly and daily MACD both rising are '+(mc?'watched':'given orders')+', and a held stock is sold at the close once either stops rising. Off: every stock in the universe, and the trend never sells. Changing it re-plans today at the next check.</span></span></label>',
     function(ok){
       if(!ok)return;
-      var g=function(k){return Number(((document.getElementById('fl-'+k)||{}).value||'').replace(',','.'))};
+      var g=function(k){var el=document.getElementById('fl-'+k);return el?Number((el.value||'').replace(',','.')):NaN};
+      var gl=g('low'),gs=g('sec');
+      if(mc){gl=low;gs=sec}
+      var tf=!!(document.getElementById('fl-trend')||{}).checked;
       try{
-        var r=JSON.parse(Android.floorSettings(id,g('cap'),Math.round(g('seats')),Math.round(g('uni')),Math.round(g('low')),g('sec'),Math.round(g('hold')))||'{}');
+        var r=JSON.parse(Android.floorSettings(id,g('cap'),Math.round(g('seats')),Math.round(g('uni')),Math.round(gl),gs,Math.round(g('hold')),g('stop'),g('tgt'),tf)||'{}');
         if(!r.ok){uiAlert('Not saved',escHtml(r.error||''));return}
       }catch(e){uiAlert('Error',e.message);return}
       renderKeepScroll();
@@ -14407,6 +14961,9 @@ function renderPortfolio(){
   // ── Crypto (Binance) space = paper Live Automated Trading only ──────────
   // No broker portfolio fetch yet (paper-only). The whole tab IS the lab panel.
   if(SPACE==='BN'){
+    // What the algos' real Binance trades made, above the lab — the same table
+    // the stock spaces have.
+    h+=closedAnalysisPanel();
     var panel=renderStrategyLabPanel();
     if(!panel){
       panel='<div class="empty"><div style="font-size:24px;margin-bottom:8px">🪙</div><b style="color:var(--t1);font-size:13px">Crypto — Binance</b><br/><br/>'+
@@ -14441,12 +14998,16 @@ function renderPortfolio(){
     // Refresh OCO pair cache so per-card badges show current SL/Tgt prices
     reloadT212Pairs();
     var allT212pos=T212_PORTFOLIO.positions||[];
-    var t212pos=allT212pos;
+    // Only this space's market: US stocks on the US tab, German on the German
+    // one. Both live in the same Trading 212 account, so the split is ours.
+    var t212pos=t212PositionsForSpace(SPACE);
+    var t212Other=allT212pos.length-t212pos.length;
     var t212sum=T212_PORTFOLIO.summary;
     var t212age=T212_PORTFOLIO.capturedAt?Math.round((Date.now()-T212_PORTFOLIO.capturedAt)/60000):null;
     // Header: ticker count + summary cash + refresh
     h+='<div style="padding:8px 8px 4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
-    h+='<div style="font-size:13px;font-weight:800;color:var(--t1)">Trading 212 <span style="font-size:10px;font-weight:500;color:var(--t3)">· '+t212pos.length+' position'+(t212pos.length===1?'':'s')+'</span></div>';
+    h+='<div style="font-size:13px;font-weight:800;color:var(--t1)">Trading 212 · '+(SPACE==='DE'?'Germany':'USA')+' <span style="font-size:10px;font-weight:500;color:var(--t3)">· '+t212pos.length+' position'+(t212pos.length===1?'':'s')+
+      (t212Other>0?' · '+t212Other+' more in '+(SPACE==='DE'?'US':'Germany'):'')+'</span></div>';
     h+='<span style="flex:1"></span>';
     if(T212_PORTFOLIO.loading){
       h+='<span style="font-size:10px;color:var(--t3)">⏳ fetching…</span>';
@@ -14496,10 +15057,11 @@ function renderPortfolio(){
     }
     // Summary cash card
     if(t212sum){
+      h+='<div style="margin:0 8px 4px;font-size:9px;color:var(--t3)">Whole Trading 212 account — cash is shared by the US and German spaces</div>';
       h+='<div style="margin:0 8px 8px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-family:monospace">';
-      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">CASH</div><div style="font-size:14px;font-weight:800;color:var(--t1)">$'+(t212sum.cash||0).toFixed(2)+'</div></div>';
-      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">FREE</div><div style="font-size:14px;font-weight:800;color:var(--gn)">$'+(t212sum.freeFunds||0).toFixed(2)+'</div></div>';
-      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">TOTAL</div><div style="font-size:14px;font-weight:800;color:var(--bl)">$'+(t212sum.totalValue||0).toFixed(2)+'</div></div>';
+      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">CASH</div><div style="font-size:14px;font-weight:800;color:var(--t1)">'+t212CurSym()+(t212sum.cash||0).toFixed(2)+'</div></div>';
+      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">FREE</div><div style="font-size:14px;font-weight:800;color:var(--gn)">'+t212CurSym()+(t212sum.freeFunds||0).toFixed(2)+'</div></div>';
+      h+='<div style="padding:8px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">TOTAL</div><div style="font-size:14px;font-weight:800;color:var(--bl)">'+t212CurSym()+(t212sum.totalValue||0).toFixed(2)+'</div></div>';
       h+='</div>';
     }
     // ── RETIRED: the manual T212 order panel ────────────────────────────────
@@ -15364,6 +15926,99 @@ function mtfLadderLoad(sym){
     }
   });
 }
+// How old this space's Discovery scan is, when it is old enough to matter
+// (20 hours: yesterday's evening scan is still "today's" the next morning).
+// Null when fresh or unknown.
+function scanAge(){
+  var t=(typeof STATE!=='undefined')?STATE.lastScanTime:null;
+  if(!t||!t.getTime)return null;
+  var ageH=(Date.now()-t.getTime())/3600000;
+  if(!(ageH>=20))return null;
+  return {date:t.toLocaleDateString('en-GB',{day:'numeric',month:'short'}),days:Math.max(1,Math.floor(ageH/24))};
+}
+// ── THE DAILY MACD, FETCHED FRESH ──────────────────────────────────────────
+// The scan stores 30 MACD values per stock and they are only as current as the
+// scan: a US scan left from August drew August's curve under today's name, while
+// the dots beside it — fetched live — said something else. So the sheet asks for
+// the daily prices when it opens and draws the standard picture: MACD (12, 26, 9),
+// its signal line and the histogram, about six months of it.
+var DMACD_CACHE={}, DMACD_LOADING={}, DMACD_TTL_MS=10*60*1000;
+function dailyMacdHtml(s){
+  var sym=mtfSymFor(s);
+  if(SPACE==='BN'||!sym||typeof Android==='undefined'||!Android.callAsync)
+    return macdBigSvg(s.macdCurve,s.macdPhase,300,80);
+  var c=DMACD_CACHE[sym], fresh=c&&(Date.now()-c.at)<DMACD_TTL_MS;
+  if(!fresh)setTimeout(function(){dailyMacdLoad(sym)},0);
+  return '<div id="dmacd-chart" data-sym="'+escHtml(sym)+'">'+(fresh?dailyMacdBody(c.data):
+    '<div style="height:150px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--bg2);font-size:10px;color:var(--t3)">Loading the daily MACD…</div>')+'</div>';
+}
+function dailyMacdLoad(sym){
+  if(DMACD_LOADING[sym])return;
+  DMACD_LOADING[sym]=true;
+  androidAsync('dailyMacd',[sym,SPACE],function(raw){
+    delete DMACD_LOADING[sym];
+    var d=null;try{d=JSON.parse(raw||'{}')}catch(e){}
+    // A failed read is not cached for long — the next open tries again.
+    DMACD_CACHE[sym]={at:(d&&d.ok)?Date.now():Date.now()-DMACD_TTL_MS+30000,data:d};
+    var el=document.getElementById('dmacd-chart');
+    if(el&&el.getAttribute('data-sym')===sym)el.innerHTML=dailyMacdBody(d);
+  });
+}
+function dailyMacdBody(d){
+  if(!d||!d.ok||!d.m||d.m.length<2)
+    return '<div style="padding:10px;border-radius:6px;background:var(--bg2);font-size:10px;color:var(--t3)">Could not load the daily MACD: '+escHtml((d&&d.error)||'no answer from the price feed')+'.</div>';
+  var n=d.m.length, lastD=d.d[n-1];
+  var today=new Date().toISOString().slice(0,10);
+  var dt=new Date(lastD+'T12:00:00Z').toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+  return '<div style="font-size:8px;color:var(--t3);margin-bottom:3px">1D MACD (12, 26, 9) · '+n+' trading days to '+dt+
+    (lastD===today?' (today so far)':'')+' · close '+Number(d.c[n-1]).toFixed(2)+
+    ' · <span style="color:#2962ff">▬ MACD '+Number(d.m[n-1]).toFixed(2)+'</span>'+
+    ' <span style="color:#ff6d00">▬ signal '+Number(d.s[n-1]).toFixed(2)+'</span></div>'+
+    dailyMacdSvg(d);
+}
+function dailyMacdSvg(d){
+  var W=320,H=140,gut=34,top=4,bot=14,n=d.m.length;
+  var cw=W-gut-2, ch=H-top-bot;
+  var all=d.m.concat(d.s,d.h,[0]);
+  var mn=Math.min.apply(null,all), mx=Math.max.apply(null,all);
+  var pad=(mx-mn)*0.06||1; mn-=pad; mx+=pad;
+  var y=function(v){return top+ch-(v-mn)/(mx-mn)*ch};
+  var x=function(i){return 1+(i+0.5)*cw/n};
+  var bw=Math.max(0.6,cw/n*0.7);
+  var svg='<svg width="100%" height="'+H+'" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" style="display:block;border-radius:6px;background:var(--bg2)">';
+  // Month boundaries, as on a broker's chart.
+  var lastM=null;
+  for(var i=0;i<n;i++){
+    var mo=String(d.d[i]).slice(0,7);
+    if(lastM!==null&&mo!==lastM){
+      var xm=x(i)-cw/n/2;
+      svg+='<line x1="'+xm.toFixed(1)+'" y1="'+top+'" x2="'+xm.toFixed(1)+'" y2="'+(top+ch)+'" stroke="var(--bd)" stroke-width="0.5"/>';
+      svg+='<text x="'+(xm+2).toFixed(1)+'" y="'+(H-3)+'" font-size="7" fill="var(--t3)">'+new Date(d.d[i]+'T12:00:00Z').toLocaleDateString('en-GB',{month:'short'})+'</text>';
+    }
+    lastM=mo;
+  }
+  var zy=y(0);
+  svg+='<line x1="0" y1="'+zy.toFixed(1)+'" x2="'+(W-gut)+'" y2="'+zy.toFixed(1)+'" stroke="var(--t3)" stroke-width="0.6" stroke-dasharray="3,2"/>';
+  // Histogram in the four shades brokers use: above zero and growing / shrinking,
+  // below zero and growing / shrinking.
+  for(var i=0;i<n;i++){
+    var hv=Number(d.h[i]), pv=i>0?Number(d.h[i-1]):hv;
+    var col=hv>=0?(hv>=pv?'#26a69a':'#b2dfdb'):(hv<pv?'#ef5350':'#ffcdd2');
+    var y1=y(Math.max(hv,0)), y2=y(Math.min(hv,0));
+    svg+='<rect x="'+(x(i)-bw/2).toFixed(1)+'" y="'+y1.toFixed(1)+'" width="'+bw.toFixed(2)+'" height="'+Math.max(0.5,y2-y1).toFixed(1)+'" fill="'+col+'"/>';
+  }
+  var line=function(arr,col){
+    var p=[];for(var i=0;i<n;i++)p.push(x(i).toFixed(1)+','+y(Number(arr[i])).toFixed(1));
+    return '<polyline points="'+p.join(' ')+'" fill="none" stroke="'+col+'" stroke-width="1.3" stroke-linejoin="round"/>';
+  };
+  svg+=line(d.s,'#ff6d00')+line(d.m,'#2962ff');
+  // The scale on the right, and where the two lines end.
+  var lab=function(v,col,bold){return '<text x="'+(W-gut+3)+'" y="'+(y(v)+2.5).toFixed(1)+'" font-size="7" fill="'+col+'"'+(bold?' font-weight="700"':'')+'>'+Number(v).toFixed(2)+'</text>'};
+  svg+=lab(mx-pad,'var(--t3)')+lab(0,'var(--t3)')+lab(mn+pad,'var(--t3)');
+  svg+=lab(Number(d.m[n-1]),'#2962ff',true);
+  svg+='</svg>';
+  return svg;
+}
 function showDetail(idx,focus){
   // Accepts either an index into FILTERED (normal scan-row click) OR a full
   // stock object (manual-search result, watchlist-row click). The object form
@@ -15380,6 +16035,11 @@ function showDetail(idx,focus){
   if(detailSub)hh+='<span style="font-size:10px;color:var(--t3);font-family:monospace">'+escHtml(detailSub)+'</span>';
   hh+='</div>';
   hh+='<div style="font-size:20px;font-weight:800;font-family:monospace;margin-top:4px">'+cur+fmt(s.price)+'</div>';
+  // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a
+  // two-month-old price shown bare reads as today's.
+  var fromScan=(typeof idx==='number')||(STATE.data&&STATE.data.indexOf(s)>=0);
+  var stale=fromScan?scanAge():null;
+  if(stale)hh+='<div style="font-size:9px;font-weight:700;color:#b45309">⚠ Price and figures from the Discovery scan of '+stale.date+' — '+stale.days+' day'+(stale.days===1?'':'s')+' old. Run a scan for today’s. The daily MACD chart below is fetched fresh.</div>';
   if(s.avgVol20)hh+='<div style="font-size:9px;color:var(--t3);font-family:monospace">Vol: '+fmtV(s.avgVol20)+'/day</div>';
   hh+='</div><button class="mox" onclick="closeDetail()">\u2715</button>';
   document.getElementById('modal-header').innerHTML=hh;
@@ -15671,9 +16331,11 @@ function showDetail(idx,focus){
   // MACD Momentum
   b+='<div style="margin-top:8px;padding:10px;background:var(--cd);border:1px solid var(--bd);border-radius:8px">';
   b+='<div style="font-size:8px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:6px">MACD MOMENTUM ANALYSIS</div>';
-  // Big MACD chart
-  b+=macdBigSvg(s.macdCurve,s.macdPhase,300,80);
+  // The daily MACD, fetched fresh when the sheet opens — the scan's own 30-value
+  // curve is only as current as the scan (see dailyMacdHtml).
+  b+=dailyMacdHtml(s);
   b+=mtfLadderHtml(s);
+  if(stale)b+='<div style="font-size:8px;color:#b45309;margin-top:6px">The phase and figures below are from the scan of '+stale.date+'; the chart and the dots above are current.</div>';
   b+='<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">';
   b+='<div style="padding:5px 12px;background:'+pc+'18;border-radius:5px;border:1px solid '+pc+'40"><div style="font-size:13px;font-weight:800;color:'+pc+'">'+s.macdPhase+'</div></div>';
   b+='<div><div style="font-size:7px;color:var(--t3)">d(MACD)/dt</div><div style="font-size:13px;font-weight:700;font-family:monospace;color:'+(s.macdSlope>0?'var(--gn)':s.macdSlope<0?'var(--rd)':'var(--t3)')+'">'+(s.macdSlope>0?'+':'')+fmt(s.macdSlope,4)+'</div></div>';

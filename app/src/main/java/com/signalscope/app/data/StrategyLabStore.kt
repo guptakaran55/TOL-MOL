@@ -95,7 +95,9 @@ object StrategyLabStore {
         val trades: List<LedgerTrade> = emptyList(),
         val audit: List<Audit> = emptyList(),
         val statuses: Map<String, SymbolStatus> = emptyMap(),
-        val lastRunAt: Long = 0L
+        val lastRunAt: Long = 0L,
+        /** The bar grid this book's timestamps were made on (StrategyLabConfig.barAnchorSec). */
+        val barAnchorSec: Long = 0L
     )
 
     // ── Namespacing ───────────────────────────────────────────────────────
@@ -154,7 +156,10 @@ object StrategyLabStore {
         // Remove BEFORE the overlay so a row that is both removed and re-supplied
         // in newTrades keeps the fresh version.
         removeIds.forEach { map.remove(it) }
-        newTrades.forEach { map[it.id] = it }
+        // A CLOSED TRADE IS NEVER REOPENED. A pass that read the book before a
+        // trade was closed by hand (the take-profit button) still carries it as
+        // open; writing that back would resurrect a position already sold.
+        newTrades.forEach { if (!(map[it.id]?.status == "CLOSED" && it.status != "CLOSED")) map[it.id] = it }
         val existing = s.audit.map { it.id }.toHashSet()
         val audit = (s.audit + newAudits.filter { it.id !in existing }).takeLast(maxAudit)
         val curBase = (s.baselines as? Map<String, Long>) ?: emptyMap()
@@ -168,6 +173,23 @@ object StrategyLabStore {
         ), ns)
     }
 
+    /** Close one OPEN trade by hand, recording how — and touch nothing else: not
+     *  the watermark, the baseline or the enrollment, so the algo carries on
+     *  exactly as before. False if the trade was not open any more. */
+    @Synchronized
+    fun closeByHand(ctx: Context, ns: String, closed: LedgerTrade, audit: Audit): Boolean {
+        var done = false
+        mutate(ctx, ns) { s ->
+            if (s.trades.none { it.id == closed.id && it.status == "OPEN" }) s
+            else {
+                done = true
+                s.copy(trades = s.trades.map { if (it.id == closed.id) closed else it },
+                    audit = (s.audit + audit).takeLast(500))
+            }
+        }
+        return done
+    }
+
     /** The flat-start baseline bar ts for a symbol (0 = no baseline yet). */
     fun baselineFor(ctx: Context, symbol: String, ns: String = "us"): Long =
         ((load(ctx, ns).baselines as? Map<String, Long>) ?: emptyMap())[symbol.uppercase()] ?: 0L
@@ -177,11 +199,14 @@ object StrategyLabStore {
     fun activeConfig(ctx: Context, ns: String = "us"): StrategyLabConfig {
         val st = load(ctx, ns)
         val raw = st.configJson
-        val base = if (raw == null) StrategyLabConfig.preset()
+        val parsed = if (raw == null) StrategyLabConfig.preset()
             else when (val r = StrategyLabConfig.fromJson(raw, st.configSource)) {
                 is StrategyLabConfig.Companion.ParseResult.Ok -> r.config
                 is StrategyLabConfig.Companion.ParseResult.Rejected -> StrategyLabConfig.preset()
             }
+        // Bars are grouped on the exchange's own clock, as the desktop lab groups them. Only India
+        // needs it: its +5:30 offset is the one that does not land on the epoch grid.
+        val base = parsed.copy(barAnchorSec = gridFor(ctx, ns, st))
         // COSTS ARE RESOLVED HERE, AND ONLY HERE.
         //
         // This is the single function every engine gets its config from — the
@@ -248,6 +273,34 @@ object StrategyLabStore {
             if (slip == base.slippagePct && totalFeePct == 0.0) base
             else base.copy(slippagePct = slip, flatFeeRoundTripPct = totalFeePct)
         } catch (e: Exception) { base }
+    }
+
+    /** Seconds east of UTC at which a space's bar grid SHOULD start (StrategyLabConfig.barAnchorSec). */
+    fun barAnchorFor(ns: String): Long =
+        if (com.signalscope.app.trading.Spaces.baseOf(ns) == "in") 19_800L else 0L
+
+    /**
+     * The grid this book may run on NOW — which is not always the one it should run on.
+     *
+     * A trade is identified by its symbol and its entry bar's timestamp, and moving the grid moves
+     * every timestamp. Switched under an OPEN position, the engine would report that position under
+     * a new id: the book would hold it twice, the original never closing. So a book moves to its
+     * target grid only while it holds nothing, and at that moment its watermarks and baselines are
+     * cleared so the next run is a clean flat start on the new clock — exactly what Reset does, minus
+     * the ledger, which is kept as history. Until then it stays on the grid it was built on and its
+     * open positions finish under the rules they were opened under.
+     */
+    private fun gridFor(ctx: Context, ns: String, st: State): Long {
+        val target = barAnchorFor(ns)
+        if (st.barAnchorSec == target) return target
+        if (st.trades.any { it.status == "OPEN" }) return st.barAnchorSec
+        val after = mutate(ctx, ns) { cur ->
+            if (cur.barAnchorSec == target || cur.trades.any { it.status == "OPEN" }) cur
+            else cur.copy(barAnchorSec = target, watermarks = emptyMap(), baselines = emptyMap())
+        }
+        if (after.barAnchorSec == target)
+            Log.i(TAG, "[$ns] bar grid moved to anchor ${target}s — flat book, tracking restarts on the new clock")
+        return after.barAnchorSec
     }
 
     fun setEnabled(ctx: Context, on: Boolean, ns: String = "us"): State = mutate(ctx, ns) {

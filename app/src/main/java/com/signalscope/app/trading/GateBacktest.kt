@@ -347,7 +347,7 @@ object GateBacktest {
                 if (t0Day < 0) {
                     val basket = rankedAsOf(t).take(p.topN)
                     if (basket.isEmpty()) continue
-                    for (s in basket) { balances[s] = p.notional; since[s] = t }
+                    for (s in basket) { balances[s] = p.notional; since[s] = t + 1 }   // screened on t's close → owns trades from t+1
                     injected = p.notional * basket.size; t0Day = t; prevScreen = t
                     logLine("${d(t)} INIT basket=${basket.size} injected=${"%.0f".format(injected)}")
                     markEquity(balances.values.sum()); continue
@@ -391,7 +391,7 @@ object GateBacktest {
                 val joiners = newBasket.filter { nb -> balances.keys.none { it.equals(nb, true) } }
                 if (joiners.isNotEmpty() && pool > 0) {
                     val share = pool / joiners.size
-                    for (s in joiners) { balances[s] = share; since[s] = t }
+                    for (s in joiners) { balances[s] = share; since[s] = t + 1 }
                     logLine("${d(t)} rebalance: -${leavers.size} +${joiners.size} pool=${"%.0f".format(pool)}")
                 }
                 prevScreen = t
@@ -510,7 +510,12 @@ object GateBacktest {
                         it.symbol.uppercase() !in held && (slopeAsOf(it.symbol, day) ?: -1.0) > 0.0
                     } ?: continue
                     val pick = pickR.symbol
-                    s.symbol = pick; s.sinceDay = day; s.negDays = 0; s.flagged = false
+                    // CHOSEN WITH TODAY'S CLOSE, SO IT OWNS TRADES FROM TOMORROW. The ranking and the
+                    // slope gate both read this day's closing bar, which does not exist until the
+                    // session is over — crediting a trade that entered during it let the screen pick
+                    // names with hindsight of the very day they then traded (the desktop lab carried
+                    // the same flaw: ~8 CAGR points on NSE daily, 5–19 on the intraday champions).
+                    s.symbol = pick; s.sinceDay = day + 1; s.negDays = 0; s.flagged = false
                     held.add(pick.uppercase())
                     openEnroll[si] = OpenEnroll(si, pick, day, pickR.rank, pickR.score,
                         slopeAsOf(pick, day) ?: 0.0)

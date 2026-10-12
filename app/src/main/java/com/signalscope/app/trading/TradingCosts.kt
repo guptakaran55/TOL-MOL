@@ -112,6 +112,33 @@ object TradingCosts {
      *  taxes in their own right and not services. */
     const val GST_RATE = 0.18
 
+    // ── Binance, for the closed-trades view only ────────────────────────────
+    //
+    // Binance's standard spot fee, per side. NOT used to cost any algo or
+    // backtest — that stays unmodelled, for the reasons [rulesFor] gives. It only
+    // splits a closed trade's real net result into a gross figure and a fee,
+    // because the fee itself was taken out of the coins and the proceeds and
+    // never recorded on its own.
+    const val BINANCE_FEE_PCT_PER_SIDE_ESTIMATE = 0.1
+
+    // ── Zerodha, bought and sold the SAME DAY ───────────────────────────────
+    //
+    // A delivery order squared off the same day never reaches the demat account,
+    // so the exchange settles it as intraday and Zerodha charges it as intraday —
+    // whatever product it was placed under. Charging those trades the delivery
+    // card put a 0.1% tax on both legs and a depository fee on a sale that never
+    // left the account: about three times what the contract note says.
+
+    /** Intraday brokerage: 0.03% of each order's value, never more than ₹20 an order. */
+    const val ZERODHA_INTRADAY_BROKERAGE_PCT_PER_SIDE = 0.03
+    const val ZERODHA_INTRADAY_BROKERAGE_CAP = 20.0
+
+    /** Intraday STT: 0.025%, on the SELL leg only. */
+    const val ZERODHA_INTRADAY_STT_PCT_SELL_ONLY = 0.025
+
+    /** Intraday stamp duty: 0.003%, buy side only. */
+    const val ZERODHA_INTRADAY_STAMP_PCT_BUY_ONLY = 0.003
+
     // ── the model ───────────────────────────────────────────────────────────
 
     // ── THE RATE CARD, WRITTEN ONCE ─────────────────────────────────────────
@@ -134,12 +161,29 @@ object TradingCosts {
         val sellCash: Double = 0.0,
         /** Does GST ride on this one? True for services, false for taxes —
          *  GST is not levied on STT or on stamp duty. */
-        val gstable: Boolean = false
+        val gstable: Boolean = false,
+        /** Most a percentage line may come to on one leg, 0 = no limit
+         *  (intraday brokerage stops at ₹20 an order). */
+        val capPerSide: Double = 0.0
     )
 
-    private fun rulesFor(ns: String, accountCurrency: String, fxPctPerSide: Double): List<Rule> =
+    private fun rulesFor(ns: String, accountCurrency: String, fxPctPerSide: Double,
+                         intraday: Boolean = false): List<Rule> =
         when (Spaces.baseOf(ns)) {
-            "in" -> listOf(
+            "in" -> if (intraday) listOf(
+                Rule("brokerage",
+                    buyPct = ZERODHA_INTRADAY_BROKERAGE_PCT_PER_SIDE,
+                    sellPct = ZERODHA_INTRADAY_BROKERAGE_PCT_PER_SIDE,
+                    gstable = true, capPerSide = ZERODHA_INTRADAY_BROKERAGE_CAP),
+                Rule("STT", sellPct = ZERODHA_INTRADAY_STT_PCT_SELL_ONLY),
+                Rule("stamp duty", buyPct = ZERODHA_INTRADAY_STAMP_PCT_BUY_ONLY),
+                Rule("exchange",
+                    buyPct = ZERODHA_EXCHANGE_PCT_PER_SIDE,
+                    sellPct = ZERODHA_EXCHANGE_PCT_PER_SIDE, gstable = true),
+                Rule("SEBI",
+                    buyPct = ZERODHA_SEBI_PCT_PER_SIDE,
+                    sellPct = ZERODHA_SEBI_PCT_PER_SIDE, gstable = true))
+            else listOf(
                 Rule("brokerage",
                     buyPct = ZERODHA_BROKERAGE_PCT_PER_SIDE,
                     sellPct = ZERODHA_BROKERAGE_PCT_PER_SIDE, gstable = true),
@@ -181,25 +225,39 @@ object TradingCosts {
      *
      * This is the difference between the trade and the contract note.
      */
+    /**
+     * @param intraday bought and sold the same day — charged on the intraday card
+     *   where the broker has one (Zerodha); ignored elsewhere.
+     * @param fixedShare the part of the per-sale fixed fee this trade carries. The
+     *   depository fee is charged once per company per day sold, so when one day's
+     *   sale is split across several matched trades each carries its share of the
+     *   one fee — never a whole fee each.
+     */
     fun chargesFor(
         ns: String,
         buyValue: Double,
         sellValue: Double,
         accountCurrency: String,
-        fxPctPerSide: Double = T212_FX_PCT_PER_SIDE
+        fxPctPerSide: Double = T212_FX_PCT_PER_SIDE,
+        intraday: Boolean = false,
+        fixedShare: Double = 1.0
     ): Breakdown {
         val b = buyValue.coerceAtLeast(0.0)
         val s = sellValue.coerceAtLeast(0.0)
         val out = ArrayList<Component>()
         var gstBase = 0.0
-        for (r in rulesFor(ns, accountCurrency, fxPctPerSide)) {
+        for (r in rulesFor(ns, accountCurrency, fxPctPerSide, intraday)) {
+            fun leg(pct: Double, v: Double): Double {
+                val c = pct / 100.0 * v
+                return if (r.capPerSide > 0.0) minOf(c, r.capPerSide) else c
+            }
             // THE FIXED FEE NEEDS A SALE TO EXIST. It was added unconditionally,
             // so a half-finished round trip — a buy with no sell yet — was charged
             // a depository fee for shares that had not left the account. Every
             // percentage line already falls to zero on a zero leg; this one had to
             // be told.
-            val cash = r.buyPct / 100.0 * b + r.sellPct / 100.0 * s +
-                       (if (s > 0.0) r.sellCash else 0.0)
+            val cash = leg(r.buyPct, b) + leg(r.sellPct, s) +
+                       (if (s > 0.0) r.sellCash * fixedShare.coerceIn(0.0, 1.0) else 0.0)
             if (cash <= 0.0) continue
             if (r.gstable) gstBase += cash
             out.add(Component(r.label, cash = cash))

@@ -11,7 +11,7 @@ None of the following apply:
 
 | Not used | What happens instead |
 |---|---|
-| 3b screener (90-day return / volatility / time above the 50-day average) | Universe = top 30 by **return on capital** |
+| 3b screener (90-day return / volatility / time above the 50-day average) | Universe = top 30 by **ROC** (room to the nearest resistance) |
 | A seat "owning" a stock and waiting for it | Seats are generic. Whichever order fills first takes a free seat. |
 | Waiting for "all dots green" | Only the **1M and 1D** MACD slopes are checked. The 4H, 1H and 15m dots are **not used**. |
 | "Natural exit" when the dots turn red | **Time exit**: sold at the close 3 trading days after buying |
@@ -38,13 +38,20 @@ rules, not signals.
 
 - The market's Discovery scan (Germany: the "DAX 100" list, already cut by a
   median-turnover floor at scan time).
-- Keep stocks with a return-on-capital figure (Yahoo's return-on-equity value,
-  shown as ROCE in the app). Sort descending and take the top 30.
+- Rank by **ROC**, the app's own figure (the Discovery table's "ROC" column) —
+  NOT the textbook rate-of-change indicator and NOT return on capital:
+  `ROC % = (resistance − close) ÷ close × 100`, from daily bars, where
+  `resistance` is the nearest resistance level above the price found by the
+  app's support/resistance finder (pivot highs clustered by ATR, with a lookback
+  it picks from the stock's own cycle length). Stocks with no resistance above
+  the price have no ROC and are left out. Sort descending and take the top 30.
+  (Until 9 Oct 2026 the app ranked by return on capital instead; that was a
+  misreading of "ROC" and was corrected.)
 - Refreshed **once per exchange day** from the latest complete scan.
 - Stocks that drop out of the top 30 keep being managed until their exit.
-- ⚠ Backtest caveat: this is a **snapshot of today's fundamentals**. Applying it
-  to past dates is look-ahead and survivorship biased. Either accept that and say
-  so, or use point-in-time fundamentals.
+- ⚠ Backtest caveat: ROC moves with the price every day, so a backtest must
+  recompute it **as of each date** from bars up to the previous close —
+  ranking past dates by today's ROC would be look-ahead.
 
 ## MACD slope (the only indicator)
 
@@ -54,7 +61,7 @@ For a series of closes:
 ema(x, span): a = 2/(span+1); out[0] = x[0]; out[i] = a*x[i] + (1-a)*out[i-1]
 macd  = ema(close, 12) - ema(close, 26)
 raw   = [0] + [macd[i] - macd[i-1] for i >= 1]
-slope = ema(raw, 5)[-1]          # smoothing 5 for stocks
+slope = raw[-1]                  # no smoothing for stocks (since 9 Oct 2026; was ema(raw, 5)[-1])
 rising = slope > 0               # need >= 30 closes, else "unknown" (fails the filter)
 ```
 

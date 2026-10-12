@@ -70,7 +70,13 @@ object ClosedTrades {
          * strategy judged on gross looks better than the account ever will, while
          * one judged only on net cannot tell a bad entry from an expensive seat.
          */
-        val charges: Double = 0.0
+        val charges: Double = 0.0,
+        /** What [charges] is made of — STT, stamp duty, the depository fee, GST… —
+         *  so a figure that looks too big can be opened and checked line by line.
+         *  Null on a broker that is not costed. */
+        val chargeParts: Map<String, Double>? = null,
+        /** Bought and sold the same day — charged as intraday where that differs. */
+        val sameDay: Boolean = false
     ) {
         /** What actually reached the account. */
         val netPnl: Double get() = pnl - charges
@@ -163,9 +169,28 @@ object ClosedTrades {
      */
     fun costed(rep: Report, ns: String, accountCurrency: String,
                fxPctPerSide: Double = TradingCosts.T212_FX_PCT_PER_SIDE): Report {
+        // TWO THINGS A PIECE CANNOT KNOW ON ITS OWN, decided across all of them.
+        //
+        // Each row here is one matched PIECE — one buy lot against one sell — and
+        // a sale that filled in three parts, or closed three lots, is three pieces.
+        // Costing every piece as a whole trade charged the depository fee three
+        // times for one sale (Zerodha charges it once per company per day sold),
+        // so it is now shared across that day's pieces by value.
+        //
+        // And a piece bought and sold on the same day is intraday in the broker's
+        // books, whatever product it went in as — a different, much smaller card.
+        fun day(at: String) = at.take(10)
+        val delivered = rep.trips.filter { day(it.boughtAt) != day(it.soldAt) }
+        val soldThatDay = delivered.groupBy { it.ticker + "|" + day(it.soldAt) }
+            .mapValues { (_, ts) -> ts.sumOf { it.cashOut } }
         val priced = rep.trips.map { t ->
-            val c = TradingCosts.chargesFor(ns, t.cashIn, t.cashOut, accountCurrency, fxPctPerSide)
-            t.copy(charges = c.cashRoundTrip)
+            val same = day(t.boughtAt).isNotEmpty() && day(t.boughtAt) == day(t.soldAt)
+            val dayTotal = soldThatDay[t.ticker + "|" + day(t.soldAt)] ?: 0.0
+            val share = if (same) 0.0 else if (dayTotal > 0.0) t.cashOut / dayTotal else 1.0
+            val c = TradingCosts.chargesFor(ns, t.cashIn, t.cashOut, accountCurrency, fxPctPerSide,
+                intraday = same, fixedShare = share)
+            t.copy(charges = c.cashRoundTrip, sameDay = same,
+                chargeParts = c.components.associate { it.label to it.cash })
         }
         return rep.copy(
             trips = priced,
