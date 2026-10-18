@@ -172,6 +172,23 @@ object RvManualQueue {
     private fun logOf(o: Order, asked: Boolean, outcome: String, why: String, note: String = "") =
         LogRow(System.currentTimeMillis(), o.kind, o.space, o.symbol, !o.isSell, asked, outcome, why, note)
 
+    // ── THE RV GATE'S LONG RECORD (see [RvJournal]) ─────────────────────────
+    private fun jSide(o: Order) = if (o.isSell) RvGate.Side.SELL else RvGate.Side.BUY
+    private fun jKey(id: String) = "you|$id"
+    private fun jNewId() = "x${System.currentTimeMillis()}${(Math.random() * 1000).toInt()}"
+    private fun jBase(o: Order, ticker: String, asked: Boolean, runBy: String) =
+        RvJournal.base("you", jSide(o), o.ns, o.symbol, ticker, mapOf("kind" to o.kind, "asked" to asked,
+            "runBy" to runBy, "amount" to o.cash.takeIf { it > 0.0 }, "qty" to o.qty.takeIf { it > 0.0 },
+            "limit" to o.capLimit.takeIf { it > 0.0 }))
+
+    /** What a finished order filled, or why it did not — one line in the record. */
+    private fun jOutcome(ctx: Context, key: String, text: String, fill: Map<String, Any?>) {
+        val qty = (fill["qty"] as? Double) ?: 0.0
+        val price = (fill["price"] as? Double) ?: 0.0
+        if (qty > 0.0 || price > 0.0) RvJournal.event(ctx, "fill", key, fill + ("result" to text))
+        else RvJournal.event(ctx, "end", key, mapOf("why" to text))
+    }
+
     /** This market's decisions since [sinceMs], newest first. */
     fun history(ctx: Context, space: String, sinceMs: Long): List<LogRow> =
         logRows(ctx).filter { it.space.equals(space, true) && it.at >= sinceMs }.sortedByDescending { it.at }
@@ -183,8 +200,12 @@ object RvManualQueue {
      */
     fun notAsked(ctx: Context, o: Order) {
         val outcome = "box not ticked — started at once"
+        val key = jKey(jNewId())
         if (!MarketHours.isRegularSession(o.ns, System.currentTimeMillis())) {
-            logAdd(ctx, logOf(o, false, outcome, "the market was shut")); return
+            logAdd(ctx, logOf(o, false, outcome, "the market was shut"))
+            RvJournal.event(ctx, "first", key, jBase(o, o.ticker, false, "page") + ("marketShut" to true))
+            RvJournal.event(ctx, "release", key, mapOf("why" to outcome, "waitedMin" to 0L))
+            return
         }
         val config = ConfigManager(ctx)
         val ticker = o.ticker.ifBlank { resolve(config, o.symbol, o.space) }
@@ -192,6 +213,10 @@ object RvManualQueue {
             RvGate.check(config, ticker, o.symbol, o.ns,
                 if (o.isSell) RvGate.Side.SELL else RvGate.Side.BUY, 0L)
         } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+        // The control group: what the gate would have said, and the price it ran at.
+        RvJournal.event(ctx, "first", key, jBase(o, ticker, false, "page") + RvJournal.reading(rd) +
+            mapOf("gateWouldGo" to gate.go, "gateWhy" to gate.why))
+        RvJournal.event(ctx, "release", key, RvJournal.reading(rd) + mapOf("why" to outcome, "waitedMin" to 0L))
         logAdd(ctx, logOf(o, false, outcome,
             (if (gate.go) "the gate would have started it too — " else "the gate would have held it — ") + gate.why,
             RvGate.snapshot(rd, gate)))
@@ -222,6 +247,7 @@ object RvManualQueue {
             } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
             if (gate.go) {
                 logAdd(ctx, logOf(o, true, "started at once", gate.why, RvGate.snapshot(rd, gate)))
+                RvJournal.look(ctx, jKey(jNewId()), jBase(o, ticker, true, "page"), true, 0L, gate, rd)
                 return Triple(false, gate.why, 0L)
             }
             val ref = rd?.price?.takeIf { it > 0.0 } ?: o.refPrice
@@ -231,6 +257,7 @@ object RvManualQueue {
                 capRef = if (o.isSell) 0.0 else ref, capLimit = if (o.isSell) 0.0 else limitFor(ref, rd?.atr ?: 0.0))
             save(ctx, all(ctx) + q)
             logAdd(ctx, logOf(o, true, "held", gate.why, q.rvNote))
+            RvJournal.look(ctx, jKey(q.id), jBase(q, ticker, true, "queue"), true, 0L, gate, rd)
             RvGate.ensureTick(ctx)
             return Triple(true, gate.why, now + RvGate.MAX_WAIT_MS)
         }
@@ -247,6 +274,8 @@ object RvManualQueue {
             capRef = if (ref > 0.0) ref else 0.0, capLimit = limitFor(ref, atr))
         save(ctx, all(ctx) + q)
         logAdd(ctx, logOf(o, true, "held for the open", q.why))
+        RvJournal.event(ctx, "queued", jKey(q.id), jBase(q, q.ticker, true, "queue") +
+            mapOf("price" to ref.takeIf { it > 0.0 }, "marketShut" to true))
         return Triple(true, q.why, 0L)
     }
 
@@ -254,6 +283,7 @@ object RvManualQueue {
         val o = all(ctx).firstOrNull { it.id == id && (it.status == "WAITING" || it.status == "ASK") } ?: return false
         update(ctx, o.id) { it.copy(status = "CANCELLED", result = "called off by you") }
         logAdd(ctx, logOf(o, true, "called off", "by you, before it started"))
+        RvJournal.event(ctx, "end", jKey(o.id), mapOf("why" to "called off by you"))
         return true
     }
 
@@ -284,6 +314,8 @@ object RvManualQueue {
                 RvGate.check(config, ticker, o.symbol, o.ns,
                     if (o.isSell) RvGate.Side.SELL else RvGate.Side.BUY, o.createdAt, memory = mem)
             } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+            RvJournal.look(ctx, jKey(o.id), jBase(o, ticker, true, "queue"), firstLook = o.rvNote.isBlank(),
+                since = maxOf(o.createdAt, RvGate.todayOpenMs(o.ns, now)), d = gate, rd = rd)
             if (!gate.go) {
                 update(ctx, o.id) { it.copy(why = gate.why, ticker = ticker, rvNote = RvGate.snapshot(rd, gate),
                     rvPeak = gate.memory?.peak ?: it.rvPeak, rvTrough = gate.memory?.trough ?: it.rvTrough) }
@@ -301,15 +333,17 @@ object RvManualQueue {
                     update(ctx, o.id) { it.copy(status = "ASK", askedAt = now, ticker = ticker,
                         capRef = ref, capLimit = limit, why = why, rvNote = RvGate.snapshot(rd, gate)) }
                     logAdd(ctx, logOf(o, true, "asked you — over its price limit", why, RvGate.snapshot(rd, gate)))
+                    RvJournal.event(ctx, "ask", jKey(o.id), mapOf("price" to price, "ref" to ref, "limit" to limit))
                     try { LabNotifier.rvManualAsk(ctx, o.space, o.symbol, ref, price ?: 0.0, limit) } catch (_: Exception) {}
                     continue
                 }
             }
             update(ctx, o.id) { it.copy(status = "STARTED", why = gate.why, ticker = ticker) }
             Log.i(TAG, "${o.symbol} ${o.kind} released by the RV gate: ${gate.why}")
-            val result = try { run(ctx, config, o.copy(ticker = ticker)) }
-                         catch (e: Exception) { Log.e(TAG, "${o.symbol} ${o.kind} failed", e); "failed: ${e.message}" }
+            val (result, fill) = try { run(ctx, config, o.copy(ticker = ticker)) }
+                         catch (e: Exception) { Log.e(TAG, "${o.symbol} ${o.kind} failed", e); "failed: ${e.message}" to emptyMap() }
             update(ctx, o.id) { it.copy(status = "DONE", result = result) }
+            jOutcome(ctx, jKey(o.id), result, fill)
             val heldMin = (System.currentTimeMillis() - maxOf(o.createdAt, RvGate.todayOpenMs(o.ns))) / 60_000L
             logAdd(ctx, logOf(o, true,
                 if (gate.timedOut) "started at the 2-hour limit" else "started after ${heldMin.coerceAtLeast(0L)} min",
@@ -331,13 +365,17 @@ object RvManualQueue {
         if (!MarketHours.isRegularSession(o.ns, System.currentTimeMillis())) {
             update(ctx, o.id) { it.copy(status = "CANCELLED", result = "the market had closed — nothing bought") }
             logAdd(ctx, logOf(o, true, "lapsed", "the market had closed before your answer"))
+            RvJournal.event(ctx, "end", jKey(o.id), mapOf("why" to "lapsed — the market had closed before your answer"))
             return "The market has closed, so nothing was bought. Ask again at the next open."
         }
         update(ctx, o.id) { it.copy(status = "STARTED") }
+        RvJournal.event(ctx, "release", jKey(o.id), mapOf("why" to "you said buy anyway",
+            "waitedMin" to ((System.currentTimeMillis() - maxOf(o.createdAt, RvGate.todayOpenMs(o.ns))) / 60_000L).coerceAtLeast(0L)))
         val config = ConfigManager(ctx)
-        val result = try { run(ctx, config, o) }
-                     catch (e: Exception) { Log.e(TAG, "${o.symbol} buy anyway failed", e); "failed: ${e.message}" }
+        val (result, fill) = try { run(ctx, config, o) }
+                     catch (e: Exception) { Log.e(TAG, "${o.symbol} buy anyway failed", e); "failed: ${e.message}" to emptyMap() }
         update(ctx, o.id) { it.copy(status = "DONE", result = result) }
+        jOutcome(ctx, jKey(o.id), result, fill)
         logAdd(ctx, logOf(o, true, "bought anyway, at your word", result))
         try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, true, false, "you said buy anyway", result) }
         catch (_: Exception) {}
@@ -354,18 +392,25 @@ object RvManualQueue {
             if (MarketHours.isRegularSession(o.ns, now)) continue
             update(ctx, o.id) { it.copy(status = "CANCELLED", result = "not answered before the close — nothing bought") }
             logAdd(ctx, logOf(o, true, "lapsed", "not answered before the close — nothing bought"))
+            RvJournal.event(ctx, "end", jKey(o.id), mapOf("why" to "lapsed — not answered before the close"))
         }
     }
 
-    /** Exactly what the button would have run. Returns a sentence for the notice. */
-    private fun run(ctx: Context, config: ConfigManager, o: Order): String {
+    /**
+     * Exactly what the button would have run. Returns a sentence for the notice,
+     * and what filled for the record: quantity, price when the route reports one,
+     * order ids when it reports those (the price can be looked up by them later).
+     */
+    private fun run(ctx: Context, config: ConfigManager, o: Order): Pair<String, Map<String, Any?>> {
         val ys = o.yahooSymbol.ifBlank {
             com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(o.symbol, o.space)
         }
         return when (o.kind) {
             Kind.T212_SELL -> {
                 val r = PatientExecutor.sell(config, o.ticker, ys, o.space, o.qty, o.refPrice)
-                if (r.error != null) "nothing sold: ${r.error}" else {
+                val fill = mapOf("qty" to r.filled, "orderIds" to r.orderIds.takeIf { it.isNotEmpty() },
+                    "ladderFrom" to r.refPrice.takeIf { it > 0.0 })
+                (if (r.error != null) "nothing sold: ${r.error}" else {
                     val handled = if (r.filled > 0.0) try {
                         T212HandSales.afterAppSale(ctx, r.ticker, r.orderIds, r.refPrice)
                     } catch (e: Exception) { "" } else ""
@@ -373,27 +418,32 @@ object RvManualQueue {
                         (if (r.remaining > 0.0) ", ${"%.4f".format(r.remaining)} left unsold" else "")
                      else "nothing sold: ${r.note.ifBlank { "the ladder found no buyer" }}") +
                         (if (handled.isNotBlank()) ". $handled" else "")
-                }
+                }) to fill
             }
             Kind.T212_BUY -> {
                 val r = PatientExecutor.buy(config, o.symbol, ys, o.space, o.cash, o.refPrice)
-                if (r.error != null) "nothing bought: ${r.error}"
-                else if (r.filled > 0.0) "bought ${"%.4f".format(r.filled)}"
-                else "nothing bought: ${r.note.ifBlank { "the ladder filled nothing" }}"
+                val fill = mapOf("qty" to r.filled, "orderIds" to r.orderIds.takeIf { it.isNotEmpty() },
+                    "ladderFrom" to r.refPrice.takeIf { it > 0.0 })
+                (if (r.error != null) "nothing bought: ${r.error}"
+                 else if (r.filled > 0.0) "bought ${"%.4f".format(r.filled)}"
+                 else "nothing bought: ${r.note.ifBlank { "the ladder filled nothing" }}") to fill
             }
             Kind.DETAIL_BUY, Kind.WATCH_BUY -> {
                 val r = ManualEntryWatcher.buyAndHandOver(ctx, o.ns, o.symbol, o.cash, null,
                     force = o.kind == Kind.DETAIL_BUY || o.force)
-                if (r.ok && r.filledQty > 0.0) "bought ${"%.4f".format(r.filledQty)} and handed to your watchlist"
-                else "nothing bought: ${r.error.ifBlank { r.note.ifBlank { "the ladder filled nothing" } }}"
+                val fill = mapOf("qty" to r.filledQty, "price" to r.filledPrice.takeIf { it > 0.0 },
+                    "signal" to r.signalPrice.takeIf { it > 0.0 })
+                (if (r.ok && r.filledQty > 0.0) "bought ${"%.4f".format(r.filledQty)} and handed to your watchlist"
+                 else "nothing bought: ${r.error.ifBlank { r.note.ifBlank { "the ladder filled nothing" } }}") to fill
             }
             Kind.ALGO_TP -> {
                 val r = AlgoTakeProfit.takeNow(ctx, o.algoNs, o.symbol)
-                if (!r.ok) "not taken: ${r.error}"
-                else "sold at ${"%.2f".format(r.exitPrice)}, booked to the algo at " +
-                    "${"%+.2f".format(r.pctReturn)}%" + (if (r.note.isNotBlank()) ". ${r.note}" else "")
+                val fill: Map<String, Any?> = if (r.ok && r.real) mapOf("price" to r.exitPrice.takeIf { it > 0.0 }) else emptyMap()
+                (if (!r.ok) "not taken: ${r.error}"
+                 else "sold at ${"%.2f".format(r.exitPrice)}, booked to the algo at " +
+                    "${"%+.2f".format(r.pctReturn)}%" + (if (r.note.isNotBlank()) ". ${r.note}" else "")) to fill
             }
-            else -> "unknown order kind ${o.kind}"
+            else -> "unknown order kind ${o.kind}" to emptyMap()
         }
     }
 }

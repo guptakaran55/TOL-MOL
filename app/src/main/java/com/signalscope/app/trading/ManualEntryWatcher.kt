@@ -2386,6 +2386,11 @@ object ManualEntryWatcher {
                         RvGate.check(com.signalscope.app.data.ConfigManager(ctx), lr.t212Ticker, sym, ns,
                             RvGate.Side.SELL, since)
                     } catch (ex: Exception) { RvGate.Decision(true, "gate failed: ${ex.message}") to null }
+                    RvJournal.look(ctx, RvJournal.algoKey(ns, lr.paperTradeId, RvGate.Side.SELL),
+                        RvJournal.base("watch", RvGate.Side.SELL, ns, sym, lr.t212Ticker,
+                            mapOf("qty" to lr.qty, "entry" to lr.liveEntryPrice.takeIf { it > 0.0 },
+                                "reason" to v.reason)),
+                        firstLook = lr.rvSince == 0L, since = since, d = gate, rd = rd)
                     if (!gate.go) {
                         com.signalscope.app.data.T212LiveStore.upsert(ctx, lr.copy(rvSince = since,
                             rvNote = RvGate.snapshot(rd, gate),

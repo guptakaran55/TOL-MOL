@@ -490,6 +490,12 @@ object T212LiveMirror {
                         val (gate, rd) = try {
                             RvGate.check(config, ticker, head.sym, head.ns, RvGate.Side.BUY, 0L)
                         } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                        group.forEach { g ->
+                            RvJournal.look(ctx, RvJournal.algoKey(g.ns, g.paperTradeId, RvGate.Side.BUY),
+                                RvJournal.base("algo", RvGate.Side.BUY, g.ns, g.sym, ticker,
+                                    mapOf("amount" to g.amount, "signal" to g.price)),
+                                firstLook = true, since = 0L, d = gate, rd = rd)
+                        }
                         if (!gate.go) {
                             val now = System.currentTimeMillis()
                             group.forEach { g ->
@@ -782,6 +788,10 @@ object T212LiveMirror {
             val (gate, rd) = try {
                 RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.SELL, since, belowStop)
             } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+            RvJournal.look(ctx, RvJournal.algoKey(row.ns, row.paperTradeId, RvGate.Side.SELL),
+                RvJournal.base(srcOf(row.ns), RvGate.Side.SELL, row.ns, row.symbol, row.t212Ticker,
+                    mapOf("qty" to row.qty, "entry" to row.liveEntryPrice.takeIf { it > 0.0 })),
+                firstLook = row.rvSince == 0L, since = since, d = gate, rd = rd)
             if (!gate.go) {
                 val note = "holding the sale: ${RvGate.NOTE} — ${gate.why}; sells by itself within 2 hours"
                 T212LiveStore.upsert(ctx, row.copy(error = note, rvSince = since,
@@ -1639,6 +1649,10 @@ object T212LiveMirror {
                 val (gate, rd) = try {
                     RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.BUY, since, memory = mem)
                 } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                RvJournal.look(ctx, RvJournal.algoKey(row.ns, row.paperTradeId, RvGate.Side.BUY),
+                    RvJournal.base(srcOf(row.ns), RvGate.Side.BUY, row.ns, row.symbol, row.t212Ticker,
+                        mapOf("amount" to row.amount, "signal" to row.paperEntryPrice)),
+                    firstLook = row.rvSince == 0L, since = since, d = gate, rd = rd)
                 if (!gate.go) {
                     T212LiveStore.upsert(ctx, row.copy(
                         status = "RETRY", parkedForOpen = false, rvSince = since,
@@ -1827,6 +1841,10 @@ object T212LiveMirror {
                                  paperTradeId: String): Boolean =
         trades.any { it.id == paperTradeId && it.status == "OPEN" }
 
+    /** For the RV gate's record: the watchlist's own orders, or an algo's. */
+    private fun srcOf(ns: String): String =
+        if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) "watch" else "algo"
+
     internal fun entryCeiling(signalPrice: Double, stopPct: Double,
                               stopEnabled: Boolean, atr: Double): Double {
         if (signalPrice <= 0.0) return 0.0
@@ -1987,6 +2005,11 @@ object T212LiveMirror {
                     val (gate, rd) = try {
                         RvGate.check(config, live.t212Ticker, live.symbol, ns, RvGate.Side.SELL, 0L)
                     } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                    RvJournal.look(ctx, RvJournal.algoKey(ns, paperTradeId, RvGate.Side.SELL),
+                        RvJournal.base(srcOf(ns), RvGate.Side.SELL, ns, live.symbol, live.t212Ticker,
+                            mapOf("qty" to sellQty, "entry" to live.liveEntryPrice.takeIf { it > 0.0 },
+                                "reason" to trade.exitReason)),
+                        firstLook = true, since = 0L, d = gate, rd = rd)
                     if (!gate.go) {
                         val now = System.currentTimeMillis()
                         T212LiveStore.get(ctx, paperTradeId, ns)?.let { row ->
