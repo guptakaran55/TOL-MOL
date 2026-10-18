@@ -903,6 +903,10 @@ function openPendingOrders(keepTab){
         }
       }else if(p.status==='RVMANUAL'&&p.rvManualId){
         h+='<div onclick="rvManualCancelPrompt(\''+escHtml(p.rvManualId)+'\',\''+escHtml(p.symbol||'')+'\')" style="display:inline-block;margin-top:7px;cursor:pointer;font-size:9px;font-weight:800;color:var(--rd);border:1px solid rgba(220,38,38,.45);border-radius:5px;padding:3px 9px">✕ Call it off</div>';
+      }else if(p.status==='RVASK'&&p.rvManualId){
+        // RAN PAST ITS PRICE LIMIT: your answer, either way.
+        h+='<div onclick="rvBuyAnywayPrompt(\''+escHtml(p.rvManualId)+'\',\''+escHtml(p.symbol||'')+'\')" style="display:inline-block;margin-top:7px;cursor:pointer;font-size:9px;font-weight:800;color:var(--gn);border:1px solid rgba(22,163,74,.5);border-radius:5px;padding:3px 9px">✓ Buy anyway</div>'+
+           '<div onclick="rvManualCancelPrompt(\''+escHtml(p.rvManualId)+'\',\''+escHtml(p.symbol||'')+'\')" style="display:inline-block;margin:7px 0 0 6px;cursor:pointer;font-size:9px;font-weight:800;color:var(--rd);border:1px solid rgba(220,38,38,.45);border-radius:5px;padding:3px 9px">✕ Call it off</div>';
       }else if(p.status==='BROKER'&&!p.brokerOrderId){
         h+='';
       }else if(p.status==='BROKER'&&p.brokerOrderId){
@@ -913,6 +917,7 @@ function openPendingOrders(keepTab){
       h+='</div>';
     });
   }
+  h+=rvGateLogHtml(PENDING_TAB==='SELL'?'SELL':'BUY');
   // ── WHAT IT DECLINED ──────────────────────────────────────────────────────
   // A refusal is a decision made about your money without asking, and until now
   // it lived only in a log line. It belongs beside what is still waiting: the
@@ -1006,6 +1011,38 @@ window.onRequeueEntry=function(json){
   render();
 };
 function closePendingOrders(){var o=document.getElementById('pending-sheet');if(o&&o.parentNode)o.parentNode.removeChild(o)}
+// ── THE RV GATE'S DECISIONS ON YOUR BUTTON ORDERS (last three days) ──────────
+// Every one: started at once, held, released, called off — and orders placed
+// with the box unticked, with what the gate would have said. Where the price
+// sat in today's range and which way it was moving, as the gate saw it.
+function rvGateLogHtml(side){
+  if(!(SPACE==='DE'||SPACE==='US')||typeof Android==='undefined'||!Android.rvGateLog)return '';
+  var rows=[];try{rows=(JSON.parse(Android.rvGateLog(SPACE)||'{}').rows)||[]}catch(e){}
+  rows=rows.filter(function(r){return side==='SELL'?!r.buy:!!r.buy});
+  if(!rows.length)return '';
+  var today=new Date().toDateString();
+  var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:12px 14px 4px;letter-spacing:.03em">RV GATE — YOUR ORDERS, LAST 3 DAYS</div>';
+  rows.slice(0,30).forEach(function(r){
+    var d=new Date(r.at), when=(d.toDateString()===today?'':d.toLocaleDateString([], {weekday:'short'})+' ')+
+      d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+    var n={};try{n=JSON.parse(r.rvNote||'{}')}catch(e){}
+    var where=[];
+    if(n.pos!=null&&isFinite(n.pos))where.push(Number(n.pos)<0?'range too narrow':Math.round(Number(n.pos)*100)+'% up today’s range');
+    if(n.dir&&n.dir!=='unknown')where.push(n.dir);
+    var wouldHold=!r.asked&&/would have held/.test(String(r.why||''));
+    var col=wouldHold?'var(--rd)':!r.asked?'var(--t3)':/^held/.test(r.outcome||'')?'var(--am)':/called off/.test(r.outcome||'')?'var(--t3)':'var(--gn)';
+    h+='<div style="margin:0 12px 6px;border:1px solid var(--bd);border-left:3px solid '+col+';border-radius:8px;background:var(--cd);padding:7px 10px">'+
+      '<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
+        '<span style="font-weight:800;font-size:12px;color:var(--t1)">'+escHtml(r.symbol||'')+'</span>'+
+        '<span style="font-size:9px;font-weight:800;color:'+col+'">'+escHtml(r.outcome||'')+'</span>'+
+        '<span style="flex:1"></span>'+
+        '<span style="font-size:9px;color:var(--t3);font-family:monospace">'+escHtml(when)+'</span></div>'+
+      (where.length?'<div style="font-size:10px;color:var(--t2);margin-top:3px">'+escHtml(where.join(' · '))+'</div>':'')+
+      (r.why?'<div style="font-size:9px;color:var(--t3);margin-top:2px;line-height:1.45">'+escHtml(r.why)+'</div>':'')+
+      '</div>';
+  });
+  return h;
+}
 function agoText(ms){
   var s=Math.max(0,Math.floor((Date.now()-Number(ms))/1000));
   if(s<3600)return Math.floor(s/60)+'m';
@@ -1063,26 +1100,39 @@ function openWaitingBuysIn(sp){
 // ── THE RV GATE CHECKBOX, beside every patient buy and sale (Germany, US) ────
 // Ticked: the order waits until the price is near the right end of today's range
 // or moving your way — two trading hours at most, then it runs anyway and tells
-// you. Unticked: it starts at once, as before. The choice is remembered.
-function rvGateBox(id){
-  if(!(SPACE==='DE'||SPACE==='US'))return '';
-  var on=false;try{on=localStorage.getItem('rvgate_manual')==='1'}catch(e){}
+// you. Unticked: it starts at once, as before. The choice is remembered — except
+// where [alwaysOn] is set (the watchlist's Buy), which opens ticked every time
+// and leaves the remembered choice alone, so unticking it is one order's decision.
+function rvGateBox(id,alwaysOn,sp){
+  sp=String(sp||SPACE).toUpperCase();
+  if(!(sp==='DE'||sp==='US'))return '';
+  var on=!!alwaysOn;if(!on){try{on=localStorage.getItem('rvgate_manual')==='1'}catch(e){}}
   return '<div style="margin-top:10px;padding:8px;border:1px solid rgba(37,99,235,.4);border-radius:6px;background:rgba(37,99,235,.06)">'+
     '<label style="display:flex;gap:7px;align-items:flex-start;cursor:pointer">'+
     '<input id="'+id+'" type="checkbox" '+(on?'checked':'')+' style="margin-top:2px"/>'+
     '<span style="font-size:10px;line-height:1.5;color:var(--t2)"><b style="color:var(--bl)">Wait for the RV gate</b><br/>'+
-    'Buys only in the bottom 40% of today’s range or on a rising price; sells only in the top 40% or on a falling price. '+
-    'Otherwise it waits — at most 2 trading hours, then it starts anyway and notifies you.</span></label></div>';
+    'Buys in the bottom 40% of today’s range, on a rising price (except near today’s high), or after a dip and a turn up; sells in the top 40% or on a falling price. '+
+    'Otherwise it waits — at most 2 trading hours, then it starts anyway and notifies you.'+
+    (alwaysOn?'<br/><span style="color:var(--t3)">Ticked every time here — untick to start this order at once.</span>':'')+
+    '</span></label></div>';
 }
-function rvGateChecked(id){
+function rvGateChecked(id,dontRemember){
   var el=document.getElementById(id), on=!!(el&&el.checked);
-  try{localStorage.setItem('rvgate_manual',on?'1':'0')}catch(e){}
+  if(!dontRemember){try{localStorage.setItem('rvgate_manual',on?'1':'0')}catch(e){}}
   return on;
 }
 // Run [now] straight away, or hand the order to the RV gate. [now] receives the
 // gate's reason when the gate says "go".
 function rvGateOrRun(on,kind,args,sym,now){
-  if(!on){now('');return}
+  if(!on){
+    // UNTICKED STILL LEAVES A RECORD: where the price sat and what the gate would
+    // have said, written in the background. The order itself starts at once.
+    var sp=String((args&&args.space)||'').toUpperCase();
+    if((sp==='DE'||sp==='US')&&typeof Android!=='undefined'&&Android.rvGateNotAsked){
+      try{Android.rvGateNotAsked(kind,JSON.stringify(args))}catch(e){}
+    }
+    now('');return;
+  }
   if(typeof Android==='undefined'||!Android.callAsync){uiAlert('Unavailable','Rebuild the APK for this.');return}
   refBusy(true,'Asking the RV gate about '+sym+'…');
   androidAsync('rvGateOrder',[kind,JSON.stringify(args)],function(raw){
@@ -1095,11 +1145,24 @@ function rvGateOrRun(on,kind,args,sym,now){
       '<div style="font-size:11px;line-height:1.6;color:var(--t2)">Not now: <b>'+escHtml(r.why||'')+'</b>.<br/><br/>'+
       'It is checked every minute and starts on its own when the moment comes'+
       (by>0?(' — by <b>'+new Date(by).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+'</b> at the latest'):' — two trading hours after the open at the latest')+
-      '. A notification tells you when it runs and how it went.<br/><br/>'+
+      '. A notification tells you when it runs and how it went.'+
+      (/[Bb]uy/.test(kind)?' If the price runs more than half a day’s move above today’s meanwhile, it asks you before buying.':'')+'<br/><br/>'+
       '<span style="color:var(--t3)">Changed your mind? Call it off in <b>Waiting orders</b> (the flag menu).</span></div>');
     renderKeepScroll();
   });
 }
+function rvBuyAnywayPrompt(id,sym){
+  if(typeof Android==='undefined'||!Android.rvManualBuyAnyway){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  uiConfirm('Buy '+escHtml(sym)+' anyway?',
+    '<div style="font-size:11px;line-height:1.55">It ran more than half a day’s move above where you asked. This buys it now, at today’s price, through the patient ladder — no more waiting.</div>',
+    function(ok){ if(!ok)return;
+      try{Android.rvManualBuyAnyway(id);closePendingOrders();
+        uiAlert('⏳ Buying '+escHtml(sym),'Working it up the ladder. A notification reports the fill.')}catch(e){uiAlert('Error',e.message)} });
+}
+window.onRvBuyAnyway=function(json){
+  var r={};try{r=JSON.parse(json||'{}')}catch(e){}
+  if(r.note&&/no longer waiting|closed/i.test(r.note))uiAlert('Not bought',escHtml(r.note));
+};
 function rvManualCancelPrompt(id,sym){
   uiConfirm('Call off your waiting order for '+escHtml(sym)+'?',
     '<div style="font-size:11px;line-height:1.55">It has not been placed yet — it was waiting for the RV gate. Nothing is cancelled at the broker.</div>',
@@ -10758,7 +10821,7 @@ function manualBuyPrompt(sym,rank,px,pxLive,pxAt){
     '<span style="font-size:10px;line-height:1.5;color:var(--t2)"><b style="color:var(--pu)">Buy even with no entry signal</b><br/>'+
     'For when you are bullish and the strategy is not. You keep every exit rule and the hard stop, both measured from what you actually pay. '+
     'What you give up is the entry timing, which is the half with the evidence behind it.</span></label></div>'+
-    (isIN?'':rvGateBox('rv-manual-buy')),
+    (isIN?'':rvGateBox('rv-manual-buy',true)),
     function(ok){
       if(!ok)return;
       var el=document.getElementById('manual-buy-amt');
@@ -10766,8 +10829,9 @@ function manualBuyPrompt(sym,rank,px,pxLive,pxAt){
       if(!(amt>0)){uiAlert('No amount','Enter an amount greater than 0 to place the order.');return}
       var fEl=document.getElementById('manual-buy-force');
       var force=!!(fEl&&fEl.checked);
-      var rv=!isIN&&rvGateChecked('rv-manual-buy');
+      var rv=!isIN&&rvGateChecked('rv-manual-buy',true);
       rvGateOrRun(rv,'watchBuy',{space:SPACE,symbol:sym,cash:amt,force:force},sym,function(note){
+        if(note)uiAlert('⏳ Patient buy started','RV gate: '+escHtml(note)+'.<br/>Working '+escHtml(sym)+' up the ladder. You can leave this screen — a notification reports the fill.');
         try{
           if(force&&Android.manualBuyForce)Android.manualBuyForce(SPACE,sym,amt,true);
           else Android.manualBuy(SPACE,sym,amt);
@@ -15149,10 +15213,14 @@ function t212PatientSellClick(space){
     uiConfirm('⏳ Patient sell '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
       qty+' shares<br/>Starts ≈ '+cur+startApx.toFixed(2)+' (above), floor ≈ '+cur+floorApx.toFixed(2)+' — steps DOWN every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
       '<span style="color:var(--am);font-size:10px">Holds out for a better price, re-reading the LIVE price at every step — only the floor is locked at start. If nothing fills by the floor it cancels and notifies. Nothing is left resting; never a market order.</span><br/>'+
-      '<span style="color:var(--t3);font-size:10px">Quantity is re-checked from your live position after every step, so a fill mid-way can never double-sell.</span></div>',function(ok){
+      '<span style="color:var(--t3);font-size:10px">Quantity is re-checked from your live position after every step, so a fill mid-way can never double-sell.</span></div>'+
+      rvGateBox('rv-panel-sell',false,space),function(ok){
       if(!ok)return;
-      uiAlert('⏳ Patient sell started','Working '+escHtml(sym)+' down the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
-      try{Android.t212PatientSell(pos.ticker,yv,space,qty,ref)}catch(e){uiAlert('Error',e.message)}
+      var rv=rvGateChecked('rv-panel-sell');
+      rvGateOrRun(rv,'t212Sell',{space:space,symbol:sym,ticker:pos.ticker,yahooSymbol:yv,qty:qty,refPrice:ref},sym,function(note){
+        uiAlert('⏳ Patient sell started',(note?'RV gate: '+escHtml(note)+'.<br/>':'')+'Working '+escHtml(sym)+' down the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
+        try{Android.t212PatientSell(pos.ticker,yv,space,qty,ref)}catch(e){uiAlert('Error',e.message)}
+      });
     });
   });
 }
@@ -15172,10 +15240,14 @@ function t212PatientBuyClick(space){
     uiConfirm('⏳ Patient buy '+sym,'<div style="font-family:monospace;font-size:11px;line-height:1.7">'+
       '~'+cur+amt.toFixed(2)+'<br/>Starts ≈ '+cur+ref.toFixed(2)+' (at the price), pays up to ≈ '+cur+capApx.toFixed(2)+' max — steps UP every 40s.<br/>'+t212RefLine(cur,info)+'<br/><span style="font-size:9px;color:var(--t3)">≈ uses a rough ATR; the exact start price appears in the live banner when it begins.</span><br/>'+
       '<span style="color:var(--am);font-size:10px">Tries to buy cheap first; only pays up if it must — re-reading the LIVE price at every step, so a moving market can’t strand it. Only the cap is locked at start; it is never exceeded, never a market order. If the market runs past the cap it cancels and notifies.</span><br/>'+
-      '<span style="color:var(--t3);font-size:10px">Amount already bought is re-checked from your live position after every step, so a fill mid-way can never double-buy.</span></div>',function(ok){
+      '<span style="color:var(--t3);font-size:10px">Amount already bought is re-checked from your live position after every step, so a fill mid-way can never double-buy.</span></div>'+
+      rvGateBox('rv-panel-buy',true,space),function(ok){
       if(!ok)return;
-      uiAlert('⏳ Patient buy started','Working '+escHtml(sym)+' up the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
-      try{Android.t212PatientBuy(sym,yv,space,amt,ref)}catch(e){uiAlert('Error',e.message)}
+      var rv=rvGateChecked('rv-panel-buy',true);
+      rvGateOrRun(rv,'t212Buy',{space:space,symbol:sym,yahooSymbol:yv,cash:amt,refPrice:ref},sym,function(note){
+        uiAlert('⏳ Patient buy started',(note?'RV gate: '+escHtml(note)+'.<br/>':'')+'Working '+escHtml(sym)+' up the ATR ladder (40s per step). You can leave this screen — a notification will tell you when it fills or gives up.');
+        try{Android.t212PatientBuy(sym,yv,space,amt,ref)}catch(e){uiAlert('Error',e.message)}
+      });
     });
   });
 }
@@ -17336,10 +17408,10 @@ function detailBuy(sym,px){
       (managed
         ? '<div style="font-size:11px;line-height:1.55;margin-top:8px">Once bought it is <b>handed to your '+market+' watchlist</b>: its exit rules and trailing stop manage the sale, and a target set from its week and month ranges goes in at Trading 212.</div>'
         : '<div style="font-size:11px;line-height:1.55;margin-top:8px;color:var(--am)"><b>Nothing will manage this position.</b> The '+market+' watchlist has no strategy attached, so there is no exit rule, trailing stop or target for it to hand over to. Attach one in the Watchlist tab first if you want that.</div>')+
-      rvGateBox('rv-detail-buy'),
+      rvGateBox('rv-detail-buy',true),
       function(ok){
         if(!ok)return;
-        var rv=rvGateChecked('rv-detail-buy');
+        var rv=rvGateChecked('rv-detail-buy',true);
         var go=function(note){
           uiAlert('⏳ Patient buy started',(note?'RV gate: '+escHtml(note)+'.<br/>':'')+'Working '+escHtml(sym)+' up the ladder. You can leave this screen — a notification reports the fill.');
           try{

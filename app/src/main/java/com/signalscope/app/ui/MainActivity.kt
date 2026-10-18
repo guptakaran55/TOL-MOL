@@ -5482,9 +5482,15 @@ class MainActivity : AppCompatActivity() {
                     val pos = n.optDouble("pos", -1.0)
                     val where = if (pos >= 0.0) " (${Math.round(pos * 100)}% up)" else " (range still too narrow)"
                     val dir = n.optString("dir")
+                    val top = pos >= 1.0 - com.signalscope.app.trading.RvGate.TOP_ZONE
+                    val peak = n.optDouble("peak", 0.0); val trough = n.optDouble("trough", 0.0)
                     return if (buy) listOf(
                         cond(pos in 0.0..com.signalscope.app.trading.RvGate.EDGE, "Low in today's range$where"),
-                        cond(dir == "rising", "Price rising", either = true))
+                        cond(dir == "rising" && !top,
+                            if (top) "Price rising — not counted near today's high" else "Price rising", either = true),
+                        cond(false, if (trough > 0.0) "Dipped to ${px(trough)} — waiting for the turn up"
+                                    else if (peak > 0.0) "A dip under ${px(peak)}, then a turn up"
+                                    else "A dip, then a turn up", either = true))
                     else listOf(
                         cond(pos >= 1.0 - com.signalscope.app.trading.RvGate.EDGE, "High in today's range$where"),
                         cond(dir == "falling", "Price falling", either = true))
@@ -5658,7 +5664,23 @@ class MainActivity : AppCompatActivity() {
                                 "It starts by itself — at the latest two trading hours after you asked.",
                             "tries" to 0, "dueAt" to com.signalscope.app.trading.RvManualQueue.startsBy(o),
                             "since" to o.createdAt, "signalPrice" to o.refPrice, "amount" to o.cash,
+                            "ceiling" to (if (!o.isSell && o.capLimit > 0.0) o.capLimit else 0.0),
                             "cancellable" to false, "sortKey" to 0))
+                    }
+                    // …and those that ran past their price limit and are asking you.
+                    com.signalscope.app.trading.RvManualQueue.askingFor(applicationContext, base).forEach { o ->
+                        out.add(mapOf(
+                            "id" to o.id, "ns" to o.algoNs, "symbol" to o.symbol,
+                            "kind" to "your buy — waiting for your answer",
+                            "status" to "RVASK", "rvManualId" to o.id, "side" to "BUY",
+                            "from" to (if (o.kind == com.signalscope.app.trading.RvManualQueue.Kind.WATCH_BUY)
+                                "You · watchlist Buy" else "You · stock page"),
+                            "conds" to listOf(cond(false, "Price at or under your limit ${px(o.capLimit)} " +
+                                "(you asked at ${px(o.capRef)})")),
+                            "why" to "Nothing bought: ${o.why}. Buy anyway, or call it off. " +
+                                "Unanswered, it lapses at the close.",
+                            "tries" to 0, "dueAt" to 0L, "since" to o.askedAt, "amount" to o.cash,
+                            "cancellable" to false, "sortKey" to -1))
                     }
                 }
 
@@ -6712,18 +6734,54 @@ class MainActivity : AppCompatActivity() {
 
         /** A patient order with "Wait for the RV gate" ticked — see [RvManualQueue.submit]. */
         fun rvGateOrderJson(kind: String, argsJson: String): String = try {
-            val a = com.google.gson.JsonParser.parseString(argsJson).asJsonObject
-            fun s(k: String) = a.get(k)?.takeIf { !it.isJsonNull }?.asString.orEmpty()
-            fun d(k: String) = try { a.get(k)?.asDouble ?: 0.0 } catch (_: Exception) { 0.0 }
-            val space = s("space").uppercase().let { if (it == "DE") "DE" else "US" }
-            val o = com.signalscope.app.trading.RvManualQueue.Order(
-                id = "", kind = kind, space = space, symbol = s("symbol").uppercase().removeSuffix(".DE"),
-                ticker = s("ticker"), yahooSymbol = s("yahooSymbol"), qty = d("qty"), cash = d("cash"),
-                refPrice = d("refPrice"), force = (a.get("force")?.asBoolean ?: false), algoNs = s("algoNs"))
+            val o = rvOrderOf(kind, argsJson)
             val (queued, why, by) = com.signalscope.app.trading.RvManualQueue.submit(applicationContext, o)
             gson.toJson(mapOf("ok" to true, "queued" to queued, "why" to why, "startsBy" to by))
         } catch (e: Exception) {
             gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "the RV gate could not be asked")))
+        }
+
+        private fun rvOrderOf(kind: String, argsJson: String): com.signalscope.app.trading.RvManualQueue.Order {
+            val a = com.google.gson.JsonParser.parseString(argsJson).asJsonObject
+            fun s(k: String) = a.get(k)?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+            fun d(k: String) = try { a.get(k)?.asDouble ?: 0.0 } catch (_: Exception) { 0.0 }
+            val space = s("space").uppercase().let { if (it == "DE") "DE" else "US" }
+            return com.signalscope.app.trading.RvManualQueue.Order(
+                id = "", kind = kind, space = space, symbol = s("symbol").uppercase().removeSuffix(".DE"),
+                ticker = s("ticker"), yahooSymbol = s("yahooSymbol"), qty = d("qty"), cash = d("cash"),
+                refPrice = d("refPrice"), force = (a.get("force")?.asBoolean ?: false), algoNs = s("algoNs"))
+        }
+
+        /**
+         * A button order placed with the RV gate box UNticked. It has already run;
+         * this only records where the price sat and what the gate would have said,
+         * for the decisions list. Network, on its own thread; never in the way.
+         */
+        @JavascriptInterface
+        fun rvGateNotAsked(kind: String, argsJson: String) {
+            thread(isDaemon = true, name = "rv-not-asked") {
+                try { com.signalscope.app.trading.RvManualQueue.notAsked(applicationContext, rvOrderOf(kind, argsJson)) }
+                catch (e: Exception) { Log.w("MainActivity", "rv not-asked record failed: ${e.message}") }
+            }
+        }
+
+        /** The RV gate's decisions on your button orders in [space], last three days. No network. */
+        @JavascriptInterface
+        fun rvGateLog(space: String): String = try {
+            val since = System.currentTimeMillis() - 3 * 24 * 3_600_000L
+            gson.toJson(mapOf("ok" to true,
+                "rows" to com.signalscope.app.trading.RvManualQueue.history(applicationContext, space, since)))
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
+
+        /** You said buy anyway to a waiting buy that stopped at its price limit. The
+         *  ladder runs in the background; the result arrives as a notification. */
+        @JavascriptInterface
+        fun rvManualBuyAnyway(id: String) {
+            thread(isDaemon = true, name = "rv-buy-anyway") {
+                val msg = try { com.signalscope.app.trading.RvManualQueue.buyAnyway(applicationContext, id) }
+                          catch (e: Exception) { "failed: ${e.message}" }
+                deliverAiCallback("window.onRvBuyAnyway", gson.toJson(mapOf("note" to msg)))
+            }
         }
 
         /** Call off one of your orders waiting on the RV gate. */

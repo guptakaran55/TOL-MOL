@@ -66,6 +66,11 @@ object T212LiveStore {
          *  range, which way it was moving — as a small JSON note for the waiting-
          *  orders list. See [com.signalscope.app.trading.RvGate.snapshot]. */
         val rvNote: String? = null,
+        /** A waiting buy's memory for the RV gate's dip-and-turn — the highest price
+         *  since it began waiting, and the dip's low (0 = none yet). Read only while
+         *  [rvSince] is set. See [com.signalscope.app.trading.RvGate.Memory]. */
+        val rvPeak: Double = 0.0,
+        val rvTrough: Double = 0.0,
         // ── EVERY RUNG, not just the first ────────────────────────────────────
         // The patient ladder places up to six orders per leg (marketable limit,
         // then cancel-replace-chase at widening concessions). A single Long can

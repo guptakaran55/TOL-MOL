@@ -21,6 +21,15 @@ import com.signalscope.app.network.YahooFinanceClient
  *   BUY  — start now if the price is in the BOTTOM 40% of today's range, or if
  *          it is RISING (waiting would only cost more). Otherwise — high in the
  *          range and drifting down — wait for it to come down.
+ *          EXCEPT NEAR THE TOP: in the top fifth of today's range a rising price
+ *          is a chase, so there it waits for a DIP AND A TURN instead — the price
+ *          falling a fifth of a day's move under the highest it has been since the
+ *          order began waiting, then coming back up a tenth of one. Measured from
+ *          the order's own high, not the day's range, so a dip that never reaches
+ *          the bottom 40% still counts. A dip and turn starts a buy anywhere in
+ *          the range. (Replayed over 294 real buy decisions, 18 Oct: in the top
+ *          fifth it bought 0.04% cheaper on average than "rising" did — small,
+ *          and most of those orders ran to the two-hour limit.)
  *
  * It only ever waits when time is on your side, and never longer than
  * [MAX_WAIT_MS]: after two hours the order starts anyway, with a notification.
@@ -37,8 +46,9 @@ import com.signalscope.app.network.YahooFinanceClient
  *    prices to judge by once the session has settled, means go now.
  *
  * Applies to the algos' automatic buys and sales and the watchlist's automatic
- * strategy exits on Trading 212. Buttons you press start at once. India is not
- * gated: its exits rest at Zerodha as triggers.
+ * strategy exits on Trading 212, and to your own patient orders when their box
+ * is ticked (it opens ticked on every buy). India is not gated: its exits rest
+ * at Zerodha as triggers.
  */
 object RvGate {
     private const val TAG = "RvGate"
@@ -54,10 +64,37 @@ object RvGate {
     const val OPENING_GRACE_MIN = 20L
     /** How often a waiting order is looked at again. */
     const val TICK_MS = 60_000L
+    /** The top of today's range where a rising price no longer starts a buy. */
+    const val TOP_ZONE = 0.20
+    /** A dip: this many ATRs under the highest price since the order began waiting. */
+    const val DIP_ATR = 0.20
+    /** A turn: back up this many ATRs off the dip's low. */
+    const val TURN_ATR = 0.10
 
     enum class Side { BUY, SELL }
 
-    data class Decision(val go: Boolean, val why: String, val timedOut: Boolean = false)
+    /**
+     * What a waiting buy remembers between looks: the highest price since it
+     * began waiting, and — once the price has fallen [DIP_ATR] under that — the
+     * dip's lowest point. 0 = not yet. A new high clears the dip.
+     */
+    data class Memory(val peak: Double = 0.0, val trough: Double = 0.0)
+
+    /** [m] brought up to date with the latest [price]. */
+    fun remember(m: Memory?, price: Double, atr: Double): Memory {
+        if (!(price > 0.0)) return m ?: Memory()
+        val unit = if (atr > 0.0) atr else price * 0.02
+        var peak = m?.peak ?: 0.0
+        var trough = m?.trough ?: 0.0
+        if (peak <= 0.0 || price > peak) { peak = price; trough = 0.0 }
+        if (peak - price >= DIP_ATR * unit) trough = if (trough > 0.0) minOf(trough, price) else price
+        else if (trough > 0.0) trough = minOf(trough, price)
+        return Memory(peak, trough)
+    }
+
+    /** [memory] is the buy's memory after this look — kept on the waiting order. */
+    data class Decision(val go: Boolean, val why: String, val timedOut: Boolean = false,
+                        val memory: Memory? = null)
 
     /**
      * The rule itself, with no I/O.
@@ -71,10 +108,11 @@ object RvGate {
      * @param waitedMs  how long this order has already been held back
      * @param minutesSinceOpen minutes since today's regular session opened
      * @param belowStop for a sale: the price is at or under the position's stop
+     * @param memory    for a buy: its memory, already brought up to date with [price]
      */
     fun decide(side: Side, price: Double?, high: Double, low: Double, atr: Double,
                velocity: Double?, waitedMs: Long, minutesSinceOpen: Long,
-               belowStop: Boolean = false): Decision {
+               belowStop: Boolean = false, memory: Memory? = null): Decision {
         if (side == Side.SELL && belowStop) return Decision(true, "under its stop — stop sales never wait")
         if (price == null || !(price > 0.0)) return Decision(true, "no live price — not held back blind")
         if (waitedMs >= MAX_WAIT_MS) return Decision(true, "held back 2 hours — starting anyway", timedOut = true)
@@ -83,13 +121,19 @@ object RvGate {
         val lo = if (low > 0.0) minOf(low, price) else price
         val range = hi - lo
         val rangeMeans = range > 0.0 && (atr <= 0.0 || range >= RANGE_MIN_ATR * atr)
+        val pos = if (rangeMeans) (price - lo) / range else -1.0
         if (rangeMeans) {
-            val pos = (price - lo) / range
             if (side == Side.SELL && pos >= 1.0 - EDGE)
                 return Decision(true, "in the top 40% of today's range")
             if (side == Side.BUY && pos <= EDGE)
                 return Decision(true, "in the bottom 40% of today's range")
         }
+        // THE DIP AND THE TURN, from the order's own high — anywhere in the range.
+        val unit = if (atr > 0.0) atr else price * 0.02
+        if (side == Side.BUY && memory != null && memory.trough > 0.0 &&
+            price - memory.trough >= TURN_ATR * unit)
+            return Decision(true, "dipped %.2f under its high since it began waiting, and turned up"
+                .format(memory.peak - memory.trough))
 
         if (velocity == null) {
             return if (minutesSinceOpen < OPENING_GRACE_MIN)
@@ -106,6 +150,9 @@ object RvGate {
                 else -> Decision(false, "$where and flat")
             }
             Side.BUY -> when {
+                // Near the top of the day a rise is a chase: wait for a dip and a turn.
+                velocity > dead && rangeMeans && pos >= 1.0 - TOP_ZONE ->
+                    Decision(false, "near today's high and rising — waiting for a dip and a turn")
                 velocity > dead -> Decision(true, "rising on the 15-minute prices")
                 velocity < -dead -> Decision(false, "$where and drifting down")
                 else -> Decision(false, "$where and flat")
@@ -160,7 +207,7 @@ object RvGate {
      * wait that ran into the close does not carry the evening into tomorrow.
      */
     fun check(config: ConfigManager, ticker: String, symbol: String, ns: String, side: Side,
-              since: Long, belowStop: Boolean = false): Pair<Decision, Reading?> {
+              since: Long, belowStop: Boolean = false, memory: Memory? = null): Pair<Decision, Reading?> {
         val base = Spaces.baseOf(ns)
         val now = System.currentTimeMillis()
         val waited = if (since > 0L) now - maxOf(since, todayOpenMs(base, now)) else 0L
@@ -168,11 +215,14 @@ object RvGate {
             return Decision(true, "under its stop — stop sales never wait") to null
         val r = try { read(config, ticker, symbol, base) } catch (e: Exception) { null }
             ?: return Decision(true, "prices unreadable — not held back blind") to null
+        // A buy's memory, brought up to date with this look's price.
+        val m = if (side == Side.BUY) r.price?.let { remember(memory, it, r.atr) } else null
         val d = decide(side, r.price, r.high, r.low, r.atr, r.velocity, waited.coerceAtLeast(0L),
-            r.minutesSinceOpen, belowStop)
+            r.minutesSinceOpen, belowStop, m).copy(memory = m)
         Log.i(TAG, "[$ns] $symbol ${side.name} ${if (d.go) "GO" else "WAIT"} — ${d.why} " +
             "(price ${r.price}, range ${r.low}–${r.high}, ATR ${"%.3f".format(r.atr)}, " +
-            "velocity ${r.velocity?.let { "%.3f".format(it) }}, waited ${waited / 60_000}m)")
+            "velocity ${r.velocity?.let { "%.3f".format(it) }}, waited ${waited / 60_000}m" +
+            (m?.let { ", high since waiting ${it.peak}, dip low ${it.trough}" } ?: "") + ")")
         return d to r
     }
 
@@ -201,6 +251,7 @@ object RvGate {
                     else -> "flat"
                 })
         }
+        d.memory?.let { o.put("peak", it.peak).put("trough", it.trough) }
         o.toString()
     } catch (e: Exception) { "" }
 

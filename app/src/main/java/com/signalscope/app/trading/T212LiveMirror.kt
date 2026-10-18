@@ -497,6 +497,7 @@ object T212LiveMirror {
                                     T212LiveStore.upsert(ctx, row.copy(status = "RETRY", qty = 0.0,
                                         retryCount = 0, rvSince = now, parkedForOpen = false,
                                         rvNote = RvGate.snapshot(rd, gate),
+                                        rvPeak = gate.memory?.peak ?: 0.0, rvTrough = gate.memory?.trough ?: 0.0,
                                         error = "${RvGate.NOTE}: waiting — ${gate.why}; starts by itself within 2 hours",
                                         retryAfter = now + RvGate.TICK_MS))
                                 }
@@ -1633,13 +1634,16 @@ object T212LiveMirror {
             var rvTimedOut = false
             if (!bypassTiming) {
                 val since = if (row.rvSince > 0L) row.rvSince else System.currentTimeMillis()
+                // Its memory only counts while it has been waiting on the gate.
+                val mem = if (row.rvSince > 0L && row.rvPeak > 0.0) RvGate.Memory(row.rvPeak, row.rvTrough) else null
                 val (gate, rd) = try {
-                    RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.BUY, since)
+                    RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.BUY, since, memory = mem)
                 } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
                 if (!gate.go) {
                     T212LiveStore.upsert(ctx, row.copy(
                         status = "RETRY", parkedForOpen = false, rvSince = since,
                         rvNote = RvGate.snapshot(rd, gate),
+                        rvPeak = gate.memory?.peak ?: 0.0, rvTrough = gate.memory?.trough ?: 0.0,
                         error = "${RvGate.NOTE}: waiting — ${gate.why}; starts by itself within 2 hours — no attempt spent",
                         retryAfter = System.currentTimeMillis() + RvGate.TICK_MS))
                     Log.i(TAG, "[${row.ns}] ${row.symbol} held by the RV gate: ${gate.why}")

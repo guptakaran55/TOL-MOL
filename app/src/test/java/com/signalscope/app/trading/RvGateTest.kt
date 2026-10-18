@@ -1,6 +1,7 @@
 package com.signalscope.app.trading
 
 import com.signalscope.app.trading.RvGate.Side
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,8 +43,55 @@ class RvGateTest {
         assertTrue(buy(103.0, -0.5).go)            // 30% up the range
     }
 
-    @Test fun `a buy high in the range goes at once when the price is rising`() {
-        assertTrue(buy(108.0, +0.5).go)
+    @Test fun `a buy in the upper middle of the range goes at once when the price is rising`() {
+        assertTrue(buy(106.0, +0.5).go)            // 60% up
+    }
+
+    // ── NEAR THE TOP: A DIP AND A TURN, NOT A CHASE ─────────────────────────
+    // Range 100–110, ATR 4: the top fifth is 108 and up; a dip is 0.8 under the
+    // order's own high, a turn 0.4 back up off the dip's low.
+
+    @Test fun `near today's high a rising price no longer starts a buy`() {
+        val d = buy(108.5, +0.5)
+        assertFalse(d.go)
+        assertTrue(d.why.contains("dip and a turn"))
+    }
+
+    @Test fun `a dip from the order's own high and a turn up starts it, though still high in the range`() {
+        var m = RvGate.remember(null, 109.5, 4.0)          // began waiting at 109.5
+        m = RvGate.remember(m, 108.6, 4.0)                 // 0.9 under: a dip
+        m = RvGate.remember(m, 108.4, 4.0)                 // its low
+        m = RvGate.remember(m, 108.85, 4.0)                // 0.45 back up: the turn
+        assertEquals(108.4, m.trough, 1e-9)
+        val d = RvGate.decide(Side.BUY, 108.85, 110.0, 100.0, 4.0, +0.5, 0L, 60L, memory = m)
+        assertTrue(d.go)
+        assertTrue(d.why.contains("turned up"))
+    }
+
+    @Test fun `a dip too shallow to count leaves it waiting`() {
+        var m = RvGate.remember(null, 109.5, 4.0)
+        m = RvGate.remember(m, 109.0, 4.0)                 // only 0.5 under
+        assertEquals(0.0, m.trough, 1e-9)
+        m = RvGate.remember(m, 109.4, 4.0)
+        assertFalse(RvGate.decide(Side.BUY, 109.4, 110.0, 100.0, 4.0, +0.5, 0L, 60L, memory = m).go)
+    }
+
+    @Test fun `a new high clears the dip`() {
+        var m = RvGate.remember(null, 109.0, 4.0)
+        m = RvGate.remember(m, 108.0, 4.0)                 // dipped
+        m = RvGate.remember(m, 109.6, 4.0)                 // and ran to a new high instead
+        assertEquals(109.6, m.peak, 1e-9)
+        assertEquals(0.0, m.trough, 1e-9)
+    }
+
+    @Test fun `with no dip it still buys at the two-hour limit`() {
+        val d = RvGate.decide(Side.BUY, 109.5, 110.0, 100.0, 4.0, +0.5, RvGate.MAX_WAIT_MS, 150L,
+            memory = RvGate.remember(null, 109.5, 4.0))
+        assertTrue(d.go); assertTrue(d.timedOut)
+    }
+
+    @Test fun `sales are unchanged by the dip rule`() {
+        assertTrue(sell(108.5, +0.5).go)                  // top 40%: sells at once
     }
 
     @Test fun `a buy high in the range waits while the price drifts down`() {

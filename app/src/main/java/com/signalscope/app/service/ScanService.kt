@@ -721,6 +721,8 @@ class ScanService : Service() {
         // the broker still holds is real money exposed with nothing managing it.
         // Unconditional — an exit is never withheld for a preference.
         try { com.signalscope.app.trading.RvGate.ensureTick(applicationContext) } catch (_: Exception) {}
+        // Your buys that stopped at their price limit and were not answered by the close.
+        try { com.signalscope.app.trading.RvManualQueue.expireAsks(applicationContext) } catch (_: Exception) {}
         try { com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext) }
         catch (e: Exception) { Log.w(TAG, "exit retry failed: ${e.message}") }
         // ALGO POSITIONS SOLD IN THE BROKER'S OWN APP — gone from the account on two

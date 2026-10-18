@@ -745,6 +745,20 @@ object LabNotifier {
             "rvm-$space-$symbol-${System.currentTimeMillis() / 60000}",
             openSymbol = symbol, openSpace = space.lowercase())
 
+    /**
+     * A buy you asked to wait on the RV gate was ready to go, but the price had
+     * run more than half a day's move above where you pressed the button. Nothing
+     * bought — it asks first, as the algos' price ceiling refuses outright.
+     */
+    fun rvManualAsk(ctx: Context, space: String, symbol: String, pressed: Double, now: Double, limit: Double) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
+            "⏸ $symbol ran up — still want it?",
+            "You asked to buy at ${"%.2f".format(pressed)}; it is now ${"%.2f".format(now)}, above your " +
+                "limit of ${"%.2f".format(limit)} (half a day's move higher). Nothing has been bought. " +
+                "Open Waiting orders to buy anyway or call it off — unanswered, it lapses at the close.",
+            "rva-$space-$symbol-${System.currentTimeMillis() / 60000}",
+            openSymbol = symbol, openSpace = space.lowercase())
+
     fun t212EntryQueued(ctx: Context, ns: String, symbol: String, why: String) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
             "⏳ $symbol — buy queued for retry",
