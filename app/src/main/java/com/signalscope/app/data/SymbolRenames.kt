@@ -61,6 +61,48 @@ object SymbolRenames {
         "DPW" to "DHL"
     )
 
+    /**
+     * A LINE THAT MOVED ON THE PRICE FEED ONLY — the same share, a new feed
+     * symbol, and NOTHING else in the app may follow it.
+     *
+     * Not a rename in the sense of the table above. The company kept its name and
+     * Trading 212 kept its code; only Yahoo started publishing the share under a
+     * new symbol and froze the old one. Everything the app stores — the watchlist
+     * book, the live-order rows, the resting targets keyed "SYMBOL-signalBar", the
+     * strategy ledger, the peak store — carries the old name, and stays correct,
+     * because the old name is still what the broker calls it. So the change is
+     * made in exactly one place, the request that goes out to the feed, and the
+     * table above (which also rewrites the stored book) is left alone on purpose:
+     * putting a line change there would re-key an OPEN position away from every
+     * record that points at it.
+     *
+     * The old line is not simply dropped. Yahoo moved the live prices to the new
+     * symbol but left the daily history behind on the old one — the new line held
+     * five daily bars on its first week — so a chart request asks BOTH and splices
+     * them, the new line winning wherever both have a bar.
+     *
+     *   PFSE → PFS0 : Pfisterer Holding SE, Oct 2026 (Yahoo labels the old line
+     *                 bearer, the new one registered; the ISIN did not change).
+     *                 PFSE.DE froze at 66.60 on 7 Oct; PFS0.DE
+     *                 trades, its 9 Oct close (64.51) is the old line's, and
+     *                 Trading 212's own instrument list already names it PFS0.
+     *
+     * Same bar for adding one as for the table above: checked against the live
+     * feed, the same company, the same share continuing.
+     */
+    private val FEED_LINE_DE = mapOf(
+        "PFSE" to "PFS0"
+    )
+
+    /** The live feed symbol for a frozen one ("PFSE.DE" → "PFS0.DE"), or null
+     *  when the line never moved. Xetra symbols only — that is where the table
+     *  lives, and a bare US symbol of the same spelling is a different company. */
+    fun feedSuccessor(feedSymbol: String): String? {
+        val s = feedSymbol.trim().uppercase()
+        if (!s.endsWith(".DE")) return null
+        return FEED_LINE_DE[s.removeSuffix(".DE")]?.let { "$it.DE" }
+    }
+
     private val US_REVERSE = US.entries.associate { (k, v) -> v to k }
     private val DE_REVERSE = DE.entries.associate { (k, v) -> v to k }
 

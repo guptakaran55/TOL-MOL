@@ -919,6 +919,8 @@ object StockAnalyzer {
             "Long-term suitability|$longTermScore|Trend structure ${trendStructureScore.toInt()}/100; drift ${"%.1f".format(driftPct)}%; ADX trend ${adxTrendScore.toInt()}/100"
         ).joinToString("\n")
 
+        val area = AreaScore.compute(candles)
+
         return StockAnalysis(
             symbol = symbol,
             name = name,
@@ -1028,7 +1030,11 @@ object StockAnalyzer {
             styleScoreReport = styleScoreReport,
             projectedCeiling = waveProjection?.projectedCeiling,
             projectedFloor = waveProjection?.projectedFloor,
-            projectedMidpoint = waveProjection?.projectedMidpoint
+            projectedMidpoint = waveProjection?.projectedMidpoint,
+            areaScore = area?.score?.round(2),
+            areaGreen = area?.green?.round(2),
+            areaRed = area?.red?.round(2),
+            areaRank = area?.rank?.round(1)
         )
     }
 

@@ -51,6 +51,27 @@ class SymbolRenamesTest {
         assertTrue(SymbolRenames.isRetiredDe("dai"))
     }
 
+    @Test fun `Pfisterer's frozen feed line is asked for under its live one`() {
+        assertEquals("PFS0.DE", SymbolRenames.feedSuccessor("PFSE.DE"))
+        assertEquals("PFS0.DE", SymbolRenames.feedSuccessor(" pfse.de "))
+        // Xetra only: a bare or US symbol of the same spelling is not this share.
+        assertEquals(null, SymbolRenames.feedSuccessor("PFSE"))
+        assertEquals(null, SymbolRenames.feedSuccessor("PFSE.F"))
+        // A line that never moved, and the live line itself, pass through.
+        assertEquals(null, SymbolRenames.feedSuccessor("SAP.DE"))
+        assertEquals(null, SymbolRenames.feedSuccessor("PFS0.DE"))
+    }
+
+    @Test fun `a feed-line change never renames what the app stores or what it orders`() {
+        // The open position is booked as PFSE, and so are its live-order row, its
+        // resting target ("PFSE-<signal bar>") and its ledger entries. Re-keying
+        // the book to PFS0 would orphan every one of them, so the book clean-up
+        // and both order directions must not see this entry at all.
+        assertFalse(SymbolRenames.isRetiredDe("PFSE"))
+        assertEquals("PFSE", SymbolRenames.currentDe("PFSE"))
+        assertEquals("PFS0", SymbolRenames.legacyDe("PFS0"))
+    }
+
     @Test fun `every rename round trips, and no retired name is also a live one`() {
         for (old in listOf("DAI", "DRI", "DPW")) {
             val now = SymbolRenames.currentDe(old)

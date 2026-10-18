@@ -137,7 +137,7 @@ object ExitAddressCheck {
                 ctx, NOTIFICATION_ID, launch,
                 android.app.PendingIntent.FLAG_UPDATE_CURRENT or
                     android.app.PendingIntent.FLAG_IMMUTABLE)
-            nm.notify(NOTIFICATION_ID, androidx.core.app.NotificationCompat.Builder(ctx, CHANNEL)
+            com.signalscope.app.data.NotificationLog.post(ctx, nm, NOTIFICATION_ID, androidx.core.app.NotificationCompat.Builder(ctx, CHANNEL)
                 .setContentTitle("Live orders blocked — VPN tunnel is down")
                 .setContentText("Seen as $seen, whitelisted is $expected")
                 .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(

@@ -2,8 +2,8 @@ package com.signalscope.app.trading
 
 import android.util.Log
 import com.signalscope.app.data.ConfigManager
+import com.signalscope.app.network.FeedHealth
 import com.signalscope.app.network.Trading212Client
-import com.signalscope.app.network.TradegateClient
 import com.signalscope.app.network.YahooFinanceClient
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -84,21 +84,36 @@ object PatientExecutor {
      * market traded at $333.67; the +0.5×ATR cap can never bridge a 5% gap, so the
      * order was doomed at placement). DE → Tradegate (real-time); anything → live
      * Yahoo; else the caller's ref.
+     *
+     * A FEED THAT HAS STOPPED IS NOT A PRICE (see FeedHealth). Yahoo then gives
+     * no live quote at all, rather than the last one it ever had: a sale anchored
+     * on Pfisterer's frozen 66.60 would have rested its whole ladder above a
+     * market at 59 and filled nothing. The venue quote is then checked against
+     * the broker's own valuation instead, and the broker's price stands in for
+     * the feed's before the caller's guess does.
      */
     private fun freshRef(
-        client: Trading212Client, ticker: String, yahooSymbol: String,
+        config: ConfigManager, client: Trading212Client, ticker: String, yahooSymbol: String,
         space: String, uiRef: Double
     ): Double {
-        val yahooLive = YahooFinanceClient.fetchLivePrice(yahooSymbol.trim())
+        val ys = yahooSymbol.trim()
+        val yahooLive = YahooFinanceClient.fetchLivePrice(ys)
+        val stopped = FeedHealth.stoppedSince(ys) > 0L
         if (space.equals("DE", true)) {
             val isin = when (val r = client.fetchInstrumentMetadata(setOf(ticker))) {
                 is Trading212Client.T212Result.Success -> r.data[ticker]?.isin
                 else -> null
             }
-            val tg = isin?.let { TradegateClient.fetchQuote(it, yahooLive ?: uiRef) }
+            val tg = isin?.let {
+                GermanRealtime.checkedQuote(config.appContext, it, ys, ticker,
+                    yahooLive ?: uiRef, feedStale = stopped)
+            }
             if (tg != null) return tg.mid
         }
-        return yahooLive ?: uiRef
+        if (yahooLive != null) return yahooLive
+        if (stopped) BrokerHoldings.t212Price(config.appContext, ticker, space)
+            .takeIf { it > 0.0 }?.let { return it }
+        return uiRef
     }
 
     /**
@@ -131,6 +146,33 @@ object PatientExecutor {
      * cancel failed, so the worst case is a wasted pass rather than a stale limit
      * waiting to be hit at tomorrow's open.
      */
+    /**
+     * Throws when the name's price feed has stopped — for a BUY only.
+     *
+     * Read straight after [requireMarketOpen], whose reply is what judged it, so
+     * the verdict is as fresh as the question. A sale is never refused for this:
+     * getting out of a name the app can no longer see is the one trade that
+     * stays sensible.
+     *
+     * Why refuse at all: everything that would look after the position once
+     * bought — its stop, its target, its value — reads the same frozen price, and
+     * the signal that asked for the buy was drawn on it. Pfisterer was bought on
+     * 14 Oct exactly like this, a week into its feed being frozen.
+     */
+    private fun requireLiveFeed(config: ConfigManager, yahooSymbol: String, space: String) {
+        val ys = yahooSymbol.trim()
+        val since = FeedHealth.stoppedSince(ys)
+        if (since <= 0L) return
+        val sym = ys.uppercase().substringBefore('.')
+        try {
+            LabNotifier.feedStopped(config.appContext, space.lowercase(), sym, ys, since, held = false)
+        } catch (e: Exception) { Log.w(TAG, "feed alarm failed", e) }
+        throw IllegalArgumentException(
+            "Not buying $sym: its price feed ($ys) has shown no trade since " +
+            "${FeedHealth.describe(since)} although the market is open, so nothing could watch " +
+            "a stop or a target on it. Nothing was placed.")
+    }
+
     private fun requireMarketOpen(yahooSymbol: String, space: String) {
         val extended = space.uppercase() == "US"
         if (YahooFinanceClient.fetchMarketOpen(yahooSymbol.trim(), extended) == false)
@@ -155,7 +197,7 @@ object PatientExecutor {
      */
     fun currentRef(config: ConfigManager, ticker: String, yahooSymbol: String,
                    space: String, fallback: Double): Double =
-        try { freshRef(Trading212Client(config), ticker, yahooSymbol, space, fallback) }
+        try { freshRef(config, Trading212Client(config), ticker, yahooSymbol, space, fallback) }
         catch (e: Exception) { Log.w(TAG, "currentRef failed", e); fallback }
 
     /**
@@ -180,7 +222,7 @@ object PatientExecutor {
             // A sentinel no real quote can equal, so "the fallback came back" is
             // distinguishable from "a price came back".
             val probe = -1.0
-            val v = freshRef(Trading212Client(config), ticker, yahooSymbol, space, probe)
+            val v = freshRef(config, Trading212Client(config), ticker, yahooSymbol, space, probe)
             if (v > 0.0 && v != probe) v else null
         } catch (e: Exception) { Log.w(TAG, "currentRefOrNull failed", e); null }
 
@@ -312,7 +354,7 @@ object PatientExecutor {
             // `space` rather than a normalised copy: the sell path has no such
             // local, and the gate normalises what it is given.
             requireMarketOpen(yahooSymbol, space)
-            val ref = freshRef(client, t, yahooSymbol, space, refPrice)
+            val ref = freshRef(config, client, t, yahooSymbol, space, refPrice)
             val atr = estimateAtr(yahooSymbol, space, ref)
             // HYBRID ladder: the concession schedule (+START×ATR shrinking to
             // −FLOOR×ATR) applies to a FRESH market quote at every rung, so a moving
@@ -416,7 +458,7 @@ object PatientExecutor {
                 val qty = minOf(left, inPool)
                 if (qty <= 0.0) { filledAny = true; break@rung }
                 if (remaining > 0) lastKnownRemaining = remaining
-                val mkt = freshRef(client, t, yahooSymbol, space, lastMarket)
+                val mkt = freshRef(config, client, t, yahooSymbol, space, lastMarket)
                 lastMarket = mkt
                 val price = Math.max(Math.round((mkt + offsets[i] * atr) * 100.0) / 100.0, hardFloor)
                 prog(onProgress, mapOf(
@@ -537,6 +579,7 @@ object PatientExecutor {
             if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
             val client = Trading212Client(config)
             requireMarketOpen(yahooSymbol, spc)
+            requireLiveFeed(config, yahooSymbol, spc)
             val raw = symbol.trim()
             val ticker = if (raw.contains("_")) raw else {
                 val sym = raw.uppercase()
@@ -544,7 +587,7 @@ object PatientExecutor {
                     ?: throw IllegalArgumentException("Couldn't resolve \"$sym\": ${client.resolveFailureReason(sym, spc)}")
             }
             tickerForMsg = ticker
-            val ref = freshRef(client, ticker, yahooSymbol, space, refPrice)
+            val ref = freshRef(config, client, ticker, yahooSymbol, space, refPrice)
             // REFUSE BEFORE PLACING ANYTHING. The market is already above the limit
             // the caller set, so no rung of this ladder could fill under it — and a
             // ladder that rests orders it does not want filled is how a stale limit
@@ -602,7 +645,7 @@ object PatientExecutor {
                 if (ownedNow >= 0) lastKnownOwned = ownedNow
                 val need = targetShares - boughtSoFar
                 if (need <= dustShares || need * ref < MIN_ORDER_VALUE) { filledAny = true; break@rung }
-                val mkt = freshRef(client, ticker, yahooSymbol, space, lastMarket)
+                val mkt = freshRef(config, client, ticker, yahooSymbol, space, lastMarket)
                 lastMarket = mkt
                 val price = Math.min(Math.round((mkt + offsets[i] * atr) * 100.0) / 100.0, hardCap)
                 prog(onProgress, mapOf(

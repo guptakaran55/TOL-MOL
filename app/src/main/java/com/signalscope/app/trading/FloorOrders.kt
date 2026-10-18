@@ -89,6 +89,51 @@ object FloorOrders {
     /** The second order's price: [pct] percent under the floor. */
     fun secondPrice(low: Double, pct: Double): Double = low * (1.0 - pct / 100.0)
 
+    /** Trading days in "the week" the weekly zones are read from. */
+    const val WEEK_DAYS = 5
+
+    /** The weekly zones for an order placed on [day]: the last week's low and
+     *  high, the price at the top of the support zone (where it buys) and the
+     *  price at the bottom of the resistance zone (where it gives up). */
+    data class WeekZone(val low: Double, val high: Double, val buyAt: Double, val cancelAt: Double)
+
+    /**
+     * From the [WEEK_DAYS] trading days before [day]: buy at the low plus
+     * [zonePct] of the range, give up at the high minus [zonePct] of it.
+     * RANGE-RELATIVE ON PURPOSE, as the watcher's own floor zone is: a fixed
+     * percentage of the price means something different on a quiet stock than a
+     * wild one — and "within 10% of the price" of its weekly low is where most
+     * stocks already are. Null without a full week, or with no range at all.
+     */
+    fun weekZone(days: TreeMap<LocalDate, List<CandleData>>, day: LocalDate, zonePct: Double): WeekZone? {
+        val prior = days.headMap(day, false)
+        if (prior.size < WEEK_DAYS) return null
+        val bars = prior.values.toList().takeLast(WEEK_DAYS).flatten()
+        val lo = bars.minOfOrNull { it.low } ?: return null
+        val hi = bars.maxOfOrNull { it.high } ?: return null
+        if (!(lo > 0.0) || !(hi > lo)) return null
+        val z = (zonePct / 100.0).coerceIn(0.0, 0.49) * (hi - lo)
+        return WeekZone(lo, hi, lo + z, hi - z)
+    }
+
+    /** What has become of a waiting weekly order: when each half filled (null =
+     *  not yet) and when the price reached the resistance zone (0 = not yet). */
+    data class WeekFate(val first: Fill?, val second: Fill?, val cancelSec: Long)
+
+    /**
+     * A waiting order through [bars] — every bar since it was placed, across
+     * days. It is CANCELLED by the first bar that reaches [cancelAt] (touching
+     * the zone is enough), and a half fills only in a bar strictly BEFORE that
+     * one: a single bar that spans both says nothing about which came first, so
+     * the order is taken to have given up rather than bought.
+     */
+    fun weekFate(bars: List<CandleData>, firstPrice: Double, secondPrice: Double, cancelAt: Double): WeekFate {
+        val sorted = bars.sortedBy { it.timestamp }
+        val cancelSec = if (cancelAt > 0.0) sorted.firstOrNull { it.high >= cancelAt }?.timestamp ?: 0L else 0L
+        val live = if (cancelSec > 0L) sorted.filter { it.timestamp < cancelSec } else sorted
+        return WeekFate(firstFill(live, firstPrice), firstFill(live, secondPrice), cancelSec)
+    }
+
     data class Fill(val sec: Long, val price: Double)
 
     /**

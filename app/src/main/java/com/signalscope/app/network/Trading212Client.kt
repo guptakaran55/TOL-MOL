@@ -109,9 +109,9 @@ class Trading212Client(private val config: ConfigManager) {
          *
          * Bump the suffix whenever a field is added to InstrumentMeta.
          */
-        private const val META_DISK_FILE = "t212_instruments_v3.json"
+        private const val META_DISK_FILE = "t212_instruments_v4.json"
         private val META_DISK_FILES_OLD =
-            listOf("t212_instruments.json", "t212_instruments_v2.json")
+            listOf("t212_instruments.json", "t212_instruments_v2.json", "t212_instruments_v3.json")
 
         /**
          * T212's minimum, in CURRENCY — "one full unit (1.00 GBP, 1.00 EUR, 1.00
@@ -257,7 +257,11 @@ class Trading212Client(private val config: ConfigManager) {
          * companies and index trackers is not screening anything meaningful.
          * Nullable for rows cached before the field was read.
          */
-        val instrumentType: String? = null
+        val instrumentType: String? = null,
+        /** The company's name as Trading 212 lists it ("Ströer" for SAX) — what the
+         *  portfolio shows in place of the bare code. Null for rows cached before
+         *  it was kept. */
+        val name: String? = null
     )
 
     /**
@@ -366,7 +370,9 @@ class Trading212Client(private val config: ConfigManager) {
                             maxOpenQuantity = o.get("maxOpenQuantity")
                                 ?.takeIf { !it.isJsonNull }?.asDouble,
                             instrumentType = o.get("type")
-                                ?.takeIf { !it.isJsonNull }?.asString
+                                ?.takeIf { !it.isJsonNull }?.asString,
+                            name = o.get("name")?.takeIf { !it.isJsonNull }?.asString
+                                ?.trim()?.takeIf { it.isNotBlank() }
                         )
                     } catch (e: Exception) { /* skip malformed */ }
                 }
@@ -619,6 +625,28 @@ class Trading212Client(private val config: ConfigManager) {
         return loaded
     }
 
+    /**
+     * THE BROKER'S OWN CURRENT TICKER for an instrument whose code is out of date.
+     *
+     * Trading 212 keeps the code it assigned at listing for ever — Booking is
+     * still PCLN_US_EQ, Keurig Dr Pepper DPS_US_EQ, Mercedes DAId_EQ — but its
+     * instrument list carries the live ticker as the short name. Null when the two
+     * agree, when the list is not in hand, or when the short name is not a plain
+     * ticker (BRK.A and the like keep their old handling).
+     */
+    fun currentShortName(t212Ticker: String): String? {
+        val key = t212Ticker.trim()
+        val meta = (metaCache ?: loadMetaFromDisk()?.also { metaCache = it })?.get(key) ?: return null
+        // Read back from disk by a parser that ignores declared nullability, so a
+        // missing short name can arrive as null despite the type.
+        val raw: String? = meta.shortName
+        val sn = raw?.trim()?.uppercase() ?: return null
+        var base = key.substringBefore("_")
+        if (base.length > 1 && base.last() == 'd') base = base.dropLast(1)
+        if (sn.isBlank() || sn == base.uppercase() || !sn.matches(Regex("[A-Z0-9]{1,6}"))) return null
+        return sn
+    }
+
     /** The confirmed price-feed symbol for [t212Ticker], or null if nothing has
      *  ever confirmed one. Cheap — memory, then one small file. Safe anywhere. */
     fun learnedFeedSymbol(t212Ticker: String): String? =
@@ -711,6 +739,12 @@ class Trading212Client(private val config: ConfigManager) {
         learnedFeedSymbol(t212Ticker)?.let { return it }
         val parts = t212Ticker.split("_")
         if (parts.size < 2) return t212Ticker
+        // A US CODE THE BROKER NEVER UPDATED. Its own instrument list knows the
+        // live ticker, and that is what the exchange and the feed use. Without
+        // this, Booking (still PCLN_US_EQ) was priced off whatever now trades as
+        // PCLN, and named PCLN in every holdings check — so the watcher's BKNG
+        // position looked sold and was written off while it was still held.
+        if (parts[1] == "US") currentShortName(t212Ticker)?.let { return it }
         // Modern T212 Xetra format tags the venue as a trailing LOWERCASE 'd' on
         // the base itself ("PUMd_EQ" = Puma on Xetra) — there is no "_DE_"
         // segment to switch on. Without this branch the function returned the
@@ -763,6 +797,10 @@ class Trading212Client(private val config: ConfigManager) {
         }
 
         add(t212ToYahooSymbol(t212Ticker))
+        // The broker's own current ticker as the next try for a German code it
+        // never updated. Second, not first: on Xetra the rename table and the
+        // learned map already cover the cases confirmed against the feed.
+        if (!parts.contains("US")) currentShortName(t212Ticker)?.let { add("$it.DE") }
 
         // ── Concatenated-short-form fix (e.g. TUI1D → TUI1.DE) ───────────────
         // T212 sometimes appends a single-letter venue tag DIRECTLY to the base
@@ -1100,19 +1138,18 @@ class Trading212Client(private val config: ConfigManager) {
         var pages = 0
         var lastError = ""
         while (pages < maxPages) {
-            val body = rawHistoryPage(cursor) ?: run {
-                lastError = "history page ${pages + 1} did not respond"; null
-            } ?: break
-            val fills = parseFills(body)
-            all.addAll(fills)
+            val page = historyPageRetrying(cursor)
+            if (page.code != 200) { lastError = "history page ${pages + 1} did not respond (${page.code})"; break }
+            all.addAll(page.fills)
             pages++
-            val next = parseNextCursor(body)
-            if (next.isNullOrBlank() || !seenCursors.add(next) || fills.isEmpty()) break
+            // NOT "no executed orders on this page". A page can be nothing but
+            // cancelled ladder rungs — an evening of unfilled sell attempts makes
+            // several — and stopping there cut the history off at last night.
+            // Only an EMPTY page, or no next page, is the end.
+            val next = page.next
+            if (page.items == 0 || next.isNullOrBlank() || !seenCursors.add(next)) break
             cursor = next
-            // Deliberate breath between pages. This endpoint is the one that
-            // rate-limits first, and being throttled mid-walk loses the rest of
-            // the history for no gain.
-            try { Thread.sleep(350) } catch (_: InterruptedException) { break }
+            try { Thread.sleep(400) } catch (_: InterruptedException) { break }
         }
         if (all.isEmpty() && lastError.isNotBlank()) return T212Result.Failure(lastError)
         // Oldest first: every downstream matcher pairs sells against buys in the
@@ -1120,10 +1157,17 @@ class Trading212Client(private val config: ConfigManager) {
         return T212Result.Success(all.sortedBy { it.dateExecuted })
     }
 
-    /** One raw page, from whichever history path this account answers on. */
-    private fun rawHistoryPage(cursor: String?): String? {
-        val paths = listOf("/equity/history/orders", "/history/orders", "/equity/orders/history")
-        for (p in paths) {
+    /**
+     * One page of the executed-order history: its executed orders, how many
+     * orders it held AT ALL (cancelled ones included — the only honest "is this
+     * the end?"), the next page's cursor, and the HTTP answer (429 = slow down).
+     */
+    data class HistoryPage(val code: Int, val fills: List<HistoricalFill>, val items: Int, val next: String?)
+
+    fun historyPage(cursor: String?): HistoryPage {
+        if (!config.hasT212Credentials) return HistoryPage(-1, emptyList(), 0, null)
+        var lastCode = -1
+        for (p in listOf("/equity/history/orders", "/history/orders", "/equity/orders/history")) {
             val base = "${config.t212BaseUrl}$p".toHttpUrlOrNull() ?: continue
             val url = base.newBuilder()
                 .addQueryParameter("limit", "50")
@@ -1134,13 +1178,37 @@ class Trading212Client(private val config: ConfigManager) {
                     .addHeader("Authorization", authHeader())
                     .addHeader("Accept", "application/json").build()
                 client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) return@use
-                    return resp.body?.string().orEmpty()
+                    if (resp.code == 429) return HistoryPage(429, emptyList(), 0, null)
+                    if (!resp.isSuccessful) { lastCode = resp.code; return@use }
+                    val body = resp.body?.string().orEmpty()
+                    return HistoryPage(200, parseFills(body), countHistoryItems(body), parseNextCursor(body))
                 }
             } catch (_: Exception) { }
         }
-        return null
+        return HistoryPage(lastCode, emptyList(), 0, null)
     }
+
+    /** [historyPage], waiting out "too many requests" — Trading 212 allows only a
+     *  few history reads a minute, and giving up at the limit is how a long
+     *  history used to come back cut in half. */
+    fun historyPageRetrying(cursor: String?, retries: Int = 6): HistoryPage {
+        var page = historyPage(cursor)
+        var n = 0
+        while (page.code == 429 && n < retries) {
+            try { Thread.sleep(11_000L) } catch (_: InterruptedException) { return page }
+            page = historyPage(cursor); n++
+        }
+        return page
+    }
+
+    private fun countHistoryItems(body: String): Int = try {
+        if (body.trimStart().startsWith("[")) org.json.JSONArray(body).length()
+        else {
+            val o = org.json.JSONObject(body)
+            listOf("items", "data", "orders", "results")
+                .firstNotNullOfOrNull { o.optJSONArray(it) }?.length() ?: 0
+        }
+    } catch (_: Exception) { 0 }
 
     /**
      * The cursor for the next page.

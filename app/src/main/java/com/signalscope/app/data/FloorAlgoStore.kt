@@ -47,6 +47,16 @@ object FloorAlgoStore {
 
     const val KIND_FLOOR = "floor"
     const val KIND_MACD = "macd"
+    /** A CAMPAIGN per stock: entered near its monthly support, swung between
+     *  daily highs and lows, ended on the daily or 4-hour MACD turning down.
+     *  See [com.signalscope.app.trading.CampaignRules]. */
+    const val KIND_CAMPAIGN = "campaign"
+
+    /** Floor orders that expire at the close and are placed afresh each morning. */
+    const val MODE_DAY = "day"
+    /** Floor orders that wait, day after day, in the weekly support zone until
+     *  they fill — or until the price reaches the weekly resistance zone first. */
+    const val MODE_WEEK = "week"
 
     data class Settings(
         /** Paper money for the whole algo, in the market's currency. */
@@ -74,8 +84,55 @@ object FloorAlgoStore {
          * Off by default (the user's choice, 9 Oct 2026, after a week in which the
          * filter let through 0–6 stocks a day and sold dip buys the next morning).
          */
-        val trendFilter: Boolean = false
+        val trendFilter: Boolean = false,
+        /**
+         * Floor orders only: [MODE_DAY] — at the recent low, expiring at each
+         * close; or [MODE_WEEK] — at the top of the weekly support zone, waiting
+         * until filled, cancelled if the price reaches the weekly resistance zone
+         * first (the user's design, 14 Oct 2026).
+         */
+        val orderMode: String = MODE_DAY,
+        /** Weekly zones: the bottom and the top this many percent of the last
+         *  week's price range (low to high) — support and resistance. */
+        val zonePct: Double = 10.0,
+        /**
+         * HALF THE BID/ASK SPREAD, in percent — what a MARKET order gives up on
+         * each execution against the price the chart shows. Charged on MACD buys
+         * and on sales by the stop, the time limit or the trend; never on a floor
+         * buy or a sale at the target, which are limit orders and do not cross
+         * the spread. Null = the market's default ([defaultSpreadPct]).
+         */
+        val spreadPct: Double? = null,
+        // ── campaigns only ──
+        /** What the campaign's stop is counted in — PCT, ATR or BB — and [stopPct]
+         *  is its size, as on the watcher's own trailing stop: hung off the highest
+         *  price since each buy. */
+        val stopUnit: String = "PCT",
+        /** Buffer zones are this fraction of the ATR of their own timescale. */
+        val atrFrac: Double = 0.1,
+        /** "projected" — supports and resistances from the trend channel the
+         *  wave projection draws; "range" — plain recent lows and highs. */
+        val levelSource: String = "projected",
+        /** A campaign still running after this many trading days is ended. */
+        val maxDays: Int = 60,
+        /** Ask the news outlook before starting a campaign: AVOID / STRONG AVOID skips
+         *  the stock, BUY / STRONG BUY bids higher so the buy is surer to fill. */
+        val useNews: Boolean = true,
+        /** "top" — the top [universeSize] by ROC; "all" — every stock in the
+         *  market's latest Discovery scan, which has already passed the market's
+         *  volume × price floor (the watcher panel's turnover filter). */
+        val universeMode: String = "top",
+        /** Campaigns only: money per campaign. 0 = capital ÷ seats. With [seats]
+         *  at 0 — no limit on campaigns — this is what each one is given. */
+        val seatAmount: Double = 0.0,
+        /** Campaigns only: news outlooks asked a morning at most — each is a paid
+         *  call. Candidates past it wait for the next morning, never start unasked. */
+        val newsPerDay: Int = 12
     )
+
+    /** Half-spread to assume per market order when none is set: Germany sits
+     *  between tight DAX names and wider small caps; NASDAQ 100 names are tight. */
+    fun defaultSpreadPct(space: String): Double = when (space) { "de" -> 0.10; "us" -> 0.03; else -> 0.05 }
 
     /** A stock in the universe, and what the trend filter said on the plan day. */
     data class Member(
@@ -119,12 +176,23 @@ object FloorAlgoStore {
         val low: Double = 0.0,
         val first: Leg = Leg(),
         val second: Leg = Leg(),
-        /** RESTING while the day is on; ENDED once the day is over (any half
-         *  still unfilled then simply expired). */
+        /** RESTING while it can fill; ENDED once its day is over (any half still
+         *  unfilled then simply expired); CANCELLED — a weekly order whose price
+         *  reached the resistance zone before it dipped. */
         val status: String = "RESTING",
         /** Only prices from this moment on can fill it — never one that traded
          *  before the order existed. */
-        val fromSec: Long = 0L
+        val fromSec: Long = 0L,
+        /** [MODE_DAY] or [MODE_WEEK]. */
+        val mode: String = MODE_DAY,
+        /** Weekly orders: the day it was placed, the resistance-zone price that
+         *  cancels it, and when that happened. */
+        val placedDay: String = "",
+        val cancelAt: Double = 0.0,
+        val cancelSec: Long = 0L,
+        /** The trade its fills went into — a weekly order's second half can fill
+         *  on a later day than its first. */
+        val tradeId: String = ""
     )
 
     data class Trade(
@@ -165,7 +233,20 @@ object FloorAlgoStore {
         /** The day the morning check found the daily or weekly MACD no longer
          *  rising — sold at that day's close unless the stop or target comes first. */
         val trendDay: String? = null,
+        /** Money result, AFTER the broker's charges once [feesIn]. */
         val pnl: Double = 0.0,
+        /** The broker's charges for the round trip, in the market's currency —
+         *  what was charged once sold; what a sale at the latest price would be
+         *  charged while held or followed. Same rate card as the live algos. */
+        val fees: Double = 0.0,
+        /** [pnl] has the charges taken off. Sales from before charges were
+         *  modelled are put right once, on the next pass. */
+        val feesIn: Boolean = false,
+        /** The spread paid on market executions, in the market's currency — charged
+         *  once sold, estimated (as a sale at the market) while held or followed. */
+        val slip: Double = 0.0,
+        /** [pnl] has [slip] taken off. Older sales are put right once. */
+        val slipIn: Boolean = false,
         val lastPrice: Double = 0.0,
         val lastSec: Long = 0L,
         // What happened next, in percent from the buying price; null until known.
@@ -178,6 +259,68 @@ object FloorAlgoStore {
     ) {
         val entry: Double get() = if (qty > 0.0) cost / qty else 0.0
     }
+
+    /**
+     * ONE CAMPAIGN on one stock — a seat held for weeks, through several swing
+     * trades, until the trend gives out. Each swing's buy and sale is a [Trade]
+     * of its own (id "campaignId|n"), so the card's Held and Closed lists, the
+     * charges and the results work for campaigns as for any algo.
+     */
+    data class Campaign(
+        val id: String = "",
+        val symbol: String = "",
+        val name: String = "",
+        /** WAITING (entry order resting) · HOLDING · RIDING (above the day's high,
+         *  waiting for the price to turn down) · OUT (sold a swing, waiting to buy
+         *  back lower) · ENDED. */
+        val state: String = "WAITING",
+        val startDay: String = "",
+        val endDay: String = "",
+        val endReason: String = "",
+        /** Money for the next buy: the seat at the start, then what each sale left. */
+        val cash: Double = 0.0,
+        val seat: Double = 0.0,
+        /** The resting buy order's price, and the first bar that may fill it. */
+        val orderPrice: Double = 0.0,
+        val orderFromSec: Long = 0L,
+        /** The swing held now: its trade, size, cost, and highest price since bought. */
+        val legId: String = "",
+        val qty: Double = 0.0,
+        val cost: Double = 0.0,
+        val peak: Double = 0.0,
+        val rideLast: Double = 0.0,
+        val legs: Int = 0,
+        // Today's levels, from the morning's daily bars.
+        val levelsDay: String = "",
+        val support: Double = 0.0,
+        val weekRes: Double = 0.0,
+        val monthRes: Double = 0.0,
+        val prevHigh: Double = 0.0,
+        val prevLow: Double = 0.0,
+        val atr: Double = 0.0,
+        val bbHalf: Double = 0.0,
+        val bufDay: Double = 0.0,
+        val bufWeek: Double = 0.0,
+        val bufMonth: Double = 0.0,
+        /** Days in a row the daily MACD slope has been falling. */
+        val negDays: Int = 0,
+        /** In the monthly resistance zone — swings stop, the tighter exit applies. */
+        val inMonthZone: Boolean = false,
+        /** Entered the weekly resistance zone today: the swing target is the
+         *  weekly resistance itself. */
+        val inWeekZone: Boolean = false,
+        val weekCrosses: Int = 0,
+        /** The 4-hour MACD slope at the last look, to see it flip. */
+        val h4Sign: Int = 0,
+        /** Sell at the next bar's open, and why. */
+        val exitPending: String = "",
+        /** Bars up to here are done with. */
+        val lastBarSec: Long = 0L,
+        /** The news outlook's verdict when the campaign was started. */
+        val verdict: String = "",
+        /** Money made or lost by its finished swings, after charges and spread. */
+        val pnl: Double = 0.0
+    )
 
     data class Algo(
         val id: String = "",
@@ -204,6 +347,13 @@ object FloorAlgoStore {
          *  before the filter became a switch were — hence the default. When this
          *  and the setting disagree, today is planned again. */
         val planFilter: Boolean = true,
+        /** The floor order type [planDay] was planned with; a change re-plans today. */
+        val planMode: String = MODE_DAY,
+        /** Campaigns only: every campaign, running or ended (the newest 200 kept). */
+        val campaigns: List<Campaign> = emptyList(),
+        /** News outlook verdicts by stock: "VERDICT|yyyy-mm-dd" — asked again after
+         *  a few days, not on every pass. */
+        val outlooks: Map<String, String> = emptyMap(),
         val orders: List<Order> = emptyList(),
         val trades: List<Trade> = emptyList(),
         val log: List<String> = emptyList(),
@@ -257,7 +407,12 @@ object FloorAlgoStore {
             val old = a.trades.filterNot { it.status == "OPEN" || !it.done }
             old.takeLast((MAX_TRADES - keep.size).coerceAtLeast(0)) + keep
         }
-        return a.copy(trades = trades.sortedBy { it.firstSec }, log = a.log.takeLast(MAX_LOG))
+        // Ended campaigns fall off past 200; running ones never do.
+        val campaigns = if (a.campaigns.size <= 200) a.campaigns else {
+            val live = a.campaigns.filter { it.state != "ENDED" }
+            a.campaigns.filter { it.state == "ENDED" }.takeLast((200 - live.size).coerceAtLeast(0)) + live
+        }
+        return a.copy(trades = trades.sortedBy { it.firstSec }, log = a.log.takeLast(MAX_LOG), campaigns = campaigns)
     }
 
     fun list(ctx: Context, space: String): List<Algo> = load(ctx).algos.filter { it.space == space }
@@ -271,11 +426,18 @@ object FloorAlgoStore {
     fun anyRunning(ctx: Context): Boolean = load(ctx).algos.any { hasWork(it) }
 
     fun create(ctx: Context, space: String, name: String, kind: String = KIND_FLOOR): Algo {
-        val k = if (kind == KIND_MACD) KIND_MACD else KIND_FLOOR
+        val k = if (kind == KIND_MACD || kind == KIND_CAMPAIGN) kind else KIND_FLOOR
+        // A campaign's stop starts as the watcher's own trailing stop for this
+        // market — the same unit and size — or two ATRs where none is set.
+        val settings = if (k != KIND_CAMPAIGN) Settings() else try {
+            val w = ManualWatchStore.load(ctx, space)
+            if (w.trailPct > 0.0) Settings(stopPct = w.trailPct, stopUnit = (w.trailUnit ?: ManualWatchStore.TrailUnit.PCT).name)
+            else Settings(stopPct = 2.0, stopUnit = "ATR")
+        } catch (e: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
         val a = Algo(
             id = "f" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36),
-            name = name.trim().ifBlank { if (k == KIND_MACD) "MACD turns" else "Floor orders" }.take(40),
-            kind = k, space = space, createdAt = System.currentTimeMillis(),
+            name = name.trim().ifBlank { when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"; else -> "Floor orders" } }.take(40),
+            kind = k, space = space, createdAt = System.currentTimeMillis(), settings = settings,
             log = listOf(stamp() + " · created"))
         mutate(ctx) { it.copy(algos = it.algos + a) }
         return a

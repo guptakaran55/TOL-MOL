@@ -1082,6 +1082,12 @@ object StrategyLabEngine {
          */
         val baselineTs: Long = 0L,
         /**
+         * When tracking ENDED — the seat was lost or the position handed back —
+         * on the same clock as [baselineTs]; 0 while the algo is still watching.
+         * Entries right of it are replay, exactly like those left of the start.
+         */
+        val trackingEndTs: Long = 0L,
+        /**
          * THE DAILY GATE'S VERDICT, as a series the chart can shade.
          *
          * The entry rules and the gate are two layers, and only one of them was
@@ -1135,13 +1141,32 @@ object StrategyLabEngine {
     data class RealFill(
         val entryTs: Long, val entryPrice: Double,
         val exitTs: Long = 0L, val exitPrice: Double = 0.0,
-        val pnl: Double = 0.0, val open: Boolean = false
+        val pnl: Double = 0.0, val open: Boolean = false,
+        /**
+         * WHY THE REAL SALE HAPPENED, in the words whichever rule used ("take
+         * profit +4%", "MACD slope flipped + to -", "your own order sold it").
+         * Blank when nothing recorded one. The triangles carry the strategy's
+         * reason; this is the reason for the sale that actually moved money,
+         * which is often a different thing — a target or stop resting at the
+         * broker, or your own thumb.
+         */
+        val exitReason: String = "",
+        /** Which part of the app (or you) decided to sell, when it was not
+         *  simply the algo's own rules. Blank = the algo itself. */
+        val exitBy: String = "",
+        /** Sold outside the app's own orders — by hand, or found gone. */
+        val handClosed: Boolean = false
     )
 
     private fun g3(v: Double): String = if (v.isNaN()) "–" else "%.4f".format(v)
 
+    /**
+     * @param entriesFromTs where the algo began tracking this name (0 = never) —
+     *   the same boundary the live loop hands the engine. See the trades below.
+     */
     fun reviewPayload(symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
-                      sourcePeriodSec: Long = 15 * 60L, maxBars: Int = 320): ReviewPayload {
+                      sourcePeriodSec: Long = 15 * 60L, maxBars: Int = 320,
+                      entriesFromTs: Long = 0L): ReviewPayload {
         return try {
             // Same resample clamp as the engine's dispatch(), so the chart's bars
             // and the trades drawn on them are built the identical way.
@@ -1173,9 +1198,27 @@ object StrategyLabEngine {
             for (i in fine.indices) fineIdxOfTs[fine[i].timestamp] = i
 
             // Trades (for markers + open-position lookups), from the real engine run.
-            val trades = applySlippage(
-                if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, complete) else runSingle(symbol, raw, cfg, entryTf, complete),
+            //
+            // REPLAYED THE WAY THE LIVE ALGO RUNS IT. The live loop tells the engine
+            // where tracking began, so the engine reaches that bar flat and opens only
+            // what it signals afterwards. This replay used to run without that
+            // boundary, so it could still be holding a trade it opened BEFORE the algo
+            // was watching — and from there every later entry, stop and exit shifted.
+            // The chart then drew a whole sequence of trades the algo never had,
+            // sitting between two real fills as if it had failed to act on them.
+            //
+            // The free replay is kept only for trades that FINISHED before tracking
+            // began: what the strategy would have done had it been watching. One still
+            // open at the boundary is precisely the trade the live algo never had, so
+            // it is dropped rather than drawn across the line.
+            fun replay(from: Long) = applySlippage(
+                if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, complete, from)
+                else runSingle(symbol, raw, cfg, entryTf, complete, from),
                 cfg).trades
+            val free = replay(0L)
+            val trades = if (entriesFromTs <= 0L) free
+                else free.filter { it.status == "CLOSED" && (it.exitTs ?: Long.MAX_VALUE) < entriesFromTs } +
+                    replay(entriesFromTs)
             val entryFineTs = trades.associateBy { it.entryTs }
             val exitFineTs = trades.filter { it.exitTs != null }.associateBy { it.exitTs!! }
 

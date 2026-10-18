@@ -72,6 +72,8 @@ class ScanService : Service() {
         const val ACTION_ZERODHA_AUTO_LOGIN       = "com.signalscope.ZERODHA_AUTO_LOGIN"
         /** The alarm that wakes portfolio monitoring at the Indian open. */
         const val ACTION_MONITOR_WAKE             = "com.signalscope.MONITOR_WAKE"
+        /** The refresh button on the positions widget. */
+        const val ACTION_WIDGET_REFRESH           = "com.signalscope.WIDGET_REFRESH"
 
         // Broadcast events
         const val BROADCAST_SCAN_UPDATE      = "com.signalscope.SCAN_UPDATE"
@@ -175,6 +177,9 @@ class ScanService : Service() {
         zerodhaClient = ZerodhaClient(config)
         weights = config.scoringWeights
         createNotificationChannels()
+        // Redraw the positions widget from the last summary as soon as the app is
+        // running again (and take down the old pinned card, if one is left over).
+        com.signalscope.app.trading.PositionRadar.publish(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -203,6 +208,8 @@ class ScanService : Service() {
             ACTION_DISCOVERY_STOP          -> stopDiscoveryScan()
             ACTION_T212_DAILY_TRAIL        -> triggerT212DailyTrail("alarm")
             ACTION_STRATEGY_LAB_TICK       -> triggerStrategyLabPaperTick("alarm")
+            com.signalscope.app.trading.RvGate.ACTION_TICK -> triggerRvGateTick()
+            ACTION_WIDGET_REFRESH          -> triggerWidgetRefresh()
             ACTION_ZERODHA_AUTO_LOGIN      -> triggerZerodhaAutoLogin("alarm")
             // THE MARKET IS OPENING. Monitoring let the phone sleep at the close;
             // this puts it back to work. Started as a foreground service by the
@@ -554,7 +561,7 @@ class ScanService : Service() {
             val pi = PendingIntent.getActivity(
                 this, 0x2ED0, launch,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            nm.notify(NOTIFICATION_ZERODHA_LOGIN_ID, NotificationCompat.Builder(this, CHANNEL_ZERODHA_LOGIN)
+            NotificationLog.post(this, nm, NOTIFICATION_ZERODHA_LOGIN_ID, NotificationCompat.Builder(this, CHANNEL_ZERODHA_LOGIN)
                 .setContentTitle("Zerodha auto-login didn't go through")
                 .setContentText(message)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(
@@ -566,6 +573,53 @@ class ScanService : Service() {
                 .build())
         } catch (e: Exception) {
             Log.w(TAG, "Couldn't post auto-login notification", e)
+        }
+    }
+
+    /**
+     * THE RV GATE'S MINUTE CHECK — only while an automatic order is waiting on it.
+     * Looks at the waiting buys and sales again and starts any whose moment has
+     * come (or whose two hours are up), then arms the next minute if anything is
+     * still waiting.
+     */
+    /**
+     * THE WIDGET'S ↻ — re-read every position now instead of at the end of the
+     * next pass. Prices are asked for again unless under a minute old (the pass
+     * accepts twenty), so a tap shows the market as it is. Reports only: nothing
+     * is bought, sold or moved.
+     */
+    private fun triggerWidgetRefresh() {
+        beginJob(3 * 60 * 1000L, "Refreshing positions…")
+        try { com.signalscope.app.trading.PositionWidget.markRefreshing(applicationContext) } catch (_: Exception) {}
+        serviceScope.launch {
+            try {
+                com.signalscope.app.trading.PositionRadar.refresh(applicationContext, priceMaxAgeMs = 60_000L)
+            } catch (e: Exception) {
+                Log.w(TAG, "widget refresh failed: ${e.message}")
+            } finally {
+                try {
+                    com.signalscope.app.trading.PositionWidget.clearRefreshing()
+                    com.signalscope.app.trading.PositionRadar.publish(applicationContext)
+                } catch (_: Exception) {}
+                endJob()
+            }
+        }
+    }
+
+    private fun triggerRvGateTick() {
+        beginJob(10 * 60 * 1000L, "Checking waiting orders…")
+        serviceScope.launch {
+            try {
+                com.signalscope.app.trading.T212LiveMirror.retryPendingEntries(applicationContext)
+                com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext)
+                // Your own patient orders that you asked to wait on the gate.
+                com.signalscope.app.trading.RvManualQueue.process(applicationContext)
+            } catch (e: Exception) {
+                Log.e(TAG, "RV gate check failed", e)
+            } finally {
+                try { com.signalscope.app.trading.RvGate.ensureTick(applicationContext) } catch (_: Exception) {}
+                endJob()
+            }
         }
     }
 
@@ -618,7 +672,13 @@ class ScanService : Service() {
             return
         }
 
-        updateScanNotification("Strategy Lab: paper tick...")
+        // Said plainly when the stock markets are shut: the pass still runs (crypto
+        // never closes, and prices, stops and the widget are kept current), but
+        // "paper tick" at 2 a.m. on a Saturday read like a scan of shut markets.
+        updateScanNotification(
+            if (com.signalscope.app.trading.MarketHours.nextOpeningText(System.currentTimeMillis()) != null)
+                "Checking · stock markets shut"
+            else "Strategy Lab: paper tick...")
         // Run the SAME list the activity check saw. runAll self-gates per
         // namespace, so inactive ones no-op — no double-run, no divergence
         // between "what we checked" and "what we run".
@@ -629,6 +689,12 @@ class ScanService : Service() {
         val completed = withContext(Dispatchers.IO) {
             latch.await(10, java.util.concurrent.TimeUnit.MINUTES)
         }
+        // Paper trades found late on a shut market were held back; any whose market
+        // is now trading go out here, on the first pass after the open.
+        try {
+            val n = com.signalscope.app.trading.LatePaperAlerts.flush(applicationContext)
+            if (n > 0) Log.i(TAG, "Sent $n paper alert(s) held for the open")
+        } catch (e: Exception) { Log.w(TAG, "held paper alerts failed: ${e.message}") }
         // Log the namespaces actually swept, not three fixed booleans — the old
         // us/de/binance flags were exactly what made bucket algos invisible here.
         // Every namespace has now run, so any entries they queued are complete as
@@ -654,8 +720,20 @@ class ScanService : Service() {
         // UNSOLD EXITS come first in importance: a position the book has closed but
         // the broker still holds is real money exposed with nothing managing it.
         // Unconditional — an exit is never withheld for a preference.
+        try { com.signalscope.app.trading.RvGate.ensureTick(applicationContext) } catch (_: Exception) {}
         try { com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext) }
         catch (e: Exception) { Log.w(TAG, "exit retry failed: ${e.message}") }
+        // ALGO POSITIONS SOLD IN THE BROKER'S OWN APP — gone from the account on two
+        // reads half an hour apart — are closed and their seats handed on.
+        try {
+            val hs = com.signalscope.app.trading.T212HandSales.sweep(applicationContext)
+            if (hs.isNotBlank()) Log.i(TAG, "Hand sales: $hs")
+        } catch (e: Exception) { Log.w(TAG, "hand-sale sweep failed: ${e.message}") }
+        // …and the same for India's algos, priced from the day's Zerodha fills.
+        try {
+            val hz = com.signalscope.app.trading.ZerodhaHandSales.sweep(applicationContext)
+            if (hz.isNotBlank()) Log.i(TAG, "Hand sales (India): $hz")
+        } catch (e: Exception) { Log.w(TAG, "Indian hand-sale sweep failed: ${e.message}") }
         // TODAY'S INDIAN FILLS, CAPTURED WHILE THE DAY STILL EXISTS. Kite's trade
         // list is emptied overnight and there is no endpoint that gives a past day
         // back, so a pass that does not ask loses that day's trades permanently.
@@ -703,12 +781,38 @@ class ScanService : Service() {
             }
             if (tg.isNotBlank()) { Log.i(TAG, "Week targets: $tg"); watchBits.add(tg) }
         } catch (e: Exception) { Log.w(TAG, "week targets failed: ${e.message}") }
+        // SAFETY STOPS UNDER SALES THAT ARE WAITING — after the exit retry and the
+        // targets, so a sale made this pass is tidied rather than protected, and a
+        // sale that found no buyer gets its stop back straight away.
+        try {
+            val gd = withContext(Dispatchers.IO) {
+                com.signalscope.app.trading.T212ExitGuards.keep(applicationContext)
+            }
+            if (gd.isNotBlank()) { Log.i(TAG, "Safety stops: $gd"); watchBits.add(gd) }
+        } catch (e: Exception) { Log.w(TAG, "safety stops failed: ${e.message}") }
+        // BUYS WAITING AT TRADING 212 — yours as well as the app's. Each holds cash
+        // back from the account, so the waiting-orders list and the algos' cash
+        // check both need to know they are there. Read only.
+        try {
+            val wb = withContext(Dispatchers.IO) {
+                com.signalscope.app.trading.T212WaitingOrders.refresh(applicationContext)
+            }
+            if (wb.isNotBlank()) Log.i(TAG, "Waiting buys: $wb")
+        } catch (e: Exception) { Log.w(TAG, "waiting buys read failed: ${e.message}") }
         // FLOOR-ORDER ALGOS — paper only, last in the pass for the same reason as
         // the watcher: nothing here holds real money, so it never goes ahead of
         // anything that does.
         val floorNote = try {
             withContext(Dispatchers.IO) { com.signalscope.app.trading.FloorAlgoEngine.runAll(applicationContext) }
         } catch (e: Exception) { Log.w(TAG, "floor algos failed: ${e.message}"); "" }
+        // WHAT YOU HOLD, FOR THE PINNED NOTIFICATION — last, so it reads the
+        // positions, targets and stops exactly as this pass left them. Reports
+        // only; it places and cancels nothing.
+        try {
+            withContext(Dispatchers.IO) {
+                com.signalscope.app.trading.PositionRadar.refresh(applicationContext)
+            }
+        } catch (e: Exception) { Log.w(TAG, "position summary failed: ${e.message}") }
         if (completed) {
             Log.i(TAG, "Strategy Lab tick complete ($reason): ${nsList.size} ns [${nsList.joinToString(",")}]")
             // NAME WHAT IT DID. "Paper tick complete" told the user a thing had
@@ -722,7 +826,29 @@ class ScanService : Service() {
                     .sumOf { n -> StrategyLabStore.load(applicationContext, n)
                         .trades.count { it.status == "OPEN" } }
             } catch (e: Exception) { -1 }
-            val summary = buildString {
+            // WITH EVERY STOCK MARKET SHUT, say that instead. The watchlist sizes and
+            // held counts are unchanged all night and read like a scan; what is
+            // worth knowing is that nothing can trade, and when that changes.
+            val nextOpen = com.signalscope.app.trading.MarketHours.nextOpeningText(System.currentTimeMillis())
+            val summary = if (nextOpen != null) buildString {
+                append("Stock markets shut")
+                // Same test as the activity check above: an armed seat gate counts
+                // even with every seat in cash, because the pass still runs it.
+                val cryptoOn = nsList.any { n ->
+                    com.signalscope.app.trading.Spaces.baseOf(n) == "binance" &&
+                        StrategyLabStore.load(applicationContext, n).let { s ->
+                            s.enabled && (s.enrolled.isNotEmpty() || try {
+                                com.signalscope.app.data.MacdGateStore.load(applicationContext, n).enabled
+                            } catch (e: Exception) { false })
+                        }
+                }
+                if (cryptoOn) append(" · crypto checked")
+                append(" · $nextOpen")
+                // Anything that actually happened still shows — only the plain
+                // counts ("DE 40") are left out.
+                val notable = watchBits.filterNot { Regex("^(DE|US|IN) \\d+$").matches(it) }
+                if (notable.isNotEmpty()) append(" · ${notable.joinToString(", ")}")
+            } else buildString {
                 append("Checked ${nsList.size} algos")
                 if (open >= 0) append(" · $open open")
                 if (watchBits.isNotEmpty()) append(" · watcher ${watchBits.joinToString(", ")}")
@@ -1148,6 +1274,7 @@ class ScanService : Service() {
          *  say WHY rather than reporting one opaque "skipped" total. */
         val thinlyTraded = mutableListOf<String>()
         val tooShort = mutableListOf<String>()
+        val noData = mutableListOf<String>()
 
         // ── THE TURNOVER FLOOR, THE SAME ONE THE WATCHER USES ─────────────────
         //
@@ -1371,6 +1498,7 @@ class ScanService : Service() {
                     is YahooFinanceClient.CandleResult.NoData -> {
                         consecutiveErrors = 0
                         skipped++
+                        noData.add(symbol)
                     }
                     is YahooFinanceClient.CandleResult.Error -> {
                         consecutiveErrors++
@@ -1520,7 +1648,7 @@ class ScanService : Service() {
                             errors++
                             delay(5000L) // extra 5s cool-down on retry rate limit
                         }
-                        is YahooFinanceClient.CandleResult.NoData -> skipped++
+                        is YahooFinanceClient.CandleResult.NoData -> { skipped++; noData.add(symbol) }
                         is YahooFinanceClient.CandleResult.Error -> {
                             retryErrors++
                             errors++
@@ -1596,7 +1724,14 @@ class ScanService : Service() {
                 (it.sma200 != null && it.price > it.sma200) &&
                         (it.macdPhase == "BUY FLIP" || it.macdPhase == "EARLY BUY")
             },
-            durationMs = elapsed
+            durationMs = elapsed,
+            dropped = mapOf(
+                "belowFloor" to belowTurnover.distinct(),
+                "noData" to noData.distinct(),
+                "tooShort" to tooShort.distinct(),
+                "thinVolume" to thinlyTraded.distinct()
+            ).filterValues { it.isNotEmpty() },
+            turnoverFloor = liqFloor
         )
         ScanServiceResultHolder.lastDiscoveryResult = lastDiscoveryResult
         ScanServiceResultHolder.discoveryVersion++
@@ -2559,8 +2694,12 @@ class ScanService : Service() {
                 }
             }
             .build()
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-            .notify(alert.symbol.hashCode() + 1000, notification)
+        // The holding it is about, in the market it trades in, so the list can
+        // open it again.
+        val alertSpace = when (currency) { "$" -> "us"; "€" -> "de"; else -> "in" }
+        NotificationLog.post(this, getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
+            alert.symbol.hashCode() + 1000, notification,
+            NotificationLog.Link(holding = alert.symbol, space = alertSpace))
     }
 
     private fun sendZerodhaExpiredNotification() {
@@ -2571,7 +2710,8 @@ class ScanService : Service() {
             .setContentText("Open SignalScope to reconnect your Zerodha account")
             .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentIntent(pi)
             .setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).build()
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(9999, notification)
+        NotificationLog.post(this, getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
+            9999, notification)
     }
 
     private fun broadcastUpdate() {
@@ -2816,14 +2956,13 @@ val NIFTY_500_YAHOO_SYMBOLS = listOf(
 // ═══════════════════════════════════════════════════════
 // AUTOMATIC ROBUST DISCOVERY SCHEDULER
 //
-// Wakes the service once per weekday after NSE close to run a ROBUST NIFTY 500
-// scan. Discovery indicators are daily-candle driven, so intraday repeats just
-// re-fetch the same Yahoo bars. One post-close pass refreshes the next-day
-// discovery/setup buckets without wasting requests.
+// Wakes the service once per weekday PER MARKET to run a ROBUST discovery scan:
+// India after the NSE close, Germany and the US an hour after each opens. See
+// [DiscoveryAutoScheduler] for why each sits where it does.
 //
-// Schedules one alarm at a time (the next slot) and re-arms after each fire,
-// so the chain self-heals across reboots / process death without needing
-// setRepeating's drift problems.
+// Each market keeps one alarm (its next slot) and re-arms after every fire, so
+// the chains self-heal across reboots / process death without needing
+// setRepeating's drift problems — and a slot missed outright is caught up.
 // ═══════════════════════════════════════════════════════
 /**
  * Schedule a wake-up that is actually ALLOWED to start a foreground service.
@@ -2941,10 +3080,22 @@ object StrategyLabScheduler {
             s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
         } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(ctx) } catch (e: Exception) { false }
 
-    private fun nextQuarterWithGraceMs(): Long {
-        val now = System.currentTimeMillis()
+    /**
+     * The next pass slot still ahead of [now].
+     *
+     * A SLOT LESS THAN A MINUTE AWAY IS STILL THIS ONE. This used to require a
+     * full minute's notice and otherwise jump to the slot after — so any start of
+     * the service in the minute before a pass (an automatic discovery scan firing
+     * at 12:45 ahead of the 12:46:30 pass, a scan or order started by hand) re-armed
+     * the alarm a quarter of an hour on, and that pass simply never ran: no stop
+     * checked, no exit taken, for fifteen minutes. Now it is kept, and the
+     * one-minute floor on the alarm makes it run at most a minute late instead.
+     * The alarm never fires early, so at its own firing the slot has passed and
+     * this moves on to the next one as before.
+     */
+    internal fun nextQuarterWithGraceMs(now: Long = System.currentTimeMillis()): Long {
         val currentSlot = (now / INTERVAL_MS) * INTERVAL_MS + GRACE_MS
-        if (currentSlot - now >= 60_000L) return currentSlot
+        if (currentSlot > now) return currentSlot
         return ((now / INTERVAL_MS) + 1) * INTERVAL_MS + GRACE_MS
     }
 }
@@ -3142,57 +3293,174 @@ class ZerodhaAutoLoginReceiver : android.content.BroadcastReceiver() {
     }
 }
 
+/**
+ * ONE AUTOMATIC DISCOVERY SCAN PER MARKET, EACH WEEKDAY, ON THAT MARKET'S CLOCK.
+ *
+ * Only India used to have one. Germany and the US refreshed only when someone
+ * tapped Scan, so their tables sat for days — "2 days old" on a Monday morning
+ * with Xetra three hours into the session — and every number read off them (a
+ * stock's sheet, its MACD line) was as old as the scan.
+ *
+ * WHEN EACH ONE RUNS, and why they differ:
+ *  • India, 16:15 IST — after the close. Unchanged: it was placed there so the
+ *    day's candle is finished and the table is ready for the next morning.
+ *  • Germany, 09:17 Berlin — as soon as the open is in the data. Xetra prices
+ *    reach the app about a quarter of an hour late, so 09:17 is the first
+ *    moment the day's opening trades are there to score.
+ *  • The US, 09:31 New York — a minute after the bell. US prices arrive with
+ *    next to no delay, so one minute is enough for the opening trade to be in.
+ *    Kept on New York time so the clock changes, which Europe and America make
+ *    on different weekends, cannot shift it off the open.
+ *
+ * A MISSED SLOT IS CAUGHT UP. The phone may be off at 10:00, or the alarm may be
+ * held back by the OS; whenever the service next starts on the same day and the
+ * market has no finished scan since its slot, it schedules one a minute out. A
+ * scan you ran by hand after the slot counts — it is the same table. Each market
+ * gets at most [MAX_TRIES_PER_DAY] attempts a day, [RETRY_GAP_MS] apart, so a
+ * day when the data source is down costs three tries, not a battery.
+ *
+ * Holidays are not known here: on a weekday the market is shut, the scan simply
+ * reads the previous session again.
+ */
 object DiscoveryAutoScheduler {
     private const val TAG = "DiscoveryAutoSched"
     private const val ACTION_FIRE = "com.signalscope.AUTO_DISCOVERY_FIRE"
-    private const val REQUEST_CODE = 0x5C0E
+    const val EXTRA_MARKET = "market"
+    private const val PREFS = "discovery_auto"
+    private const val RETRY_GAP_MS = 30 * 60 * 1000L
+    private const val MAX_TRIES_PER_DAY = 3
 
-    // 16:15 IST: after NSE close, with a buffer for Yahoo's daily candle to settle.
-    private val SLOT_MINUTES = listOf(16 * 60 + 15)
+    /**
+     * @param minute     local time the scan starts
+     * @param lastMinute local time after which a missed scan waits for the next day
+     */
+    private data class Slot(
+        val market: String, val name: String, val zone: String,
+        val minute: Int, val lastMinute: Int, val requestCode: Int, val action: String)
+
+    private val SLOTS = listOf(
+        // India's request code is the one its single alarm always had, so the
+        // alarm armed by the previous install is replaced rather than doubled.
+        Slot("nifty500", "NIFTY 500", "Asia/Kolkata", 16 * 60 + 15, 22 * 60, 0x5C0E,
+            ScanService.ACTION_DISCOVERY_NIFTY500_AUTO),
+        Slot("dax", "DAX 100", "Europe/Berlin", 9 * 60 + 17, 17 * 60 + 30, 0x5C0F,
+            ScanService.ACTION_DISCOVERY_DAX_AUTO),
+        Slot("nasdaq100", "NASDAQ 100", "America/New_York", 9 * 60 + 31, 16 * 60, 0x5C10,
+            ScanService.ACTION_DISCOVERY_NASDAQ100_AUTO))
 
     fun ensureScheduled(ctx: Context) {
         val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val pi = android.app.PendingIntent.getBroadcast(
-            ctx, REQUEST_CODE,
-            Intent(ctx, AutoDiscoveryReceiver::class.java).setAction(ACTION_FIRE),
-            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-        val nextFireWallMs = nextSlotWallTimeMs()
-        val delay = (nextFireWallMs - System.currentTimeMillis()).coerceAtLeast(60_000L)
-        val triggerAt = SystemClock.elapsedRealtime() + delay
-        // Replace any pre-update intraday alarm that may still be pending.
-        am.cancel(pi)
-        // ELAPSED_REALTIME so phone-clock changes don't surprise us.
-        // setAndAllowWhileIdle so Doze doesn't suppress it (still inexact,
-        // OS may delay by a few minutes — fine for a scheduled discovery).
-        scheduleWakeupAlarm(am, triggerAt, pi, TAG)
-        Log.i(TAG, "Next auto-discovery in ${delay / 60000} min")
-    }
-
-    /** Wall-clock millis of the next slot, skipping weekends. */
-    private fun nextSlotWallTimeMs(): Long {
-        val tz = TimeZone.getTimeZone("Asia/Kolkata")
-        val cal = Calendar.getInstance(tz)
-        val nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
-        val today = cal.clone() as Calendar
-        today.set(Calendar.SECOND, 0); today.set(Calendar.MILLISECOND, 0)
-
-        // Try today's remaining slots first
-        for (slot in SLOT_MINUTES) {
-            if (slot > nowMin) {
-                today.set(Calendar.HOUR_OF_DAY, slot / 60)
-                today.set(Calendar.MINUTE, slot % 60)
-                if (isWeekday(today)) return today.timeInMillis
+        val now = System.currentTimeMillis()
+        for (slot in SLOTS) {
+            try {
+                val at = catchUpAt(ctx, slot, now) ?: nextSlotMs(slot, now)
+                val delay = (at - now).coerceAtLeast(60_000L)
+                val pi = pending(ctx, slot)
+                am.cancel(pi)
+                scheduleWakeupAlarm(am, SystemClock.elapsedRealtime() + delay, pi, TAG)
+                Log.i(TAG, "[${slot.name}] next auto-discovery in ${delay / 60000} min")
+            } catch (e: Exception) {
+                Log.w(TAG, "[${slot.name}] could not set its alarm", e)
             }
         }
-        // Otherwise next valid weekday's post-close slot.
-        val next = today.clone() as Calendar
+    }
+
+    /**
+     * The alarm for [market] has gone off: is a scan actually due? Records the
+     * attempt and returns the service action to run, or null when today's scan
+     * already exists or the day's attempts are spent. Asked at the moment of
+     * firing because a retry armed half an hour ago knows nothing of a scan that
+     * has finished since.
+     */
+    fun claimIfDue(ctx: Context, market: String?): String? {
+        val slot = SLOTS.firstOrNull { it.market == market } ?: SLOTS[0]
+        val now = System.currentTimeMillis()
+        val due = catchUpAt(ctx, slot, now, firing = true) ?: return null
+        if (due > now + 60_000L) return null
+        val p = prefs(ctx)
+        val slotMs = slotMsOn(slot, now)
+        val tries = if (p.getLong("lastTry_${slot.market}", 0L) >= slotMs)
+            p.getInt("tries_${slot.market}", 0) else 0
+        p.edit().putLong("lastTry_${slot.market}", now)
+            .putInt("tries_${slot.market}", tries + 1).apply()
+        return slot.action
+    }
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private fun pending(ctx: Context, slot: Slot): android.app.PendingIntent =
+        android.app.PendingIntent.getBroadcast(
+            ctx, slot.requestCode,
+            Intent(ctx, AutoDiscoveryReceiver::class.java).setAction(ACTION_FIRE)
+                .putExtra(EXTRA_MARKET, slot.market),
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+
+    /** Today's slot for this market, in wall-clock millis — whether or not it has passed. */
+    private fun slotMsOn(slot: Slot, now: Long): Long {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone(slot.zone))
+        cal.timeInMillis = now
+        cal.set(Calendar.HOUR_OF_DAY, slot.minute / 60)
+        cal.set(Calendar.MINUTE, slot.minute % 60)
+        cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
+    }
+
+    /**
+     * When today's scan should still be run, or null if it is not owed: not a
+     * weekday, before the slot or past the day's window, already scanned since
+     * the slot (by the alarm or by hand), or out of attempts. [firing] relaxes the
+     * spacing by two minutes, since an alarm can land a little after it was due.
+     */
+    private fun catchUpAt(ctx: Context, slot: Slot, now: Long, firing: Boolean = false): Long? {
+        val p = prefs(ctx)
+        return owedAt(slot, now,
+            lastCompleteAt = DiscoveryResultStore.lastCompleteAt(ctx, slot.name),
+            lastTry = p.getLong("lastTry_${slot.market}", 0L),
+            tries = p.getInt("tries_${slot.market}", 0), firing = firing)
+    }
+
+    /** When [market]'s automatic scan next runs: a catch-up still owed today,
+     *  else the next regular slot. For the page's "last scan" line. */
+    fun nextRunAt(ctx: Context, market: String, now: Long = System.currentTimeMillis()): Long? {
+        val slot = SLOTS.firstOrNull { it.market == market } ?: return null
+        return catchUpAt(ctx, slot, now) ?: nextSlotMs(slot, now)
+    }
+
+    /** [catchUpAt] with its stored inputs passed in, so the rules can be tested. */
+    internal fun owedAt(market: String, now: Long, lastCompleteAt: Long, lastTry: Long,
+                        tries: Int, firing: Boolean = false): Long? =
+        owedAt(SLOTS.first { it.market == market }, now, lastCompleteAt, lastTry, tries, firing)
+
+    private fun owedAt(slot: Slot, now: Long, lastCompleteAt: Long, lastTry: Long,
+                       tries: Int, firing: Boolean): Long? {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone(slot.zone))
+        cal.timeInMillis = now
+        if (!isWeekday(cal)) return null
+        val nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        if (nowMin < slot.minute || nowMin >= slot.lastMinute) return null
+        val slotMs = slotMsOn(slot, now)
+        if (lastCompleteAt >= slotMs) return null
+        val triedToday = lastTry >= slotMs
+        if (triedToday && tries >= MAX_TRIES_PER_DAY) return null
+        val at = if (!triedToday) now
+                 else lastTry + RETRY_GAP_MS - (if (firing) 2 * 60_000L else 0L)
+        val endMs = slotMs + (slot.lastMinute - slot.minute) * 60_000L
+        return if (at < endMs) maxOf(at, now) else null
+    }
+
+    /** The next regular slot for [market]: today's if still ahead, else the next weekday's. */
+    internal fun nextSlotMs(market: String, now: Long): Long =
+        nextSlotMs(SLOTS.first { it.market == market }, now)
+
+    private fun nextSlotMs(slot: Slot, now: Long): Long {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone(slot.zone))
+        cal.timeInMillis = slotMsOn(slot, now)
+        if (isWeekday(cal) && cal.timeInMillis > now) return cal.timeInMillis
         do {
-            next.add(Calendar.DAY_OF_MONTH, 1)
-        } while (!isWeekday(next))
-        next.set(Calendar.HOUR_OF_DAY, SLOT_MINUTES[0] / 60)
-        next.set(Calendar.MINUTE, SLOT_MINUTES[0] % 60)
-        return next.timeInMillis
+            cal.add(Calendar.DAY_OF_MONTH, 1)
+        } while (!isWeekday(cal))
+        return cal.timeInMillis
     }
 
     private fun isWeekday(cal: Calendar): Boolean {
@@ -3202,19 +3470,26 @@ object DiscoveryAutoScheduler {
 }
 
 /**
- * Broadcast receiver that AlarmManager pokes at each scheduled slot.
- * Kicks off a ROBUST NIFTY 500 discovery and re-arms the chain.
+ * Broadcast receiver that AlarmManager pokes at each market's slot (or retry).
+ * Starts that market's ROBUST discovery if it is still owed, and re-arms.
  */
 class AutoDiscoveryReceiver : android.content.BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        Log.i("AutoDiscoveryRecv", "Auto-discovery alarm fired — starting ROBUST NIFTY 500 scan")
-        // Re-arm the next slot first so a crash in the scan doesn't break the chain.
+        // No market on the intent = the India-only alarm an older install armed.
+        val market = intent?.getStringExtra(DiscoveryAutoScheduler.EXTRA_MARKET) ?: "nifty500"
+        val action = try { DiscoveryAutoScheduler.claimIfDue(context, market) }
+                     catch (e: Exception) { Log.e("AutoDiscoveryRecv", "due check failed", e); null }
+        // Re-arm before starting anything, so a crash in the scan can't break the chain.
         DiscoveryAutoScheduler.ensureScheduled(context)
-        val svc = ScanService.createIntent(context, ScanService.ACTION_DISCOVERY_NIFTY500_AUTO)
-        // Foreground service start is allowed from a broadcast triggered by
-        // setAndAllowWhileIdle (alarm-driven exemption on Android 12+).
+        if (action == null) {
+            Log.i("AutoDiscoveryRecv", "Auto-discovery alarm for $market — nothing owed today")
+            return
+        }
+        Log.i("AutoDiscoveryRecv", "Auto-discovery alarm fired — starting ROBUST $market scan")
+        // Foreground service start is allowed from a broadcast triggered by an
+        // exact alarm (alarm-driven exemption on Android 12+).
         try {
-            context.startForegroundService(svc)
+            context.startForegroundService(ScanService.createIntent(context, action))
         } catch (e: Exception) {
             Log.e("AutoDiscoveryRecv", "Failed to start ScanService for auto-discovery", e)
         }

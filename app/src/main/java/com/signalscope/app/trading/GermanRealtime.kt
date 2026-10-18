@@ -90,20 +90,95 @@ object GermanRealtime {
     /**
      * A live mid for a German symbol, or null.
      *
-     * [referencePrice] is the plausibility anchor and is REQUIRED — a stale one
+     * [referencePrice] is the plausibility anchor and is REQUIRED — a delayed one
      * is fine, which is the whole point: a fifteen-minute-old price is a perfectly
      * good answer to "is this roughly the right company", and a useless answer to
-     * "what is it worth now".
+     * "what is it worth now". [referenceStale] says it is older than that — see
+     * [checkedQuote] for what changes.
      *
      * Null on anything at all going wrong. Every caller falls back to Yahoo, and
      * none of them surfaces an error: a scrape that breaks should never be louder
      * to the user than the slightly stale price it replaced.
      */
-    fun mid(ctx: Context, symbol: String, referencePrice: Double): Double? {
+    fun mid(ctx: Context, symbol: String, referencePrice: Double,
+            referenceStale: Boolean = false): Double? {
         if (referencePrice <= 0.0) return null
         val isin = isinFor(ctx, symbol) ?: return null
-        val q = TradegateClient.fetchQuote(isin, referencePrice) ?: return null
+        val q = checkedQuote(ctx, isin, symbol, null, referencePrice, referenceStale) ?: return null
         return q.mid.takeIf { it > 0.0 }
+    }
+
+    // ── WHICH REFERENCE MAY VOUCH FOR A VENUE QUOTE ─────────────────────────
+    //
+    // The reference check guards against one thing: an ISIN that resolved to the
+    // wrong instrument, whose price is real, confident and somebody else's. It
+    // was anchored on Yahoo alone — and when Yahoo's line for Pfisterer froze at
+    // 66.60, the check did the opposite of its job for a week: the venue said 59,
+    // which was right, and was thrown away for disagreeing with a number that had
+    // stopped. The guard became the fault.
+    //
+    // So a quote now needs ONE trusted price to agree with it, tried in order:
+    //
+    //   1. the feed's price, while it is current — within [CLOSE_BAND], as before;
+    //   2. Trading 212's own valuation of the holding — within [CLOSE_BAND]. The
+    //      broker prices the very instrument the ISIN came from, so agreement
+    //      there settles both "right company" and "right price";
+    //   3. a feed price that has stopped — within [STALE_BAND] only. Days of drift
+    //      fit inside it; another company's price (the SMA Solar test: 1.82
+    //      against 61.75) does not.
+    //
+    // Nothing agrees, nothing is used: the quote is refused exactly as before.
+
+    /** How far a quote may sit from a CURRENT reference. */
+    const val CLOSE_BAND = TradegateClient.MAX_YAHOO_DEVIATION
+    /** How far from a reference that has stopped moving. */
+    const val STALE_BAND = 0.25
+
+    enum class Vouch { FEED, BROKER, STALE_FEED }
+
+    private fun near(x: Double, ref: Double, band: Double): Boolean =
+        ref > 0.0 && ref.isFinite() && Math.abs(x - ref) / ref <= band
+
+    /** Pure: which price, if any, vouches for a venue [mid]. 0 = not known. */
+    fun vouch(mid: Double, feedRef: Double, feedStale: Boolean, brokerPrice: Double): Vouch? = when {
+        !(mid > 0.0) || !mid.isFinite() -> null
+        !feedStale && near(mid, feedRef, CLOSE_BAND) -> Vouch.FEED
+        near(mid, brokerPrice, CLOSE_BAND) -> Vouch.BROKER
+        feedStale && near(mid, feedRef, STALE_BAND) -> Vouch.STALE_FEED
+        else -> null
+    }
+
+    /** True when the feed for this German symbol has stopped — see FeedHealth. */
+    fun feedStopped(symbol: String): Boolean =
+        com.signalscope.app.network.FeedHealth.stoppedSince(bare(symbol) + ".DE") > 0L
+
+    /**
+     * The venue's quote for [isin], if some trusted price vouches for it.
+     *
+     * The usual case costs nothing new: a current feed price that agrees settles
+     * it. Only a disagreement, or a stale feed, asks the broker — one shared,
+     * cached portfolio read — and [t212Ticker] makes that match exact when the
+     * caller has it.
+     */
+    fun checkedQuote(ctx: Context, isin: String, symbol: String, t212Ticker: String?,
+                     feedRef: Double, feedStale: Boolean): TradegateClient.Quote? {
+        val q = TradegateClient.fetchUnanchored(isin) ?: return null
+        if (!feedStale && near(q.mid, feedRef, CLOSE_BAND)) return q
+        val broker = try {
+            BrokerHoldings.t212Price(ctx, t212Ticker ?: bare(symbol), "de")
+        } catch (e: Exception) { 0.0 }
+        val how = vouch(q.mid, feedRef, feedStale, broker)
+        val k = bare(symbol)
+        when (how) {
+            null -> Log.d(TAG, "$k ($isin): venue ${q.mid} matches no trusted price " +
+                "(feed $feedRef${if (feedStale) ", stopped" else ""}, broker $broker) — rejected")
+            Vouch.FEED -> {}
+            Vouch.BROKER -> Log.i(TAG, "$k: venue ${q.mid} vouched for by the broker's own $broker " +
+                "(feed $feedRef${if (feedStale) ", stopped" else ""})")
+            Vouch.STALE_FEED -> Log.i(TAG, "$k: venue ${q.mid} accepted against a stopped feed " +
+                "price $feedRef (within ${(STALE_BAND * 100).toInt()}%)")
+        }
+        return if (how == null) null else q
     }
 
     /** For tests and diagnostics: forget everything learned so far. */

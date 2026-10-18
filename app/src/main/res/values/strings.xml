@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Tol-Mol</string>
+    <string name="widget_positions_desc">What you hold: positions near their stop, their target or their high since you bought</string>
 </resources>

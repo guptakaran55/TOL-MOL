@@ -12,6 +12,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8766", "--directory", "app/src/main/assets"],
       "port": 8766
+    },
+    {
+      "name": "area-score-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8771", "--bind", "127.0.0.1", "--directory", "backtest_results/area_score/step1"],
+      "port": 8771
     }
   ]
 }

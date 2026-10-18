@@ -108,7 +108,7 @@ object DummyGttMonitor {
                 .build()
 
             val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify((id + side.name).hashCode(), n)
+            com.signalscope.app.data.NotificationLog.post(ctx, nm, (id + side.name).hashCode(), n)
         } catch (e: Exception) {
             Log.e(TAG, "notify failed for $symbol", e)
         }

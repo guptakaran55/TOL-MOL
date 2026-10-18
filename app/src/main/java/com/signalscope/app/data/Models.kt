@@ -255,7 +255,15 @@ data class StockAnalysis(
 
     val valueScore: Int = 0,              // 0–100 fundamental value score
     val valueRating: String = "N/A",      // "DEEP VALUE" / "MODERATE VALUE" / "MILD VALUE" / "NOT ATTRACTIVE" / "N/A"
-    val valueScoreReport: String = ""     // bucket|max|reason rows for audit
+    val valueScoreReport: String = "",    // bucket|max|reason rows for audit
+
+    // ── Area score (see AreaScore): weighted average gap of the last 12 months' closes to
+    //    today's close, in %. Positive = the past sat mostly above today. Null when there is
+    //    less than a year of history. areaRank = 0–100 against the stock's own earlier scores. ──
+    val areaScore: Double? = null,
+    val areaGreen: Double? = null,
+    val areaRed: Double? = null,
+    val areaRank: Double? = null
 )
 
 // ═══════════════════════════════════════════════════════
@@ -346,5 +354,16 @@ data class DiscoveryScanResult(
     /** Setups: SMA pass + BUY FLIP or EARLY BUY phase */
     val setups: List<StockAnalysis>,
 
-    val durationMs: Long
+    val durationMs: Long,
+
+    /**
+     * WHICH NAMES WERE LEFT OUT, BY REASON: "belowFloor" (median daily turnover
+     * under [turnoverFloor]), "noData" (Yahoo has no prices for the symbol),
+     * "tooShort" (under 50 days of history), "thinVolume" (under the volume
+     * floor). One "skipped" count used to read as "no data" for all of them —
+     * 251 German names that were cut on purpose looked like a broken feed.
+     * Null on a result saved before this existed.
+     */
+    val dropped: Map<String, List<String>>? = null,
+    val turnoverFloor: Double = 0.0
 )

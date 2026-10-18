@@ -110,6 +110,39 @@ object LabNotifier {
         }
     } catch (e: Exception) { Log.w(TAG, "chart for $symbol failed", e); null }
 
+    /**
+     * THE NEAR-LOW ALERT'S PICTURE — see [LowsChartBitmap]: the slope dots, price
+     * over a year, a month and five days with each window's low, and the daily
+     * MACD as a strip. The price comes from the bars the watchlist downloaded for
+     * this stock moments ago on the same pass; the MACD curve from the stored
+     * series, as before. Null when there is nothing to draw.
+     */
+    private fun lowsArt(ctx: Context, space: String, symbol: String, price: Double,
+                        bars0: List<com.signalscope.app.data.CandleData>? = null): ChartArt? = try {
+        val sym = symbol.trim().uppercase()
+        val base = Spaces.baseOf(space.lowercase())
+        val s = com.signalscope.app.data.ManualSparkStore.load(ctx, space).series[sym]
+        val curve = s?.macdRecent.orEmpty()
+        val c15 = try {
+            (com.signalscope.app.network.YahooFinanceClient.fetchCandles15m(
+                sym, Spaces.exchangeOf(base), includePrePost = false)
+                as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles
+        } catch (e: Exception) { null }
+        val v = if (base == "us") velocity15m(space, sym)
+                else c15?.let { PriceVelocity.last15m(it, System.currentTimeMillis() / 1000L, FeedDelay.secFor(base)) }
+        val slopes = macdSlopes(ctx, base, sym, curve, c15)
+        val bars = bars0 ?: StrategyLabRunner.lastCandles
+            ?.takeIf { it.first.equals(MacdLadder.bare(sym), true) }?.third.orEmpty()
+        val panels = LowsChartBitmap.panels(bars, price)
+        // NO CORNER SQUARE. The phone keeps that small picture beside the title even
+        // when the alert is expanded, and narrows the main picture to make room for
+        // it — the three price charts came out at about half the card's width.
+        // Without it they use the full width; folded, the alert is its title and
+        // one line, which is all a folded alert has room for anyway.
+        LowsChartBitmap.wide(ctx, panels, curve, s?.phase, slopes, v?.pct, v?.let { note15m(it) })
+            ?.let { w -> ChartArt(w, null) }
+    } catch (e: Exception) { Log.w(TAG, "lows chart for $symbol failed", e); null }
+
     /** The five MACD-slope dots — the same routine the detail view uses, so an
      *  alert and the app can never show one stock two ways. See [MacdLadder]. */
     private fun macdSlopes(ctx: Context, base: String, sym: String, dailyMacd: List<Double>,
@@ -144,7 +177,10 @@ object LabNotifier {
                        openNs: String? = null,
                        openSymbol: String? = null, openSpace: String? = null,
                        openWatchSymbol: String? = null,
-                       chart: ChartArt? = null) {
+                       chart: ChartArt? = null,
+                       /** False: the expanded view is the title and the picture
+                        *  only — the text shows while folded. */
+                       textInBig: Boolean = true) {
         try {
             val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.createNotificationChannel(NotificationChannel(channel, channelName, importance))
@@ -182,7 +218,7 @@ object LabNotifier {
             val pi = PendingIntent.getActivity(ctx, idSeed.hashCode(), launch,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val b = NotificationCompat.Builder(ctx, channel)
-                .setContentTitle(title).setContentText(text)
+                .setContentTitle(coloured(title)).setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_menu_sort_by_size)
                 .setContentIntent(pi).setAutoCancel(true)
             if (chart != null) {
@@ -192,9 +228,10 @@ object LabNotifier {
                 // the whole text and puts the chart beneath it; the collapsed view
                 // stays the standard one, with the small chart beside the title.
                 val big = RemoteViews(ctx.packageName, R.layout.notification_chart).apply {
-                    setTextViewText(R.id.nc_title, title)
+                    setTextViewText(R.id.nc_title, coloured(title))
                     setTextViewText(R.id.nc_text, text)
                     setImageViewBitmap(R.id.nc_chart, chart.wide)
+                    if (!textInBig) setViewVisibility(R.id.nc_text, android.view.View.GONE)
                 }
                 b.setStyle(NotificationCompat.DecoratedCustomViewStyle())
                     .setCustomBigContentView(big)
@@ -204,7 +241,12 @@ object LabNotifier {
             }
             val n = b.build()
             // Unique id per trade event so a burst of fills doesn't overwrite itself.
-            nm.notify(idSeed.hashCode(), n)
+            // Recorded with the same destination the tap carries, so the in-app
+            // list can open it again after the notification itself is gone.
+            val link = if (openNs.isNullOrBlank() && openSymbol.isNullOrBlank() && openWatchSymbol.isNullOrBlank()) null
+                else com.signalscope.app.data.NotificationLog.Link(ns = openNs, symbol = openSymbol,
+                    watchSymbol = openWatchSymbol, space = openSpace)
+            com.signalscope.app.data.NotificationLog.post(ctx, nm, idSeed.hashCode(), n, link)
         } catch (e: Exception) { Log.w(TAG, "notify failed", e) }
     }
 
@@ -298,6 +340,20 @@ object LabNotifier {
      */
     fun manualEntrySignal(ctx: Context, space: String, symbol: String, rank: Int,
                           price: Double, reason: String) {
+        // THE SAME COMPACT PICTURE AS THE NEAR-LOW ALERT — see [lowsArt]: a
+        // one-line title, then the slope strip and the 2×2 grid of price and MACD.
+        // The rule wording goes to the folded line only; expanded, the picture
+        // shows what it described. Without a picture, the full wording below.
+        val art = lowsArt(ctx, space, symbol, price)
+        if (art != null) {
+            notify(ctx, CH_MANUAL, NotificationManager.IMPORTANCE_HIGH, "Manual entry signals",
+                "🟣 $symbol" + (if (rank > 0) " #$rank" else "") +
+                    " ${curOf(space)}${"%.2f".format(price)} · entry signal",
+                reason.ifBlank { "The watcher config would enter here" },
+                "me-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
+                openSymbol = symbol, openSpace = space, chart = art, textInBig = false)
+            return
+        }
         notify(ctx, CH_MANUAL, NotificationManager.IMPORTANCE_HIGH, "Manual entry signals",
             "🟣 $symbol — entry signal (#$rank)",
             "${spaceLabel(space)} · the watcher config would enter at ${"%.4f".format(price)}" +
@@ -356,6 +412,25 @@ object LabNotifier {
         val deep = hits.lastOrNull() ?: return
         val offLow = if (deep.low > 0.0) (price / deep.low - 1.0) * 100.0 else 0.0
         val others = hits.dropLast(1).map { it.label }
+        // THE PICTURE CARRIES IT NOW. With the price charts showing each window's
+        // low, the alert is the title and the picture: how far above the low goes
+        // in the title, the low and the range are the folded line, and the rest —
+        // "nothing was bought", the visit count — is dropped. It never buys, and
+        // the space is better spent on the charts. Without a picture the full
+        // wording below is still sent, as before.
+        val art = lowsArt(ctx, space, symbol, price)
+        if (art != null) {
+            // SHORT ENOUGH FOR ONE LINE: "🔵 PANW #13 $366.17 · +1.2% vs 1W low". The
+            // longer "1.2% above its 1-week low" was cut off at the price.
+            val lowTag = when (deep.scale) { "3d" -> "3D"; "1w" -> "1W"; "1m" -> "1M"; else -> deep.label }
+            notify(ctx, CH_SUPPORT, NotificationManager.IMPORTANCE_DEFAULT, "Near support",
+                "🔵 $symbol" + (if (rank > 0) " #$rank" else "") + " $cur${"%.2f".format(price)} · " +
+                    "${"%+.1f".format(offLow)}% vs $lowTag low",
+                "Low $cur${"%.2f".format(deep.low)} · range to $cur${"%.2f".format(deep.high)}",
+                "ns-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}-${deep.scale}",
+                openWatchSymbol = symbol, openSpace = space, chart = art, textInBig = false)
+            return
+        }
         notify(ctx, CH_SUPPORT, NotificationManager.IMPORTANCE_DEFAULT, "Near support",
             "🔵 $symbol — near its ${deep.label} low" + (if (rank > 0) " (#$rank)" else ""),
             "${spaceLabel(space)} · $cur${"%.2f".format(price)} is " +
@@ -389,7 +464,18 @@ object LabNotifier {
      * order has already gone in.
      */
     fun turningUp(ctx: Context, space: String, symbol: String, rank: Int, price: Double) {
-        val cur = when (Spaces.baseOf(space.lowercase())) { "de" -> "€"; "in" -> "₹"; else -> "$" }
+        val cur = curOf(space)
+        // The compact picture, as for the near-low and entry alerts.
+        val art = lowsArt(ctx, space, symbol, price)
+        if (art != null) {
+            notify(ctx, CH_TURN, NotificationManager.IMPORTANCE_DEFAULT, "Turning up at a floor",
+                "🟢 $symbol" + (if (rank > 0) " #$rank" else "") +
+                    " $cur${"%.2f".format(price)} · turning up at floor",
+                "Month and day rising, 15m and 1h just turned up, at its 3-day low",
+                "tu-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
+                openWatchSymbol = symbol, openSpace = space, chart = art, textInBig = false)
+            return
+        }
         notify(ctx, CH_TURN, NotificationManager.IMPORTANCE_DEFAULT, "Turning up at a floor",
             "🟢 $symbol — turning up at its floor" + (if (rank > 0) " (#$rank)" else ""),
             "${spaceLabel(space)} · $cur${"%.2f".format(price)}, at the bottom of its 3-day range, with the " +
@@ -401,14 +487,28 @@ object LabNotifier {
             chart = macdArt(ctx, space, symbol))
     }
 
-    fun previewChart(ctx: Context, space: String, symbol: String): Boolean {
-        val art = macdArt(ctx, space, symbol) ?: return false
+    /** "€", "₹" or "$" for a space. */
+    private fun curOf(space: String): String =
+        when (Spaces.baseOf(space.lowercase())) { "de" -> "€"; "in" -> "₹"; else -> "$" }
+
+    /**
+     * A clearly-labelled PREVIEW of a watcher alert's picture: [kind] is "low"
+     * (near-low), "entry" (entry signal) or "turn" (turning up at a floor). All
+     * three share one picture, with its own download of the bars — a preview is
+     * not part of a pass that has just fetched them. Posted quietly on the
+     * near-low channel whatever the kind, so trying one never rings the phone.
+     */
+    fun previewChart(ctx: Context, space: String, symbol: String, kind: String = "low"): Boolean {
+        val bars = StrategyLabRunner.recentClosedCandles(ctx,
+            com.signalscope.app.data.ManualWatchStore.nsFor(space), symbol)
+        val px = MarkToMarket.get(symbol)?.price?.takeIf { it > 0.0 } ?: bars.lastOrNull()?.close ?: 0.0
+        val art = lowsArt(ctx, space, symbol, px, bars) ?: macdArt(ctx, space, symbol) ?: return false
+        val what = when (kind) { "entry" -> "🟣 entry signal"; "turn" -> "🟢 turning up at floor"; else -> "🔵 near-low alert" }
         notify(ctx, CH_SUPPORT, NotificationManager.IMPORTANCE_DEFAULT, "Near support",
-            "🔍 PREVIEW — $symbol chart",
-            "${spaceLabel(space)} · this is how a watcher alert for $symbol shows its " +
-                "daily MACD. Nothing fired and nothing has been bought.",
-            "pv-$space-$symbol-${System.currentTimeMillis()}",
-            openWatchSymbol = symbol, openSpace = space, chart = art)
+            "🔍 PREVIEW — $symbol ${curOf(space)}${"%.2f".format(px)} · $what",
+            "Nothing fired and nothing has been bought.",
+            "pv-$space-$symbol-$kind-${System.currentTimeMillis()}",
+            openWatchSymbol = symbol, openSpace = space, chart = art, textInBig = false)
         return true
     }
 
@@ -422,9 +522,8 @@ object LabNotifier {
      */
     fun t212Buy(ctx: Context, ns: String, symbol: String, qty: Double, spent: Double, cur: String) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
-            "🟢 LIVE BUY $symbol",
-            "${algoLabel(ctx, ns)} bought ${"%.4f".format(qty)} for ${"%.2f".format(spent)} $cur " +
-                "(real order on Trading 212).",
+            "${flagOf(ns)} $symbol bought",
+            whoBought(ctx, ns, ""),
             "t2b-$ns-$symbol-${System.currentTimeMillis() / 60000}", openNs = ns)
 
     /**
@@ -469,9 +568,11 @@ object LabNotifier {
                  paid: Double = 0.0, realExit: Double = 0.0,
                  broker: String = "Trading 212") {
         val t = sellAlertText(
-            who = algoLabel(ctx, ns) + (if (origin.isNotBlank()) " · $origin" else ""),
-            symbol = symbol, qty = qty, cur = cur, reason = reason,
-            paid = paid, realExit = realExit, broker = broker)
+            who = whoBought(ctx, ns, origin),
+            symbol = symbol, qty = qty, cur = cur,
+            // The origin can carry the kind of exit too ("its target at Trading 212").
+            reason = listOf(reason, origin).filter { it.isNotBlank() }.joinToString(" · "),
+            paid = paid, realExit = realExit, broker = broker, flag = flagOf(ns))
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             t.first, t.second, "t2s-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
     }
@@ -481,14 +582,54 @@ object LabNotifier {
      * position, quietly: it is a standing instruction, not a trade, and the sale
      * it may lead to gets its own loud alert when it happens.
      */
+    fun yourSaleBooked(ctx: Context, ns: String, symbol: String, price: Double, paid: Double,
+                       seatTo: String?, tradeKey: String, cur: String) {
+        val pct = if (paid > 0.0) (price / paid - 1.0) * 100.0 else null
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
+            "💰 $symbol — your order sold it at ${"%.2f".format(price)}" +
+                (pct?.let { " (${"%+.1f".format(it)}%)" } ?: ""),
+            "${algoLabel(ctx, ns)} held $symbol, and an order you placed yourself sold it at " +
+                "${"%.2f".format(price)} $cur. It is booked to the algo like a take-profit. " +
+                (if (seatTo != null) "Its seat goes to $seatTo, bought on its next entry signal."
+                 else "Its seat waits in cash until a rising contender comes up."),
+            "t2y-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
+    }
+
+    fun soldOutsideApp(ctx: Context, ns: String, symbol: String, seatTo: String?, tradeKey: String) {
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
+            "✋ $symbol — sold outside the app, removed from ${algoLabel(ctx, ns)}",
+            "The $symbol shares were no longer in your Trading 212 account on two checks half an hour " +
+                "apart, so ${algoLabel(ctx, ns)}'s position is closed as sold by you. Its paper result is " +
+                "set aside, since the strategy did not choose that exit. " +
+                (if (seatTo != null) "Its seat goes to $seatTo, bought on its next entry signal."
+                 else "Its seat waits in cash until a rising contender comes up."),
+            "t2x-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
+    }
+
+    fun exitGuardSet(ctx: Context, ns: String, symbol: String, level: Double, decision: Double,
+                     qty: Double, cur: String, tradeKey: String) {
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_LOW, "Stock LIVE trades",
+            "\uD83D\uDEE1 $symbol — safety stop at ${"%.2f".format(level)} while its sale waits",
+            "${algoLabel(ctx, ns)} · the strategy sold $symbol" +
+                (if (decision > 0.0) " at ${"%.2f".format(decision)} $cur" else "") +
+                ", but the shares could not be sold yet. A stop for ${"%.4f".format(qty)} now waits at " +
+                "Trading 212 at ${"%.2f".format(level)} $cur: if the price falls there before the app " +
+                "sells, Trading 212 sells it, even with the phone off. The app still tries to sell at " +
+                "the next chance and takes the stop off first.",
+            "t2g-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
+    }
+
+    /** @param label which rule set the price, in words — "its 1-week high",
+     *  "near its 1-month high". */
     fun weekTargetSet(ctx: Context, ns: String, symbol: String, price: Double, paid: Double,
-                      qty: Double, cur: String, tradeKey: String) {
+                      qty: Double, cur: String, tradeKey: String,
+                      label: String = "its 1-week high") {
         val pct = if (paid > 0.0) (price / paid - 1.0) * 100.0 else null
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_LOW, "Stock LIVE trades",
             "🎯 $symbol — target set at ${"%.2f".format(price)}" +
                 (pct?.let { " (${"%+.1f".format(it)}%)" } ?: ""),
             "${algoLabel(ctx, ns)} · a sell for ${"%.4f".format(qty)} is waiting at Trading 212 " +
-                "at its 1-week high of ${"%.2f".format(price)} $cur" +
+                "at ${"%.2f".format(price)} $cur ($label)" +
                 (if (paid > 0.0) ", against the ${"%.2f".format(paid)} you paid" else "") +
                 ". It sells there even with the phone off. The stop is still watched by the app, " +
                 "and any other sale clears this order first.",
@@ -511,29 +652,99 @@ object LabNotifier {
      */
     internal fun sellAlertText(who: String, symbol: String, qty: Double, cur: String,
                                reason: String, paid: Double, realExit: Double,
-                               broker: String): Pair<String, String> {
+                               broker: String, flag: String = ""): Pair<String, String> {
+        // MINIMAL, ON THE USER'S ASK (16 Oct 2026): the title is the market, the
+        // stock and the result; the body is who bought it and what sold it. No
+        // quantities, no prices, nothing said twice — the detail is in the app.
         val settled = realExit > 0.0 && qty > 0.0
         val pct = if (settled && paid > 0.0) (realExit / paid - 1.0) * 100.0 else null
-        val body = if (settled)
-            "$who sold ${"%.4f".format(qty)} at ${"%.2f".format(realExit)} " +
-                "for ${"%.2f".format(realExit * qty)} $cur" +
-                (if (reason.isNotBlank()) " · $reason" else "") +
-                (if (pct != null)
-                    " · your money ${"%+.2f".format(pct)}% (bought at ${"%.2f".format(paid)})"
-                 else "") + "."
-        else
-            "$who sold ${"%.4f".format(qty)} $symbol" +
-                (if (reason.isNotBlank()) " · $reason" else "") +
-                " · waiting on $broker to report the fill price — the real figure " +
-                "replaces this alert as soon as it does."
-        return Pair(
-            "🔴 LIVE SELL $symbol" + (pct?.let { "  (${"%+.2f".format(it)}%)" } ?: ""),
-            body)
+        val title = (if (flag.isNotBlank()) "$flag " else "") + "$symbol sold" +
+            (pct?.let { " ${"%+.2f".format(it)}%" } ?: "")
+        val body = listOf(who, shortReason(reason)).filter { it.isNotBlank() }.joinToString(" · ") +
+            (if (settled) "" else " · result once $broker reports the price")
+        return Pair(title, body)
+    }
+
+    /** The market's flag, for the front of a trade alert. */
+    fun flagOf(ns: String): String = when (com.signalscope.app.trading.Spaces.baseOf(ns)) {
+        "de" -> "🇩🇪"; "in" -> "🇮🇳"; "us" -> "🇺🇸"; "binance" -> "🪙"; else -> ""
+    }
+
+    /**
+     * WHAT SOLD IT, in a few words. The reasons arrive as sentences written for
+     * the log — "reached its target of 145.00 (its 1-week high)" — and the card
+     * wants the kind of exit, not the sentence. Unknown wording is cut to its
+     * first clause rather than dropped.
+     */
+    internal fun shortReason(reason: String): String {
+        val r = reason.lowercase()
+        return when {
+            r.isBlank() -> ""
+            ("week" in r && "high" in r) || "1-week" in r -> "1-week-high target reached"
+            "month" in r && ("target" in r || "high" in r) -> "month target reached"
+            ("your" in r || "you set" in r || "manual" in r) && ("target" in r || "take profit" in r || "take-profit" in r) ->
+                "your target reached"
+            "target" in r || "take profit" in r || "take-profit" in r -> "target reached"
+            "atr" in r -> "ATR stop triggered"
+            "bollinger" in r -> "Bollinger stop triggered"
+            "trail" in r -> "trailing stop triggered"
+            "stop" in r -> "stop-loss triggered"
+            "macd" in r -> "MACD exit"
+            "trend" in r -> "trend exit"
+            "hold" in r && "day" in r -> "time limit"
+            else -> reason.split(" · ", " (", " — ", ": ").first().trim().take(40)
+        }
+    }
+
+    /** Who bought it: an algo by name, or the watcher — and whether the buy was
+     *  your own, which the exit minder says in its [origin]. */
+    private fun whoBought(ctx: Context, ns: String, origin: String): String {
+        val watcher = try {
+            com.signalscope.app.trading.Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID
+        } catch (e: Exception) { false }
+        val yours = origin.contains("yourself", true) || origin.contains("your own", true)
+        return when {
+            watcher && yours -> "Watcher · your buy"
+            watcher -> "Watcher buy"
+            else -> "Algo ${algoLabel(ctx, ns)}"
+        }
+    }
+
+    /** Titles carry their result in colour where the phone shows it: a gain green,
+     *  a loss red. */
+    private fun coloured(title: String): CharSequence {
+        val m = Regex("([+\\-−])\\d+(\\.\\d+)?%").find(title) ?: return title
+        val s = android.text.SpannableString(title)
+        val col = if (m.groupValues[1] == "+") 0xFF059669.toInt() else 0xFFDC2626.toInt()
+        s.setSpan(android.text.style.ForegroundColorSpan(col), m.range.first, m.range.last + 1,
+            android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return s
     }
 
     /** An entry that could not be placed is being kept for another attempt. Told
      *  once per queued order, because a decision that is waiting rather than dead
      *  is a different thing to know about than one that failed outright. */
+    /** The RV gate held an automatic order back for its full two hours and has now
+     *  started it anyway. */
+    fun rvGateTimedOut(ctx: Context, ns: String, symbol: String, buy: Boolean) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
+            "⏱ $symbol — patient ${if (buy) "buy" else "sale"} started after 2 hours",
+            "${algoLabel(ctx, ns)}'s ${if (buy) "buy" else "sale"} waited the RV gate's full two hours for a " +
+                "better moment (${if (buy) "price low in today's range, or rising" else "price high in today's range, or falling"}) " +
+                "and none came, so the patient ${if (buy) "buy" else "sale"} has started now.",
+            "rvt-$ns-$symbol-${System.currentTimeMillis() / 60000}", openNs = ns)
+
+    /** One of YOUR patient orders, held by the RV gate, has now run. */
+    fun rvManualDone(ctx: Context, space: String, symbol: String, buy: Boolean,
+                     timedOut: Boolean, why: String, result: String) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
+            (if (timedOut) "⏱ " else "✅ ") + "$symbol — your patient ${if (buy) "buy" else "sale"} " +
+                (if (timedOut) "started after 2 hours" else "started by the RV gate"),
+            (if (timedOut) "No better moment came in two hours of trading, so it ran anyway. "
+             else "The RV gate found its moment: $why. ") + "Result: $result.",
+            "rvm-$space-$symbol-${System.currentTimeMillis() / 60000}",
+            openSymbol = symbol, openSpace = space.lowercase())
+
     fun t212EntryQueued(ctx: Context, ns: String, symbol: String, why: String) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
             "⏳ $symbol — buy queued for retry",
@@ -671,6 +882,16 @@ object LabNotifier {
             "fb-$ns-$symbol-$price", openNs = ns)
     }
 
+    /** A campaign crossing a level it was told to watch — the weekly resistance,
+     *  the monthly resistance zone. A price observation, not a trade. */
+    fun campaignNote(ctx: Context, algo: String, ns: String, symbol: String, what: String) {
+        if (paperMuted(ctx, ns)) return
+        notify(ctx, CH_PAPER, NotificationManager.IMPORTANCE_DEFAULT, "Lab paper trades",
+            "🎯 $algo · $symbol",
+            "${spaceLabel(ns)} · $what. Paper only.",
+            "fc-$ns-$symbol-${what.hashCode()}", openNs = ns)
+    }
+
     fun floorSold(ctx: Context, algo: String, ns: String, symbol: String, price: Double,
                   pct: Double, what: String) {
         if (paperMuted(ctx, ns)) return
@@ -680,15 +901,21 @@ object LabNotifier {
             "fs-$ns-$symbol-$price", openNs = ns)
     }
 
-    fun paperOpen(ctx: Context, ns: String, symbol: String, price: Double) {
+    /**
+     * [late] is set when the signal is from a bar that finished well before this
+     * pass — a catch-up, held back to the market's open rather than announced at
+     * night as though it had just happened. It says which bar, in plain words.
+     */
+    fun paperOpen(ctx: Context, ns: String, symbol: String, price: Double, late: String? = null) {
         if (paperMuted(ctx, ns)) return
         val prompt = promptsRatherThanReports(ctx, ns)
         notify(ctx, CH_PAPER,
             if (prompt) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_DEFAULT,
             "Lab paper trades",
-            (if (prompt) "🟢 ${algoLabel(ctx, ns)} would BUY $symbol"
-             else "📈 ${algoLabel(ctx, ns)} bought $symbol (paper)"),
+            (if (prompt) "🟢 ${algoLabel(ctx, ns)} would BUY $symbol" + (if (late != null) " (late)" else "")
+             else "📈 ${algoLabel(ctx, ns)} bought $symbol (paper${if (late != null) ", late" else ""})"),
             "${spaceLabel(ns)} · ${"%.2f".format(price)}. " +
+                (if (late != null) "$late. " else "") +
                 (if (prompt)
                     "Nothing has been bought — this algo is not armed for real money. " +
                     "If you want it, buy it yourself; the app will manage the exit."
@@ -697,16 +924,19 @@ object LabNotifier {
             "po-$ns-$symbol-$price", openNs = ns)
     }
 
-    fun paperClose(ctx: Context, ns: String, symbol: String, pctReturn: Double, reason: String) {
+    fun paperClose(ctx: Context, ns: String, symbol: String, pctReturn: Double, reason: String,
+                   late: String? = null) {
         if (paperMuted(ctx, ns)) return
         val prompt = promptsRatherThanReports(ctx, ns)
         notify(ctx, CH_PAPER,
             if (prompt) NotificationManager.IMPORTANCE_HIGH else NotificationManager.IMPORTANCE_DEFAULT,
             "Lab paper trades",
             (if (prompt) "🔴 ${algoLabel(ctx, ns)} would SELL $symbol (${"%+.2f".format(pctReturn)}%)"
-             else "📉 ${algoLabel(ctx, ns)} sold $symbol  (${"%+.2f".format(pctReturn)}%)"),
+             else "📉 ${algoLabel(ctx, ns)} sold $symbol  (${"%+.2f".format(pctReturn)}%)") +
+                (if (late != null) " · late" else ""),
             "${spaceLabel(ns)} · ${"%+.2f".format(pctReturn)}%" +
                 (if (reason.isNotBlank()) " · $reason" else "") +
+                (if (late != null) ". $late" else "") +
                 (if (prompt) ". Nothing has been sold — sell it yourself if you agree."
                  else ". Tap to open this algo."),
             "pc-$ns-$symbol-$pctReturn", openNs = ns)
@@ -796,4 +1026,35 @@ object LabNotifier {
                 (if (count == 1) "" else "s") + ". Open Algos to see the diff — P&L is unreliable " +
                 "until it is resolved. Repeats once a day while it stands.",
             "pd-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}")
+
+    /**
+     * A NAME WHOSE PRICE FEED HAS STOPPED while its market is open — see
+     * FeedHealth for how that is told apart from a quiet one.
+     *
+     * HIGH IMPORTANCE, on the stock channel, because nothing about the name can
+     * be trusted while this stands: its value on the panel is the last price the
+     * feed ever gave, the stops and targets the app watches read that price, and
+     * the app refuses to buy it. Pfisterer sat like that for a week with nothing
+     * said. Once a day per name, since it stays true until the feed moves.
+     *
+     * [held] picks the wording — for a position the risk is a fall nobody sees,
+     * for a candidate it is a signal drawn on a frozen chart.
+     */
+    fun feedStopped(ctx: Context, space: String, symbol: String, feedSymbol: String,
+                    lastTradeSec: Long, held: Boolean) {
+        val day = java.time.LocalDate.now(java.time.ZoneOffset.UTC).toString()
+        if (!com.signalscope.app.network.FeedHealth.claimAlarm(feedSymbol, day)) return
+        val since = com.signalscope.app.network.FeedHealth.describe(lastTradeSec)
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
+            "⚠ $symbol — price feed stopped",
+            "${spaceLabel(space)} · no trade on $feedSymbol since $since, although the market " +
+                "is open. " +
+                (if (held) "You hold it, and the app's exits read this feed — where no live " +
+                    "venue price stands in, its stop and target are watching a frozen number. " +
+                    "Check it at the broker. "
+                 else "Its signals are drawn on a frozen chart. ") +
+                "The app will not buy it until the feed moves again. Often the listing has " +
+                "moved to a new symbol.",
+            "fs-$feedSymbol-$day", openSymbol = symbol, openSpace = Spaces.uiSpaceOf(space))
+    }
 }

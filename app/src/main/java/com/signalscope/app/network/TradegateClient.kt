@@ -44,7 +44,7 @@ object TradegateClient {
      */
     private const val BASE = "https://www.tradegatebsx.com"
     private const val MAX_SPREAD_FRAC = 0.06      // 6% bid/ask spread cap — wider looks like a bad/halted quote
-    private const val MAX_YAHOO_DEVIATION = 0.08  // 8% vs Yahoo's (stale) price — wider looks like wrong instrument/garbage
+    const val MAX_YAHOO_DEVIATION = 0.08  // 8% vs Yahoo's (delayed) price — wider looks like wrong instrument/garbage
 
     data class Quote(val bid: Double, val ask: Double, val last: Double, val mid: Double)
 
@@ -73,6 +73,25 @@ object TradegateClient {
      * callers must fall back to Yahoo silently, per design.
      */
     fun fetchQuote(isin: String, yahooRefPrice: Double): Quote? {
+        val q = fetchUnanchored(isin) ?: return null
+        if (yahooRefPrice > 0.0) {
+            val deviation = Math.abs(q.mid - yahooRefPrice) / yahooRefPrice
+            if (deviation > MAX_YAHOO_DEVIATION) {
+                Log.d(TAG, "$isin deviates ${deviation*100}% from Yahoo ref $yahooRefPrice — rejected")
+                return null
+            }
+        }
+        return q
+    }
+
+    /**
+     * The quote with every check EXCEPT the reference — malformed, crossed and
+     * absurdly wide books are still refused. For a caller that brings its own
+     * judgement of which reference to trust (see GermanRealtime): the comparison
+     * against a price is only as good as the price, and a frozen one turns the
+     * safety check into the thing that throws the right answer away.
+     */
+    fun fetchUnanchored(isin: String): Quote? {
         if (isin.isBlank()) return null
         return try {
             val req = Request.Builder()
@@ -92,13 +111,6 @@ object TradegateClient {
                 val mid = (bid + ask) / 2.0
                 val spread = (ask - bid) / mid
                 if (spread > MAX_SPREAD_FRAC) { Log.d(TAG, "$isin spread ${spread*100}% too wide — rejected"); return null }
-                if (yahooRefPrice > 0.0) {
-                    val deviation = Math.abs(mid - yahooRefPrice) / yahooRefPrice
-                    if (deviation > MAX_YAHOO_DEVIATION) {
-                        Log.d(TAG, "$isin deviates ${deviation*100}% from Yahoo ref $yahooRefPrice — rejected")
-                        return null
-                    }
-                }
                 Quote(bid, ask, last, mid)
             }
         } catch (e: Exception) {

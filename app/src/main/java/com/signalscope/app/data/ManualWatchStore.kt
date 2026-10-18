@@ -70,6 +70,14 @@ object ManualWatchStore {
         val peakPrice: Double = 0.0,
         val peakAt: Long = 0L,
         /**
+         * The trailing floor last worked out, and the setting it was worked out
+         * under ("ATR:1.5"). A floor measured in the stock's daily range would
+         * slip down on a day the range widened; this keeps it rising only, until
+         * the setting itself changes.
+         */
+        val trailLevel: Double = 0.0,
+        val trailBasis: String = "",
+        /**
          * The limit the ladder actually rested at, quantity-weighted across its
          * rungs. Paired with [filledPrice] this is EXECUTION quality — did the
          * order get the price it asked for, or better?
@@ -324,6 +332,15 @@ object ManualWatchStore {
      */
     enum class TrailSource { BAR_CLOSE, TICK, TICK_PEAK }
 
+    /**
+     * WHAT THE TRAIL'S NUMBER IS COUNTED IN. A flat percentage gives a quiet
+     * utility and a jumpy chip maker the same room, which is too tight for one or
+     * too loose for the other. The other two scale to the stock's own daily
+     * range: [ATR] — multiples of the 14-day average true range; [BB] —
+     * multiples of half the 20-day Bollinger width, (upper − lower) / 2.
+     */
+    enum class TrailUnit { PCT, ATR, BB }
+
     data class State(
         /** SYMBOL -> UTC day (yyyy-MM-dd) it was last alerted on. */
         val alerted: Map<String, String> = emptyMap(),
@@ -372,6 +389,9 @@ object ManualWatchStore {
          */
         val takeProfitPct: Double = 0.0,
         val trailSource: TrailSource = TrailSource.BAR_CLOSE,
+        /** What [trailPct] counts in. Null on files saved before the choice
+         *  existed, which were all percentages. */
+        val trailUnit: TrailUnit? = null,
         val entries: List<Entry> = emptyList(),
         val lastRunAt: Long = 0L,
         val lastRunNote: String = "",
@@ -504,8 +524,36 @@ object ManualWatchStore {
     fun load(ctx: Context, space: String): State = try {
         val f = file(ctx, space)
         val raw = if (!f.exists()) State() else gson.fromJson(f.readText(), State::class.java) ?: State()
-        renameRetiredSymbols(ctx, space, raw)
+        repairExitSeconds(ctx, space, renameRetiredSymbols(ctx, space, raw))
     } catch (e: Exception) { Log.e(TAG, "load($space) failed", e); State() }
+
+    /** Any epoch time above this is milliseconds: in seconds it would be the year 5138. */
+    private const val MS_FLOOR = 100_000_000_000L
+
+    /**
+     * ONE-TIME CLEAN-UP FOR EXIT TIMES SAVED IN MILLISECONDS.
+     *
+     * [Entry.exitTs] is seconds everywhere, but when the strategy closed a
+     * position the watcher copied the broker's sale time across unconverted —
+     * and every broker stamps that in milliseconds. Those rows read as a date
+     * tens of thousands of years out: wrong on every screen that shows when the
+     * trade ended, and sorted to the top of any list ordered by it. The writer
+     * is fixed; this puts right the rows it already wrote, and saves them back
+     * so it happens once.
+     *
+     * Runs on every load, so it asks the cheap question first and touches
+     * neither disk nor state when nothing needs fixing.
+     */
+    private fun repairExitSeconds(ctx: Context, space: String, s: State): State {
+        val bad = s.entries.count { it.exitTs > MS_FLOOR }
+        if (bad == 0) return s
+        val next = s.copy(entries = s.entries.map {
+            if (it.exitTs > MS_FLOOR) it.copy(exitTs = it.exitTs / 1000L) else it
+        })
+        save(ctx, space, next)
+        Log.w(TAG, "repaired $bad exit time${if (bad == 1) "" else "s"} saved in milliseconds in the $space book")
+        return next
+    }
 
     /**
      * ONE-TIME CLEAN-UP FOR A COMPANY THAT RENAMED WHILE WE HELD IT.

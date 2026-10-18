@@ -613,8 +613,12 @@ object StrategyLabRunner {
                 // notification, because the only line that could raise one never ran
                 // outside crypto. Whether to notify is the switches' decision and it
                 // is taken inside the notifier — this line's job is only to ask.
-                if (newEntry) LabNotifier.paperOpen(ctx, ns, sym, t.entryPrice)
-                if (newExit) LabNotifier.paperClose(ctx, ns, sym, t.pctReturn, t.exitReason)
+                //
+                // A SIGNAL FOUND HOURS AFTER ITS BAR is told as such, and on a shut
+                // stock market it waits for the open — see [LatePaperAlerts].
+                if (newEntry) LatePaperAlerts.opened(ctx, ns, sym, t.entryPrice, t.entryTs, frameSec)
+                if (newExit) LatePaperAlerts.closed(ctx, ns, sym, t.pctReturn, t.exitReason,
+                    t.exitTs ?: lastBarTs, frameSec)
                 val base = Spaces.baseOf(ns)
                 // ASYMMETRIC GATING: entries stay newest-bar-only + fresh-data
                 // (adding risk = paranoid). Exits fire on ANY new exit, however
@@ -920,6 +924,17 @@ object StrategyLabRunner {
             entryReason = t.entryReason, exitTs = t.exitTs, exitPrice = t.exitPrice, exitReason = t.exitReason,
             pctReturn = t.pctReturn, pnlNotional = t.pnlNotional, barsHeld = t.barsHeld
         )
+
+    /** This namespace's completed bars for one stock, on its own feed — for a
+     *  picture drawn outside a pass (the alert preview), where no pass has just
+     *  downloaded them. Empty when they cannot be had. */
+    fun recentClosedCandles(ctx: Context, ns: String, symbol: String): List<CandleData> = try {
+        val cfg = StrategyLabStore.activeConfig(ctx, ns)
+        val plan = FeedPlan.plan(cfg, ns)
+        if (!plan.ok) emptyList()
+        else sanitizeCandles(fetchClosed(ns, symbol.trim().uppercase(), Spaces.exchangeOf(ns), plan),
+            System.currentTimeMillis() / 1000, plan.sourceSec).clean
+    } catch (e: Exception) { Log.w(TAG, "[$ns] $symbol recent bars failed", e); emptyList() }
 
     private fun fetchClosed(
         ns: String, symbol: String, exchange: String, plan: FeedPlan.Plan
@@ -1275,6 +1290,19 @@ object StrategyLabRunner {
         private set
 
     /**
+     * The newest bar the feed returned for the last [freshEntrySignal] stock —
+     * INCLUDING one still forming — as (symbol, its start in seconds).
+     *
+     * [lastCandles] holds finished bars only, and in the first hour of a session
+     * the newest finished bar is yesterday's, so "is this market trading today?"
+     * read off it answered no until the first hour had passed. A bar of today's,
+     * even half-formed, answers yes from the opening minutes.
+     */
+    @Volatile
+    var lastRawNewest: Pair<String, Long>? = null
+        private set
+
+    /**
      * @param entriesFromTs the watcher's own FRESH-START boundary — no entry may
      *   open before it, so the replay arrives flat at the moment the name joined
      *   the watch list rather than inheriting a position from weeks of history.
@@ -1292,6 +1320,7 @@ object StrategyLabRunner {
         lastHistoricalState = null
         lastLevels = null
         lastCandles = null
+        lastRawNewest = null
         val sym = symbol.trim().uppercase()
         if (sym.isBlank()) return null
         val cfg = StrategyLabStore.activeConfig(ctx, ns)
@@ -1300,6 +1329,7 @@ object StrategyLabRunner {
         val ex = exchange.trim().ifBlank { Spaces.exchangeOf(ns) }
         val res = fetchCandlesFor(ctx, ns, sym, ex, plan)
         if (res !is YahooFinanceClient.CandleResult.Success) return null
+        lastRawNewest = sym to (res.candles.maxOfOrNull { it.timestamp } ?: 0L)
         val nowSec = System.currentTimeMillis() / 1000
         val closed = res.candles.filter {
                 FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
@@ -1399,14 +1429,42 @@ object StrategyLabRunner {
     }
 
     /**
-     * The stock's 1-week high AS IT STOOD WHEN IT WAS BOUGHT, on this namespace's
-     * own feed — see [WeekTarget]. Bars that had not closed by [beforeSec] are
-     * left out, so nothing the stock did after the buy can move it.
+     * The highest price this stock has traded at SINCE [sinceSec], on this
+     * namespace's own feed — the seed for a position's high since it was bought.
+     * Only bars that began at or after the buy count: the bar the buy landed in
+     * holds prices from before it, and those are not the position's to claim.
      *
-     * Null when the bars could not be fetched (worth asking again later); 0.0
-     * when they arrived but do not reach back a week before the buy.
+     * Null when the bars could not be fetched; 0.0 when none began after it yet.
      */
-    fun weekHighBefore(ctx: Context, ns: String, symbol: String, beforeSec: Long): Double? {
+    fun highSince(ctx: Context, ns: String, symbol: String, sinceSec: Long): Double? {
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank() || sinceSec <= 0L) return null
+        return try {
+            val cfg = StrategyLabStore.activeConfig(ctx, ns)
+            val plan = FeedPlan.plan(cfg, ns)
+            if (!plan.ok) return null
+            val res = fetchCandlesFor(ctx, ns, sym, Spaces.exchangeOf(ns), plan)
+            if (res !is YahooFinanceClient.CandleResult.Success) return null
+            val nowSec = System.currentTimeMillis() / 1000
+            sanitizeCandles(res.candles, nowSec, plan.sourceSec).clean
+                .filter { it.timestamp >= sinceSec }
+                .maxOfOrNull { it.high }?.takeIf { it > 0.0 && it.isFinite() } ?: 0.0
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym high-since lookup failed", e); null
+        }
+    }
+
+    /**
+     * The stock's week and month ranges AS THEY STOOD WHEN IT WAS BOUGHT, on this
+     * namespace's own feed — see [WeekTarget]. Bars that had not closed by
+     * [beforeSec] are left out, so nothing the stock did after the buy can move
+     * the target.
+     *
+     * Null when the bars could not be fetched (worth asking again later); a
+     * window comes back null inside the result when the bars arrived but do not
+     * reach back that far before the buy.
+     */
+    fun rangesBefore(ctx: Context, ns: String, symbol: String, beforeSec: Long): WeekTarget.Ranges? {
         val sym = symbol.trim().uppercase()
         if (sym.isBlank() || beforeSec <= 0L) return null
         return try {
@@ -1417,9 +1475,9 @@ object StrategyLabRunner {
             if (res !is YahooFinanceClient.CandleResult.Success) return null
             val nowSec = System.currentTimeMillis() / 1000
             val candles = sanitizeCandles(res.candles, nowSec, plan.sourceSec).clean
-            WeekTarget.highBefore(candles, beforeSec, plan.sourceSec) ?: 0.0
+            WeekTarget.rangesBefore(candles, beforeSec, plan.sourceSec)
         } catch (e: Exception) {
-            Log.w(TAG, "[$ns] $sym week-high lookup failed", e); null
+            Log.w(TAG, "[$ns] $sym range lookup failed", e); null
         }
     }
 
@@ -1493,11 +1551,51 @@ object StrategyLabRunner {
         // That makes it a RECONSTRUCTION, consistent with everything else on this
         // chart, and it is labelled as one rather than passed off as an audit.
         val gate = gateVerdictSeries(ctx, ns, candles, symbol)
-        return StrategyLabEngine.reviewPayload(symbol.uppercase(), candles, cfg, plan.sourceSec, maxBars = 700)
-            .copy(baselineTs = StrategyLabStore.baselineFor(ctx, symbol, ns),
+        val (trackFrom, trackTo) = trackingSpan(ctx, ns, symbol)
+        return StrategyLabEngine.reviewPayload(symbol.uppercase(), candles, cfg, plan.sourceSec, maxBars = 700,
+                entriesFromTs = trackFrom)
+            .copy(baselineTs = trackFrom, trackingEndTs = trackTo,
                   gateApplies = gate.applies, gateDays = gate.days,
                   gateOpen = gate.open, gateState = gate.state, gateNote = gate.note,
                   realFills = realFillsFor(ctx, ns, symbol.uppercase()))
+    }
+
+    /**
+     * WHEN THIS ALGO WAS WATCHING A NAME, as (from, to) in epoch seconds on the
+     * engine's bar clock; to = 0 while it still is.
+     *
+     * The baseline answers while the name is enrolled. Unenrolling drops it — so
+     * a name that had lost its seat, often the very one whose chart you open
+     * because it just traded, had no boundary at all and was replayed as if the
+     * algo had held it all along. The gate's seat history and the book itself
+     * still say when tracking ran, so they answer once the baseline cannot.
+     */
+    private fun trackingSpan(ctx: Context, ns: String, symbol: String): Pair<Long, Long> {
+        val sym = symbol.trim().uppercase()
+        val baseline = StrategyLabStore.baselineFor(ctx, sym, ns)
+        if (baseline > 0L) return baseline to 0L
+        return try {
+            val booked = StrategyLabStore.load(ctx, ns).trades.filter { it.symbol.equals(sym, true) }
+            val seat = if (Spaces.isBucket(ns))
+                com.signalscope.app.data.MacdGateStore.load(ctx, ns).enrollments.orEmpty()
+                    .filter { it.symbol.equals(sym, true) }.maxByOrNull { it.fromMs }
+            else null
+            if (seat != null) {
+                val from = seat.fromMs / 1000L
+                // The seat is stamped in wall time, the baseline on the bar clock:
+                // a seat taken mid-session may trade the bar that had just closed,
+                // which began before it. A booked entry that early is the truer start.
+                val firstBooked = booked.filter { it.entryTs >= from - 86_400L }.minOfOrNull { it.entryTs }
+                minOf(from, firstBooked ?: from) to ((seat.toMs ?: 0L) / 1000L)
+            } else {
+                // No seat history (a watchlist position, a plain lab): the book's
+                // latest trade is where the algo last picked this name up.
+                val last = booked.maxByOrNull { it.entryTs } ?: return 0L to 0L
+                last.entryTs to (last.exitTs ?: 0L)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] tracking span for $sym failed", e); 0L to 0L
+        }
     }
 
     /**
@@ -1511,6 +1609,15 @@ object StrategyLabRunner {
             List<StrategyLabEngine.RealFill> = try {
         val base = Spaces.baseOf(ns)
         val out = ArrayList<StrategyLabEngine.RealFill>()
+        // THE ALGO'S OWN LEDGER, for the reason behind a sale the broker row does
+        // not record. Zerodha and Binance rows keep no reason at all, and older
+        // Trading 212 rows predate theirs; the paper trade each one mirrors does,
+        // including the sales booked to it by hand ("your own order sold it").
+        val ledgerWhy: Map<String, String> = try {
+            StrategyLabStore.load(ctx, ns).trades
+                .filter { it.exitReason.isNotBlank() }
+                .associate { it.id to it.exitReason }
+        } catch (e: Exception) { emptyMap() }
         when (base) {
             "binance" -> com.signalscope.app.data.BinanceLiveStore.load(ctx, ns).trades
                 .filter { it.symbol.equals(sym, true) && it.liveAvgBuyPrice > 0.0 }
@@ -1518,7 +1625,8 @@ object StrategyLabRunner {
                     out.add(StrategyLabEngine.RealFill(
                         entryTs = it.entryTs, entryPrice = it.liveAvgBuyPrice,
                         exitTs = it.exitTs ?: 0L, exitPrice = it.liveAvgSellPrice,
-                        pnl = it.livePnlQuote, open = it.status == "OPEN"))
+                        pnl = it.livePnlQuote, open = it.status == "OPEN",
+                        exitReason = ledgerWhy[it.paperTradeId].orEmpty()))
                 }
             "de", "us" -> com.signalscope.app.data.T212LiveStore.load(ctx).trades
                 .filter {
@@ -1526,22 +1634,59 @@ object StrategyLabRunner {
                         it.symbol.equals(sym, true) && it.liveEntryPrice > 0.0
                 }
                 .forEach {
+                    // A position you declared sold in the Trading 212 app, or one
+                    // found gone from the account. Neither went through the app's
+                    // own sell, so neither has a ladder fill — the price, when
+                    // known, is the one matched from the broker's history.
+                    val declared = it.isManual()
+                    val hand = declared || it.status == "MANUAL_CLOSED"
+                    val exitPx = when {
+                        it.liveExitPrice > 0.0 -> it.liveExitPrice
+                        declared -> it.manualExitPrice
+                        else -> 0.0
+                    }
+                    // The SELL time is when the order went, not a bar — good
+                    // enough to place a marker, and the only time there is.
+                    val exitAt = when {
+                        it.liveExitPrice > 0.0 -> it.sellAt / 1000L
+                        declared -> it.manualClosedAt / 1000L
+                        else -> 0L
+                    }
+                    val why = when {
+                        declared -> "sold by you in the Trading 212 app"
+                        hand -> it.error.ifBlank { "closed outside the app" }
+                        else -> it.exitReasonNote?.takeIf { n -> n.isNotBlank() }
+                            ?: ledgerWhy[it.paperTradeId].orEmpty()
+                    }
                     out.add(StrategyLabEngine.RealFill(
                         entryTs = it.entryTs, entryPrice = it.liveEntryPrice,
-                        // The SELL time is when the order went, not a bar — good
-                        // enough to place a marker, and the only time there is.
-                        exitTs = if (it.liveExitPrice > 0.0) it.sellAt / 1000L else 0L,
-                        exitPrice = it.liveExitPrice,
-                        open = it.status == "OPEN"))
+                        exitTs = exitAt, exitPrice = exitPx,
+                        open = it.status == "OPEN",
+                        exitReason = why, exitBy = it.exitOrigin.orEmpty(), handClosed = hand))
                 }
             "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
                 .filter { it.ns == ns && it.symbol.equals(sym, true) && it.entryPrice > 0.0 }
                 .forEach {
+                    val hand = it.isManual
+                    // No exit time was ever passed here, so no Indian sale was
+                    // drawn at all. The sale time when the app sold; the moment it
+                    // was found gone when it did not.
+                    val exitAt = when {
+                        it.sellAt > 0L -> it.sellAt / 1000L
+                        hand -> it.manualClosedAt / 1000L
+                        else -> 0L
+                    }
+                    val why = if (hand)
+                        it.error.removePrefix("Closed:").trim().trimEnd('.')
+                            .ifBlank { "sold outside the app" }
+                    else ledgerWhy[it.paperTradeId].orEmpty()
                     out.add(StrategyLabEngine.RealFill(
                         entryTs = it.paperTradeId.substringAfterLast('-').toLongOrNull() ?: 0L,
                         entryPrice = it.entryPrice,
+                        exitTs = if (it.isLive) 0L else exitAt,
                         exitPrice = it.exitPrice,
-                        open = it.status == "OPEN"))
+                        open = it.status == "OPEN",
+                        exitReason = why, handClosed = hand))
                 }
         }
         out.filter { it.entryTs > 0L }

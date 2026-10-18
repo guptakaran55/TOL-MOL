@@ -496,7 +496,8 @@ class DailyPortfolioManager(
                 .setCategory(NotificationCompat.CATEGORY_ALARM)
                 .setAutoCancel(true)
                 .build()
-            nm.notify(("macd_${h.symbol}").hashCode(), notif)
+            com.signalscope.app.data.NotificationLog.post(context, nm, ("macd_${h.symbol}").hashCode(), notif,
+                com.signalscope.app.data.NotificationLog.Link(holding = h.symbol, space = "in"))
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send MACD flip notification for ${h.symbol}", e)
         }

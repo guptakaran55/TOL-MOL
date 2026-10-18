@@ -482,6 +482,30 @@ object T212LiveMirror {
             val head = group.first()
             ladder.execute {
                 try {
+                    // ── THE RV GATE: NOW, OR A BETTER MOMENT? ───────────────────────
+                    // High in today's range and drifting down: wait for it, at most
+                    // two hours, re-checked every minute. Out of the regular session
+                    // the existing queue-for-the-open handling decides instead.
+                    if (MarketHours.isRegularSession(Spaces.baseOf(head.ns), System.currentTimeMillis())) {
+                        val (gate, rd) = try {
+                            RvGate.check(config, ticker, head.sym, head.ns, RvGate.Side.BUY, 0L)
+                        } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                        if (!gate.go) {
+                            val now = System.currentTimeMillis()
+                            group.forEach { g ->
+                                T212LiveStore.get(ctx, g.paperTradeId, g.ns)?.let { row ->
+                                    T212LiveStore.upsert(ctx, row.copy(status = "RETRY", qty = 0.0,
+                                        retryCount = 0, rvSince = now, parkedForOpen = false,
+                                        rvNote = RvGate.snapshot(rd, gate),
+                                        error = "${RvGate.NOTE}: waiting — ${gate.why}; starts by itself within 2 hours",
+                                        retryAfter = now + RvGate.TICK_MS))
+                                }
+                            }
+                            Log.i(TAG, "BUY ${head.sym} held by the RV gate: ${gate.why}")
+                            RvGate.ensureTick(ctx)
+                            return@execute
+                        }
+                    }
                     // €200 A SEAT MEANS €200. The budget is in the account's
                     // currency and the ladder sizes in the instrument's, so a US
                     // order used to go out as $200 — about €176. Converted here, at
@@ -622,7 +646,16 @@ object T212LiveMirror {
      *  attempt while a real one is still working. */
     private const val EXITING_ABANDONED_MS = 2 * 60 * 60 * 1000L
 
+    private val exitSweepBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** One sweep at a time: the RV gate's minute check and the 15-minute pass both
+     *  call this, and two at once could start two sales of the same position. */
     fun retryPendingExits(ctx: Context) {
+        if (!exitSweepBusy.compareAndSet(false, true)) { Log.i(TAG, "exit sweep already running — skipped"); return }
+        try { retryPendingExitsLocked(ctx) } finally { exitSweepBusy.set(false) }
+    }
+
+    private fun retryPendingExitsLocked(ctx: Context) {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return
         val now = System.currentTimeMillis()
@@ -676,6 +709,13 @@ object T212LiveMirror {
         val open = T212LiveStore.load(ctx).trades.filter {
             t212Row(it.ns) && it.status == "OPEN" && it.qty > 0.0 && it.retryAfter <= now
         }
+        // Held-back sales whose position is no longer waiting: forget them.
+        try {
+            val live = T212LiveStore.load(ctx).trades.filter { it.status == "OPEN" }
+                .map { "${it.ns}|${it.paperTradeId}" }.toSet()
+            val w = ctx.getSharedPreferences(EXIT_WAITS, Context.MODE_PRIVATE)
+            w.all.keys.filter { it !in live }.forEach { w.edit().remove(it).apply() }
+        } catch (_: Exception) {}
         if (open.isEmpty()) return
 
         // WHAT THE BROKER ACTUALLY HOLDS, read once for the whole sweep.
@@ -719,8 +759,41 @@ object T212LiveMirror {
                 continue
             }
 
-            Log.w(TAG, "[${row.ns}] ${row.symbol} still held but paper has closed it — re-selling")
-            val out = stopOutNow(ctx, row.ns, row.symbol, "exit retry (paper already closed)",
+            // ONLY IN THE REGULAR SESSION. The ladder's own market check counts the
+            // US pre-market and after-hours as open, but the orders it places do
+            // not ask Trading 212 for extended-hours execution — so out of hours it
+            // walked six rungs down to its floor and cancelled them, every quarter
+            // hour, all evening (PANW, 13 Oct: two full ladders after the close,
+            // not one share sold). The position is not unprotected while it waits:
+            // [T212ExitGuards] keeps a stop under it at the broker until this sells.
+            if (!MarketHours.isRegularSession(Spaces.baseOf(row.ns), now)) continue
+
+            // ── DON'T SELL INTO A RISING OPEN ─────────────────────────────────
+            // The buy side waits for a falling open to turn up; this is its
+            // mirror. A stock still rising is left to rise — with the safety stop
+            // under it at the broker — and sold once the rise stops. Stop sales,
+            // and anything without prices to judge by, go at once. See [ExitTiming].
+            // THE RV GATE, the same rule a fresh algo sale meets: sell in the top
+            // 40% of today's range or on a falling price; otherwise hold, at most
+            // two hours, with the safety stop under it. Under its own stop it goes.
+            val since = if (row.rvSince > 0L) row.rvSince else now
+            val belowStop = try { underOwnStop(ctx, config, row) } catch (e: Exception) { false }
+            val (gate, rd) = try {
+                RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.SELL, since, belowStop)
+            } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+            if (!gate.go) {
+                val note = "holding the sale: ${RvGate.NOTE} — ${gate.why}; sells by itself within 2 hours"
+                T212LiveStore.upsert(ctx, row.copy(error = note, rvSince = since,
+                    rvNote = RvGate.snapshot(rd, gate),
+                    retryAfter = now + RvGate.TICK_MS))
+                Log.i(TAG, "[${row.ns}] ${row.symbol} sale held: ${gate.why}")
+                continue
+            }
+            if (gate.timedOut) try { LabNotifier.rvGateTimedOut(ctx, row.ns, row.symbol, buy = false) } catch (_: Exception) {}
+            val why = gate.why
+
+            Log.w(TAG, "[${row.ns}] ${row.symbol} still held but paper has closed it — re-selling ($why)")
+            val out = stopOutNow(ctx, row.ns, row.symbol, "exit retry (paper already closed) — $why",
                 origin = "retry of an exit the broker had not completed")
             if (!out.ok) {
                 val shut = out.error.contains("is closed", true) ||
@@ -734,6 +807,87 @@ object T212LiveMirror {
                 Log.w(TAG, "[${row.ns}] ${row.symbol} exit retry failed: ${out.error}")
             }
         }
+    }
+
+    private const val EXIT_WAITS = "t212_exit_waits"
+
+    /** Is a waiting sale's live price already at or under the position's own stop? */
+    private fun underOwnStop(ctx: Context, config: ConfigManager, row: T212LiveStore.LiveTrade): Boolean {
+        val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(ctx, row.ns)
+        if (!cfg.exit.stopLossEnabled || cfg.exit.stopLossPct <= 0.0 || row.liveEntryPrice <= 0.0) return false
+        val stopAt = row.liveEntryPrice * (1 - cfg.exit.stopLossPct / 100.0)
+        val space = if (Spaces.baseOf(row.ns) == "de") "DE" else "US"
+        val ys = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(row.symbol, space)
+        val live = PatientExecutor.currentRefOrNull(config, row.t212Ticker, ys, space) ?: return false
+        return live <= stopAt
+    }
+
+    /**
+     * [ExitTiming] for one waiting sale, with its inputs gathered: the live price,
+     * the position's own stop, today's 15-minute bars and how long the sale has
+     * already been held. Remembers when holding began and the highest price seen
+     * while holding, so a rise that turns between two passes is still measured
+     * from its real top.
+     */
+    private fun exitTiming(ctx: Context, config: ConfigManager, row: T212LiveStore.LiveTrade,
+                           now: Long): ExitTiming.Decision {
+        val base = Spaces.baseOf(row.ns)
+        val space = if (base == "de") "DE" else "US"
+        val ys = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(row.symbol, space)
+        val live = PatientExecutor.currentRefOrNull(config, row.t212Ticker, ys, space)
+        val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(ctx, row.ns)
+        val stopAt = if (cfg.exit.stopLossEnabled && cfg.exit.stopLossPct > 0.0 && row.liveEntryPrice > 0.0)
+            row.liveEntryPrice * (1 - cfg.exit.stopLossPct / 100.0) else 0.0
+        val belowStop = live != null && stopAt > 0.0 && live <= stopAt
+
+        val zone = MarketHours.zoneOf(base)
+        val open = MarketHours.openOf(base)
+        val minsSinceOpen = if (zone != null && open != null) {
+            val openMs = java.time.LocalDate.now(zone).atTime(open).atZone(zone).toInstant().toEpochMilli()
+            (now - openMs) / 60_000L
+        } else Long.MAX_VALUE
+        val fine = if (minsSinceOpen >= ExitTiming.SETTLE_MIN && !belowStop && live != null)
+            fineBarsToday(row.symbol, space, base) else null
+
+        val p = ctx.getSharedPreferences(EXIT_WAITS, Context.MODE_PRIVATE)
+        val key = "${row.ns}|${row.paperTradeId}"
+        val parts = (p.getString(key, null) ?: "").split(";")
+        val since = parts.getOrNull(0)?.toLongOrNull() ?: 0L
+        val seenHigh = parts.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        val high = maxOf(fine?.high ?: 0.0, seenHigh, live ?: 0.0)
+        val atr = if (live != null) cachedAtr(ys, space, live) else 0.0
+
+        val d = ExitTiming.decide(belowStop, live, minsSinceOpen, fine != null,
+            fine?.lastUp, high, atr, if (since > 0L) now - since else 0L)
+        if (d.sell) p.edit().remove(key).apply()
+        else p.edit().putString(key, "${if (since > 0L) since else now};$high").apply()
+        return d
+    }
+
+    /** Today's finished 15-minute bars, regular session only: whether the last
+     *  closed above its open (null when none has finished yet) and the day's high. */
+    private class FineToday(val lastUp: Boolean?, val high: Double)
+
+    private fun fineBarsToday(symbol: String, space: String, base: String): FineToday? {
+        val exch = if (space.equals("DE", true)) "DE" else "NASDAQ"
+        val res = com.signalscope.app.network.YahooFinanceClient
+            .fetchCandles15m(symbol.trim(), exch, includePrePost = false)
+        val cs = (res as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)
+            ?.candles ?: return null
+        val nowSec = System.currentTimeMillis() / 1000
+        // The same feed delay the buy side waits out — a German bar is only whole
+        // once Yahoo's fifteen minutes have passed.
+        val lag = if (space.equals("DE", true)) FeedDelay.XETRA_SEC else 0L
+        val zone = MarketHours.zoneOf(base) ?: return null
+        val open = MarketHours.openOf(base) ?: return null
+        val openSec = java.time.LocalDate.now(zone).atTime(open).atZone(zone).toEpochSecond()
+        val today = cs.filter {
+            it.timestamp >= openSec && it.close > 0.0 &&
+                FeedDelay.isComplete(it.timestamp, 15 * 60L, nowSec, 0L, lag)
+        }
+        val last = today.lastOrNull()
+        val lastUp = last?.let { if (it.open > 0.0) it.close > it.open else null }
+        return FineToday(lastUp, today.maxOfOrNull { it.high } ?: 0.0)
     }
 
     /** How many times one queued entry may be re-attempted before it is given up.
@@ -856,7 +1010,8 @@ object T212LiveMirror {
      *   fill-anchored stop — so the alert and the ledger both record which.
      */
     fun stopOutNow(ctx: Context, ns: String, symbol: String, reason: String,
-                   origin: String = "", paperTradeId: String? = null): StopOut {
+                   origin: String = "", paperTradeId: String? = null,
+                   decisionPrice: Double = 0.0): StopOut {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return StopOut(false, error = "no T212 credentials")
         // [paperTradeId] pins the exact position when the caller knows it — an algo
@@ -867,6 +1022,18 @@ object T212LiveMirror {
         } ?: return StopOut(false, error = "no open live position")
         val paid = row.liveEntryPrice
         if (paid <= 0.0) return StopOut(false, error = "real fill price not settled — refusing to act on a guess")
+
+        // NORMAL HOURS ONLY, for every automatic sale. The ladder's own check counts
+        // the US pre-market and after-hours as open, but its orders do not ask
+        // Trading 212 for extended-hours execution, so out of hours it can only
+        // rest six rungs and cancel them. On 13–14 Oct the fill-anchored stop on
+        // PANW did exactly that at every pass all evening (the last close stays
+        // under the stop until the next session) — and each ladder began by
+        // cancelling the safety stop [T212ExitGuards] had just put under it.
+        // Waiting is not doing nothing: the first pass after the bell sells.
+        if (!MarketHours.isRegularSession(Spaces.baseOf(ns), System.currentTimeMillis()))
+            return StopOut(false, error = "the market is closed outside normal trading hours — " +
+                "the sale waits for the next open")
 
         val space = if (Spaces.baseOf(ns) == "de") "DE" else "US"
         val ys = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(row.symbol, space)
@@ -888,6 +1055,10 @@ object T212LiveMirror {
             T212LiveStore.upsert(ctx, row.copy(status = "CLOSED",
                 sellOrderId = r.orderIds.firstOrNull() ?: 0L, sellOrderIds = r.orderIds,
                 refExitPrice = r.refPrice, sweptQty = r.sweptQty, error = "",
+                // THE PRICE THAT DECIDED THE SALE — the stop or target level. Without
+                // it the trade has a fill and nothing to measure the fill against,
+                // and the closed-trades table could draw no mark for it.
+                paperExitPrice = row.paperExitPrice ?: decisionPrice.takeIf { it > 0.0 },
                 sellAt = System.currentTimeMillis(),
                 exitOrigin = origin.ifBlank { null },
                 exitReasonNote = reason.ifBlank { null }))
@@ -1226,10 +1397,13 @@ object T212LiveMirror {
         // THE PREFERENCE GOVERNS THE SWEEP, NOT THE USER. Turning automatic
         // retries off is a statement about what should happen unattended; it is
         // not a refusal to act when somebody presses the button themselves.
-        if (!force && !config.t212RetryUnfilledEntries) return null
+        // A buy the RV GATE is holding is not a retry: it has not been tried yet,
+        // and it starts within two hours whatever this setting says.
+        val rvOnly = !force && !config.t212RetryUnfilledEntries
         if (!config.hasT212Credentials) return "Trading 212 is not connected."
         val now = System.currentTimeMillis()
         val due = T212LiveStore.load(ctx).trades.filter {
+            (!rvOnly || it.rvSince > 0L) &&
             // Same guard as the exit sweep. Inert today only because the stray
             // Zerodha rows happen to be OPEN rather than RETRY — which is luck,
             // not design, and luck is not a filter.
@@ -1325,7 +1499,7 @@ object T212LiveMirror {
                 val wake = if (session.start > nowSec) session.start * 1000L + OPEN_SETTLE_MS
                            else System.currentTimeMillis() + SESSION_POLL_MS
                 T212LiveStore.upsert(ctx, row.copy(
-                    status = "RETRY", parkedForOpen = true,
+                    status = "RETRY", parkedForOpen = true, rvSince = 0L,
                     error = "waiting for the market to open — no attempt spent",
                     retryAfter = wake))
                 if (!row.parkedForOpen) newlyParked.add(row)
@@ -1453,14 +1627,28 @@ object T212LiveMirror {
             // The PRICE gates below are not skipped and must never be. They are
             // not about when to buy, they are about what this entry is allowed to
             // pay — which is part of the trade's definition, not of its timing.
-            if (!bypassTiming && !risingOnFineBars(row.symbol, space)) {
-                T212LiveStore.upsert(ctx, row.copy(
-                    status = "RETRY", parkedForOpen = false,
-                    error = "waiting for the 15-minute trend to turn up — no attempt spent",
-                    retryAfter = System.currentTimeMillis() + FINE_BAR_MS))
-                Log.i(TAG, "[${row.ns}] ${row.symbol} held: last 15-minute bar not rising")
-                continue
+            // THE RV GATE, the same rule a fresh algo buy meets: start in the
+            // bottom 40% of today's range or on a rising price; otherwise wait, at
+            // most two hours, and then start anyway with a notice.
+            var rvTimedOut = false
+            if (!bypassTiming) {
+                val since = if (row.rvSince > 0L) row.rvSince else System.currentTimeMillis()
+                val (gate, rd) = try {
+                    RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.BUY, since)
+                } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                if (!gate.go) {
+                    T212LiveStore.upsert(ctx, row.copy(
+                        status = "RETRY", parkedForOpen = false, rvSince = since,
+                        rvNote = RvGate.snapshot(rd, gate),
+                        error = "${RvGate.NOTE}: waiting — ${gate.why}; starts by itself within 2 hours — no attempt spent",
+                        retryAfter = System.currentTimeMillis() + RvGate.TICK_MS))
+                    Log.i(TAG, "[${row.ns}] ${row.symbol} held by the RV gate: ${gate.why}")
+                    continue
+                }
+                rvTimedOut = gate.timedOut
             }
+
+            if (rvTimedOut) try { LabNotifier.rvGateTimedOut(ctx, row.ns, row.symbol, buy = true) } catch (_: Exception) {}
 
             // ── THE PRICE GATES, NOW THAT THE TRADE IS OTHERWISE READY ──────────
             val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(ctx, row.ns)
@@ -1522,7 +1710,7 @@ object T212LiveMirror {
             // simply becomes due again and retries — still capped by the attempt
             // count, so it cannot loop forever either.
             T212LiveStore.upsert(ctx, row.copy(
-                retryCount = row.retryCount + 1, parkedForOpen = false,
+                retryCount = row.retryCount + 1, parkedForOpen = false, rvSince = 0L,
                 retryAfter = System.currentTimeMillis() + RETRY_CLAIM_MS))
             ladder.execute {
                 try {
@@ -1786,6 +1974,29 @@ object T212LiveMirror {
             Log.i(TAG, "[$ns] live SELL ${live.symbol}: our claim $sellQty, other rows claim $others")
         ladder.execute {
             try {
+                // ── THE RV GATE: SELL NOW, OR LET A RISE FINISH? ────────────────
+                // Low in today's range and rising: hold the sale, at most two hours,
+                // re-checked every minute, with the safety stop at the broker under
+                // it meanwhile. A stop-loss exit never waits.
+                val isStop = trade.exitReason.contains("stop", ignoreCase = true)
+                if (!isStop && MarketHours.isRegularSession(Spaces.baseOf(ns), System.currentTimeMillis())) {
+                    val (gate, rd) = try {
+                        RvGate.check(config, live.t212Ticker, live.symbol, ns, RvGate.Side.SELL, 0L)
+                    } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
+                    if (!gate.go) {
+                        val now = System.currentTimeMillis()
+                        T212LiveStore.get(ctx, paperTradeId, ns)?.let { row ->
+                            T212LiveStore.upsert(ctx, row.copy(status = "OPEN", rvSince = now,
+                                rvNote = RvGate.snapshot(rd, gate),
+                                exitReasonNote = trade.exitReason.ifBlank { null },
+                                error = "holding the sale: ${RvGate.NOTE} — ${gate.why}; sells by itself within 2 hours",
+                                retryAfter = now + RvGate.TICK_MS))
+                        }
+                        Log.i(TAG, "[$ns] SELL ${live.symbol} held by the RV gate: ${gate.why}")
+                        RvGate.ensureTick(ctx)
+                        return@execute
+                    }
+                }
                 val r = PatientExecutor.sell(config, live.t212Ticker, ysx, space, sellQty, exitRef,
                     targetQty = sellQty, claimedByOthers = others)
                 val row = T212LiveStore.get(ctx, paperTradeId, ns) ?: return@execute

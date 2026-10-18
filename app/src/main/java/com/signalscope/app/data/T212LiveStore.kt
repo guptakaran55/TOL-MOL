@@ -58,6 +58,14 @@ object T212LiveStore {
         val retryCount: Int = 0,
         /** Epoch ms before which no further attempt should be made. */
         val retryAfter: Long = 0L,
+        /** When the RV gate began holding this order back (0 = not waiting): a buy
+         *  waiting for a better moment, or a sale held while the price rises. The
+         *  two-hour limit is counted from here. See [com.signalscope.app.trading.RvGate]. */
+        val rvSince: Long = 0L,
+        /** The RV gate's last look at a held order — where the price sat in today's
+         *  range, which way it was moving — as a small JSON note for the waiting-
+         *  orders list. See [com.signalscope.app.trading.RvGate.snapshot]. */
+        val rvNote: String? = null,
         // ── EVERY RUNG, not just the first ────────────────────────────────────
         // The patient ladder places up to six orders per leg (marketable limit,
         // then cancel-replace-chase at widening concessions). A single Long can

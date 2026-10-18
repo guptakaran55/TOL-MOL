@@ -14,86 +14,82 @@ import java.util.Locale
  * MACD flip. The rule fired on a Friday close, the German market was already
  * shut, and the order did not fill until Monday's open — 1.40 higher, at 58.05.
  *
- * The alert that arrived said 80.78 EUR and "your money +0.80%", because it had
- * been built from the strategy's candle rather than the broker's fill. The trade
- * had in fact made +3.29%. These cases hold that line: a percentage under those
- * words is a real fill against a real fill, or it is not printed at all.
+ * The alert that arrived said "+0.80%", because it had been built from the
+ * strategy's candle rather than the broker's fill. The trade had in fact made
+ * +3.29%. These cases hold that line: a result in the alert is a real fill
+ * against a real fill, or it is not printed at all.
+ *
+ * AND THE CARD IS MINIMAL (the user's ask, 16 Oct 2026): the market's flag, the
+ * stock and the result in the title; who bought it and what sold it below — no
+ * quantities, no prices, nothing said twice.
  */
 class LabNotifierSellTextTest {
 
     /** The formatter is locale-sensitive; the assertions below are not meant to be. */
     @Before fun pinLocale() { Locale.setDefault(Locale.US) }
 
-    private val who = "Germany watchlist · exit minder for stock you bought yourself"
+    private val who = "Watcher · your buy"
     private val why = "MACD slope flipped + to -"
 
-    @Test fun `settled sale reports the broker fill, not the candle`() {
+    @Test fun `settled sale - flag, stock and the real result in the title, who and why below`() {
         val (title, body) = LabNotifier.sellAlertText(
             who = who, symbol = "S92", qty = 1.426, cur = "EUR", reason = why,
-            paid = 56.20, realExit = 58.05, broker = "Trading 212")
-
-        assertTrue("percentage belongs in the title", title.contains("+3.29%"))
-        assertTrue("real proceeds", body.contains("for 82.78 EUR"))
-        assertTrue("real per-share exit", body.contains("at 58.05"))
-        assertTrue("real return", body.contains("your money +3.29%"))
-        assertTrue("what was paid", body.contains("bought at 56.20"))
-        assertTrue("why it sold", body.contains(why))
-
-        // The exact figures the shipped alert used. Neither may reappear.
-        assertFalse("the candle close must not be quoted", body.contains("56.65"))
-        assertFalse("the candle-derived return must not be quoted", body.contains("+0.80%"))
+            paid = 56.20, realExit = 58.05, broker = "Trading 212", flag = "🇩🇪")
+        assertEquals("🇩🇪 S92 sold +3.29%", title)
+        assertEquals("Watcher · your buy · MACD exit", body)
+        // The candle-derived return of the shipped alert may not reappear.
+        assertFalse(title.contains("+0.80%"))
     }
 
-    @Test fun `unpriced sale quotes no money at all`() {
+    @Test fun `no quantities, prices or repeated figures in the body`() {
+        val (title, body) = LabNotifier.sellAlertText(
+            who = "Watcher buy", symbol = "HEI", qty = 0.348, cur = "EUR",
+            reason = "reached its target of 145.00 (its 1-week high) · its target at Trading 212",
+            paid = 143.25, realExit = 145.00, broker = "Trading 212", flag = "🇩🇪")
+        assertEquals("🇩🇪 HEI sold +1.22%", title)
+        assertEquals("Watcher buy · 1-week-high target reached", body)
+        assertFalse(body.contains("145")); assertFalse(body.contains("0.348")); assertFalse(body.contains("%"))
+    }
+
+    @Test fun `unpriced sale quotes no result at all`() {
         val (title, body) = LabNotifier.sellAlertText(
             who = who, symbol = "S92", qty = 1.426, cur = "EUR", reason = why,
-            paid = 56.20, realExit = 0.0, broker = "Trading 212")
-
-        assertEquals("no percentage may be implied before a fill is known",
-            "🔴 LIVE SELL S92", title)
-        assertTrue(body.contains("waiting on Trading 212"))
-        assertTrue("the reason survives into the provisional card", body.contains(why))
-        assertFalse("no cash figure", body.contains("EUR"))
-        assertFalse("no return figure", body.contains("your money"))
+            paid = 56.20, realExit = 0.0, broker = "Trading 212", flag = "🇩🇪")
+        assertEquals("no result may be implied before a fill is known", "🇩🇪 S92 sold", title)
+        assertTrue(body.contains("result once Trading 212 reports the price"))
         assertFalse("nothing resembling a percentage", body.contains("%"))
     }
 
     @Test fun `the broker doing the waiting is named`() {
         val (_, body) = LabNotifier.sellAlertText(
             who = who, symbol = "TATAMOTORS", qty = 3.0, cur = "INR", reason = why,
-            paid = 700.0, realExit = 0.0, broker = "Zerodha")
-        assertTrue(body.contains("waiting on Zerodha"))
+            paid = 700.0, realExit = 0.0, broker = "Zerodha", flag = "🇮🇳")
+        assertTrue(body.contains("once Zerodha reports"))
     }
 
-    @Test fun `a known fill against an unknown cost states the money but not a return`() {
-        // Entry never reconciled — real for the sale, absent for the purchase. A
-        // percentage here would be measured against nothing.
-        val (title, body) = LabNotifier.sellAlertText(
+    @Test fun `a known fill against an unknown cost states no return`() {
+        // Entry never reconciled — a percentage here would be measured against nothing.
+        val (title, _) = LabNotifier.sellAlertText(
             who = who, symbol = "S92", qty = 1.426, cur = "EUR", reason = why,
-            paid = 0.0, realExit = 58.05, broker = "Trading 212")
-
-        assertEquals("🔴 LIVE SELL S92", title)
-        assertTrue("the cash received is real and is reported", body.contains("for 82.78 EUR"))
-        assertFalse("but no return can be computed", body.contains("your money"))
-    }
-
-    @Test fun `the cash figure always agrees with the percentage beside it`() {
-        val paid = 56.20; val exit = 58.05; val qty = 1.426
-        val (_, body) = LabNotifier.sellAlertText(
-            who = who, symbol = "S92", qty = qty, cur = "EUR", reason = "",
-            paid = paid, realExit = exit, broker = "Trading 212")
-
-        // Both derive from the same pair of fills, so the reader can check one
-        // against the other — which is exactly what the old alert failed.
-        assertTrue(body.contains("for ${"%.2f".format(exit * qty)} EUR"))
-        assertTrue(body.contains("your money ${"%+.2f".format((exit / paid - 1.0) * 100.0)}%"))
+            paid = 0.0, realExit = 58.05, broker = "Trading 212", flag = "🇩🇪")
+        assertEquals("🇩🇪 S92 sold", title)
     }
 
     @Test fun `a loss is signed, not silently dropped`() {
-        val (title, body) = LabNotifier.sellAlertText(
+        val (title, _) = LabNotifier.sellAlertText(
             who = who, symbol = "S92", qty = 1.0, cur = "EUR", reason = why,
-            paid = 60.0, realExit = 57.0, broker = "Trading 212")
-        assertTrue(title.contains("(-5.00%)"))
-        assertTrue(body.contains("your money -5.00%"))
+            paid = 60.0, realExit = 57.0, broker = "Trading 212", flag = "🇩🇪")
+        assertEquals("🇩🇪 S92 sold -5.00%", title)
+    }
+
+    @Test fun `the kind of exit in a few words`() {
+        assertEquals("ATR stop triggered", LabNotifier.shortReason("ATR trailing stop 2.0× hit at 41.20"))
+        assertEquals("stop-loss triggered", LabNotifier.shortReason("stop loss -4%"))
+        assertEquals("target reached", LabNotifier.shortReason("take profit +7%"))
+        assertEquals("your target reached", LabNotifier.shortReason("your own take profit on stock you bought yourself"))
+        assertEquals("trailing stop triggered", LabNotifier.shortReason("trailing floor raised and hit"))
+        assertEquals("", LabNotifier.shortReason(""))
+        // Unknown wording keeps its first clause rather than vanishing.
+        assertEquals("rotation to a stronger name", LabNotifier.shortReason("rotation to a stronger name · seat freed"))
     }
 }

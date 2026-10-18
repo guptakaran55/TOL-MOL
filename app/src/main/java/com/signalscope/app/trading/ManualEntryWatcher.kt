@@ -945,6 +945,23 @@ object ManualEntryWatcher {
             }
             checked++
 
+            // ── A PRICE FEED THAT HAS STOPPED ────────────────────────────────
+            //
+            // Everything below reads this name's price, and the check above has
+            // just fetched its chart — whose reply also says whether the feed is
+            // still moving (see FeedHealth). A frozen chart still produces
+            // "signals": the watchlist recorded Pfisterer's entry off bars that had
+            // ended a week before. So: say so, once a day, and leave the name alone
+            // — no floor alert, no entry alert, no buy — until it trades again.
+            val feedSym = YahooFinanceClient.toYahooSymbol(k0, exchange)
+            val feedStoppedAt = com.signalscope.app.network.FeedHealth.stoppedSince(feedSym)
+            if (feedStoppedAt > 0L) {
+                try { LabNotifier.feedStopped(ctx, base, k0, feedSym, feedStoppedAt, held = false) }
+                catch (ex: Exception) { Log.w(TAG, "[$base] $k0 feed alarm failed", ex) }
+                Log.w(TAG, "[$base] $k0 left alone — its price feed has stopped")
+                continue
+            }
+
             // ── NEAR ITS FLOOR ──────────────────────────────────────────────
             //
             // A PRICE OBSERVATION, NOT A SIGNAL, and the difference is the whole
@@ -1029,7 +1046,15 @@ object ManualEntryWatcher {
                 // margin for a late or skipped pass shrank from half an hour to a
                 // quarter — one missed pass and a real entry signal went unsent.
                 val staleLimit = maxOf(90L, (fresh.exitTfMin.toLong()) + 30L) + FeedDelay.secFor(base) / 60L
-                if (barAgeMin > staleLimit) {
+                // AN OLD BAR IS FINE ONCE THE MARKET IS TRADING AGAIN. A signal on a
+                // session's last bar was held while the market was shut — rightly —
+                // and then held on through the next morning too, because its bar was
+                // still hours old; once that day's first bar finished it was no longer
+                // the newest signal and was never sent at all (COIN, DXCM and PYPL on
+                // 16 Oct). The first pass with the market trading again sends it.
+                val tradingNow = MarketHours.isRegularSession(base, System.currentTimeMillis()) &&
+                    SignalWatch.tradedToday(base, k0)
+                if (barAgeMin > staleLimit && !tradingNow) {
                     // NOT marked as alerted, deliberately: the signal is real and may
                     // still stand when trading resumes. Suppressing it now and letting
                     // the first pass of the session raise it is the whole point —
@@ -1941,6 +1966,11 @@ object ManualEntryWatcher {
             // currency — neither is reconstructed from account-currency cash.
             var realExit = 0.0
             var realQty = 0.0
+            // Epoch MILLISECONDS — both brokers stamp their sale time that way. The
+            // book's exit time is SECONDS, like every bar time it is compared with,
+            // so it is converted where it is written below. Storing it raw put a
+            // closed position somewhere around the year 58000 on anything that
+            // read it as a date.
             var exitAt = 0L
             try {
                 if (base == "in") {
@@ -1968,7 +1998,7 @@ object ManualEntryWatcher {
 
             ManualWatchStore.upsert(ctx, base, e.copy(
                 status = "CLOSED",
-                exitTs = if (exitAt > 0L) exitAt else (done.exitTs ?: 0L),
+                exitTs = if (exitAt > 0L) exitAt / 1000L else (done.exitTs ?: 0L),
                 exitPrice = realExit,
                 exitQty = realQty,
                 exitReason = done.exitReason.orEmpty().ifBlank { "closed by the strategy" },
@@ -2014,6 +2044,7 @@ object ManualEntryWatcher {
         if (open.isEmpty()) return
         val ns = ManualWatchStore.nsFor(base)
         val pct = st.trailPct
+        val unit = st.trailUnit ?: ManualWatchStore.TrailUnit.PCT
         val tpPct = st.takeProfitPct
         val src = st.trailSource
         // ONE READ OF THE BROKER'S TRIGGER LIST FOR THE WHOLE SWEEP. It was being
@@ -2090,7 +2121,23 @@ object ManualEntryWatcher {
             }
             if (pct <= 0.0 && tpPct <= 0.0) continue
 
-            val level = ManualTrailingStop.levelFor(peak, pct)
+            // THE TRAIL'S WIDTH, in the unit chosen: a percentage of the high, or
+            // a multiple of the stock's own daily range — the 14-day ATR or half
+            // the Bollinger width — so a quiet stock and a wild one each get room
+            // that suits them. The range moves daily; the floor still only rises.
+            val level = if (pct <= 0.0) 0.0 else {
+                val vol = if (unit == ManualWatchStore.TrailUnit.PCT) null
+                          else DailyVolatility.of(sym, Spaces.exchangeOf(base))
+                val raw = ManualTrailingStop.levelForWidth(peak,
+                    ManualTrailingStop.widthFor(unit, pct, peak, vol?.atr ?: 0.0, vol?.bbHalf ?: 0.0))
+                val basis = ManualTrailingStop.basis(unit, pct)
+                val held = ManualTrailingStop.ratchet(cur.trailLevel, cur.trailBasis, basis, raw)
+                if (held != cur.trailLevel || basis != cur.trailBasis) {
+                    cur = cur.copy(trailLevel = held, trailBasis = basis)
+                    ManualWatchStore.upsert(ctx, base, cur)
+                }
+                held
+            }
             // THE CEILING IS MEASURED FROM YOUR FILL, NOT FROM THE PEAK — see
             // [ManualTakeProfit]. Hanging it off the high would make it retreat
             // upward as the position ran, which is a target that can never be
@@ -2164,7 +2211,8 @@ object ManualEntryWatcher {
             val sold = try {
                 T212LiveMirror.stopOutNow(ctx, ns, sym, why,
                     origin = if (hitTarget) "your own take profit on stock you bought yourself"
-                             else "your own trailing stop on stock you bought yourself").ok
+                             else "your own trailing stop on stock you bought yourself",
+                    decisionPrice = if (hitTarget) ceiling else level).ok
             } catch (ex: Exception) {
                 Log.e(TAG, "[$base] $sym hand-set sell threw", ex); false
             }
@@ -2321,6 +2369,36 @@ object ManualEntryWatcher {
             Log.w(TAG, "[$base] $sym adopted exit fires: ${v.reason} " +
                 "(bar ${v.barTs}, ${"%.2f".format(v.price)})")
 
+            // ── THE RV GATE, for the strategy's own exit on Germany and the US ──
+            // Low in today's range and rising: hold the sale (at most two hours),
+            // exactly as an algo's sale is held. Stops never wait, and India is
+            // not gated — its exits rest at Zerodha as triggers.
+            if (base != "in" && !v.reason.contains("stop", ignoreCase = true) &&
+                MarketHours.isRegularSession(base, System.currentTimeMillis())) {
+                val lr = try {
+                    com.signalscope.app.data.T212LiveStore.load(ctx).trades.firstOrNull {
+                        it.ns == ns && it.symbol.equals(sym, true) && it.status == "OPEN" && it.qty > 0.0
+                    }
+                } catch (ex: Exception) { null }
+                if (lr != null) {
+                    val since = if (lr.rvSince > 0L) lr.rvSince else System.currentTimeMillis()
+                    val (gate, rd) = try {
+                        RvGate.check(com.signalscope.app.data.ConfigManager(ctx), lr.t212Ticker, sym, ns,
+                            RvGate.Side.SELL, since)
+                    } catch (ex: Exception) { RvGate.Decision(true, "gate failed: ${ex.message}") to null }
+                    if (!gate.go) {
+                        com.signalscope.app.data.T212LiveStore.upsert(ctx, lr.copy(rvSince = since,
+                            rvNote = RvGate.snapshot(rd, gate),
+                            error = "holding the sale: ${RvGate.NOTE} — ${gate.why}; sells by itself within 2 hours"))
+                        // Looked at again by the next pass — this exit is decided
+                        // here, not by the minute check's waiting-sale sweep.
+                        Log.i(TAG, "[$base] $sym strategy exit held by the RV gate: ${gate.why}")
+                        continue
+                    }
+                    if (gate.timedOut) try { LabNotifier.rvGateTimedOut(ctx, ns, sym, buy = false) } catch (_: Exception) {}
+                }
+            }
+
             // Per-share exit AS THE BROKER REPORTS IT, or 0 while it has not. Never
             // `v.price`: that is the candle the rule fired on, which is a statement
             // about the strategy and not about the account.
@@ -2464,6 +2542,8 @@ object ManualEntryWatcher {
         if (open.isEmpty()) return
 
         val cfg = ConfigManager(ctx)
+        // How many shares the account holds of each name (Trading 212 only).
+        var heldQty: Map<String, Double> = emptyMap()
         // held == null means WE DO NOT KNOW. Distinct from an empty set, which means
         // the account genuinely holds nothing. Collapsing the two is how a rate-limit
         // reply turns into closing every position you own.
@@ -2508,8 +2588,17 @@ object ManualEntryWatcher {
                     null
                 } else settled.apply { addAll(today) }
             }
+            // THE BROKER'S OWN CODES COUNT AS NAMES TOO. A row records the exact
+            // instrument it bought, and that is the one identity that cannot be
+            // misspelled: matching on the derived symbol alone closed a Booking
+            // position bought as BKNG because the account listed it as PCLN.
             "de", "us" -> (BrokerHoldings.t212(ctx) as? BrokerHoldings.Result.Ok)
-                ?.holdings?.map { it.symbol.uppercase() }?.toHashSet()
+                ?.holdings?.also { hs ->
+                    heldQty = hs.flatMap { listOf(it.symbol.uppercase() to it.qty, it.ticker.uppercase() to it.qty) }
+                        .filter { it.first.isNotBlank() }.toMap()
+                }
+                ?.flatMap { listOf(it.symbol.uppercase(), it.ticker.uppercase()) }
+                ?.filter { it.isNotBlank() }?.toHashSet()
             else -> null
         }
         if (held == null) {
@@ -2526,7 +2615,15 @@ object ManualEntryWatcher {
         val ns = ManualWatchStore.nsFor(base)
         for (e in open) {
             val sym = e.symbol.uppercase()
-            if (sym in held) {
+            val code: String? = e.t212Ticker   // may be null in rows read back from disk
+            // A SCRAP IS NOT THE POSITION. HAG on 16 Oct: the watchlist's 3.683
+            // shares were sold at the open by a sell order for the whole holding,
+            // and a €1 buy minutes later left 0.0118 of a share — enough to keep
+            // "HAG" in the account, so the row stayed open for a position that was
+            // gone. Under a tenth of what the row holds counts as sold.
+            val bq = heldQty[sym] ?: code?.let { heldQty[it.uppercase()] }
+            val onlyScrap = bq != null && e.filledQty > 0.0 && bq < e.filledQty * 0.1
+            if (!onlyScrap && (sym in held || (!code.isNullOrBlank() && code.uppercase() in held))) {
                 // BACK IN THE LIST — forget that we ever missed it, so a name that
                 // flickers once never accumulates its way to being retired.
                 if (e.absentAt != 0L)
@@ -2577,10 +2674,23 @@ object ManualEntryWatcher {
                 Log.w(TAG, "[$base] $sym live-row retire failed", ex)
             }
 
+            // WHAT IT SOLD FOR, when the broker's record says — the sale orders on
+            // this stock since the position was bought.
+            val soldPx = if (base == "in" || code.isNullOrBlank()) 0.0 else try {
+                val fills = (com.signalscope.app.network.Trading212Client(cfg).fetchOrderHistory(50)
+                    as? com.signalscope.app.network.Trading212Client.T212Result.Success)?.data.orEmpty()
+                    .filter { f -> f.ticker.equals(code, true) && f.side.equals("SELL", true) &&
+                        f.filledQuantity > 0.0 && f.fillPrice > 0.0 &&
+                        (try { java.time.Instant.parse(f.dateExecuted).toEpochMilli() }
+                         catch (x: Exception) { now }) >= e.createdAt }
+                val q = fills.sumOf { it.filledQuantity }
+                if (q > 0.0) fills.sumOf { it.fillPrice * it.filledQuantity } / q else 0.0
+            } catch (ex: Exception) { 0.0 }
             ManualWatchStore.upsert(ctx, base, e.copy(
                 status = "CLOSED", exitTs = now / 1000L,
-                exitPrice = 0.0, exitQty = e.filledQty,
-                exitReason = "sold outside the app — not held at the broker",
+                exitPrice = soldPx, exitQty = e.filledQty,
+                exitReason = if (soldPx > 0.0) "sold outside the watchlist at ${"%.2f".format(soldPx)}"
+                             else "sold outside the app — not held at the broker",
                 closedAt = now))
             ManualWatchStore.mutate(ctx, base) { s -> s.copy(adoptedNote = s.adoptedNote - sym) }
         }

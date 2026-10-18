@@ -30,6 +30,13 @@ object T212TargetStore {
         val ticker: String = "",
         /** The price, fixed at the buy. 0 = none (see [note]). */
         val price: Double = 0.0,
+        /** Which rule picked it: "week" or "month". Null on rows decided before
+         *  there was a choice — those were all the week's high. */
+        val kind: String? = null,
+        /** The rule version that decided this row; null = the old week-high-only
+         *  rule. A "no target" from that rule is decided again under the new one.
+         *  Nullable because Gson never runs a Kotlin default. */
+        val rule: String? = null,
         /** The fill it was measured against. */
         val paid: Double = 0.0,
         /** Why there is no target, or what went wrong last. Null = nothing to say.

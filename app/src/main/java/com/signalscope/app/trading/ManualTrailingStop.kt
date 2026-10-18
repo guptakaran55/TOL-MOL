@@ -62,6 +62,50 @@ object ManualTrailingStop {
         if (peak <= 0.0 || pct <= 0.0) 0.0 else peak * (1.0 - pct / 100.0)
 
     /**
+     * How far below the high the floor sits, in price, for a trail of [size] in
+     * [unit]: a percentage of the high, [size] × the 14-day ATR, or [size] × half
+     * the Bollinger width. 0 when the yardstick is unknown — no floor rather than
+     * a guessed one.
+     */
+    fun widthFor(unit: ManualWatchStore.TrailUnit, size: Double, peak: Double,
+                 atr: Double, bbHalf: Double): Double = when {
+        size <= 0.0 || peak <= 0.0 -> 0.0
+        unit == ManualWatchStore.TrailUnit.ATR -> if (atr > 0.0) size * atr else 0.0
+        unit == ManualWatchStore.TrailUnit.BB -> if (bbHalf > 0.0) size * bbHalf else 0.0
+        else -> peak * size / 100.0
+    }
+
+    /** The floor a width below the high gives. 0 when the width is unusable or
+     *  would put the floor at or below nothing. */
+    fun levelForWidth(peak: Double, width: Double): Double =
+        if (peak <= 0.0 || width <= 0.0 || width >= peak) 0.0 else peak - width
+
+    /** The setting a floor was worked out under — a change of either half starts
+     *  the ratchet afresh. */
+    fun basis(unit: ManualWatchStore.TrailUnit, size: Double): String = "${unit.name}:$size"
+
+    /**
+     * A FLOOR MEASURED IN DAILY RANGE MAY NOT FALL. The high only rises, but the
+     * ATR and the band breathe: a volatile day widens them and would pull the
+     * floor down under a position that has done nothing. So under an unchanged
+     * setting the floor keeps the higher of where it was and where it now works
+     * out — and an unknown range this pass (0) keeps the last floor. Changing the
+     * setting starts afresh, which is the one time the floor should be free to
+     * move down: you asked for more room.
+     */
+    fun ratchet(prevLevel: Double, prevBasis: String, basis: String, level: Double): Double =
+        if (prevBasis != basis) level else maxOf(prevLevel, level)
+
+    /** (upper − lower) / 2 of a [period]-day Bollinger band at [k] standard
+     *  deviations — k × the population standard deviation of the last closes. */
+    fun bbHalfWidth(closes: List<Double>, period: Int = 20, k: Double = 2.0): Double {
+        val xs = closes.filter { it > 0.0 }.takeLast(period)
+        if (xs.size < period) return 0.0
+        val m = xs.average()
+        return k * kotlin.math.sqrt(xs.sumOf { (it - m) * (it - m) } / period)
+    }
+
+    /**
      * Which price decides whether the stop has been breached.
      *
      * The peak and the trigger can run on different clocks by design — see

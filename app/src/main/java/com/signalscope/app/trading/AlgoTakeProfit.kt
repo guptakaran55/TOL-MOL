@@ -191,7 +191,13 @@ object AlgoTakeProfit {
 
         Log.w(TAG, "[$ns] $sym taken profit by hand at $exitPx (${"%+.2f".format(closed.pctReturn)}%) " +
             if (real) "— real sale at $broker" else "— paper only")
+        // YOUR exit, so the seat moves on to the next contender rather than
+        // waiting to buy this name again. See [MacdGateEngine.handOn].
+        val seat = try { MacdGateEngine.handOn(ctx, ns, sym, "profit taken by you") }
+                   catch (e: Exception) { Log.w(TAG, "seat hand-on failed", e); null }
+        val seatNote = if (seat != null) "Its seat goes to $seat, bought on its next entry signal." else ""
         return Result(true, symbol = sym, real = real, broker = broker, exitPrice = exitPx,
-            pctReturn = closed.pctReturn, pnl = closed.pnlNotional, note = note)
+            pctReturn = closed.pctReturn, pnl = closed.pnlNotional,
+            note = listOf(note, seatNote).filter { it.isNotBlank() }.joinToString(" "))
     }
 }

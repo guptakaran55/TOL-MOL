@@ -491,6 +491,53 @@ object MacdGateEngine {
     /** Compound the slot's capital by the trade's net return; if the symbol was
      *  flagged and is now flat with the slope still ≤0, release the slot and
      *  migrate its capital one-for-one into the best cached-eligible name. */
+    /**
+     * HAND THE SEAT ON after YOU ended a position — a take-profit tap, a sale
+     * from the stock page, or shares sold in the broker's own app.
+     *
+     * A strategy's own exit keeps the seat on the same name: the algo buys it
+     * again on its next fresh signal. A sale you made is different — you have
+     * decided against the name for now — so the seat goes straight to the next
+     * contender in the last ranking whose daily slope is rising, never the one
+     * just sold, rather than sitting on it or waiting empty for tomorrow's
+     * evaluation. With no contender the seat waits in cash and the daily
+     * evaluation fills it. Capital stays with the seat, whatever it was.
+     *
+     * Call AFTER the trade is closed (and compounded, where it is booked).
+     * @return the stock that took the seat, or null.
+     */
+    fun handOn(ctx: Context, ns: String, symbol: String, why: String): String? {
+        val st0 = MacdGateStore.load(ctx, ns)
+        if (!st0.enabled) return null
+        val idx = st0.slots.indexOfFirst { it.symbol?.equals(symbol, true) == true }
+        if (idx < 0) return null
+        if (inPosition(ctx, ns, symbol)) return null        // still held on paper: not ours to move
+        val now = System.currentTimeMillis()
+        val slots = st0.slots.toMutableList()
+        val held = slots.mapNotNull { it.symbol?.uppercase() }.toMutableSet()
+        held.remove(symbol.uppercase())
+        val replacement = st0.lastRanking.firstOrNull {
+            !it.equals(symbol, true) && it.uppercase() !in held && (st0.lastSlopes[it] ?: -1.0) > 0.0
+        }
+        try { StrategyLabStore.unenroll(ctx, symbol, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $symbol", e) }
+        setWindingDown(ctx, ns, symbol, false)
+        var st = MacdGateStore.closeEnrollment(st0, idx, symbol, "sold_by_you", now)
+        slots[idx] = MacdGateStore.Slot(replacement, slots[idx].capital, now, 0, false)
+        if (replacement != null) {
+            try { StrategyLabStore.enroll(ctx, replacement, exchangeFor(ns), ns) }
+            catch (e: Exception) { Log.w(TAG, "enroll $replacement", e) }
+            st = MacdGateStore.openEnrollment(st, idx, replacement,
+                st.lastRanking.indexOf(replacement) + 1,
+                st.lastScores?.get(replacement), st.lastSlopes[replacement], now)
+            st = MacdGateStore.appendLog(st, "${today()} $symbol $why → $replacement takes the seat")
+        } else {
+            st = MacdGateStore.appendLog(st, "${today()} $symbol $why → seat waits in cash (no rising contender)")
+        }
+        MacdGateStore.save(ctx, ns, st.copy(slots = slots))
+        Log.w(TAG, "[$ns] seat of $symbol handed on ($why) → ${replacement ?: "cash"}")
+        return replacement
+    }
+
     fun onTradeClosed(ctx: Context, ns: String, symbol: String, netPctReturn: Double) {
         val st0 = MacdGateStore.load(ctx, ns)
         if (!st0.enabled) return

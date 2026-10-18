@@ -119,8 +119,10 @@ object Trading212TrailingManager {
         // buy. Raising one here would turn it into a different target; creating a
         // stop beside one would be refused for reserved shares. A stock carrying
         // one is left entirely to it.
-        val weekTargetIds = try { com.signalscope.app.data.T212TargetStore.restingIds(ctx) }
-                            catch (e: Exception) { emptySet<Long>() }
+        val weekTargetIds = try {
+            com.signalscope.app.data.T212TargetStore.restingIds(ctx) +
+                com.signalscope.app.data.T212ExitGuardStore.restingIds(ctx)
+        } catch (e: Exception) { emptySet<Long>() }
 
         for (h in holdings) {
             if (h.quantity <= 0) continue

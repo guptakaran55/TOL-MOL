@@ -429,6 +429,19 @@ object ZerodhaLiveMirror {
         if (!cfg.isZerodhaConnected) return ManualResult(false, error = "Zerodha is not connected.")
         if (ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId) != null)
             return ManualResult(false, error = "This entry already has an order.")
+        // NOT INTO A PRICE FEED THAT HAS STOPPED — the same refusal Trading 212's
+        // buys make (PatientExecutor). The order below is priced off the broker,
+        // but the signal that asked for it was drawn on the feed, and every exit
+        // the app would then watch reads the feed too.
+        val stoppedAt = com.signalscope.app.network.FeedHealth.stoppedSince(sym, "NSE")
+        if (stoppedAt > 0L) {
+            val fs = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(sym, "NSE")
+            try { LabNotifier.feedStopped(ctx, "in", sym, fs, stoppedAt, held = false) }
+            catch (e: Exception) { Log.w(TAG, "feed alarm failed", e) }
+            return ManualResult(false, error = "Not buying $sym: its price feed ($fs) has shown " +
+                "no trade since ${com.signalscope.app.network.FeedHealth.describe(stoppedAt)} although " +
+                "the market is open. Nothing was placed.")
+        }
 
         val client = ZerodhaClient(cfg)
         return try { run route@{
@@ -1019,6 +1032,93 @@ object ZerodhaLiveMirror {
         }
     }
 
+    /** The position's resting trigger at Zerodha: by its own id first, else the
+     *  active sell trigger on the same stock. Null when none, or unreadable. */
+    private fun restingTriggerOf(client: ZerodhaClient, row: ZerodhaLiveStore.Row): ZerodhaClient.GttTrigger? {
+        val list = (client.fetchGttTriggers() as? ZerodhaClient.GttListResult.Success)?.triggers ?: return null
+        return list.firstOrNull { it.id == row.gttId && it.status == "active" }
+            ?: list.firstOrNull {
+                it.tradingsymbol.equals(row.symbol, true) && it.status == "active" &&
+                    it.transactionType.equals("SELL", true)
+            }
+    }
+
+    /**
+     * YOUR PRICE AS THIS POSITION'S TARGET — the upper side of the trigger
+     * already resting under it at Zerodha, moved to where you want it.
+     *
+     * Moved, never added: the trigger carries the stop as well, and a second one
+     * would be two sells against one holding. Either way up is allowed — this is
+     * your choice of price, not a ratchet — but never at or under the market,
+     * which Zerodha refuses, nor under the stop beside it. When it fires, the
+     * sale is booked to the algo the same way any sale of its shares by a
+     * trigger above the entry is.
+     */
+    fun setTargetLeg(ctx: Context, ns: String, paperTradeId: String, price: Double): String {
+        val cfg = ConfigManager(ctx)
+        if (!cfg.isZerodhaConnected) return "Zerodha is not connected."
+        val row = ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId)
+            ?: return "That position is not in the app's records."
+        if (row.status != "OPEN") return "That position is not open any more."
+        val client = ZerodhaClient(cfg)
+        return try {
+            val g = restingTriggerOf(client, row)
+                ?: return "${row.symbol} has no resting trigger at Zerodha to carry a target."
+            val current = g.triggerPriceAux ?: 0.0
+            if (current <= 0.0)
+                return "${row.symbol}'s trigger at Zerodha is a stop only, with no target side to move. " +
+                    "Rebuilding it would leave the position unprotected while it was replaced, so it is left alone."
+            val tick = cfg.learnedTickSize(row.symbol) ?: 0.05
+            val px = Math.round(Math.floor(price / tick + 1e-9) * tick * 10_000.0) / 10_000.0
+            if (!(px > 0.0)) return "Enter a price above zero."
+            if (px <= g.triggerPrice)
+                return "${"%.2f".format(px)} is under the stop resting beside it (${"%.2f".format(g.triggerPrice)})."
+            val ltp = (client.fetchLtp(EXCHANGE, row.symbol) as? ZerodhaClient.LtpResult.Success)?.lastPrice ?: 0.0
+            if (ltp > 0.0 && px <= ltp * 1.0025)
+                return "${"%.2f".format(px)} is at or under the current price (${"%.2f".format(ltp)}) — Zerodha will " +
+                    "not rest a target there. Use Take profit to sell now, or pick a higher price."
+            when (val r = client.modifyGttTriggerPrice(g.id, px, current)) {
+                is ZerodhaClient.GttModifyResult.Success -> {
+                    Log.w(TAG, "[$ns] ${row.symbol} target set by hand: ${"%.2f".format(current)} → ${"%.2f".format(px)}")
+                    "Target for ${row.symbol} moved to ₹${"%.2f".format(px)} at Zerodha (was ₹${"%.2f".format(current)}). " +
+                        "When it sells, the sale is booked to the position like any of its exits."
+                }
+                else -> "Zerodha did not accept the new target: $r"
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] ${row.symbol} setTargetLeg failed", e)
+            "Could not change the target: ${e.message}"
+        }
+    }
+
+    /** What the target window needs to open on an Indian position. */
+    fun targetContext(ctx: Context, ns: String, paperTradeId: String): Map<String, Any?>? {
+        val row = ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId) ?: return null
+        if (row.status != "OPEN") return null
+        val cfg = ConfigManager(ctx)
+        val g = if (cfg.isZerodhaConnected) try { restingTriggerOf(ZerodhaClient(cfg), row) } catch (e: Exception) { null } else null
+        return mapOf("ok" to true, "broker" to "zerodha", "ns" to ns, "pid" to paperTradeId,
+            "ticker" to row.symbol.uppercase(), "symbol" to row.symbol.uppercase(),
+            "qty" to row.qty.toDouble(), "paid" to row.entryPrice,
+            // The price now — the cached one when there is one, else fetched: the
+            // window is opened by hand and can wait a second for a real number.
+            "ltp" to (MarkToMarket.get(row.symbol)?.price?.takeIf { it > 0.0 }
+                ?: MarkToMarket.priceNow(ctx, ns, row.symbol) ?: 0.0),
+            "currency" to "INR", "space" to "IN",
+            "owner" to (if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) "your watchlist"
+                        else "the algo " + (try { com.signalscope.app.data.BucketStore.get(ctx, ns)?.name } catch (e: Exception) { null } ?: ns)),
+            "target" to (g?.triggerPriceAux ?: 0.0), "targetLabel" to (if ((g?.triggerPriceAux ?: 0.0) > 0.0) "the trigger at Zerodha" else ""),
+            "stop" to (g?.triggerPrice ?: 0.0),
+            "resting" to ((g?.triggerPriceAux ?: 0.0) > 0.0), "noTargetLeg" to (g != null && (g.triggerPriceAux ?: 0.0) <= 0.0),
+            // The watchlist's own take-profit pulls this side DOWN to itself on
+            // every pass (never up), so a higher price of yours would not hold.
+            "watchTp" to (if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) try {
+                val st = com.signalscope.app.data.ManualWatchStore.load(ctx, "in")
+                val e = st.entries.firstOrNull { it.status == "OPEN" && "${it.symbol.uppercase()}-${it.signalBarTs}" == paperTradeId }
+                if (e != null && st.takeProfitPct > 0.0) ManualTakeProfit.targetFor(e.filledPrice, st.takeProfitPct) else 0.0
+            } catch (e: Exception) { 0.0 } else 0.0))
+    }
+
     /**
      * LOWER THE RESTING TARGET TO A NEW CEILING — never raise it, never add a second.
      *
@@ -1129,16 +1229,37 @@ object ZerodhaLiveMirror {
                 tickSize = cfg.learnedTickSize(sym) ?: 0.05,
                 broker = OcoPlanner.Broker.ZERODHA))
             if (!plan.ok) return
-            val res = createGttWithTick(cfg, client, sym, type = "two-leg",                 triggers = listOf(plan.sl, plan.target), lastPrice = entry,
+            // THE TARGET LEG FROM THE RANGE RULE — the one Trading 212 positions
+            // use ([WeekTarget]): near the month's low or bought on strength, a
+            // tenth of the month's range short of its high; near the week's low,
+            // the week's high; never closer than 1% to the fill, because India's
+            // round trip costs taxes and charges. The planner's own target stays
+            // as the fallback: a two-leg trigger needs an upper leg, and one set
+            // far off does no harm where the range rule has nothing to offer.
+            val tick = cfg.learnedTickSize(sym) ?: 0.05
+            val range = try {
+                StrategyLabRunner.rangesBefore(ctx, ns, sym, System.currentTimeMillis() / 1000L)
+                    ?.let { WeekTarget.plan(it, entry, null, preExisting = false, minGapPct = WeekTarget.minGapFor("in")) }
+            } catch (e: Exception) { null }
+            val tgt = range?.takeIf { it.ok }?.let { Math.floor(it.price / tick + 1e-9) * tick }
+                ?.takeIf { it > plan.sl }
+            val target = tgt?.let { Math.round(it * 10_000.0) / 10_000.0 } ?: plan.target
+            val targetLimit = if (tgt != null)
+                Math.round(Math.floor(target * 0.99 / tick + 1e-9) * tick * 10_000.0) / 10_000.0
+                else plan.targetLimit
+            Log.i(TAG, "[$ns] $sym target leg ${"%.2f".format(target)} — " +
+                (if (tgt != null) "${range!!.label} (range rule)"
+                 else "planner's (range rule: ${range?.why?.ifBlank { null } ?: "no prices"})"))
+            val res = createGttWithTick(cfg, client, sym, type = "two-leg",                 triggers = listOf(plan.sl, target), lastPrice = entry,
                 orders = listOf(
                     ZerodhaClient.GttOrderSpec("SELL", qty, plan.slLimit),
-                    ZerodhaClient.GttOrderSpec("SELL", qty, plan.targetLimit)))
+                    ZerodhaClient.GttOrderSpec("SELL", qty, targetLimit)))
             if (res is ZerodhaClient.GttCreateResult.Success) {
                 ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId)?.let {
                     ZerodhaLiveStore.upsert(ctx, it.copy(gttId = res.id))
                 }
                 Log.w(TAG, "[$ns] GTT ${res.id} protecting $qty $sym " +
-                    "(SL ${"%.2f".format(plan.sl)} / TGT ${"%.2f".format(plan.target)})")
+                    "(SL ${"%.2f".format(plan.sl)} / TGT ${"%.2f".format(target)})")
             } else {
                 Log.w(TAG, "[$ns] GTT for $sym not created — position is unprotected")
             }
@@ -1353,7 +1474,7 @@ object ZerodhaLiveMirror {
      * holdings yet, so a count read then would be wrong in the dangerous
      * direction). Null always means "do nothing".
      */
-    private fun heldQuantity(ctx: Context, symbol: String): Int? {
+    internal fun heldQuantity(ctx: Context, symbol: String): Int? {
         val sym = symbol.uppercase()
         val today = try { ZerodhaClient(ConfigManager(ctx)).fetchTodayPositionSymbols() } catch (e: Exception) { null }
             ?: return null

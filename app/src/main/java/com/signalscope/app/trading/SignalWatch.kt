@@ -41,6 +41,17 @@ object SignalWatch {
 
     fun newBudget() = Budget()
 
+    /** Has the feed a bar from today's regular session for [symbol] — finished or not? */
+    fun tradedToday(base: String, symbol: String, nowMs: Long = System.currentTimeMillis()): Boolean {
+        val raw = StrategyLabRunner.lastRawNewest?.takeIf { it.first.equals(MacdLadder.bare(symbol), true) }
+            ?: return false
+        val zone = MarketHours.zoneOf(base) ?: return false
+        val open = MarketHours.openOf(base) ?: return false
+        val openSec = java.time.Instant.ofEpochMilli(nowMs).atZone(zone).toLocalDate()
+            .atTime(open).atZone(zone).toEpochSecond()
+        return raw.second >= openSec
+    }
+
     private fun g(s: Int?) = when (s) { 1 -> "G"; -1 -> "R"; 0 -> "·"; else -> "·" }
 
     /**
@@ -51,6 +62,13 @@ object SignalWatch {
     fun liveDataFresh(base: String, symbol: String): Boolean {
         val nowMs = System.currentTimeMillis()
         if (!MarketHours.isRegularSession(base, nowMs)) return false
+        // TRADING TODAY, FROM THE OPENING MINUTES. The newest FINISHED bar is
+        // yesterday's for the first hour of every session, so judged on that alone
+        // the near-low and entry alerts stayed silent until an hour after the bell.
+        // A bar of today's session in the feed, even one still forming, is proof
+        // enough that the market is open and this stock is trading — a holiday
+        // has none.
+        if (tradedToday(base, symbol, nowMs)) return true
         val lc = StrategyLabRunner.lastCandles?.takeIf { it.first.equals(MacdLadder.bare(symbol), true) }
             ?: return false
         val last = lc.third.lastOrNull() ?: return false

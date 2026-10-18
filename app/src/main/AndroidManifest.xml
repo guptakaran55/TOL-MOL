@@ -91,6 +91,20 @@
             android:name=".service.ZerodhaAutoLoginReceiver"
             android:exported="false" />
 
+        <!-- The home-screen positions widget. Drawn from the summary the background
+             pass builds; it refreshes when the app pushes one, never on a timer. -->
+        <receiver
+            android:name=".trading.PositionWidget"
+            android:exported="false"
+            android:label="Tol-Mol positions">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/position_widget_info" />
+        </receiver>
+
         <!-- FileProvider for sharing PDFs from cache -->
         <provider
             android:name="androidx.core.content.FileProvider"

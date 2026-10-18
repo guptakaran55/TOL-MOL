@@ -23,7 +23,11 @@ import com.signalscope.app.network.Trading212Client
  * a stale read. They are indistinguishable from outside, and the response to each
  * is different. Guessing "you must have sold it" and then deleting a paper trade
  * and freeing a seat on that guess would be the app quietly rewriting its own
- * history. So this only ever runs from an explicit tap.
+ * history. So this runs from an explicit tap — or, since 14 Oct, from
+ * [T212HandSales.sweep], and only when the broker has shown NONE of the shares on
+ * two reads at least half an hour apart: not a stale read, not a partial
+ * rejection, but a position that is simply gone. Partly missing positions are
+ * still left to you.
  *
  * WHAT IT DOES, and the reasoning for each:
  *
@@ -57,7 +61,8 @@ object ManualIntervention {
         val matchedFill: Boolean = false,    // did we find the actual manual sell in history?
         val exitPrice: Double = 0.0,
         val exitQty: Double = 0.0,
-        val realPnl: Double = 0.0            // real cash, only when the fill was found
+        val realPnl: Double = 0.0,           // real cash, only when the fill was found
+        val seatTo: String? = null           // the stock that took the freed seat
     )
 
     fun markSoldByHand(ctx: Context, ns: String, symbol: String): Result {
@@ -122,32 +127,26 @@ object ManualIntervention {
         val hadPaper = paperOpen != null
         StrategyLabStore.unenroll(ctx, sym, ns)
 
-        // ── 4. Free the seat, keeping its capital. Same shape as an eject: the money
-        // stays, the name goes, and the next gate evaluation rotates someone in.
-        // Capital is deliberately NOT compounded by the discarded trade.
+        // ── 4. Hand the seat on, keeping its capital. Capital is deliberately NOT
+        // compounded by the discarded trade. The seat goes straight to the next
+        // rising contender ([MacdGateEngine.handOn]) rather than waiting empty for
+        // the next daily evaluation — you have decided against this name.
         var seatFreed = false
+        var seatTo: String? = null
         try {
             val st = MacdGateStore.load(ctx, ns)
-            if (st.enabled) {
-                val slots = st.slots.toMutableList()
-                val idx = slots.indexOfFirst { it.symbol?.equals(sym, true) == true }
-                if (idx >= 0) {
-                    val now = System.currentTimeMillis()
-                    slots[idx] = MacdGateStore.Slot(null, slots[idx].capital, now, 0, false)
-                    seatFreed = true
-                    val ended = MacdGateStore.closeEnrollment(st, idx, sym, "sold_by_hand", now)
-                    val logged = MacdGateStore.appendLog(ended,
-                        "${java.time.LocalDate.now()} $sym sold by hand — paper trade dropped " +
-                        "(${"%+.2f".format(discarded)}% discarded), seat freed")
-                    MacdGateStore.save(ctx, ns, logged.copy(slots = slots))
-                }
+            if (st.enabled && st.slots.any { it.symbol?.equals(sym, true) == true }) {
+                seatTo = MacdGateEngine.handOn(ctx, ns, sym,
+                    "sold by you — paper trade dropped (${"%+.2f".format(discarded)}% discarded)")
+                seatFreed = true
             }
         } catch (e: Exception) { Log.w(TAG, "seat release failed", e) }
 
-        Log.w(TAG, "[$ns] $sym marked SOLD BY HAND — paper=$hadPaper seat=$seatFreed fill=$matched")
+        Log.w(TAG, "[$ns] $sym marked SOLD BY HAND — paper=$hadPaper seat=$seatFreed→${seatTo ?: "cash"} fill=$matched")
         return Result(ok = true, symbol = sym,
             paperRemoved = hadPaper, discardedPnlPct = discarded,
             seatFreed = seatFreed, liveMarked = live != null,
-            matchedFill = matched, exitPrice = exitPx, exitQty = exitQty, realPnl = realPnl)
+            matchedFill = matched, exitPrice = exitPx, exitQty = exitQty, realPnl = realPnl,
+            seatTo = seatTo)
     }
 }

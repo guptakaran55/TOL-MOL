@@ -490,9 +490,14 @@ object MarkToMarket {
         // is the entire defence against a mis-resolved instrument returning a
         // real price for the wrong company. No reference, no attempt.
         if (Spaces.baseOf(ns) == "de") {
-            val ref = synchronized(marks) { marks[key(symbol)]?.price } ?: 0.0
+            val m = synchronized(marks) { marks[key(symbol)] }
+            val ref = m?.price ?: 0.0
             if (ref > 0.0) {
-                val live = try { GermanRealtime.mid(ctx, symbol, ref) }
+                // A REFERENCE THAT HAS STOPPED IS STILL A REFERENCE, just a looser
+                // one — see GermanRealtime. Without saying so, a frozen feed's last
+                // price outvoted the live venue and the position stayed blind.
+                val stale = isStale(m!!, System.currentTimeMillis()) || GermanRealtime.feedStopped(symbol)
+                val live = try { GermanRealtime.mid(ctx, symbol, ref, stale) }
                            catch (e: Exception) { null }
                 if (live != null && live > 0.0) return Polled(live, 0.0, realtime = true)
             }

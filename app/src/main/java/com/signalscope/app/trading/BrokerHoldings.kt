@@ -42,7 +42,10 @@ object BrokerHoldings {
         val price: Double,
         /** Yahoo form, so callers can tell a German listing from a US one. Empty
          *  for brokers where the venue is not encoded in the symbol. */
-        val yahoo: String = ""
+        val yahoo: String = "",
+        /** The broker's own instrument code (Trading 212 only). The one name for
+         *  a holding that never depends on spelling a symbol out correctly. */
+        val ticker: String = ""
     )
 
     sealed class Result {
@@ -65,6 +68,35 @@ object BrokerHoldings {
     @Synchronized
     private fun put(key: String, r: Result) { cache[key] = Entry(System.currentTimeMillis(), r) }
 
+    // ── WHAT YOU HOLD, KEPT FOR THE PAGE ────────────────────────────────────
+    // The page underlines every stock you hold, wherever its name appears. It
+    // must not ask the broker on every repaint, so the last successful read of
+    // each space is kept here and read back instantly. An unreadable reply never
+    // overwrites it — "could not read" is not "holds nothing".
+    private const val HELD_FILE = "held_symbols.json"
+
+    @Synchronized
+    private fun remember(ctx: Context, space: String, holdings: List<Holding>) {
+        try {
+            val f = java.io.File(ctx.filesDir, HELD_FILE)
+            val o = try { org.json.JSONObject(if (f.exists()) f.readText() else "{}") } catch (e: Exception) { org.json.JSONObject() }
+            o.put(space, org.json.JSONObject()
+                .put("at", System.currentTimeMillis())
+                .put("symbols", org.json.JSONArray(holdings.map { it.symbol.uppercase() }.distinct())))
+            f.writeText(o.toString())
+        } catch (e: Exception) { Log.w(TAG, "could not keep the held list: ${e.message}") }
+    }
+
+    /** The last known held symbols for [space] ("de", "us", "in"), no network. */
+    fun heldSymbols(ctx: Context, space: String): List<String> = try {
+        val f = java.io.File(ctx.filesDir, HELD_FILE)
+        if (!f.exists()) emptyList() else {
+            val a = org.json.JSONObject(f.readText()).optJSONObject(Spaces.baseOf(space.lowercase()))
+                ?.optJSONArray("symbols")
+            if (a == null) emptyList() else List(a.length()) { a.optString(it) }.filter { it.isNotBlank() }
+        }
+    } catch (e: Exception) { emptyList() }
+
     /** Everything in the Trading 212 account — BOTH venues, unfiltered. */
     fun t212(ctx: Context): Result {
         cached("t212")?.let { return it }
@@ -78,7 +110,7 @@ object BrokerHoldings {
                         Result.Ok(p.data.filter { it.quantity > 0.0 }.map {
                             val ys = client.t212ToYahooSymbol(it.ticker)
                             Holding(ys.substringBefore(".").uppercase(),
-                                it.quantity, it.averagePrice, it.currentPrice, ys)
+                                it.quantity, it.averagePrice, it.currentPrice, ys, it.ticker)
                         })
                     is Trading212Client.T212Result.Failure ->
                         Result.Unreadable("Trading 212 said: ${p.message}")
@@ -91,6 +123,10 @@ object BrokerHoldings {
         }
         if (r is Result.Unreadable) Log.w(TAG, "T212 holdings unreadable — ${r.why}")
         put("t212", r)
+        if (r is Result.Ok) {
+            remember(ctx, "de", r.holdings.filter { it.yahoo.endsWith(".DE", true) })
+            remember(ctx, "us", r.holdings.filter { !it.yahoo.endsWith(".DE", true) })
+        }
         return r
     }
 
@@ -111,6 +147,7 @@ object BrokerHoldings {
         }
         if (r is Result.Unreadable) Log.w(TAG, "Zerodha holdings unreadable — ${r.why}")
         put("in", r)
+        if (r is Result.Ok) remember(ctx, "in", r.holdings)
         return r
     }
 
@@ -135,5 +172,26 @@ object BrokerHoldings {
             }
             else -> Result.Unreadable("no broker for space $base")
         }
+    }
+
+    /**
+     * WHAT TRADING 212 ITSELF VALUES ONE OF ITS HOLDINGS AT, or 0.
+     *
+     * A price that does not come from the price feed, for the moment the feed is
+     * the thing in doubt. The broker values the exact instrument an order would
+     * trade — matched by its own code first, by the app symbol on that venue
+     * after — so when the feed and a live venue disagree, this can say which of
+     * them moved. Held names only; the account values nothing it does not hold.
+     *
+     * The shared read, so one portfolio call per [TTL_MS] however many ask.
+     */
+    fun t212Price(ctx: Context, symbolOrTicker: String, space: String): Double {
+        val k = symbolOrTicker.trim()
+        if (k.isBlank()) return 0.0
+        val held = (forSpace(ctx, space) as? Result.Ok)?.holdings ?: return 0.0
+        val bare = k.uppercase().substringBefore('.')
+        val h = held.firstOrNull { it.ticker.equals(k, true) }
+            ?: held.firstOrNull { it.symbol.equals(bare, true) }
+        return h?.price?.takeIf { it > 0.0 && it.isFinite() } ?: 0.0
     }
 }

@@ -48,7 +48,22 @@ object HeldPositionWatch {
         val price: Double
     )
 
-    private fun today(): String = LocalDate.now(ZoneOffset.UTC).toString()
+    /**
+     * THE MARKET'S OWN DAY, not the world clock's. "Once a day" counted by the
+     * world clock started each day at 2 a.m. in Germany, so every reminder that
+     * still applied went out again around 02:15 — every night, weekends included.
+     */
+    private fun today(base: String, nowMs: Long = System.currentTimeMillis()): String =
+        MarketHours.tradingDay(base, nowMs) ?: LocalDate.now(ZoneOffset.UTC).toString()
+
+    /**
+     * ONLY WHILE THE MARKET IS TRADING. A holding judged on a shut market is
+     * judged on yesterday's close, and nothing can be done about it until the
+     * open anyway — so the reminder waits for the open and goes out on the first
+     * pass after it (Germany ~09:16, US ~15:31, India ~05:46 German time).
+     */
+    private fun mayAlert(base: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+        MarketHours.isRegularSession(base, nowMs)
 
     /**
      * What the account actually holds in this space.
@@ -99,7 +114,8 @@ object HeldPositionWatch {
             ?: return Outcome(0, emptyList(), "holdings unreadable — nothing judged")
         if (held.isEmpty()) return Outcome(0, emptyList(), "nothing held")
 
-        val day = today()
+        val day = today(base)
+        val open = mayAlert(base)
         val st = ManualWatchStore.load(ctx, base)
         val alerted = ArrayList<String>()
         var checked = 0
@@ -107,6 +123,7 @@ object HeldPositionWatch {
         for (h in held) {
             if (h.avgCost <= 0.0 || h.price <= 0.0) continue
             checked++
+            if (!open) continue                       // market shut — say it at the open
             val key = "held:${h.symbol}"
             if (st.alerted[key] == day) continue      // already said so today
 
@@ -171,7 +188,8 @@ object HeldPositionWatch {
         // has not chosen a strategy for this space, so there is nothing to say.
         if (com.signalscope.app.data.StrategyLabStore.load(ctx, ns).configJson == null) return
 
-        val day = today()
+        val day = today(base)
+        val open = mayAlert(base)
         val exchange = Spaces.exchangeOf(base)
         // Shares another manager already owns are left to it — two managers on one
         // position is worse than one. Measured in SHARES rather than names, so a
@@ -221,6 +239,8 @@ object HeldPositionWatch {
                     lastReason = if (v.fires) v.reason else "holding")))
             }
             if (!v.fires) continue
+            // Judged and remembered above either way; only the telling waits.
+            if (!open) continue
 
             val st = com.signalscope.app.data.PortfolioTrackStore.load(ctx, base)
             if (st.tracks[sym]?.alertedDay == day) continue   // once a day, whatever happens

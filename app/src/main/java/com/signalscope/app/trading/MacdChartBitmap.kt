@@ -144,7 +144,7 @@ object MacdChartBitmap {
         if (drawn) bmp else null
     } catch (e: Exception) { null }
 
-    private fun paintCurve(c: Canvas, curve: List<Double>, col: Int, w: Float, h: Float,
+    internal fun paintCurve(c: Canvas, curve: List<Double>, col: Int, w: Float, h: Float,
                            pad: Float, stroke: Float, endDot: Float, startDot: Float): Boolean {
         val g = MacdChartGeometry.layout(curve, w, h, pad) ?: return false
         val n = g.xs.size

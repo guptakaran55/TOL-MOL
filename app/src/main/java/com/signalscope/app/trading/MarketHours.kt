@@ -53,6 +53,56 @@ object MarketHours {
     }
 
     /**
+     * The next time this market's regular session opens, strictly after [nowMs] —
+     * weekdays only, by the exchange's own clock. Public holidays are not known
+     * here, so on one this names the open that never comes; the next pass after
+     * it corrects itself. Null for a market without fixed hours (crypto).
+     */
+    fun nextOpenMs(base: String, nowMs: Long): Long? {
+        val s = sessionFor(base) ?: return null
+        var d = Instant.ofEpochMilli(nowMs).atZone(s.zone).toLocalDate()
+        repeat(8) {
+            if (d.dayOfWeek != DayOfWeek.SATURDAY && d.dayOfWeek != DayOfWeek.SUNDAY) {
+                val at = d.atTime(s.open).atZone(s.zone).toInstant().toEpochMilli()
+                if (at > nowMs) return at
+            }
+            d = d.plusDays(1)
+        }
+        return null
+    }
+
+    /**
+     * WHEN THE STOCK MARKETS ARE ALL SHUT, which opens next — "India opens Mon
+     * 05:45", on the phone's clock. Null while any of them is trading. For the
+     * status line, which otherwise read like a scan of markets that were closed.
+     */
+    fun nextOpeningText(nowMs: Long, local: ZoneId = ZoneId.systemDefault()): String? {
+        val markets = listOf("de" to "Germany", "us" to "US", "in" to "India")
+        if (markets.any { isRegularSession(it.first, nowMs) }) return null
+        val (name, at) = markets.mapNotNull { (b, n) -> nextOpenMs(b, nowMs)?.let { n to it } }
+            .minByOrNull { it.second } ?: return null
+        val t = Instant.ofEpochMilli(at).atZone(local)
+        val today = Instant.ofEpochMilli(nowMs).atZone(local).toLocalDate()
+        val day = when (t.toLocalDate()) {
+            today -> "at"
+            today.plusDays(1) -> "tomorrow"
+            else -> t.dayOfWeek.getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH)
+        }
+        return "$name opens $day %02d:%02d".format(t.hour, t.minute)
+    }
+
+    /**
+     * The exchange's own calendar date, as yyyy-mm-dd — the day a "once a day"
+     * alert about this market should count by. Counting by the world clock made
+     * that day start at 2 a.m. in Germany, so every daily reminder went out again
+     * in the middle of the night. Null for a market without fixed hours.
+     */
+    fun tradingDay(base: String, nowMs: Long): String? {
+        val s = sessionFor(base) ?: return null
+        return Instant.ofEpochMilli(nowMs).atZone(s.zone).toLocalDate().toString()
+    }
+
+    /**
      * Is a bar that started at [barStartSec] and lasts [barSec] recent enough to
      * be today's trading? Allows one bar's length, the feed's own delay and a
      * quarter-hour of slack for a pass that runs late.
