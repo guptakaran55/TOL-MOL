@@ -102,7 +102,7 @@ object FloorAlgoEngine {
             fresh.copy(universe = done.universe, universeDay = done.universeDay,
                 universeFrom = done.universeFrom, planDay = done.planDay,
                 trendCheckDay = done.trendCheckDay, journalDay = done.journalDay, planFilter = done.planFilter,
-                planMode = done.planMode, campaigns = done.campaigns, outlooks = done.outlooks,
+                planMode = done.planMode, campaigns = done.campaigns, chains = done.chains, outlooks = done.outlooks,
                 orders = done.orders, trades = done.trades,
                 log = (fresh.log + pass.newLog), lastRunMs = System.currentTimeMillis(),
                 lastNote = pass.summary())
@@ -200,6 +200,8 @@ object FloorAlgoEngine {
         val filterOn = start.settings.trendFilter
         /** Floor orders that wait in the weekly support zone instead of expiring. */
         val campaign = start.kind == FloorAlgoStore.KIND_CAMPAIGN
+        /** The monthly-low chain: see [ChainRules]. */
+        val chain = start.kind == FloorAlgoStore.KIND_CHAIN
         val weekMode = start.kind == FloorAlgoStore.KIND_FLOOR && start.settings.orderMode == FloorAlgoStore.MODE_WEEK
         val orderMode = if (weekMode) FloorAlgoStore.MODE_WEEK else FloorAlgoStore.MODE_DAY
         val zone: ZoneId = MarketHours.zoneOf(space) ?: ZoneId.of("Europe/Berlin")
@@ -225,6 +227,13 @@ object FloorAlgoEngine {
         fun passes(m: Member) = !filterOn || FloorOrders.inUptrend(m.week, m.day)
 
         fun summary(): String {
+            if (chain) {
+                val live = a.chains.filter { it.state != "ENDED" }
+                val counted = live.filter { it.counted }
+                return "checked ${FloorAlgoStore.stamp(nowMs)} · ${counted.size}/${a.settings.seats} seats " +
+                    "(${counted.count { it.state == "HOLDING" }} holding, ${counted.count { it.state == "WATCHING" }} watching)" +
+                    " · ${live.size - counted.size} followed on the side"
+            }
             if (campaign) {
                 val live = a.campaigns.filter { it.state != "ENDED" }
                 return "checked ${FloorAlgoStore.stamp(nowMs)} · ${live.size} campaigns running " +
@@ -253,6 +262,7 @@ object FloorAlgoEngine {
 
         fun run() {
             if (campaign) { runCampaigns(); return }
+            if (chain) { runChain(); return }
             // A PAUSED algo places nothing new, but still sells what it holds on
             // schedule and keeps its record up to date — pausing must never strand
             // a position with nothing to close it.
@@ -806,7 +816,7 @@ object FloorAlgoEngine {
          * at the market — the cautious guess, since only the target avoids it.
          */
         fun slipFor(buyValue: Double, sellValue: Double, sellReason: String?): Double {
-            val buy = if (macd) buyValue else 0.0
+            val buy = if (macd || chain) buyValue else 0.0
             val sell = if (sellReason == "target") 0.0 else sellValue
             return spreadPct / 100.0 * (buy + sell)
         }
@@ -1193,6 +1203,267 @@ object FloorAlgoEngine {
                 return after.copy(endDay = todayStr)
             }
             return after
+        }
+
+        // ── THE MONTHLY-LOW CHAIN ────────────────────────────────────────────
+        // Rules in ChainRules; this is the bookkeeping. Mornings: who touched the
+        // monthly low yesterday, the news outlook on each, watches extended or
+        // run out. Every pass in session: the timeframes turn and the champion's
+        // buy for halves still waiting, fills at the next price, and the
+        // champion's exits for halves held. Stocks the outlook turned down (or
+        // that found every seat taken) run the same way, followed on the side.
+
+        private val chainCfg: StrategyLabConfig? by lazy { ChainRules.championConfig(space) }
+        /** Engine bars fetched this pass, per stock — the champion's buy and exits share them. */
+        private val chainFeeds = HashMap<String, Pair<List<CandleData>, Long>?>()
+        private fun chainFeed(sym: String): Pair<List<CandleData>, Long>? {
+            val cfg = chainCfg ?: return null
+            return chainFeeds.getOrPut(sym) { StrategyLabRunner.engineFeed(ctx, space, sym, cfg) }
+        }
+
+
+        private fun runChain() {
+            if (a.enabled && a.universeDay != today.toString()) refreshUniverse()
+            if (today.dayOfWeek.value <= 5 && a.planDay != today.toString() && !local.toLocalTime().isBefore(PLAN_FROM))
+                chainMorning()
+            if (inSessionWindow()) chainBars()
+            chargeOldSales()
+            outcomes()
+        }
+
+        private fun chainSeatsBusy(chains: List<FloorAlgoStore.Chain>) =
+            chains.count { it.counted && it.state != "ENDED" }
+
+        /** Whether a chain gets a seat, once its verdict is known. */
+        private fun chainDecide(c: FloorAlgoStore.Chain, chains: List<FloorAlgoStore.Chain>): FloorAlgoStore.Chain {
+            val s = a.settings
+            if (s.useNews && c.verdict.isEmpty()) return c.copy(counted = false, why = "news outlook not asked yet")
+            if (s.useNews && !ChainRules.positive(c.verdict)) return c.copy(counted = false, why = "news outlook ${c.verdict}")
+            if (!a.enabled) return c.copy(counted = false, why = "algo paused")
+            val busy = chainSeatsBusy(chains.filter { it.id != c.id })
+            return if (busy < s.seats) c.copy(counted = true, why = "") else c.copy(counted = false, why = "every seat taken")
+        }
+
+        private fun chainMorning() {
+            val s = a.settings
+            val todayStr = today.toString()
+            val live = a.chains.filter { it.state != "ENDED" }
+            val syms = (a.universe.map { it.symbol } + live.map { it.symbol }).distinct()
+            if (syms.isEmpty()) { a = a.copy(planDay = todayStr); return }
+            val daily = dailyBars(syms)?.takeIf { it.isNotEmpty() } ?: return
+            outlookBudget = if (s.useNews) s.newsPerDay.coerceAtLeast(0) else 0
+            val fromSec = ChainRules.ceil15(nowSec)
+            var chains = a.chains
+
+            // 1. Chains already running.
+            chains = chains.map { c0 ->
+                if (c0.state == "ENDED") return@map c0
+                var c = c0
+                val bars = daily[c.symbol.uppercase()]
+                val judged = bars?.lastOrNull()?.date?.toString()
+                // A fresh touch keeps a watch open while nothing has bought from it yet.
+                if (bars != null && judged != null && c.state == "WATCHING" && judged > c.lastTouchDay &&
+                    ChainRules.touchedMonthlyLow(bars)) {
+                    c = c.copy(lastTouchDay = judged,
+                        expiryDay = ChainRules.addTradingDays(LocalDate.parse(judged), s.watchDays).toString())
+                }
+                // Started after the day's checks ran out: asked now.
+                if (s.useNews && c.verdict.isEmpty()) {
+                    val v = outlookFor(Member(c.symbol, c.name), bars?.lastOrNull()?.close ?: 0.0)
+                    if (v != null) {
+                        c = chainDecide(c.copy(verdict = v.ifEmpty { "NO VERDICT" }), chains)
+                        note("${c.symbol}: news outlook ${c.verdict} — " +
+                            (if (c.counted) "takes a seat" else "followed on the side (${c.why})"))
+                    }
+                }
+                // The watch ran out: a half that never bought never will.
+                if (c.expiryDay.isNotEmpty() && todayStr > c.expiryDay) {
+                    if (c.dots.isEmpty()) c = c.copy(dots = "VOID")
+                    if (c.champ.isEmpty()) c = c.copy(champ = "VOID")
+                }
+                if (!a.enabled && c.state == "WATCHING") c = c.copy(dots = "VOID", champ = "VOID")
+                chainMaybeEnd(c, if (!a.enabled) "algo paused before any buy" else "watch ran out")
+            }
+
+            // 2. New touches of the monthly low.
+            val busySyms = chains.filter { it.state != "ENDED" }.map { it.symbol }.toSet()
+            val cap = s.seats.coerceAtLeast(1) * 3       // followed chains are bounded: each costs downloads
+            val seat = s.capital / s.seats.coerceAtLeast(1)
+            var started = 0
+            val members = a.universe.map { m ->
+                val bars = daily[m.symbol.uppercase()] ?: return@map m.copy(note = "no daily prices")
+                if (m.symbol in busySyms) return@map m.copy(note = "chain running")
+                if (!ChainRules.touchedMonthlyLow(bars)) {
+                    val w = bars.takeLast(ChainRules.MONTH_DAYS)
+                    val lo = w.minOfOrNull { it.low } ?: 0.0
+                    val hi = w.maxOfOrNull { it.high } ?: 0.0
+                    val pos = if (hi > lo) (bars.last().low - lo) / (hi - lo) * 100.0 else 100.0
+                    return@map m.copy(note = "day's low at ${String.format(Locale.US, "%.0f", pos)}% of its monthly range")
+                }
+                if (!a.enabled) return@map m.copy(note = "at its monthly low — algo paused")
+                if (chains.count { it.state != "ENDED" } >= cap)
+                    return@map m.copy(note = "at its monthly low — too many chains followed already")
+                val judged = bars.last().date
+                val verdict = if (s.useNews) (outlookFor(m, bars.last().close)?.ifEmpty { "NO VERDICT" } ?: "") else "NOT ASKED"
+                val c = chainDecide(FloorAlgoStore.Chain(id = "${m.symbol}|$todayStr", symbol = m.symbol, name = m.name,
+                    touchDay = judged.toString(), lastTouchDay = judged.toString(),
+                    expiryDay = ChainRules.addTradingDays(judged, s.watchDays).toString(),
+                    watchFromSec = fromSec, verdict = verdict, seat = seat, scannedSec = fromSec), chains)
+                chains = chains + c
+                started++
+                note("${m.symbol}: at its monthly low on ${judged.format(dayFmt)}" +
+                    (if (verdict.isNotEmpty()) ", news outlook $verdict" else ", news outlook asked tomorrow") +
+                    " — " + (if (c.counted) "watching for the buys (seat ${chainSeatsBusy(chains)} of ${s.seats})"
+                             else "followed on the side (${c.why})"))
+                m.copy(note = if (c.counted) "chain started — watching" else "chain followed — ${c.why}")
+            }
+            a = a.copy(chains = chains, universe = members, planDay = todayStr)
+            note("${today.format(dayFmt)}: $started new chains; ${chainSeatsBusy(chains)}/${s.seats} seats, " +
+                "${chains.count { it.state != "ENDED" && !it.counted }} followed on the side")
+        }
+
+        /** Ended once no half is waiting, pending or held. */
+        private fun chainMaybeEnd(c: FloorAlgoStore.Chain, why: String): FloorAlgoStore.Chain {
+            if (c.state == "ENDED") return c
+            val pending = a.trades.any { it.id.startsWith(c.id + "|") && it.sellDay == null }
+            val waiting = c.dots.isEmpty() || c.champ.isEmpty()
+            if (waiting || pending) return c
+            val legs = a.trades.filter { it.id.startsWith(c.id + "|") }
+            val reason = if (legs.isEmpty()) why else "both halves done"
+            val pnl = legs.sumOf { it.pnl }
+            if (legs.isNotEmpty() || c.counted)
+                note("${c.symbol}: chain ended — $reason" + (if (legs.isNotEmpty())
+                    ", ${(if (pnl >= 0) "+" else "−")}${money(Math.abs(pnl))} in all" +
+                    (if (!c.counted) " (followed on the side, not counted)" else "") else ""))
+            return c.copy(state = "ENDED", endDay = today.toString(), endReason = reason)
+        }
+
+        private fun chainBars() {
+            val s = a.settings
+            val cfg = chainCfg
+            if (cfg == null) { note("the built-in champion config did not load — chain idle"); return }
+            val smoothing = MacdLadder.smoothingFor(ctx, space)
+            val delay = FeedDelay.secFor(space)
+            val todayStr = today.toString()
+            val live = a.chains.filter { it.state != "ENDED" && (!s.useNews || it.verdict.isNotEmpty()) }
+            if (live.isEmpty()) return
+            val daily = dailyBars(live.map { it.symbol }.distinct()) ?: emptyMap()
+            val sessionOn = MarketHours.isRegularSession(space, nowMs)
+            for (c0 in live) {
+                var c = a.chains.firstOrNull { it.id == c0.id } ?: continue
+                val days = book.days(c.symbol) ?: continue
+                val c15 = days.values.flatten()
+                val open = c.expiryDay.isEmpty() || todayStr <= c.expiryDay
+                val status = if (c.counted) "OPEN" else "MISSED"
+                val half = c.seat / 2.0
+
+                // 1. Halves whose signal was seen: bought at the next price.
+                for (t in a.trades.filter { it.id.startsWith(c.id + "|") && it.firstSec == 0L }) {
+                    val f = ChainRules.nextOpen(c15, t.fromSec) ?: continue
+                    val n = t.copy(firstSec = f.sec, firstPrice = f.price, qty = half / f.price, cost = half, halves = 1,
+                        lastPrice = f.price, lastSec = f.sec,
+                        day = Instant.ofEpochSecond(f.sec).atZone(zone).toLocalDate().toString())
+                    a = a.copy(trades = a.trades.map { if (it.id == t.id) n else it })
+                    val which = if (t.id.endsWith("|A")) "timeframes half" else "champion half"
+                    note("${c.symbol}: $which bought at ${px(f.price)} (${clock(f.sec)} open)" +
+                        (if (!c.counted) " — followed on the side" else ""))
+                    if (c.counted) notices.add(Notice(false, c.symbol, f.price, 0.0,
+                        "monthly-low chain: $which bought at ${cur}${px(f.price)}"))
+                }
+
+                // 2. The timeframes half: daily, 4-hour, hourly and 15-minute all turning up.
+                if (c.dots.isEmpty() && open && sessionOn) {
+                    val bars = daily[c.symbol.uppercase()]
+                    if (bars != null) {
+                        val after = maxOf(c.watchFromSec, c.scannedSec)
+                        val turn = ChainRules.firstGreenTurn(c15, ChainRules.dailySlopeBefore(bars, smoothing),
+                            zone, after, nowSec, delay, smoothing)
+                        val newest = c15.filter { FeedDelay.isComplete(it.timestamp, 900L, nowSec, 0L, delay) }
+                            .maxOfOrNull { it.timestamp } ?: after
+                        if (turn != null) {
+                            val t = Trade(id = "${c.id}|A", symbol = c.symbol, name = c.name, day = todayStr,
+                                signalSec = turn.endSec, fromSec = ChainRules.ceil15(maxOf(turn.endSec, nowSec)), status = status)
+                            a = a.copy(trades = a.trades.filterNot { it.id == t.id } + t)
+                            c = c.copy(dots = "OPEN", state = "HOLDING", scannedSec = turn.barSec + 900L)
+                            note("${c.symbol}: daily, 4-hour, hourly and 15-minute MACD all turned up at " +
+                                "${clock(turn.endSec)} — timeframes half buys at the next price")
+                        } else c = c.copy(scannedSec = maxOf(c.scannedSec, newest + 1))
+                    }
+                }
+
+                // 3. The champion half, and 4. the champion's exits for halves held.
+                val held = a.trades.filter { it.id.startsWith(c.id + "|") && it.firstSec > 0L && it.sellDay == null }
+                val wantChamp = c.champ.isEmpty() && open
+                // Asked once per finished two-hour bar — the only moment its answer can change.
+                val visible = ChainRules.frameVisibleAt(nowSec,
+                    StrategyLabEngine.timeframeSeconds(cfg.exitBars).coerceAtLeast(900L), cfg.barAnchorSec, delay)
+                if ((wantChamp || held.isNotEmpty()) && c.champCheckSec < visible) {
+                    c = c.copy(champCheckSec = nowSec)
+                    val feed = chainFeed(c.symbol)
+                    if (feed != null) {
+                        val (candles, src) = feed
+                        if (wantChamp) {
+                            val run = StrategyLabEngine.runLiveClosed(c.symbol, candles, cfg, src, c.watchFromSec)
+                            val tr = run.trades.firstOrNull { it.entryTs >= c.watchFromSec }
+                            if (tr != null) {
+                                val sigEnd = tr.entryTs + (if (run.exitTfSec > 0) run.exitTfSec else src)
+                                val sigDay = Instant.ofEpochSecond(sigEnd).atZone(zone).toLocalDate().toString()
+                                if (c.expiryDay.isEmpty() || sigDay <= c.expiryDay) {
+                                    val t = Trade(id = "${c.id}|B", symbol = c.symbol, name = c.name, day = sigDay,
+                                        signalSec = sigEnd, fromSec = ChainRules.ceil15(maxOf(sigEnd, nowSec)), status = status)
+                                    a = a.copy(trades = a.trades.filterNot { it.id == t.id } + t)
+                                    c = c.copy(champ = "OPEN", state = "HOLDING")
+                                    note("${c.symbol}: the conservative champion bought at ${clock(sigEnd)} " +
+                                        "(${tr.entryReason.take(60)}) — champion half buys at the next price")
+                                }
+                            }
+                        }
+                        for (t in held.filter { it.exitReason.isEmpty() }) {
+                            val ex = StrategyLabEngine.adoptedExit(candles, cfg, t.firstPrice, t.firstSec, src)
+                            if (!ex.ok || !ex.fires) continue
+                            val exitTf = StrategyLabEngine.timeframeSeconds(cfg.exitBars).coerceAtLeast(src)
+                            a = a.copy(trades = a.trades.map { if (it.id == t.id) it.copy(exitReason = ex.reason,
+                                sellSec = ChainRules.ceil15(maxOf(ex.barTs + exitTf, nowSec))) else it })
+                            note("${c.symbol}: champion exit for the " +
+                                "${if (t.id.endsWith("|A")) "timeframes" else "champion"} half — ${ex.reason}")
+                        }
+                    }
+                }
+
+                // 5. Exits decided: sold at the next price.
+                for (t in a.trades.filter { it.id.startsWith(c.id + "|") && it.firstSec > 0L &&
+                        it.sellDay == null && it.exitReason.isNotEmpty() }) {
+                    val f = ChainRules.nextOpen(c15, t.sellSec) ?: continue
+                    val sellDay = Instant.ofEpochSecond(f.sec).atZone(zone).toLocalDate().toString()
+                    val proceeds = t.qty * f.price
+                    val fees = feesFor(t.day, t.cost, proceeds, sellDay)
+                    val slip = slipFor(t.cost, proceeds, "champion exit")
+                    val pnl = proceeds - t.cost - fees - slip
+                    val pct = if (t.cost > 0) pnl / t.cost * 100.0 else 0.0
+                    a = a.copy(trades = a.trades.map { if (it.id != t.id) it else it.copy(
+                        status = if (it.status == "MISSED") "MISSED" else "SOLD", sellDay = sellDay, sellPrice = f.price,
+                        sellSec = f.sec, pnl = pnl, fees = fees, feesIn = true, slip = slip, slipIn = true,
+                        lastPrice = f.price, lastSec = f.sec) })
+                    val which = if (t.id.endsWith("|A")) "timeframes" else "champion"
+                    c = if (which == "timeframes") c.copy(dots = "SOLD") else c.copy(champ = "SOLD")
+                    val pctStr = String.format(Locale.US, "%+.2f", pct)
+                    note("${c.symbol}: $which half sold at ${px(f.price)} — ${t.exitReason.take(60)} ($pctStr%)" +
+                        (if (!c.counted) ", followed on the side" else ""))
+                    if (c.counted) notices.add(Notice(true, c.symbol, f.price, pct,
+                        "monthly-low chain: $which half sold — ${t.exitReason.take(60)}"))
+                }
+
+                // 6. Priced, as a sale at the market would leave it.
+                val last = c15.maxByOrNull { it.timestamp }
+                if (last != null) a = a.copy(trades = a.trades.map {
+                    if (!it.id.startsWith(c.id + "|") || it.firstSec == 0L || it.sellDay != null) it
+                    else it.copy(lastPrice = last.close, lastSec = last.timestamp,
+                        fees = feesFor(it.day, it.cost, it.qty * last.close, todayStr),
+                        slip = slipFor(it.cost, it.qty * last.close, null))
+                })
+                val done = chainMaybeEnd(c, "watch ran out")
+                a = a.copy(chains = a.chains.map { if (it.id == done.id) done else it })
+            }
         }
 
         private fun outcomes() {

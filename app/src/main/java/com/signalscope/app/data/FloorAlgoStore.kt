@@ -51,6 +51,11 @@ object FloorAlgoStore {
      *  daily highs and lows, ended on the daily or 4-hour MACD turning down.
      *  See [com.signalscope.app.trading.CampaignRules]. */
     const val KIND_CAMPAIGN = "campaign"
+    /** THE MONTHLY-LOW CHAIN: a stock at its monthly low, a positive news outlook,
+     *  half a seat on the timeframes all turning up, half on the conservative
+     *  champion's buy, each sold on the champion's exits. Stocks the outlook turns
+     *  down are followed on the side. See [com.signalscope.app.trading.ChainRules]. */
+    const val KIND_CHAIN = "chain"
 
     /** Floor orders that expire at the close and are placed afresh each morning. */
     const val MODE_DAY = "day"
@@ -127,7 +132,10 @@ object FloorAlgoStore {
         val seatAmount: Double = 0.0,
         /** Campaigns only: news outlooks asked a morning at most — each is a paid
          *  call. Candidates past it wait for the next morning, never start unasked. */
-        val newsPerDay: Int = 12
+        val newsPerDay: Int = 12,
+        /** Chains only: trading days a stock stays watched after its last touch of
+         *  the monthly low; a half that has not bought by then never will. */
+        val watchDays: Int = 20
     )
 
     /** Half-spread to assume per market order when none is set: Germany sits
@@ -322,6 +330,49 @@ object FloorAlgoStore {
         val pnl: Double = 0.0
     )
 
+    /**
+     * ONE STOCK'S CHAIN: watched from the morning its monthly low was touched,
+     * until both halves have sold or the watch ran out. Each half that buys is a
+     * [Trade] of its own ("chainId|A" on the timeframes, "chainId|B" on the
+     * champion), so the card's Held and Closed lists and the charges work as for
+     * every algo.
+     *
+     * [counted] false: followed on the side, never counted in the money — the
+     * news outlook said no, or every seat was taken. Its trades are MISSED. That
+     * is what lets the record answer whether the outlook helped.
+     */
+    data class Chain(
+        val id: String = "",
+        val symbol: String = "",
+        val name: String = "",
+        /** WATCHING (no half bought yet) · HOLDING (at least one half in) · ENDED. */
+        val state: String = "WATCHING",
+        /** The day judged at its monthly low, the latest such day, and the last
+         *  trading day either half may still buy. */
+        val touchDay: String = "",
+        val lastTouchDay: String = "",
+        val expiryDay: String = "",
+        /** No bar before this may buy — the watch began when the app first saw it. */
+        val watchFromSec: Long = 0L,
+        /** The news outlook when the chain started; "" = not asked yet (today's
+         *  checks were used up) — nothing buys until it is. */
+        val verdict: String = "",
+        val counted: Boolean = true,
+        /** Why it is only followed. */
+        val why: String = "",
+        /** Money for the whole seat; each half is half of it. */
+        val seat: Double = 0.0,
+        /** The 15-minute bars up to here have been looked at for the timeframes turn. */
+        val scannedSec: Long = 0L,
+        /** The last time the champion was asked about this stock. */
+        val champCheckSec: Long = 0L,
+        /** Each half: "" waiting · OPEN · SOLD · VOID (the watch ran out first). */
+        val dots: String = "",
+        val champ: String = "",
+        val endDay: String = "",
+        val endReason: String = ""
+    )
+
     data class Algo(
         val id: String = "",
         val name: String = "",
@@ -351,6 +402,8 @@ object FloorAlgoStore {
         val planMode: String = MODE_DAY,
         /** Campaigns only: every campaign, running or ended (the newest 200 kept). */
         val campaigns: List<Campaign> = emptyList(),
+        /** Chains only: every chain, running or ended (the newest 300 kept). */
+        val chains: List<Chain> = emptyList(),
         /** News outlook verdicts by stock: "VERDICT|yyyy-mm-dd" — asked again after
          *  a few days, not on every pass. */
         val outlooks: Map<String, String> = emptyMap(),
@@ -412,7 +465,12 @@ object FloorAlgoStore {
             val live = a.campaigns.filter { it.state != "ENDED" }
             a.campaigns.filter { it.state == "ENDED" }.takeLast((200 - live.size).coerceAtLeast(0)) + live
         }
-        return a.copy(trades = trades.sortedBy { it.firstSec }, log = a.log.takeLast(MAX_LOG), campaigns = campaigns)
+        val chains = if (a.chains.size <= 300) a.chains else {
+            val live = a.chains.filter { it.state != "ENDED" }
+            a.chains.filter { it.state == "ENDED" }.takeLast((300 - live.size).coerceAtLeast(0)) + live
+        }
+        return a.copy(trades = trades.sortedBy { it.firstSec }, log = a.log.takeLast(MAX_LOG),
+            campaigns = campaigns, chains = chains)
     }
 
     fun list(ctx: Context, space: String): List<Algo> = load(ctx).algos.filter { it.space == space }
@@ -421,22 +479,28 @@ object FloorAlgoStore {
 
     /** Switched on — or paused but still holding, or still following what
      *  happened after a buy. */
-    fun hasWork(a: Algo): Boolean = a.enabled || a.trades.any { it.status == "OPEN" || !it.done }
+    fun hasWork(a: Algo): Boolean = a.enabled || a.trades.any { it.status == "OPEN" || !it.done } ||
+        a.chains.any { it.state == "HOLDING" }
 
     fun anyRunning(ctx: Context): Boolean = load(ctx).algos.any { hasWork(it) }
 
     fun create(ctx: Context, space: String, name: String, kind: String = KIND_FLOOR): Algo {
-        val k = if (kind == KIND_MACD || kind == KIND_CAMPAIGN) kind else KIND_FLOOR
+        val k = if (kind == KIND_MACD || kind == KIND_CAMPAIGN || kind == KIND_CHAIN) kind else KIND_FLOOR
         // A campaign's stop starts as the watcher's own trailing stop for this
         // market — the same unit and size — or two ATRs where none is set.
-        val settings = if (k != KIND_CAMPAIGN) Settings() else try {
+        // A chain starts on the user's tested setup: seven seats, every stock past
+        // the market's volume × price floor, the news outlook on.
+        val settings = if (k == KIND_CHAIN) Settings(seats = 7, capital = 1400.0, universeMode = "all",
+            useNews = true, newsPerDay = 12, watchDays = 20, stopPct = 4.0, targetPct = 0.0)
+        else if (k != KIND_CAMPAIGN) Settings() else try {
             val w = ManualWatchStore.load(ctx, space)
             if (w.trailPct > 0.0) Settings(stopPct = w.trailPct, stopUnit = (w.trailUnit ?: ManualWatchStore.TrailUnit.PCT).name)
             else Settings(stopPct = 2.0, stopUnit = "ATR")
         } catch (e: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
         val a = Algo(
             id = "f" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36),
-            name = name.trim().ifBlank { when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"; else -> "Floor orders" } }.take(40),
+            name = name.trim().ifBlank { when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"
+                KIND_CHAIN -> "Monthly-low chain"; else -> "Floor orders" } }.take(40),
             kind = k, space = space, createdAt = System.currentTimeMillis(), settings = settings,
             log = listOf(stamp() + " · created"))
         mutate(ctx) { it.copy(algos = it.algos + a) }

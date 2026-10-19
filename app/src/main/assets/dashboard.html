@@ -13920,12 +13920,13 @@ function algosCreate(){
     '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-bottom:7px;line-height:1.4"><input type="radio" name="alg-kind" value="std" checked style="margin-top:2px"/><span><b>Standard</b><br/><span style="font-size:10px;color:var(--t3)">Rules come from a config file you attach. Can be armed for real orders.</span></span></label>'+
     '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-bottom:7px;line-height:1.4"><input type="radio" name="alg-kind" value="floor" style="margin-top:2px"/><span><b>Floor orders</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. On the top stocks by ROC (room to resistance): two resting buy orders a day at the recent low. A weekly-and-daily trend filter can be switched on in Settings. Can never place a real order.</span></span></label>'+
     '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);line-height:1.4"><input type="radio" name="alg-kind" value="macd" style="margin-top:2px"/><span><b>MACD turns</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. Same stocks: with the 4-hour MACD rising, buys at the next price when the 15-minute and hourly MACD turn up together. Same optional trend filter. Can never place a real order.</span></span></label>'+
-    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-top:7px;line-height:1.4"><input type="radio" name="alg-kind" value="campaign" style="margin-top:2px"/><span><b>Campaigns</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. Starts a campaign on a stock in the zone of its monthly support (asking the news outlook first), swings it between the day’s highs and lows, and ends it when the daily or 4-hour MACD turns down. Can never place a real order.</span></span></label>';
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-top:7px;line-height:1.4"><input type="radio" name="alg-kind" value="campaign" style="margin-top:2px"/><span><b>Campaigns</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. Starts a campaign on a stock in the zone of its monthly support (asking the news outlook first), swings it between the day’s highs and lows, and ends it when the daily or 4-hour MACD turns down. Can never place a real order.</span></span></label>'+
+    '<label style="display:flex;gap:7px;align-items:flex-start;font-size:11px;color:var(--t1);margin-top:7px;line-height:1.4"><input type="radio" name="alg-kind" value="chain" style="margin-top:2px"/><span><b>Monthly-low chain</b>'+paperTag+'<br/><span style="font-size:10px;color:var(--t3)">Rules built in, no file. A stock at its monthly low, the news outlook asked (only BUY gets a seat; the rest are followed on the side for comparison), half bought when daily, 4-hour, hourly and 15-minute MACD all turn up, half on the conservative champion’s buy, each sold on the champion’s exits. Can never place a real order.</span></span></label>';
   uiConfirm('New algo','<div style="font-size:11px;color:var(--t2);margin-bottom:8px">Name this strategy for '+spaceLabel()+'.</div><input id="alg-newname" placeholder="e.g. Momentum, Value, Rockets" style="width:100%;padding:8px;font-size:12px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>'+kind,function(ok){
     if(!ok)return;
     var name=(document.getElementById('alg-newname')||{}).value||'';
     var k=(document.querySelector('input[name="alg-kind"]:checked')||{}).value||'std';
-    if(k==='floor'||k==='macd'||k==='campaign'){
+    if(k==='floor'||k==='macd'||k==='campaign'||k==='chain'){
       try{
         var f=JSON.parse(Android.floorCreate(SPACE,name,k)||'{}');
         if(!f.ok){uiAlert('Could not create',escHtml(f.error||''));return}
@@ -14013,7 +14014,7 @@ function floorCard(x,cur){
   h+='<div onclick="floorToggle(\''+ns+'\')" style="cursor:pointer;padding:9px 11px 7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
     '<span style="font-size:13px;font-weight:800;color:var(--t1)">'+escHtml(a.name||'')+'</span>'+
     '<span onclick="event.stopPropagation();floorRename(\''+id+'\')" title="Rename" style="cursor:pointer;font-size:10px;color:var(--t3);padding:0 2px">✏️</span>'+
-    '<span title="Built-in rules, paper only — this algo cannot place a real order." style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px;border:1px solid rgba(13,148,136,.4)">PAPER · '+(floorIsCampaign(a)?'campaigns':mc?'MACD turns':'floor orders'+(s.orderMode==='week'?' · weekly zone':''))+'</span>'+
+    '<span title="Built-in rules, paper only — this algo cannot place a real order." style="font-size:8px;font-weight:800;background:rgba(13,148,136,.15);color:#0d9488;padding:1px 5px;border-radius:3px;border:1px solid rgba(13,148,136,.4)">PAPER · '+(floorIsChain(a)?'monthly-low chain':floorIsCampaign(a)?'campaigns':mc?'MACD turns':'floor orders'+(s.orderMode==='week'?' · weekly zone':''))+'</span>'+
     (a.enabled?'':'<span style="font-size:8px;font-weight:800;background:rgba(245,158,11,.18);color:#b45309;padding:1px 5px;border-radius:3px">PAUSED</span>')+
     '<span onclick="event.stopPropagation();floorBell(\''+id+'\','+(a.notify!==false)+')" title="Notifications for this algo" style="cursor:pointer;padding:0 2px;font-size:11px;opacity:'+(a.notify!==false?'1':'.45')+'">'+(a.notify!==false?'🔔':'🔕')+'</span>'+
     '<span style="flex:1"></span>'+
@@ -14023,7 +14024,7 @@ function floorCard(x,cur){
   h+='<div onclick="floorToggle(\''+ns+'\')" style="cursor:pointer;padding:0 11px 8px;display:flex;gap:8px;flex-wrap:wrap;font-size:9px;color:var(--t3)">'+
     '<span>'+(st.booked>=0?'+':'−')+cur+Math.abs(st.booked).toFixed(2)+' booked</span>'+
     (st.open.length?'<span style="color:'+(st.openPnl>=0?'var(--gn)':'var(--rd)')+'">⊕'+(st.openPnl>=0?'+':'−')+cur+Math.abs(st.openPnl).toFixed(2)+' open</span>':'')+
-    '<span>'+(floorIsCampaign(a)?floorLiveCampaigns(a).length+(s.seats===0?' campaigns (no limit)':'/'+s.seats+' seats'):st.open.length+'/'+(s.seats||5)+' seats')+'</span>'+
+    '<span>'+(floorIsChain(a)?floorLiveChains(a).filter(function(c){return c.counted}).length+'/'+(s.seats||7)+' seats · '+floorLiveChains(a).filter(function(c){return !c.counted}).length+' followed':floorIsCampaign(a)?floorLiveCampaigns(a).length+(s.seats===0?' campaigns (no limit)':'/'+s.seats+' seats'):st.open.length+'/'+(s.seats||5)+' seats')+'</span>'+
     (!mc&&a.planDay&&st.resting?'<span>'+st.resting+' stocks with orders resting</span>':'')+
     (FLOOR_BUSY[id]?'<span><span class="sp" style="width:8px;height:8px;display:inline-block;vertical-align:middle;margin:0"></span> checking…</span>':'')+
     '</div>';
@@ -14172,9 +14173,134 @@ function campaignSettingsDlg(id){
       renderKeepScroll();
     });
 }
+// ── MONTHLY-LOW CHAIN (paper only) ───────────────────────────────────────
+// The user's decision chain, run forward: a stock at its monthly low, the news
+// outlook asked, half a seat on the timeframes all turning up, half on the
+// conservative champion's buy, each sold on the champion's exits. Stocks the
+// outlook turned down are followed on the side — the point of the test is the
+// comparison between the two, which the card puts first.
+function floorIsChain(a){return (a&&a.kind)==='chain'}
+function floorLiveChains(a){return (a.chains||[]).filter(function(c){return c.state!=='ENDED'})}
+var CHAIN_STATE={WATCHING:['watching','var(--am)'],HOLDING:['holding','var(--gn)'],ENDED:['ended','var(--t3)']};
+// Finished halves grouped: those that had a seat, and those followed because
+// the outlook said no. Mean result and win rate of each.
+function chainCompare(a){
+  var byChain={};(a.chains||[]).forEach(function(c){byChain[c.id]=c});
+  var yes=[],no=[],full=[];
+  (a.trades||[]).forEach(function(t){
+    if(!(t.firstSec>0)||!t.sellDay||!(t.cost>0))return;
+    var cid=String(t.id||'').replace(/\|[AB]$/,''),c=byChain[cid];
+    var pct=Number(t.pnl||0)/Number(t.cost)*100;
+    if(t.status==='SOLD')yes.push(pct);
+    else if(c&&/^news outlook/.test(c.why||''))no.push(pct);
+    else full.push(pct);
+  });
+  function sum(v){if(!v.length)return null;var m=0;v.forEach(function(x){m+=x});return {n:v.length,m:m/v.length,w:v.filter(function(x){return x>0}).length/v.length*100}}
+  return {yes:sum(yes),no:sum(no),full:sum(full)};
+}
+function chainDetail(a,cur,st){
+  var s=a.settings||{},id=a.id,seat=Number(s.capital||1400)/Math.max(1,Number(s.seats||7));
+  var live=floorLiveChains(a),counted=live.filter(function(c){return c.counted});
+  var h='<div style="padding:0 11px 11px;border-top:1px solid var(--bd)">';
+  h+='<div style="font-size:10px;color:var(--t2);line-height:1.55;margin:9px 0 8px;padding:7px 9px;background:var(--bg);border:1px solid var(--bd);border-radius:6px">'+
+    'Universe: <b>every stock</b> in this market’s Discovery scan that passed the volume × price floor ('+(a.universe||[]).length+' today).<br/>'+
+    '<b>1. Monthly low</b>: each morning, stocks whose low yesterday was in the bottom tenth of their last 21 trading days’ range. Each stays watched <b>'+(s.watchDays||20)+'</b> trading days after its last touch.<br/>'+
+    '<b>2. News outlook</b>'+(s.useNews!==false?': asked once per stock (at most <b>'+(s.newsPerDay==null?12:s.newsPerDay)+'</b> a day). Only <b>BUY</b> or <b>STRONG BUY</b> gets a seat — every other answer is <b>followed on the side</b>, bought and sold the same way but never counted, so the two can be compared.':': <b>off</b> — every stock at its low is a candidate.')+'<br/>'+
+    '<b>3.</b> Half the seat ('+cur+(seat/2).toFixed(0)+') buys at the next price when the <b>daily, 4-hour, hourly and 15-minute MACD</b> all turn rising.<br/>'+
+    '<b>4.</b> The other half buys at the next price when the <b>conservative champion</b> (240/120, 4% stop) says buy.<br/>'+
+    '<b>5.</b> Each half sells when the champion’s own exits fire, measured from that half’s buy.<br/>'+
+    '<span style="color:var(--t3)">Paper only — no real orders. Broker charges and a '+floorSpread(a).toFixed(2)+'% spread on each buy and sale are taken off. Backtested without step 2 it made 1–6% a year (see RESULTS_decision_chain.md); this run measures whether the outlook changes that.</span></div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">'+
+    floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
+    floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
+    floorBtn('⚙ Settings','chainSettingsDlg(\''+id+'\')')+
+    floorBtn('🗑 Delete','floorDelete(\''+id+'\')','var(--rd)')+'</div>';
+  if(a.lastNote)h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">'+escHtml(a.lastNote)+'</div>';
+  var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
+  var sgn=function(v){return (v>=0?'+':'−')+cur+Math.abs(v).toFixed(2)};
+  var cmp=chainCompare(a);
+  var cmpTxt=function(x){return x?((x.m>=0?'+':'')+x.m.toFixed(2)+'%'):'—'};
+  var cmpSub=function(x){return x?x.n+' halves · '+x.w.toFixed(0)+'% won':'none finished yet'};
+  h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
+    cell('BOOKED',sgn(st.booked),st.sold.length+' halves sold · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread')+
+    cell('OPEN',sgn(st.openPnl),st.open.filter(function(t){return t.firstSec>0}).length+' halves held now')+
+    cell('SEATS',counted.length+' / '+(s.seats||7),counted.filter(function(c){return c.state==='WATCHING'}).length+' watching · '+cur+seat.toFixed(0)+' each')+'</div>';
+  h+='<div style="font-size:9px;font-weight:800;color:var(--t2);margin:6px 0 3px">DID THE NEWS OUTLOOK HELP? — mean result per finished half, after charges</div>'+
+    '<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">'+
+    cell('OUTLOOK YES',cmpTxt(cmp.yes),cmpSub(cmp.yes))+
+    cell('OUTLOOK NO',cmpTxt(cmp.no),cmpSub(cmp.no)+' · followed')+
+    cell('SEATS FULL',cmpTxt(cmp.full),cmpSub(cmp.full)+' · followed')+'</div>';
+  var tab=FLOOR_TAB[id]||'chains';
+  var tabs=[['chains','Chains ('+live.length+')'],['held','Held ('+st.open.filter(function(t){return t.firstSec>0}).length+')'],['closed','Closed ('+(st.sold.length+st.missed.length)+')'],['universe','Universe'],['log','Log']];
+  h+='<div style="display:flex;gap:12px;border-bottom:1px solid var(--bd);margin-bottom:6px;flex-wrap:wrap">';
+  tabs.forEach(function(t){
+    h+='<span onclick="FLOOR_TAB[\''+id+'\']=\''+t[0]+'\';renderKeepScroll()" style="cursor:pointer;padding:4px 0;font-size:10px;font-weight:800;color:'+(tab===t[0]?'#0d9488':'var(--t3)')+';border-bottom:2px solid '+(tab===t[0]?'#0d9488':'transparent')+'">'+t[1]+'</span>';
+  });
+  h+='</div>';
+  if(tab==='held')h+=floorHeldList(a,cur);
+  else if(tab==='closed')h+=floorClosedList(a,cur);
+  else if(tab==='universe')h+=floorUniverseList(a);
+  else if(tab==='log')h+=floorLogList(a);
+  else h+=chainList(a,cur);
+  return h+'</div>';
+}
+function chainList(a,cur){
+  var C=(a.chains||[]).slice();
+  if(!C.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px;line-height:1.5">No chain yet. Each morning from 06:00 the stocks whose low yesterday reached the bottom of their monthly range start one — see the Universe tab for how near each stock is.</div>';
+  var byId={};(a.trades||[]).forEach(function(t){byId[t.id]=t});
+  C.sort(function(x,y){var lx=x.state==='ENDED'?1:0,ly=y.state==='ENDED'?1:0;return lx-ly||(x.touchDay<y.touchDay?1:-1)});
+  var half=function(c,key,word){
+    var t=byId[c.id+'|'+key],st=c[word];
+    if(t&&t.firstSec>0)return floorPx(t.firstPrice)+'<br/>'+floorPnlText(t);
+    if(t)return '<span style="color:var(--am)">buying next price</span>';
+    if(st==='VOID')return '<span style="color:var(--t3)">never fired</span>';
+    return '<span style="color:var(--t3)">waiting</span>';
+  };
+  var rows=C.slice(0,80).map(function(c){
+    var stt=CHAIN_STATE[c.state]||[c.state,'var(--t3)'];
+    var what=c.state==='ENDED'?escHtml(c.endReason||'')+(c.endDay?' · '+floorDay(c.endDay).replace(/^\w+ /,''):'')
+      :'watched to '+floorDay(c.expiryDay).replace(/^\w+ /,'');
+    var tag=c.counted?'<span style="color:#0d9488;font-weight:800">SEAT</span>':'<span style="color:var(--t3)">followed — '+escHtml(c.why||'')+'</span>';
+    return '<tr style="border-top:1px solid var(--bd)'+(c.state==='ENDED'||!c.counted?';opacity:.75':'')+'">'+floorStock(c.symbol,'low '+floorDay(c.touchDay).replace(/^\w+ /,''))+
+      '<td style="'+FLOOR_TD+';text-align:left;white-space:normal"><b style="color:'+stt[1]+'">'+stt[0]+'</b> · '+escHtml(c.verdict||'not asked yet')+'<br/><span style="color:var(--t3)">'+what+'</span><br/><span style="font-size:8px">'+tag+'</span></td>'+
+      '<td style="'+FLOOR_TD+'">'+half(c,'A','dots')+'</td>'+
+      '<td style="'+FLOOR_TD+'">'+half(c,'B','champ')+'</td></tr>';
+  });
+  return '<div style="font-size:9px;color:var(--t3);margin:2px 0 4px;line-height:1.5">TIMEFRAMES: the half bought when daily, 4-hour, hourly and 15-minute MACD all turned up. CHAMPION: the half bought on the conservative champion’s signal. Each shows its buying price and how it is doing, after charges.</div>'+
+    floorTable(['STOCK','STATE · OUTLOOK','TIMEFRAMES','CHAMPION'],rows);
+}
+function chainSettingsDlg(id){
+  var a=floorFind(id);if(!a)return;
+  var s=a.settings||{},cur=spaceCurrency();
+  var row=function(key,label,val,hint,step){
+    return '<div style="margin-bottom:9px"><div style="font-size:11px;font-weight:700;color:var(--t1)">'+label+'</div>'+
+      '<input id="ch-'+key+'" type="number" inputmode="decimal" step="'+(step||'1')+'" value="'+val+'" style="width:100%;padding:7px;font-size:13px;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:6px;margin-top:3px"/>'+
+      '<div style="font-size:9px;color:var(--t3);margin-top:2px">'+hint+'</div></div>';
+  };
+  uiConfirm('⚙ '+escHtml(a.name||'Monthly-low chain'),
+    '<div style="font-size:10px;color:var(--t3);margin-bottom:9px;line-height:1.5">New numbers apply from the next check. A chain already running keeps the seat it started with.</div>'+
+    row('seats','Seats — chains holding money at once',s.seats||7,'Each counted chain holds its seat until both halves are done. Followed chains need none.')+
+    row('cap','Capital ('+cur+')',Number(s.capital||1400),'Split evenly over the seats; each half is half a seat.','10')+
+    row('watch','Watch, trading days after the last touch',s.watchDays||20,'A half that has not bought by then never will.')+
+    row('newscap','News checks a day, at most',s.newsPerDay==null?12:s.newsPerDay,'Each is one paid AI call. A stock past the cap is asked the next morning and buys nothing until then.')+
+    row('spread','Spread, % lost per market-price trade',floorSpread(a),'Charged on every buy and sale — all of them are at the market.','0.01')+
+    '<label style="display:flex;gap:8px;align-items:flex-start;margin-top:4px;font-size:11px;color:var(--t1);line-height:1.4"><input id="ch-news" type="checkbox" '+(s.useNews!==false?'checked ':'')+'style="margin-top:2px"/>'+
+      '<span><b>Ask the news outlook (step 2)</b><br/><span style="font-size:9px;color:var(--t3)">Only BUY or STRONG BUY gets a seat; the rest are followed on the side. Off: every stock at its low competes for a seat.</span></span></label>',
+    function(ok){
+      if(!ok)return;
+      var g=function(k){var el=document.getElementById('ch-'+k);return el?Number((el.value||'').replace(',','.')):NaN};
+      try{
+        var r=JSON.parse(Android.chainSettings(id,Math.round(g('seats')),g('cap'),Math.round(g('watch')),Math.round(g('newscap')),
+          !!(document.getElementById('ch-news')||{}).checked,g('spread'))||'{}');
+        if(!r.ok){uiAlert('Not saved',escHtml(r.error||''));return}
+      }catch(e){uiAlert('Error',e.message);return}
+      renderKeepScroll();
+    });
+}
 function floorIsCampaign(a){return (a&&a.kind)==='campaign'}
 function floorLiveCampaigns(a){return (a.campaigns||[]).filter(function(c){return c.state!=='ENDED'})}
 function floorDetail(a,cur,st){
+  if(floorIsChain(a))return chainDetail(a,cur,st);
   if(floorIsCampaign(a))return campaignDetail(a,cur,st);
   var s=a.settings||{},id=a.id,mc=floorIsMacd(a),seat=Number(s.capital||1000)/Math.max(1,Number(s.seats||5)),half=seat/2;
   var h='<div style="padding:0 11px 11px;border-top:1px solid var(--bd)">';

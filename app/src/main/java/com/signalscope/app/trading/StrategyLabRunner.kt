@@ -1521,6 +1521,31 @@ object StrategyLabRunner {
         }
     }
 
+    /**
+     * Completed, cleaned bars for [symbol] on the feed a given config needs — the
+     * same planning, provider choice, delay and cleaning a pass uses — for an
+     * engine question asked from outside the runner. The paper chain asks the
+     * conservative champion about stocks no algo has enrolled. Null when they
+     * cannot be had; the base bar length comes back with them.
+     */
+    fun engineFeed(ctx: Context, ns: String, symbol: String, cfg: StrategyLabConfig): Pair<List<CandleData>, Long>? = try {
+        val plan = FeedPlan.plan(cfg, ns)
+        if (!plan.ok) null else {
+            val res = fetchCandlesFor(ctx, ns, symbol.trim().uppercase(), Spaces.exchangeOf(ns), plan)
+            if (res !is YahooFinanceClient.CandleResult.Success) null else {
+                val nowSec = System.currentTimeMillis() / 1000
+                val closed = res.candles.filter {
+                    FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+                }
+                val clean = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+                if (clean.size < 50) null else clean to plan.sourceSec
+            }
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "[$ns] $symbol engine feed failed", e)
+        null
+    }
+
     /** Build the per-bar "why did/didn't it trade" review for one enrolled symbol
      *  (recent window). Read-only; uses the same engine indicators as the live loop. */
     fun reviewPayload(ctx: Context, ns: String, symbol: String): StrategyLabEngine.ReviewPayload {

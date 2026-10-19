@@ -4454,6 +4454,33 @@ class MainActivity : AppCompatActivity() {
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
 
+        /** The monthly-low chain's numbers: seats, capital, how long a stock stays
+         *  watched, the daily cap on news checks, whether the news outlook gates a
+         *  seat at all, and the spread charged per market-price trade. */
+        @JavascriptInterface
+        fun chainSettings(id: String, seats: Int, capital: Double, watchDays: Int, newsPerDay: Int,
+                          useNews: Boolean, spreadPct: Double): String = try {
+            fun bad(what: String): Nothing = throw IllegalArgumentException(what)
+            if (seats !in 1..50) bad("seats must be 1 to 50")
+            if (!(capital > 0.0 && capital <= 10_000_000.0)) bad("the capital must be above 0")
+            if (watchDays !in 1..120) bad("a watch may last 1 to 120 trading days")
+            if (newsPerDay !in 0..200) bad("news checks a day must be 0 to 200")
+            if (!(spreadPct >= 0.0 && spreadPct <= 5.0)) bad("the spread must be 0 to 5%")
+            val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
+                if (a.kind != com.signalscope.app.data.FloorAlgoStore.KIND_CHAIN) bad("not a chain algo")
+                val spread = spreadPct.takeIf { Math.abs(it - com.signalscope.app.data.FloorAlgoStore.defaultSpreadPct(a.space)) > 1e-9 }
+                val s = a.settings.copy(seats = seats, capital = capital, watchDays = watchDays,
+                    newsPerDay = newsPerDay, useNews = useNews, spreadPct = spread)
+                if (s == a.settings) a
+                else a.copy(settings = s, log = a.log + ("$stamp · chain settings: $seats seats, " +
+                    "${"%.0f".format(capital)} capital, watched $watchDays trading days, " +
+                    "news outlook ${if (useNews) "on, at most $newsPerDay a day" else "off"}, " +
+                    "spread ${"%.2f".format(spreadPct)}%"))
+            } ?: throw IllegalStateException("algo not found")
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
         @JavascriptInterface
         fun floorDelete(id: String): String = try {
             com.signalscope.app.data.FloorAlgoStore.delete(applicationContext, id)
