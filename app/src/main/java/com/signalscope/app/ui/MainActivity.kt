@@ -10565,17 +10565,69 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val sectorIndices = listOf(
-        Triple("Banking", "^NSEBANK", "NIFTY Bank"),
-        Triple("IT", "^CNXIT", "NIFTY IT"),
-        Triple("Pharma", "^CNXPHARMA", "NIFTY Pharma"),
-        Triple("FMCG", "^CNXFMCG", "NIFTY FMCG"),
-        Triple("Auto", "^CNXAUTO", "NIFTY Auto"),
-        Triple("Energy", "^CNXENERGY", "NIFTY Energy"),
-        Triple("Fin Services", "^CNXFIN", "NIFTY Fin Service"),
-        Triple("Metal", "^CNXMETAL", "NIFTY Metal"),
-        Triple("Realty", "^CNXREALTY", "NIFTY Realty"),
-        Triple("Media", "^CNXMEDIA", "NIFTY Media")
+    /**
+     * One sector card: the line to draw, tried in order until one answers with
+     * enough history.
+     *
+     * WHY THERE ARE FALLBACKS. Yahoo's history for most NSE sector indices has
+     * gone thin — ^CNXFMCG, ^CNXAUTO, ^CNXENERGY, ^CNXMETAL, ^CNXREALTY, ^CNXFIN
+     * and ^CNXMEDIA answer two years of daily bars with one to three of them
+     * (checked 19 Oct 2026; Bank, IT and Pharma still answer in full). The card
+     * then fell under the fetcher's 50-bar minimum and vanished, so the tab
+     * showed whatever two or three indices still worked. An ETF that tracks the
+     * same index draws the same line, so it stands in, and the card says so.
+     *
+     * The US and German spaces had no sectors at all — only their market index.
+     * They use the sector ETFs: SPDR's for the US, iShares STOXX Europe 600 on
+     * Xetra for Germany (the nearest liquid sector lines for German shares).
+     */
+    private data class SectorSpec(
+        val space: String,
+        val exchange: String,
+        val name: String,
+        val index: String,
+        val symbols: List<String>
+    )
+
+    private val sectorSpecs = listOf(
+        SectorSpec("IN", "NSE", "Banking", "NIFTY Bank", listOf("^NSEBANK", "BANKBEES.NS")),
+        SectorSpec("IN", "NSE", "IT", "NIFTY IT", listOf("^CNXIT", "ITBEES.NS")),
+        SectorSpec("IN", "NSE", "Pharma", "NIFTY Pharma", listOf("^CNXPHARMA", "PHARMABEES.NS")),
+        SectorSpec("IN", "NSE", "FMCG", "NIFTY FMCG", listOf("^CNXFMCG", "FMCGIETF.NS")),
+        SectorSpec("IN", "NSE", "Auto", "NIFTY Auto", listOf("^CNXAUTO", "AUTOBEES.NS")),
+        SectorSpec("IN", "NSE", "Energy", "NIFTY Energy", listOf("^CNXENERGY", "MOENERGY.NS")),
+        SectorSpec("IN", "NSE", "Fin Services", "NIFTY Fin Service", listOf("^CNXFIN", "BFSI.NS")),
+        SectorSpec("IN", "NSE", "Metal", "NIFTY Metal", listOf("^CNXMETAL", "METALIETF.NS")),
+        SectorSpec("IN", "NSE", "Realty", "NIFTY Realty", listOf("^CNXREALTY", "MOREALTY.NS")),
+        SectorSpec("IN", "NSE", "Media", "NIFTY Media", listOf("^CNXMEDIA")),
+        SectorSpec("IN", "NSE", "PSU Bank", "NIFTY PSU Bank", listOf("^CNXPSUBANK", "PSUBNKBEES.NS")),
+        SectorSpec("IN", "NSE", "Infra", "NIFTY Infra", listOf("^CNXINFRA", "INFRABEES.NS")),
+
+        SectorSpec("US", "US", "Tech", "Technology", listOf("XLK")),
+        SectorSpec("US", "US", "Semis", "Semiconductors", listOf("SMH")),
+        SectorSpec("US", "US", "Financials", "Financials", listOf("XLF")),
+        SectorSpec("US", "US", "Health", "Health Care", listOf("XLV")),
+        SectorSpec("US", "US", "Energy", "Energy", listOf("XLE")),
+        SectorSpec("US", "US", "Discretionary", "Consumer Discretionary", listOf("XLY")),
+        SectorSpec("US", "US", "Staples", "Consumer Staples", listOf("XLP")),
+        SectorSpec("US", "US", "Industrials", "Industrials", listOf("XLI")),
+        SectorSpec("US", "US", "Materials", "Materials", listOf("XLB")),
+        SectorSpec("US", "US", "Utilities", "Utilities", listOf("XLU")),
+        SectorSpec("US", "US", "Real Estate", "Real Estate", listOf("XLRE")),
+        SectorSpec("US", "US", "Comms", "Communication Services", listOf("XLC")),
+
+        SectorSpec("DE", "DE", "Banks", "STOXX 600 Banks", listOf("EXV1.DE")),
+        SectorSpec("DE", "DE", "Insurance", "STOXX 600 Insurance", listOf("EXH5.DE")),
+        SectorSpec("DE", "DE", "Tech", "STOXX 600 Technology", listOf("EXV3.DE")),
+        SectorSpec("DE", "DE", "Health", "STOXX 600 Health Care", listOf("EXV4.DE")),
+        SectorSpec("DE", "DE", "Autos", "STOXX 600 Automobiles", listOf("EXV5.DE")),
+        SectorSpec("DE", "DE", "Chemicals", "STOXX 600 Chemicals", listOf("EXV7.DE")),
+        SectorSpec("DE", "DE", "Industrials", "STOXX 600 Industrials", listOf("EXH4.DE")),
+        SectorSpec("DE", "DE", "Construction", "STOXX 600 Construction", listOf("EXV8.DE")),
+        SectorSpec("DE", "DE", "Basic Res.", "STOXX 600 Basic Resources", listOf("EXV6.DE")),
+        SectorSpec("DE", "DE", "Utilities", "STOXX 600 Utilities", listOf("EXH9.DE")),
+        SectorSpec("DE", "DE", "Telecom", "STOXX 600 Telecoms", listOf("EXV2.DE")),
+        SectorSpec("DE", "DE", "Real Estate", "STOXX 600 Real Estate", listOf("EXI5.DE"))
     )
 
     @Volatile private var sectorFetchInProgress = false
@@ -10588,10 +10640,12 @@ class MainActivity : AppCompatActivity() {
             try {
                 val sectors = mutableListOf<Map<String, Any?>>()
 
-                for ((name, symbol, index) in sectorIndices) {
-                    try {
-                        val result = YahooFinanceClient.fetchCandles(symbol, "NSE")
-                        if (result is YahooFinanceClient.CandleResult.Success && result.candles.size >= 2) {
+                for (spec in sectorSpecs) {
+                    for ((i, symbol) in spec.symbols.withIndex()) {
+                        try {
+                            val result = YahooFinanceClient.fetchCandles(symbol, spec.exchange)
+                            Thread.sleep(400) // pace requests
+                            if (result !is YahooFinanceClient.CandleResult.Success || result.candles.size < 2) continue
                             val candles = result.candles
                             val latest = candles.last()
                             val prev = candles[candles.size - 2]
@@ -10606,10 +10660,15 @@ class MainActivity : AppCompatActivity() {
                             // Last 60 closing prices for sparkline chart
                             val closesForChart = candles.takeLast(60).map { it.close }
 
+                            // An ETF standing in for an index (or an ETF being the
+                            // sector line itself, outside India) says which one.
+                            val viaEtf = !symbol.startsWith("^")
                             sectors.add(mapOf(
-                                "name" to name,
-                                "index" to index,
+                                "space" to spec.space,
+                                "name" to spec.name,
+                                "index" to if (viaEtf) "${spec.index} · ${symbol.substringBefore('.')} ETF" else spec.index,
                                 "symbol" to symbol,
+                                "proxy" to (viaEtf && i > 0),
                                 "price" to latest.close,
                                 "dayChange" to dayChange,
                                 "periodChange" to periodChange,
@@ -10617,12 +10676,13 @@ class MainActivity : AppCompatActivity() {
                                 "low" to low,
                                 "closes" to closesForChart
                             ))
+                            break
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Sector fetch error for ${spec.name} ($symbol)", e)
                         }
-                        Thread.sleep(600) // pace requests
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Sector fetch error for $name", e)
                     }
                 }
+                Log.i(TAG, "sectors: ${sectors.size} of ${sectorSpecs.size} lines fetched")
 
                 if (sectors.isNotEmpty()) {
                     val json = gson.toJson(sectors)

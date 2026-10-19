@@ -361,7 +361,10 @@ try{
 }catch(e){}
 var LIVE_BUY_TRACKERS=[];
 var VALUE_SORT={sortK:'valueScore',sortA:false};
-var SECTORS=[];
+var SECTORS=[];          // every space's sector lines; sectorRowsHere() picks this space's
+var SECTORS_AT=0;        // when they last arrived
+// This space's sector lines. Rows from before sectors carried a space are India's.
+function sectorRowsHere(){return (SECTORS||[]).filter(function(r){return normalizeSpace(r.space||'IN')===SPACE})}
 var MARKET_INDEX_BY_SPACE={IN:null,US:null,DE:null};
 var FILTERED=[];
 var AI_CACHE={};  // {symbol: {pullback:'html',outlook:'html'}}
@@ -5214,7 +5217,10 @@ window.updatePortfolioData=function(j){
   if(STATE.tab==='portfolio')renderExternalUpdate()}catch(e){console.error(e)}
 };
 window.updateSectorData=function(j){
-  try{SECTORS=typeof j==='string'?JSON.parse(j):j;}catch(e){console.error(e)}
+  try{SECTORS=typeof j==='string'?JSON.parse(j):j;SECTORS_AT=Date.now();}catch(e){console.error(e)}
+  // Drawn as soon as they arrive — the tab used to stay empty until something
+  // else happened to redraw it.
+  if(STATE.tab==='sectors')renderExternalUpdate();
 };
 window.updateMarketIndexData=function(j){
   try{
@@ -5229,7 +5235,12 @@ window.updateMarketIndexData=function(j){
   }catch(e){console.error(e)}
 };
 
-function setTab(t){if(SPACE==='BN'&&t!=='discovery'&&t!=='portfolio'&&t!=='algos')t='portfolio';if(t==='algos'&&!hasAlgosTab())t='discovery';STATE.tab=t;render()}
+function setTab(t){if(SPACE==='BN'&&t!=='discovery'&&t!=='portfolio'&&t!=='algos')t='portfolio';if(t==='algos'&&!hasAlgosTab())t='discovery';STATE.tab=t;render();
+  // Opening Sectors asks for fresh lines when the last ones are over half an hour old.
+  if(t==='sectors'&&Date.now()-SECTORS_AT>30*60*1000&&typeof Android!=='undefined'){
+    try{if(Android.fetchSectors)Android.fetchSectors();if(Android.fetchMarketIndex)Android.fetchMarketIndex()}catch(e){}
+  }
+}
 function doSort(k){if(STATE.sortK===k)STATE.sortA=!STATE.sortA;else{STATE.sortK=k;STATE.sortA=false}renderKeepScroll()}
 function ema200SlopeValue(s){
   if(!s)return null;
@@ -5988,7 +5999,7 @@ function render(){
 
   // Tabs
   h+='<div class="tabs">';
-  var nSec=SECTORS?SECTORS.length:0;
+  var nSec=sectorRowsHere().length;
   // Algos tab only for German stocks (DE). US/IN excluded — T212 can't trade USD
   // for a EUR-resident account, so algo-trading there isn't usable. (Crypto has its
   // own tab bar and keeps Algos.)
@@ -7040,7 +7051,7 @@ function renderWatchlist(){
   var nSe=stocks.filter(setupsFilter).length;
   var nPbW=stocks.filter(pullbackFilter).length;
   var nVW=stocks.filter(function(s){return s.valueScore>0}).length;
-  var nSecW=SECTORS?SECTORS.length:0;
+  var nSecW=sectorRowsHere().length;
   h+='<div class="tabs">';
   // Algos belongs in this strip wherever it exists: without it the watchlist tab
   // is a one-way trip in DE/BN/IN — and now that the manual candidates live here,
@@ -7474,7 +7485,10 @@ function scoreTabsFor(s,isHolding){
   }
   return T;
 }
-function scoreTabsHtml(s,isHolding,startId){
+// [extras]: id → more of that score's own detail, drawn under its table — the
+// sections that used to sit further down the stock page (the value figures,
+// the entry indicator cards, the style diagnosis, the setup checklist).
+function scoreTabsHtml(s,isHolding,startId,extras){
   var T=scoreTabsFor(s,isHolding);
   var uid='sct-'+(s.symbol||'x').replace(/[^a-zA-Z0-9]/g,'_');
   var start=0;T.forEach(function(t,i){if(t.id===startId)start=i});
@@ -7486,18 +7500,97 @@ function scoreTabsHtml(s,isHolding,startId){
       escHtml(t.label)+' <b style="font-family:monospace;color:'+t.col+'">'+escHtml(t.val)+'</b></span>';
   });
   h+='</div>';
-  h+='<div id="'+uid+'-track" data-start="'+start+'" onscroll="scoreTabSync(\''+uid+'\')" style="display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;-webkit-overflow-scrolling:touch;align-items:flex-start">';
+  h+='<div id="'+uid+'-track" data-start="'+start+'" onscroll="scoreTabSync(\''+uid+'\')" style="display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;scrollbar-width:none;-webkit-overflow-scrolling:touch;align-items:flex-start;transition:height .2s">';
   T.forEach(function(t){
     h+='<div style="flex:0 0 100%;box-sizing:border-box;scroll-snap-align:start;padding:10px;background:var(--cd);border:1px solid var(--bd);border-radius:8px">';
     h+='<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px"><b style="font-size:11px;color:'+t.col+'">'+escHtml(t.label)+'</b>'+
        '<span style="font-size:20px;font-weight:800;font-family:monospace;color:'+t.col+'">'+escHtml(t.val)+'</span></div>';
     h+='<div style="font-size:9px;color:var(--t3);line-height:1.45;margin-bottom:6px">'+escHtml(t.note||'')+'</div>';
+    var more=extras&&extras[t.id];
     if(t.rows&&t.rows.length)h+=scoreRowsHtml(t.rows);
-    else if(t.id!=='floor')h+='<div style="font-size:9px;color:var(--t3)">No per-part breakdown is stored for this score.</div>';
+    else if(t.id!=='floor'&&!more)h+='<div style="font-size:9px;color:var(--t3)">No per-part breakdown is stored for this score.</div>';
+    if(more)h+='<div style="margin-top:8px">'+more+'</div>';
     h+='</div>';
   });
   h+='</div></div>';
   return h;
+}
+// THE ENTRY CARD'S INDICATORS — trend stack, MACD setup, RSI, Bollinger,
+// ADX, OBV, divergence, volume pattern, EMA21 — each with its own figures.
+// Drawn on the Entry score card (scoreTabsHtml), not down the page.
+function entryIndicatorCardsHtml(s,cur){
+  function indMetric(label,value,color){
+    if(value==null||value==='')return '';
+    return '<div style="min-width:0"><div style="font-size:7px;color:var(--t3);font-weight:700">'+label+'</div><div style="font-size:10px;font-family:monospace;font-weight:800;color:'+(color||'var(--t2)')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+value+'</div></div>';
+  }
+  function indCard(ind){
+    var metrics=(ind.metrics||[]).map(function(m){return indMetric(m[0],m[1],m[2])}).join('');
+    return '<div class="ic"><div class="ich"><span class="ict">'+ind.k+'</span><span class="ics '+(ind.pass?'p':'f')+'">'+(ind.pass?'\u2713':'\u2717')+'</span></div>'+
+      '<div class="icv" style="font-size:12px">'+ind.v+'</div>'+
+      '<div class="icd" style="margin-bottom:6px">'+ind.desc+'</div>'+
+      (metrics?'<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;padding-top:5px;border-top:1px dashed rgba(148,163,184,.22)">'+metrics+'</div>':'')+
+      '</div>';
+  }
+  var priceNow=currentPriceFor(s);
+  var macdSlopeCol=s.macdSlope>0?'var(--gn)':s.macdSlope<0?'var(--rd)':'var(--t2)';
+  var macdHistCol=s.macdHist>0?'var(--gn)':s.macdHist<0?'var(--rd)':'var(--t2)';
+  var rsiCol=s.rsi>=70?'var(--rd)':s.rsi<=35?'var(--gn)':'var(--t2)';
+  var trendCol=s.sma200!=null&&priceNow>=s.sma200?'var(--gn)':'var(--rd)';
+  var buyInds=[
+    {k:'TREND STACK',v:'TS '+trendStackScore(s),pass:trendStackScore(s)>=65,desc:trendStackScore(s)>=75?'Long trend aligned':trendStackScore(s)>=50?'Mixed but improving':'Trend stack weak',
+      metrics:[['200S',signedNum(sma200SlopeValue(s),3),sma200SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['200E',signedNum(ema200SlopeValue(s),3),ema200SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['50E',signedNum(ema50SlopeValue(s),3),ema50SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['21E',signedNum(ema21SlopeValue(s),3),ema21SlopeValue(s)>0?'var(--gn)':'var(--rd)']]},
+    {k:'MACD SETUP',v:s.macdPhase||'\u2014',pass:s.macdSlope>0||s.macdPhase==='EARLY BUY',desc:'Momentum phase and inflection',
+      metrics:[['MACD',signedNum(s.macd,4),s.macd>0?'var(--gn)':s.macd<0?'var(--rd)':'var(--t2)'],['Signal',signedNum(s.macdSignal,4),'var(--t2)'],['Hist',signedNum(s.macdHist,4),macdHistCol],['Slope',signedNum(s.macdSlope,4),macdSlopeCol],['Angle',isFinite(macdSlopeAngleFor(s))?signedNum(macdSlopeAngleFor(s),1,'\u00B0'):null,macdSlopeCol],['%ile',isFinite(Number(s.macdPctl))?Math.round(s.macdPctl)+'%':null,s.macdPctl<=goldenBuyMacdPctlMaxFor(s)?'var(--gn)':'var(--rd)'],['Smth slope',signedNum(s.smoothMacdSlope,4),'var(--t2)'],['Smth prior',s.smoothMacdPrevSavedSlope!=null?signedNum(s.smoothMacdPrevSavedSlope,4):null,'var(--t2)'],['Smth accel',signedNum(s.smoothMacdAccel,4),'var(--t2)'],['Smth low',isFinite(Number(s.smoothMacdLowDistPct))?fmt(s.smoothMacdLowDistPct,1)+'%':null,'var(--t2)']]},
+    {k:'RSI',v:s.rsi!=null?fmt(s.rsi,1):'\u2014',pass:s.rsi!=null&&s.rsi>=25&&s.rsi<=55,desc:s.rsi!=null?'Buy zone is 25-55':'N/A',
+      metrics:[['Current',s.rsi!=null?fmt(s.rsi,1):null,rsiCol],['State',s.rsi>=70?'overbought':s.rsi<=35?'pullback':'neutral',rsiCol]]},
+    {k:'BOLLINGER',v:s.bbMid!=null?cur+fmt(s.bbMid):'\u2014',pass:s.bbMid!=null&&priceNow<=s.bbMid,desc:s.bbMid!=null?(priceNow<=s.bbMid?'At/below mid band':'Above mid band'):'N/A',
+      metrics:[['Price',cur+fmt(priceNow),s.bbMid!=null&&priceNow<=s.bbMid?'var(--gn)':'var(--t2)'],['Mid',s.bbMid!=null?cur+fmt(s.bbMid):null,'var(--t2)'],['Lower',s.bbLower!=null?cur+fmt(s.bbLower):null,'var(--gn)'],['Upper',s.bbUpper!=null?cur+fmt(s.bbUpper):null,'var(--rd)']]},
+    {k:'ADX / DI',v:s.adx!=null?fmt(s.adx,1):'\u2014',pass:s.adx>25&&s.plusDi>s.minusDi,desc:'Trend strength + direction',
+      metrics:[['ADX',s.adx!=null?fmt(s.adx,1):null,s.adx>25?'var(--gn)':'var(--t2)'],['+DI',s.plusDi!=null?fmt(s.plusDi,1):null,s.plusDi>s.minusDi?'var(--gn)':'var(--t2)'],['-DI',s.minusDi!=null?fmt(s.minusDi,1):null,s.minusDi>s.plusDi?'var(--rd)':'var(--t2)']]},
+    {k:'OBV',v:s.obv!=null?fmtV(s.obv):'\u2014',pass:!s.obvWeakness&&!s.obvDivergence,desc:s.obvDivergence?'Bearish divergence':s.obvWeakness?'Volume support weak':'Volume flow supportive',
+      metrics:[['OBV',s.obv!=null?fmtV(s.obv):null,s.obvDivergence||s.obvWeakness?'var(--rd)':'var(--t2)'],['Avg vol',s.avgVol20?fmtV(s.avgVol20):null,'var(--t2)']]},
+    {k:'DIVERGENCE',v:(s.divHistBearish||s.divVolBearish)?'Bearish':((s.divHistBullish||s.divVolBullish)?'Bullish':'None'),pass:!(s.divHistBearish||s.divVolBearish),desc:s.divDetail||'No two-pivot price/indicator divergence detected',
+      metrics:[['MACD-hist',s.divHistBullish?'Bullish':(s.divHistBearish?'Bearish':'\u2014'),s.divHistBullish?'var(--gn)':(s.divHistBearish?'var(--rd)':'var(--t2)')],['Volume/OBV',s.divVolBullish?'Bullish':(s.divVolBearish?'Bearish':'\u2014'),s.divVolBullish?'var(--gn)':(s.divVolBearish?'var(--rd)':'var(--t2)')]]},
+    {k:'VOLUME PATTERN',v:(s.volBearDryUp||s.volBearChurning)?'Bearish':((s.volBullDryUp||s.volBullCapitulation)?'Bullish':'None'),pass:!(s.volBearDryUp||s.volBearChurning),desc:s.volPatternDetail||'No specific raw-volume pattern detected',
+      metrics:[['Dry-up',s.volBullDryUp?'Bullish (lows)':(s.volBearDryUp?'Bearish (highs)':'\u2014'),s.volBullDryUp?'var(--gn)':(s.volBearDryUp?'var(--rd)':'var(--t2)')],['Climax/Churn',s.volBullCapitulation?'Capitulation':(s.volBearChurning?'Churning':'\u2014'),s.volBullCapitulation?'var(--gn)':(s.volBearChurning?'var(--rd)':'var(--t2)')]]},
+    {k:'EMA21',v:s.ema21!=null?cur+fmt(s.ema21):'\u2014',pass:s.ema21!=null&&Math.abs(s.ema21PctDiff||0)<=2,desc:s.ema21!=null?(Math.abs(s.ema21PctDiff||0)<=2?'Near entry zone':'Distance from mean'):'N/A',
+      metrics:[['EMA21',s.ema21!=null?cur+fmt(s.ema21):null,'var(--t2)'],['Distance',s.ema21PctDiff!=null?signedNum(s.ema21PctDiff,2,'%'):null,Math.abs(s.ema21PctDiff||0)<=2?'var(--gn)':Math.abs(s.ema21PctDiff||0)<=4?'var(--am)':'var(--rd)'],['EMA21 slope',s.ema21Slope!=null?signedNum(s.ema21Slope,3):null,s.ema21Slope>0?'var(--gn)':'var(--rd)'],['EMA50 slope',s.ema50Slope!=null?signedNum(s.ema50Slope,3):null,s.ema50Slope>0?'var(--gn)':'var(--rd)']]}
+  ];
+  return '<div class="ig">'+buyInds.map(indCard).join('')+'</div>';
+}
+// THE VALUE CARD'S FIGURES — the twelve numbers the value score is built from,
+// and where the price sits in its 52-week range. The score, the floor and the
+// points table are the Value and Floor cards' own; this is what sits under them.
+function valueFiguresHtml(s,cur){
+  var b='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px">';
+  var vItems=[
+    ['PE',s.trailingPe,s.trailingPe!=null&&s.trailingPe<15],
+    ['Fwd PE',s.forwardPe,s.forwardPe!=null&&s.trailingPe!=null&&s.forwardPe<s.trailingPe],
+    ['PB',s.priceToBook,s.priceToBook!=null&&s.priceToBook<1.5],
+    ['EV/EB',s.evToEbitda,s.evToEbitda!=null&&s.evToEbitda<8],
+    ['D/E',s.debtToEquity,s.debtToEquity!=null&&s.debtToEquity<0.3],
+    ['ROE',s.roce!=null?fmt(s.roce,1)+'%':null,s.roce!=null&&s.roce>15],
+    ['Rev Gr',s.revenueGrowth!=null?fmt(s.revenueGrowth,1)+'%':null,s.revenueGrowth!=null&&s.revenueGrowth>4],
+    ['Earn Gr',s.earningsGrowth!=null?fmt(s.earningsGrowth,1)+'%':null,s.earningsGrowth!=null&&s.earningsGrowth>4],
+    ['Op Mgn',s.operatingMargins!=null?fmt(s.operatingMargins,1)+'%':null,s.operatingMargins!=null&&s.operatingMargins>10],
+    ['FCF',s.freeCashflow!=null?fmtV(s.freeCashflow):null,s.freeCashflow!=null&&s.freeCashflow>0],
+    ['Cash/Debt',(s.totalCash!=null&&s.totalDebt!=null)?(fmtV(s.totalCash)+'/'+fmtV(s.totalDebt)):null,s.totalCash!=null&&s.totalDebt!=null&&s.totalCash>=s.totalDebt],
+    ['Div',s.dividendYield!=null&&s.dividendYield>0?fmt(s.dividendYield,1)+'%':null,s.dividendYield!=null&&s.dividendYield>=3]
+  ];
+  vItems.forEach(function(vi){
+    var val=vi[1];var pass=vi[2];
+    b+='<div style="text-align:center"><div style="font-size:7px;color:var(--t3)">'+vi[0]+'</div>';
+    b+='<div style="font-size:11px;font-weight:700;font-family:monospace;color:'+(val!=null?(pass?'var(--gn)':'var(--t1)'):'var(--t3)')+'">'+(typeof val==='number'?fmt(val,val<10?2:1):(val||'\u2014'))+'</div></div>';
+  });
+  b+='</div>';
+  // 52W range bar
+  if(s.fiftyTwoWeekLow!=null&&s.fiftyTwoWeekHigh!=null){
+    var range=s.fiftyTwoWeekHigh-s.fiftyTwoWeekLow;var pctPos=range>0?((s.price-s.fiftyTwoWeekLow)/range*100):50;
+    b+='<div style="margin-top:4px"><div style="font-size:7px;color:var(--t3);display:flex;justify-content:space-between"><span>52W Low: '+cur+fmt(s.fiftyTwoWeekLow)+'</span><span>52W High: '+cur+fmt(s.fiftyTwoWeekHigh)+'</span></div>';
+    b+='<div style="width:100%;height:6px;background:linear-gradient(90deg,var(--gn),var(--am),var(--rd));border-radius:3px;margin-top:2px;position:relative">';
+    b+='<div style="position:absolute;left:'+pctPos.toFixed(0)+'%;top:-2px;width:2px;height:10px;background:var(--t1);border-radius:1px;transform:translateX(-50%)"></div></div></div>';
+  }
+  return b;
 }
 function scoreTabGo(uid,i,instant){
   var t=document.getElementById(uid+'-track');if(!t||!t.children[i])return;
@@ -7518,12 +7611,26 @@ function scoreTabMark(uid,i){
   });
   var a=c.children[i];
   if(a){var l=a.offsetLeft-c.offsetLeft;if(l<c.scrollLeft||l+a.offsetWidth>c.scrollLeft+c.clientWidth)c.scrollLeft=Math.max(0,l-20)}
+  scoreTabFit(uid,i);
+}
+// The strip is as tall as the card showing, not the tallest card — the Entry
+// card with its indicator cards would otherwise leave a gap under every short
+// one. Followed as that card grows (an opened checklist, a style analysis).
+function scoreTabFit(uid,i){
+  var t=document.getElementById(uid+'-track');if(!t)return;
+  var c=t.children[i];if(!c)return;
+  t.style.height=c.offsetHeight+'px';
+  if(window.ResizeObserver){
+    if(t._ro)t._ro.disconnect();
+    t._ro=new ResizeObserver(function(){t.style.height=c.offsetHeight+'px'});
+    t._ro.observe(c);
+  }
 }
 // After the page is drawn: open on the chosen card without a visible scroll.
 function scoreTabsSettle(){
   Array.prototype.forEach.call(document.querySelectorAll('[id$="-track"][data-start]'),function(t){
     var n=Number(t.getAttribute('data-start')||0);
-    if(n>0)scoreTabGo(t.id.replace(/-track$/,''),n,true);
+    scoreTabGo(t.id.replace(/-track$/,''),n,true);
   });
 }
 function renderPointBreakdown(title,score,signal,report,color){
@@ -9612,7 +9719,7 @@ function algosTabCount(){
 function algosTabBar(){
   if(SPACE==='BN')return renderCryptoTabs();
   var nT=(STATE.data||[]).length;
-  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',portfolioTabCount(),'tcp'],['algos','🤖 Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['sectors','Sectors',SECTORS?SECTORS.length:0,'tcb']];
+  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',portfolioTabCount(),'tcp'],['algos','🤖 Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['sectors','Sectors',sectorRowsHere().length,'tcb']];
   var h='<div class="tabs">';
   tabs.forEach(function(t){h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+t[1];if(t[2]!=='')h+='<span class="tc '+t[3]+'">'+t[2]+'</span>';h+='</div>';});
   return h+'</div>';
@@ -16756,7 +16863,7 @@ function renderPortfolio(){
   // Tabs
   h+='<div class="tabs">';
   var nV2=stocks.filter(function(s){return s.valueScore>0}).length;
-  var nSec2=SECTORS?SECTORS.length:0;
+  var nSec2=sectorRowsHere().length;
   var nPb2=stocks.filter(pullbackFilter).length;
   // Portfolio builds its OWN tab bar, so the Algos entry has to be repeated here
   // with the same DE-only filter as the main bar (\u00A7render). Omitting it made the
@@ -17211,7 +17318,7 @@ function renderSectors(){
   var nP=portfolioTabCount();
   var nSe=stocks.filter(setupsFilter).length;
   var nV=stocks.filter(function(s){return s.valueScore>0}).length;
-  var sectorRows=(SPACE==='IN'&&SECTORS)?SECTORS:[];
+  var sectorRows=sectorRowsHere();
   var marketIndex=MARKET_INDEX_BY_SPACE[SPACE];
   var summaryRows=(marketIndex?[marketIndex]:[]).concat(sectorRows);
   var nSec=summaryRows.length||1;
@@ -17253,7 +17360,8 @@ function renderSectors(){
     }
 
     // Is this sector filterable (has mapped stocks)?
-    var hasMap=SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length>0;
+    // Only India's sectors have a stock list to filter Discovery by.
+    var hasMap=SPACE==='IN'&&SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length>0;
     var cardStyle='padding:10px 8px;background:var(--bg2);border-radius:10px;border:1px solid var(--bd);text-align:center;position:relative';
     if(hasMap)cardStyle+=';cursor:pointer';
     var onClickAttr=hasMap?' onclick="applySectorFilter(\''+sec.name+'\')"':'';
@@ -17303,7 +17411,7 @@ function renderValue(){
 
   // Tabs
   h+='<div class="tabs">';
-  var nSec3=SECTORS?SECTORS.length:0;
+  var nSec3=sectorRowsHere().length;
   var nPb4=stocks.filter(pullbackFilter).length;
   var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb4,'tcp'],['sectors','Sectors',nSec3,'tcb'],['gttcal','GTT Cal','','tcp']];
   tabs.forEach(function(t){
@@ -17385,7 +17493,7 @@ function renderGttCal(){
   var nSe=stocks.filter(setupsFilter).length;
   var nPbG=stocks.filter(pullbackFilter).length;
   var nVG=stocks.filter(function(s){return s.valueScore>0}).length;
-  var nSecG=SECTORS?SECTORS.length:0;
+  var nSecG=sectorRowsHere().length;
   h+='<div class="tabs">';
   var tabsG=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPbG,'tcp'],['sectors','Sectors',nSecG,'tcb'],['gttcal','GTT Cal','','tcp']];
   tabsG.forEach(function(t){
@@ -18017,7 +18125,14 @@ function showDetail(idx,focus){
   // Every score as a swipeable card — see scoreTabsHtml. Holdings also get
   // profit booking and capital protection.
   var isPortfolioStock=!!s._t212||PORTFOLIO.holdings.some(function(h){return h.symbol===s.symbol||h.symbol===s.symbol.replace('.NS','')});
-  b+=scoreTabsHtml(s,isPortfolioStock,focus==='value'?'value':'');
+  // Each score's own detail goes on its card; a section stays on the page only
+  // when there is no card to hold it.
+  var cardIds={};scoreTabsFor(s,isPortfolioStock).forEach(function(t){cardIds[t.id]=true});
+  var extras={entry:entryIndicatorCardsHtml(s,cur)};
+  if(cardIds.value)extras.value=valueFiguresHtml(s,cur);
+  if(cardIds.style)extras.style=renderStyleDiagnosis(s)+renderDeepStyleButton(s);
+  if(cardIds.golden)extras.golden=renderGoldenBuyAudit(s);
+  b+=scoreTabsHtml(s,isPortfolioStock,focus==='value'?'value':'',extras);
 
   // Discovery stocks in the T212 spaces (US/DE) are all buyable — the manual
   // order card resolves ANY symbol against T212's full instrument list, not
@@ -18031,8 +18146,7 @@ function showDetail(idx,focus){
   // Surfaced when the detail modal is opened on a Trading 212 position
   // (s._t212 === true). Lets the user place SL stop / Target limit / OCO
   // orders directly from the position card.
-  b+=renderStyleDiagnosis(s);
-  b+=renderDeepStyleButton(s);
+  if(!cardIds.style){b+=renderStyleDiagnosis(s);b+=renderDeepStyleButton(s);}
 
   if(s._t212){
     var rs=riskSettings(true);
@@ -18300,7 +18414,7 @@ function showDetail(idx,focus){
   b+='</div></div>';
 
   // Value Analysis (if data available)
-  if(s.valueScore>0||s.valueRating!=='N/A'){
+  if(!hasValueData(s)&&(s.valueScore>0||s.valueRating!=='N/A')){
     var valCol=s.valueScore>=80?'var(--gn)':s.valueScore>=65?'var(--bl)':s.valueScore>=50?'var(--am)':'var(--t3)';
     var valBg=s.valueScore>=80?'var(--gg)':s.valueScore>=65?'rgba(37,99,235,.08)':s.valueScore>=50?'rgba(217,119,6,.08)':'rgba(148,163,184,.06)';
     b+='<div id="value-analysis-panel" style="margin-top:8px;padding:10px;background:var(--cd);border:1px solid var(--bd);border-radius:8px">';
@@ -18354,51 +18468,6 @@ function showDetail(idx,focus){
     }
     b+='</div>';
   }
-
-  // Entry indicators
-  b+=dEnd+dSec('entry','ENTRY INDICATORS','what says buy');
-  b+='<div class="section-hdr" style="color:var(--gn)">ENTRY INDICATORS</div><div class="ig">';
-  function indMetric(label,value,color){
-    if(value==null||value==='')return '';
-    return '<div style="min-width:0"><div style="font-size:7px;color:var(--t3);font-weight:700">'+label+'</div><div style="font-size:10px;font-family:monospace;font-weight:800;color:'+(color||'var(--t2)')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+value+'</div></div>';
-  }
-  function indCard(ind){
-    var metrics=(ind.metrics||[]).map(function(m){return indMetric(m[0],m[1],m[2])}).join('');
-    return '<div class="ic"><div class="ich"><span class="ict">'+ind.k+'</span><span class="ics '+(ind.pass?'p':'f')+'">'+(ind.pass?'\u2713':'\u2717')+'</span></div>'+
-      '<div class="icv" style="font-size:12px">'+ind.v+'</div>'+
-      '<div class="icd" style="margin-bottom:6px">'+ind.desc+'</div>'+
-      (metrics?'<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;padding-top:5px;border-top:1px dashed rgba(148,163,184,.22)">'+metrics+'</div>':'')+
-      '</div>';
-  }
-  var priceNow=currentPriceFor(s);
-  var macdSlopeCol=s.macdSlope>0?'var(--gn)':s.macdSlope<0?'var(--rd)':'var(--t2)';
-  var macdHistCol=s.macdHist>0?'var(--gn)':s.macdHist<0?'var(--rd)':'var(--t2)';
-  var rsiCol=s.rsi>=70?'var(--rd)':s.rsi<=35?'var(--gn)':'var(--t2)';
-  var trendCol=s.sma200!=null&&priceNow>=s.sma200?'var(--gn)':'var(--rd)';
-  var buyInds=[
-    {k:'TREND STACK',v:'TS '+trendStackScore(s),pass:trendStackScore(s)>=65,desc:trendStackScore(s)>=75?'Long trend aligned':trendStackScore(s)>=50?'Mixed but improving':'Trend stack weak',
-      metrics:[['200S',signedNum(sma200SlopeValue(s),3),sma200SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['200E',signedNum(ema200SlopeValue(s),3),ema200SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['50E',signedNum(ema50SlopeValue(s),3),ema50SlopeValue(s)>0?'var(--gn)':'var(--rd)'],['21E',signedNum(ema21SlopeValue(s),3),ema21SlopeValue(s)>0?'var(--gn)':'var(--rd)']]},
-    {k:'MACD SETUP',v:s.macdPhase||'\u2014',pass:s.macdSlope>0||s.macdPhase==='EARLY BUY',desc:'Momentum phase and inflection',
-      metrics:[['MACD',signedNum(s.macd,4),s.macd>0?'var(--gn)':s.macd<0?'var(--rd)':'var(--t2)'],['Signal',signedNum(s.macdSignal,4),'var(--t2)'],['Hist',signedNum(s.macdHist,4),macdHistCol],['Slope',signedNum(s.macdSlope,4),macdSlopeCol],['Angle',isFinite(macdSlopeAngleFor(s))?signedNum(macdSlopeAngleFor(s),1,'\u00B0'):null,macdSlopeCol],['%ile',isFinite(Number(s.macdPctl))?Math.round(s.macdPctl)+'%':null,s.macdPctl<=goldenBuyMacdPctlMaxFor(s)?'var(--gn)':'var(--rd)'],['Smth slope',signedNum(s.smoothMacdSlope,4),'var(--t2)'],['Smth prior',s.smoothMacdPrevSavedSlope!=null?signedNum(s.smoothMacdPrevSavedSlope,4):null,'var(--t2)'],['Smth accel',signedNum(s.smoothMacdAccel,4),'var(--t2)'],['Smth low',isFinite(Number(s.smoothMacdLowDistPct))?fmt(s.smoothMacdLowDistPct,1)+'%':null,'var(--t2)']]},
-    {k:'RSI',v:s.rsi!=null?fmt(s.rsi,1):'\u2014',pass:s.rsi!=null&&s.rsi>=25&&s.rsi<=55,desc:s.rsi!=null?'Buy zone is 25-55':'N/A',
-      metrics:[['Current',s.rsi!=null?fmt(s.rsi,1):null,rsiCol],['State',s.rsi>=70?'overbought':s.rsi<=35?'pullback':'neutral',rsiCol]]},
-    {k:'BOLLINGER',v:s.bbMid!=null?cur+fmt(s.bbMid):'\u2014',pass:s.bbMid!=null&&priceNow<=s.bbMid,desc:s.bbMid!=null?(priceNow<=s.bbMid?'At/below mid band':'Above mid band'):'N/A',
-      metrics:[['Price',cur+fmt(priceNow),s.bbMid!=null&&priceNow<=s.bbMid?'var(--gn)':'var(--t2)'],['Mid',s.bbMid!=null?cur+fmt(s.bbMid):null,'var(--t2)'],['Lower',s.bbLower!=null?cur+fmt(s.bbLower):null,'var(--gn)'],['Upper',s.bbUpper!=null?cur+fmt(s.bbUpper):null,'var(--rd)']]},
-    {k:'ADX / DI',v:s.adx!=null?fmt(s.adx,1):'\u2014',pass:s.adx>25&&s.plusDi>s.minusDi,desc:'Trend strength + direction',
-      metrics:[['ADX',s.adx!=null?fmt(s.adx,1):null,s.adx>25?'var(--gn)':'var(--t2)'],['+DI',s.plusDi!=null?fmt(s.plusDi,1):null,s.plusDi>s.minusDi?'var(--gn)':'var(--t2)'],['-DI',s.minusDi!=null?fmt(s.minusDi,1):null,s.minusDi>s.plusDi?'var(--rd)':'var(--t2)']]},
-    {k:'OBV',v:s.obv!=null?fmtV(s.obv):'\u2014',pass:!s.obvWeakness&&!s.obvDivergence,desc:s.obvDivergence?'Bearish divergence':s.obvWeakness?'Volume support weak':'Volume flow supportive',
-      metrics:[['OBV',s.obv!=null?fmtV(s.obv):null,s.obvDivergence||s.obvWeakness?'var(--rd)':'var(--t2)'],['Avg vol',s.avgVol20?fmtV(s.avgVol20):null,'var(--t2)']]},
-    {k:'DIVERGENCE',v:(s.divHistBearish||s.divVolBearish)?'Bearish':((s.divHistBullish||s.divVolBullish)?'Bullish':'None'),pass:!(s.divHistBearish||s.divVolBearish),desc:s.divDetail||'No two-pivot price/indicator divergence detected',
-      metrics:[['MACD-hist',s.divHistBullish?'Bullish':(s.divHistBearish?'Bearish':'\u2014'),s.divHistBullish?'var(--gn)':(s.divHistBearish?'var(--rd)':'var(--t2)')],['Volume/OBV',s.divVolBullish?'Bullish':(s.divVolBearish?'Bearish':'\u2014'),s.divVolBullish?'var(--gn)':(s.divVolBearish?'var(--rd)':'var(--t2)')]]},
-    {k:'VOLUME PATTERN',v:(s.volBearDryUp||s.volBearChurning)?'Bearish':((s.volBullDryUp||s.volBullCapitulation)?'Bullish':'None'),pass:!(s.volBearDryUp||s.volBearChurning),desc:s.volPatternDetail||'No specific raw-volume pattern detected',
-      metrics:[['Dry-up',s.volBullDryUp?'Bullish (lows)':(s.volBearDryUp?'Bearish (highs)':'\u2014'),s.volBullDryUp?'var(--gn)':(s.volBearDryUp?'var(--rd)':'var(--t2)')],['Climax/Churn',s.volBullCapitulation?'Capitulation':(s.volBearChurning?'Churning':'\u2014'),s.volBullCapitulation?'var(--gn)':(s.volBearChurning?'var(--rd)':'var(--t2)')]]},
-    {k:'EMA21',v:s.ema21!=null?cur+fmt(s.ema21):'\u2014',pass:s.ema21!=null&&Math.abs(s.ema21PctDiff||0)<=2,desc:s.ema21!=null?(Math.abs(s.ema21PctDiff||0)<=2?'Near entry zone':'Distance from mean'):'N/A',
-      metrics:[['EMA21',s.ema21!=null?cur+fmt(s.ema21):null,'var(--t2)'],['Distance',s.ema21PctDiff!=null?signedNum(s.ema21PctDiff,2,'%'):null,Math.abs(s.ema21PctDiff||0)<=2?'var(--gn)':Math.abs(s.ema21PctDiff||0)<=4?'var(--am)':'var(--rd)'],['EMA21 slope',s.ema21Slope!=null?signedNum(s.ema21Slope,3):null,s.ema21Slope>0?'var(--gn)':'var(--rd)'],['EMA50 slope',s.ema50Slope!=null?signedNum(s.ema50Slope,3):null,s.ema50Slope>0?'var(--gn)':'var(--rd)']]}
-  ];
-  buyInds.forEach(function(ind){
-    b+=indCard(ind);
-  });
-  b+='</div>';
 
   b+=dEnd+dSec('sell','SELL INDICATORS','what says get out');
   b+='<div class="section-hdr" style="color:var(--rd)">SELL INDICATORS</div><div class="ig">';
@@ -18467,7 +18536,7 @@ function showDetail(idx,focus){
     b+='\uD83E\uDD16 Enable AI Analysis → Settings</div></div>';
   }
 
-  if(STATE.tab==='setups'||s.goldenBuyReport||gm(s)){
+  if(!cardIds.golden&&(STATE.tab==='setups'||s.goldenBuyReport||gm(s))){
     b+=renderGoldenBuyAuditDropdown(s);
   }
 
@@ -18781,6 +18850,25 @@ function uiAlert(title,body){
     if(document.getElementById('modal').classList.contains('show'))return false;
     return (window.scrollY||document.documentElement.scrollTop||0)<=0;
   }
+  // A PULL INSIDE A POPUP IS THAT POPUP'S OWN SCROLL. The pending orders, a
+  // dialog, any sheet floats over the page — the page under it stays scrolled
+  // to the top, so this used to read a scroll inside the popup as a pull on the
+  // page and offer a market scan. Anything fixed in place, or anything already
+  // scrolled down inside, is left to scroll.
+  function inPopup(el){
+    for(var n=el;n&&n.nodeType===1&&n!==document.body;n=n.parentElement){
+      var cs=window.getComputedStyle(n);
+      if(cs.position==='fixed')return true;
+      if((cs.overflowY==='auto'||cs.overflowY==='scroll')&&n.scrollTop>0)return true;
+    }
+    return false;
+  }
+  // Only where a pull means something: Discovery starts a scan, Portfolio
+  // reloads the holdings. Every other tab scrolls and nothing more.
+  function pullTab(){
+    var t=(STATE&&STATE.tab)||'discovery';
+    return t==='discovery'||t==='portfolio';
+  }
   function setInd(h,txt,color){
     if(!ind)return;
     ind.style.height=Math.min(h,96)+'px';
@@ -18794,7 +18882,7 @@ function uiAlert(title,body){
   }
 
   document.addEventListener('touchstart',function(e){
-    if(!atTop())return;
+    if(!atTop()||!pullTab()||inPopup(e.target))return;
     startY=e.touches[0].clientY;
     pulling=true;armed=false;
   },{passive:true});
