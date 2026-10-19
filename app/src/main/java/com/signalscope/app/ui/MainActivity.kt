@@ -10550,7 +10550,8 @@ class MainActivity : AppCompatActivity() {
         val exchange: String,
         val name: String,
         val index: String,
-        val symbols: List<String>
+        val symbols: List<String>,
+        val kind: String = "sector"
     )
 
     private val sectorSpecs = listOf(
@@ -10591,7 +10592,17 @@ class MainActivity : AppCompatActivity() {
         SectorSpec("DE", "DE", "Basic Res.", "STOXX 600 Basic Resources", listOf("EXV6.DE")),
         SectorSpec("DE", "DE", "Utilities", "STOXX 600 Utilities", listOf("EXH9.DE")),
         SectorSpec("DE", "DE", "Telecom", "STOXX 600 Telecoms", listOf("EXV2.DE")),
-        SectorSpec("DE", "DE", "Real Estate", "STOXX 600 Real Estate", listOf("EXI5.DE"))
+        SectorSpec("DE", "DE", "Real Estate", "STOXX 600 Real Estate", listOf("EXI5.DE")),
+
+        // Commodities strip: the world prices (USD futures) in every space, then
+        // the gold/silver fund each market's investors can actually buy.
+        SectorSpec("ALL", "US", "Gold", "Gold futures · USD/oz", listOf("GC=F"), "commodity"),
+        SectorSpec("ALL", "US", "Silver", "Silver futures · USD/oz", listOf("SI=F"), "commodity"),
+        SectorSpec("ALL", "US", "Crude oil", "WTI futures · USD/bbl", listOf("CL=F"), "commodity"),
+        SectorSpec("IN", "NSE", "Gold ETF", "GOLDBEES · ₹", listOf("GOLDBEES.NS"), "commodity"),
+        SectorSpec("IN", "NSE", "Silver ETF", "SILVERBEES · ₹", listOf("SILVERBEES.NS"), "commodity"),
+        SectorSpec("US", "US", "Gold ETF", "GLD · $", listOf("GLD"), "commodity"),
+        SectorSpec("DE", "DE", "Xetra-Gold", "4GLD · €", listOf("4GLD.DE"), "commodity")
     )
 
     @Volatile private var sectorFetchInProgress = false
@@ -10630,7 +10641,8 @@ class MainActivity : AppCompatActivity() {
                             sectors.add(mapOf(
                                 "space" to spec.space,
                                 "name" to spec.name,
-                                "index" to if (viaEtf) "${spec.index} · ${symbol.substringBefore('.')} ETF" else spec.index,
+                                "index" to if (viaEtf && spec.kind == "sector") "${spec.index} · ${symbol.substringBefore('.')} ETF" else spec.index,
+                            "kind" to spec.kind,
                                 "symbol" to symbol,
                                 "proxy" to (viaEtf && i > 0),
                                 "price" to latest.close,

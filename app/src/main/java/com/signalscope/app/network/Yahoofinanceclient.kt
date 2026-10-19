@@ -1063,7 +1063,9 @@ object YahooFinanceClient {
         val sharesOutstanding: Long? = null,
         val sector: String? = null,
         val industry: String? = null,
-        val name: String? = null
+        val name: String? = null,
+        /** "EQUITY", "ETF", "MUTUALFUND", "FUTURE"… — a fund has no accounts to score. */
+        val quoteType: String? = null
     )
 
     // ── Symbol autocomplete (Yahoo's `/v1/finance/search` endpoint) ──────────
@@ -1307,7 +1309,8 @@ object YahooFinanceClient {
                 sharesOutstanding = keyStats.rawLong("sharesOutstanding"),
                 sector = profile?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() },
                 industry = profile?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() },
-                name = displayName
+                name = displayName,
+                quoteType = price?.optString("quoteType", "")?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
             )
 
             Log.d(TAG, "Fundamentals: $symbol — PE=${data.trailingPe} PB=${data.priceToBook} D/E=${data.debtToEquity}")

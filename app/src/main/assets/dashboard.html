@@ -364,7 +364,9 @@ var VALUE_SORT={sortK:'valueScore',sortA:false};
 var SECTORS=[];          // every space's sector lines; sectorRowsHere() picks this space's
 var SECTORS_AT=0;        // when they last arrived
 // This space's sector lines. Rows from before sectors carried a space are India's.
-function sectorRowsHere(){return (SECTORS||[]).filter(function(r){return normalizeSpace(r.space||'IN')===SPACE})}
+function sectorRowsHere(){return (SECTORS||[]).filter(function(r){return r.kind!=='commodity'&&normalizeSpace(r.space||'IN')===SPACE})}
+// World prices (space ALL) first, then this market's own gold/silver fund.
+function commodityRowsHere(){return (SECTORS||[]).filter(function(r){return r.kind==='commodity'&&(r.space==='ALL'||normalizeSpace(r.space)===SPACE)})}
 var MARKET_INDEX_BY_SPACE={IN:null,US:null,DE:null};
 var FILTERED=[];
 var AI_CACHE={};  // {symbol: {pullback:'html',outlook:'html'}}
@@ -17311,6 +17313,43 @@ function renderPortfolio(){
 }
 
 // ===== SECTORS TAB =====
+function sectorCardHtml(sec){
+  var h='';
+  var chg=sec.dayChange!=null?sec.dayChange:0;
+  var pChg=sec.periodChange!=null?sec.periodChange:0;
+  var dayCol=chg>=0?'var(--gn)':'var(--rd)';
+  var periodCol=pChg>=0?'var(--gn)':'var(--rd)';
+  // Determine sparkline color from actual close data direction
+  var sparkCol='#64748b';
+  if(sec.closes&&sec.closes.length>=2){
+    sparkCol=sec.closes[sec.closes.length-1]>=sec.closes[0]?'#16a34a':'#dc2626';
+  }
+
+  // Is this sector filterable (has mapped stocks)?
+  // Only India's sectors have a stock list to filter Discovery by.
+  var hasMap=SPACE==='IN'&&sec.kind!=='commodity'&&SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length>0;
+  var cardStyle='padding:10px 8px;background:var(--bg2);border-radius:10px;border:1px solid var(--bd);text-align:center;position:relative';
+  if(hasMap)cardStyle+=';cursor:pointer';
+  var onClickAttr=hasMap?' onclick="applySectorFilter(\''+sec.name+'\')"':'';
+  h+='<div'+onClickAttr+' style="'+cardStyle+'">';
+  if(hasMap)h+='<div style="position:absolute;top:4px;right:6px;font-size:9px;color:var(--bl);opacity:.7" title="Click to filter Discovery by this sector">\uD83D\uDD0D</div>';
+  h+='<div style="font-size:10px;font-weight:700;color:var(--t1);margin-bottom:2px">'+sec.name+'</div>';
+  if(sec.index)h+='<div style="font-size:7px;color:var(--t3);margin-bottom:4px">'+sec.index+'</div>';
+  h+=sectorSparkSvg(sec.closes,sparkCol,80,28);
+  if(sec.price)h+='<div style="font-size:11px;font-weight:700;color:var(--t1);margin-top:4px">'+fmt(sec.price,0)+'</div>';
+  h+='<div style="display:flex;justify-content:center;gap:8px;margin-top:2px">';
+  h+='<div><div style="font-size:7px;color:var(--t3)">Day</div><div style="font-size:10px;font-weight:700;color:'+dayCol+'">'+(chg>=0?'+':'')+fmt(chg,2)+'%</div></div>';
+  h+='<div><div style="font-size:7px;color:var(--t3)">6M</div><div style="font-size:10px;font-weight:700;color:'+periodCol+'">'+(pChg>=0?'+':'')+fmt(pChg,1)+'%</div></div>';
+  h+='</div>';
+  if(sec.high!=null&&sec.low!=null){
+    var range=sec.high-sec.low;
+    var pos=range>0?((sec.price-sec.low)/range*100):50;
+    h+='<div style="margin-top:4px"><div style="font-size:7px;color:var(--t3);display:flex;justify-content:space-between"><span>'+fmt(sec.low,0)+'</span><span>'+fmt(sec.high,0)+'</span></div>';
+    h+='<div style="height:3px;background:var(--bd);border-radius:2px;position:relative;margin-top:1px"><div style="position:absolute;left:'+pos+'%;top:-1px;width:5px;height:5px;background:var(--bl);border-radius:50%;transform:translateX(-50%)"></div></div></div>';
+  }
+  h+='</div>';
+  return h;
+}
 function renderSectors(){
   var stocks=STATE.data;
   var nT=stocks.length;
@@ -17347,42 +17386,15 @@ function renderSectors(){
   // Sector cards grid
   h+='<div style="padding:8px;display:grid;grid-template-columns:repeat(2,1fr);gap:8px">';
   h+=renderMarketIndexCard();
-  sectorRows.forEach(function(sec){
-    var chg=sec.dayChange!=null?sec.dayChange:0;
-    var pChg=sec.periodChange!=null?sec.periodChange:0;
-    var dayCol=chg>=0?'var(--gn)':'var(--rd)';
-    var periodCol=pChg>=0?'var(--gn)':'var(--rd)';
-    // Determine sparkline color from actual close data direction
-    var sparkCol='#64748b';
-    if(sec.closes&&sec.closes.length>=2){
-      sparkCol=sec.closes[sec.closes.length-1]>=sec.closes[0]?'#16a34a':'#dc2626';
-    }
-
-    // Is this sector filterable (has mapped stocks)?
-    // Only India's sectors have a stock list to filter Discovery by.
-    var hasMap=SPACE==='IN'&&SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length>0;
-    var cardStyle='padding:10px 8px;background:var(--bg2);border-radius:10px;border:1px solid var(--bd);text-align:center;position:relative';
-    if(hasMap)cardStyle+=';cursor:pointer';
-    var onClickAttr=hasMap?' onclick="applySectorFilter(\''+sec.name+'\')"':'';
-    h+='<div'+onClickAttr+' style="'+cardStyle+'">';
-    if(hasMap)h+='<div style="position:absolute;top:4px;right:6px;font-size:9px;color:var(--bl);opacity:.7" title="Click to filter Discovery by this sector">\uD83D\uDD0D</div>';
-    h+='<div style="font-size:10px;font-weight:700;color:var(--t1);margin-bottom:2px">'+sec.name+'</div>';
-    if(sec.index)h+='<div style="font-size:7px;color:var(--t3);margin-bottom:4px">'+sec.index+'</div>';
-    h+=sectorSparkSvg(sec.closes,sparkCol,80,28);
-    if(sec.price)h+='<div style="font-size:11px;font-weight:700;color:var(--t1);margin-top:4px">'+fmt(sec.price,0)+'</div>';
-    h+='<div style="display:flex;justify-content:center;gap:8px;margin-top:2px">';
-    h+='<div><div style="font-size:7px;color:var(--t3)">Day</div><div style="font-size:10px;font-weight:700;color:'+dayCol+'">'+(chg>=0?'+':'')+fmt(chg,2)+'%</div></div>';
-    h+='<div><div style="font-size:7px;color:var(--t3)">6M</div><div style="font-size:10px;font-weight:700;color:'+periodCol+'">'+(pChg>=0?'+':'')+fmt(pChg,1)+'%</div></div>';
-    h+='</div>';
-    if(sec.high!=null&&sec.low!=null){
-      var range=sec.high-sec.low;
-      var pos=range>0?((sec.price-sec.low)/range*100):50;
-      h+='<div style="margin-top:4px"><div style="font-size:7px;color:var(--t3);display:flex;justify-content:space-between"><span>'+fmt(sec.low,0)+'</span><span>'+fmt(sec.high,0)+'</span></div>';
-      h+='<div style="height:3px;background:var(--bd);border-radius:2px;position:relative;margin-top:1px"><div style="position:absolute;left:'+pos+'%;top:-1px;width:5px;height:5px;background:var(--bl);border-radius:50%;transform:translateX(-50%)"></div></div></div>';
-    }
-    h+='</div>';
-  });
+  sectorRows.forEach(function(sec){h+=sectorCardHtml(sec)});
   h+='</div>';
+  var commodities=commodityRowsHere();
+  if(commodities.length){
+    h+='<div style="padding:4px 12px 0;font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.4px">COMMODITIES</div>';
+    h+='<div style="padding:8px;display:grid;grid-template-columns:repeat(2,1fr);gap:8px">';
+    commodities.forEach(function(sec){h+=sectorCardHtml(sec)});
+    h+='</div>';
+  }
 
   document.getElementById('app').innerHTML=h;
 }
