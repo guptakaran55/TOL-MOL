@@ -161,7 +161,8 @@ object StockAiClient {
         // human name ("Siemens Energy") surfaces far more coverage than a raw
         // ticker ("ENR"), especially for European names. Fall back to the
         // cleaned ticker when no name was passed.
-        val searchTerm = companyName?.trim()?.takeIf { it.isNotBlank() } ?: cleanSymbol
+        // One form of the name for every caller — see [NewsDigest.searchName].
+        val searchTerm = NewsDigest.searchName(companyName) ?: cleanSymbol
 
         // Region-aware Google News query: append market keyword only when set
         // (IN uses "NSE", US/DE use no suffix because those tickers aren't
@@ -174,6 +175,15 @@ object StockAiClient {
         val query = "$baseQuery when:30d"
         val url = "https://news.google.com/rss/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}&hl=${ctx.newsHl}&gl=${ctx.newsGl}&ceid=${ctx.newsCeid}"
 
+        // THE SAME LIST FOR HALF AN HOUR. Google's results move minute to minute,
+        // so a portfolio scan and a stock outlook a few minutes apart could read
+        // different headlines about the same company. Within 30 minutes they read
+        // the same feed.
+        synchronized(feedCache) {
+            feedCache[url]?.takeIf { System.currentTimeMillis() - it.first < FEED_CACHE_MS }?.let { (_, items) ->
+                return NewsDigest.digest(items, maxResults, System.currentTimeMillis(), listOf(searchTerm, cleanSymbol))
+            }
+        }
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -185,7 +195,9 @@ object StockAiClient {
                 val body = response.body?.string() ?: return emptyList()
                 // Google's order is relevance, not date — NewsDigest sorts, merges
                 // the same story from many outlets, and drops quote pages.
-                NewsDigest.digest(parseRssItems(body), maxResults, System.currentTimeMillis(),
+                val items = parseRssItems(body)
+                synchronized(feedCache) { feedCache[url] = System.currentTimeMillis() to items }
+                NewsDigest.digest(items, maxResults, System.currentTimeMillis(),
                     listOf(searchTerm, cleanSymbol))
             }
         } catch (e: Exception) {
@@ -199,6 +211,13 @@ object StockAiClient {
      * and article link. Items with an unparseable or absent date are kept
      * undated — we can't prove they're stale.
      */
+    private const val FEED_CACHE_MS = 30 * 60_000L
+    private val feedCache = HashMap<String, Pair<Long, List<NewsDigest.Item>>>()
+
+    /** Headlines per stock — the same number for the portfolio scan and the outlook,
+     *  so both read the same list. */
+    const val HEADLINES = 12
+
     private fun parseRssItems(xml: String): List<NewsDigest.Item> {
         val items = mutableListOf<NewsDigest.Item>()
         try {
@@ -463,7 +482,7 @@ If you're unsure, answer UNCERTAIN rather than guessing."""
         name: String? = null
     ): AiResult {
         val displayName = name?.trim()?.takeIf { it.isNotBlank() }
-        val stories = fetchStories(symbol, 12, ctx, name)
+        val stories = fetchStories(symbol, HEADLINES, ctx, name)
         val today = LocalDate.now()
         val zone = ZoneId.systemDefault()
 
@@ -492,6 +511,7 @@ Reading the headlines:
 - Each headline carries its date and age, and they are sorted newest first. Weigh the newest most; treat news more than two weeks old as background.
 - A headline marked "(+N more outlets)" is ONE story that several outlets covered. Wide coverage means it mattered — not that it happened several times.
 - Many headlines are commentary or tips ("Is now the time to buy…", "analyst says…"). Treat those as opinion and weigh real events — results, guidance, orders, deals, regulation, management changes — above them.
+- A legal or regulatory action (a regulator's case, a lawsuit, a probe, a fine) stays relevant until it is resolved: weigh it even when its headline is more than two weeks old, and name it among the risks.
 - Your own background knowledge of the company may be out of date. If you lean on it, say so.
 - Do NOT state support, resistance, target or any other price levels: you know only today's price.
 
@@ -698,7 +718,7 @@ Be direct and opinionated. Do NOT hedge excessively."""
             val sym = o.optString("symbol").trim()
             if (sym.isEmpty()) continue
             val nm = o.optString("name").trim().ifBlank { sym }
-            val hls = try { fetchNewsHeadlines(sym, 6, ctx, nm) } catch (e: Exception) { emptyList() }
+            val hls = try { fetchNewsHeadlines(sym, HEADLINES, ctx, nm) } catch (e: Exception) { emptyList() }
             items.add(Item(sym, nm, hls))
             // Be gentle on Google News RSS — small gap between holdings.
             if (i < arr.length() - 1) try { Thread.sleep(150) } catch (_: InterruptedException) {}
@@ -714,9 +734,12 @@ For EACH stock, read its recent headlines (most recent first) and assign exactly
   VERY_POSITIVE — major upside: big beat, cluster of upgrades, large contract/order, buyout or strategic catalyst
 Judge ONLY from the headlines provided — do not invent facts. If a stock has no headlines, verdict = QUIET and conclusion = "No recent news.".
 Be decisive; reserve CRITICAL and VERY_POSITIVE for genuinely strong signals.
+Each headline carries its date and age, newest first. Weigh the newest most; treat routine news more than two weeks old as background.
+A legal or regulatory action (a regulator's case, a lawsuit, a probe, a fine) stays relevant until it is resolved, even when its headline is more than two weeks old.
+The conclusion must name the story the verdict rests on and say how old it is, e.g. "FTC action over hotel ads (11 days ago)".
 
 Output ONLY a JSON object (no markdown, no code fences), exactly this shape:
-{"summary":"<=20 word portfolio-level takeaway","stocks":[{"symbol":"AAA","verdict":"CRITICAL|CAUTION|QUIET|POSITIVE|VERY_POSITIVE","conclusion":"<=22 word plain-English summary of what's happening"}]}"""
+{"summary":"<=20 word portfolio-level takeaway","stocks":[{"symbol":"AAA","verdict":"CRITICAL|CAUTION|QUIET|POSITIVE|VERY_POSITIVE","conclusion":"<=26 word plain-English summary of what's happening, ending with the age of the story it rests on"}]}"""
 
         val user = buildString {
             append("Portfolio — ${items.size} holdings (${ctx.marketLabel}). Classify every one.\n")

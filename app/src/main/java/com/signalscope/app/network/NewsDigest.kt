@@ -16,7 +16,12 @@ import kotlin.math.abs
  *   - one story told by several outlets becomes one line with an outlet count;
  *   - the newest stories are kept, newest first — with up to three places held
  *     for older stories that many outlets covered, so a big event two weeks
- *     back is not pushed out by this morning's small items.
+ *     back is not pushed out by this morning's small items;
+ *   - and up to two places for a legal or regulatory matter (a regulator's case,
+ *     a lawsuit, a probe, a fine) from the last 30 days that more than one outlet
+ *     reported, however each worded it: such a matter stays live until resolved. Added 19 Oct 2026
+ *     after the FTC action against Booking reached one AI reading and not the
+ *     other, because eleven days of small items had pushed it out of one list.
  * No network and no Android here, so it is tested on real feeds.
  */
 object NewsDigest {
@@ -33,6 +38,22 @@ object NewsDigest {
     private const val SAME_STORY_DAYS = 3
     /** A story this many outlets carried can claim a held place. */
     private const val WIDE = 3
+    /** Places a covered legal or regulatory story may claim. */
+    private const val LEGAL_PLACES = 2
+
+    /** A regulator, a court or a law-enforcement matter. */
+    private val LEGAL = Regex(
+        "\\b(ftc|sec|doj|cma|bafin|sebi|esma|antitrust|anti-trust|regulators?|regulatory|probes?|" +
+            "investigat\\w*|lawsuits?|sued|sues|class action|subpoena\\w*|fined|fines?|penalt\\w*|" +
+            "indict\\w*|fraud|banned|recalls?|sanction\\w*|settlement|settles?|injunction|courts?|ruling|" +
+            "competition commission|european commission|enforcement|cease and desist)\\b",
+        RegexOption.IGNORE_CASE)
+
+    fun isLegal(title: String): Boolean = LEGAL.containsMatchIn(title)
+
+    /** The matter a legal headline names — its first legal word, singular. */
+    internal fun matterOf(title: String): String =
+        (LEGAL.find(title)?.value ?: "").lowercase().removeSuffix("s")
 
     fun digest(items: List<Item>, max: Int, nowMs: Long, nameWords: Collection<String> = emptyList()): List<Story> {
         if (max <= 0) return emptyList()
@@ -74,6 +95,33 @@ object NewsDigest {
             pick.removeAt(out)
             pick.add(big)
         }
+        // A LEGAL OR REGULATORY MATTER stays in the list while it is under 30 days
+        // old, if more than one outlet reported it. Outlets word one matter very
+        // differently ("faces FTC action over hotel ads", "facing FTC action for
+        // deceptive practices"), so headlines are grouped by the matter they name —
+        // the FTC, a lawsuit, a probe — and the outlets counted across the group.
+        // One headline stands for each matter: the most widely carried, a statement
+        // before a question ("Should you buy before the FTC decides?" is
+        // commentary), then the newest. It takes the place of the oldest small
+        // item that is not itself one.
+        val byMatter = byDate.filter { isLegal(it.title) }.groupBy { matterOf(it.title) }
+        val legal = byMatter.values
+            .filter { group -> group.map { it.source.lowercase() }.toSet().size + group.sumOf { it.outlets - 1 } >= 2 }
+            .mapNotNull { group ->
+                if (group.any { it in pick }) null
+                else group.sortedWith(compareByDescending<Story> { it.outlets }
+                    .thenBy { it.title.trimEnd().endsWith("?") }
+                    .thenByDescending { it.timeMs ?: Long.MIN_VALUE }).first()
+            }
+            .sortedByDescending { it.timeMs ?: Long.MIN_VALUE }
+            .take(LEGAL_PLACES)
+        for (l in legal) {
+            var out = pick.indexOfLast { it.outlets < WIDE && !isLegal(it.title) }
+            if (out < 0) out = pick.indexOfLast { !isLegal(it.title) }
+            if (out < 0) break
+            pick.removeAt(out)
+            pick.add(l)
+        }
         return pick.sortedByDescending { it.timeMs ?: Long.MIN_VALUE }
     }
 
@@ -88,6 +136,32 @@ object NewsDigest {
         val src = if (s.source.isNotBlank()) " — ${s.source}" else ""
         return "$head${s.title}$src$more"
     }
+
+    /**
+     * THE COMPANY NAME A NEWS SEARCH USES — one form, whichever the caller had.
+     * The portfolio list and the stock page held the same company under different
+     * names, so the two AI readings searched Google with different words and read
+     * different news. Legal endings come off ("Booking Holdings Inc." → "Booking
+     * Holdings", "SAP SE" → "SAP"); "Holdings" and "Group" stay, because they are
+     * part of how the company is written about — "Booking stock" finds articles
+     * about book values and airline bookings.
+     */
+    fun searchName(raw: String?): String? {
+        var s = raw?.replace(Regex("\\s+"), " ")?.trim() ?: return null
+        s = s.removePrefix("The ").trim()
+        repeat(4) {
+            val t = s.replace(LEGAL_ENDING, "").trim().trimEnd(',').trim()
+            if (t == s || t.isEmpty()) return@repeat
+            s = t
+        }
+        return s.takeIf { it.isNotEmpty() }
+    }
+
+    private val LEGAL_ENDING = Regex(
+        "[\\s,]+(SE\\s*&\\s*Co\\.?\\s*KGaA|AG\\s*&\\s*Co\\.?\\s*KGaA|KGaA|SE|AG|N\\.?V\\.?|S\\.?A\\.?|" +
+            "S\\.?p\\.?A\\.?|plc|Inc\\.?|Incorporated|Corporation|Corp\\.?|Company|Co\\.?|Ltd\\.?|Limited|GmbH|" +
+            "Aktiengesellschaft|Class [A-C]|\\(The\\)|Common Stock|Ordinary Shares?|ADR|ADS)$",
+        RegexOption.IGNORE_CASE)
 
     fun dateOf(s: Story, zone: ZoneId): LocalDate? =
         s.timeMs?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalDate() }

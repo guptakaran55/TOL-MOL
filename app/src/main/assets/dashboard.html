@@ -6821,7 +6821,9 @@ function renderPortfolioNewsPanel(){
 }
 function scanPortfolioNewsNow(){
   var rows=LAST_PORTFOLIO_ROWS||[];
-  var payload=rows.map(function(r){return {symbol:(r.symbol||r.ticker||''),name:(r.name||r.symbol||'')}}).filter(function(x){return x.symbol});
+  // The company's own name — the same one the stock page's outlook searches with
+  // (the row's display name joins several forms of it for the search box).
+  var payload=rows.map(function(r){return {symbol:(r.symbol||r.ticker||''),name:(r.newsName||r.name||r.symbol||'')}}).filter(function(x){return x.symbol});
   if(!payload.length){uiAlert('Nothing to scan','No holdings found in this portfolio.');return}
   if(typeof Android==='undefined'||!Android.scanPortfolioNews){uiAlert('Unavailable','News scan bridge not available.');return}
   if(typeof Android.hasAiEnabled==='function'){try{if(!Android.hasAiEnabled()){uiAlert('AI key needed','Add an AI key in Settings → AI Stock Analysis to scan news.');return}}catch(e){}}
@@ -9286,6 +9288,7 @@ function normalizeT212Position(p,idx){
   return {
     broker:'t212',space:SPACE,idx:idx,raw:p,pair:pair,
     symbol:p.yahooSymbol||p.symbol||p.ticker,sub:t212RowSub(p),name:[p.instrumentName,p.company,p.name].filter(Boolean).join(' ')||p.yahooSymbol||p.symbol||p.ticker,
+    newsName:p.instrumentName||p.company||p.name||'',
     currency:ccy,qty:qty,avgPrice:avg,ltp:ltp,
     invested:avg*qty,pnl:(ltp-avg)*qty,dayPnl:dayPnl,totalReturnPct:avg>0?((ltp-avg)/avg*100):0,dayChangePct:(live&&live.changePercent!=null)?live.changePercent:null,
     live:!!live,

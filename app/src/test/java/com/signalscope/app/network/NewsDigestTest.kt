@@ -109,4 +109,83 @@ class NewsDigestTest {
         assertFalse(out.any { it.title == "Story 12 about topic12 word12" })   // the oldest small one made room
         assertTrue(out.any { it.title == "Story 11 about topic11 word11" })
     }
+
+    // ── A LEGAL OR REGULATORY MATTER KEEPS ITS PLACE ─────────────────────────
+    // Booking on 19 Oct 2026: the FTC action was eleven days old and three
+    // outlets had it, under a week and a half of small items.
+
+    // Fourteen small, unrelated items after it (no shared words, one outlet each),
+    // and the FTC story told by two outlets — too few for the "widely covered"
+    // places, so only the legal rule can keep it.
+    private val smallWords = listOf("alpine", "breeze", "cobalt", "dune", "ember", "fjord", "garnet", "harbor",
+        "indigo", "juniper", "kelp", "lagoon", "meadow", "nectar", "orchid", "pebble", "quartz", "ripple",
+        "saffron", "tundra", "umber", "violet", "willow", "xenon", "yarrow", "zephyr", "amber", "basalt",
+        "cedar", "delta", "echo", "flint", "glacier", "hazel", "iris", "jasper", "kestrel", "lotus", "maple", "nimbus",
+        "onyx", "prairie")
+    private val booking = (0 until 14).map { d ->
+        val w = smallWords.subList(d * 3, d * 3 + 3).joinToString(" ")
+        item("2026-10-${"%02d".format(15 - d / 2)}T0${d % 9}:00:00Z", "Booking Holdings $w - Outlet$d")
+    } + listOf(
+        item("2026-10-05T10:00:00Z", "Booking Holdings Faces FTC Action Over Hotel Ads: More Than \$500 Million at Stake - Yahoo Finance"),
+        item("2026-10-05T12:00:00Z", "Market Chatter: Booking Holdings Could Face FTC Action Over Priceline Hotel Ads - MT Newswires"))
+
+    @Test fun `an older regulatory story more than one outlet carried is kept, even among six`() {
+        val out = NewsDigest.digest(booking, 6, now, listOf("Booking Holdings"))
+        assertEquals(6, out.size)
+        assertTrue(out.any { it.title.contains("FTC") })
+    }
+
+    @Test fun `and among twelve`() {
+        assertTrue(NewsDigest.digest(booking, 12, now, listOf("Booking Holdings")).any { it.title.contains("FTC") })
+    }
+
+    @Test fun `a regulatory headline only one outlet ran is not forced in`() {
+        val lone = booking.filterNot { it.source != "Yahoo Finance" && it.title.contains("FTC") }
+        val out = NewsDigest.digest(lone, 6, now, listOf("Booking Holdings"))
+        assertFalse(out.any { it.title.contains("FTC") })
+    }
+
+    @Test fun `one matter worded differently by three outlets counts as covered`() {
+        // As the feed had it on 19 Oct: three outlets, three wordings, no two
+        // close enough to merge — and one of them a question.
+        val feed = booking.filterNot { it.title.contains("FTC") } + listOf(
+            item("2026-10-08T06:00:00Z", "Booking Holdings Stock Is Down 14% in Three Months. Should You Buy Before the FTC Decides? - TIKR.com"),
+            item("2026-10-08T05:00:00Z", "Booking Holdings Faces FTC Action Over Hotel Ads: More Than \$500 Million at Stake - Yahoo Finance"),
+            item("2026-10-07T09:00:00Z", "Booking Holdings' Priceline.com facing FTC action for third parties' deceptive practices - Seeking Alpha"))
+        val out = NewsDigest.digest(feed, 12, now, listOf("Booking Holdings"))
+        val ftc = out.filter { it.title.contains("FTC") }
+        assertEquals(1, ftc.size)                                  // one place for one matter
+        assertTrue(ftc[0].title.contains("Faces FTC Action"))      // the statement, not the question
+    }
+
+    @Test fun `legal words are recognised`() {
+        assertTrue(NewsDigest.isLegal("Booking Holdings Faces FTC Action Over Hotel Ads"))
+        assertTrue(NewsDigest.isLegal("BaFin opens probe into Wirecard accounts"))
+        assertTrue(NewsDigest.isLegal("Bayer settles Roundup lawsuits for \$10 billion"))
+        assertFalse(NewsDigest.isLegal("TD Waterhouse buys a Booking Holdings stake"))
+        assertFalse(NewsDigest.isLegal("Deutsche Bank raises its target"))
+    }
+
+    // ── ONE COMPANY NAME FOR EVERY NEWS SEARCH ───────────────────────────────
+
+    @Test fun `legal endings come off, Holdings and Group stay`() {
+        assertEquals("Booking Holdings", NewsDigest.searchName("Booking Holdings Inc."))
+        assertEquals("PayPal Holdings", NewsDigest.searchName("PayPal Holdings, Inc."))
+        assertEquals("SAP", NewsDigest.searchName("SAP SE"))
+        assertEquals("Siemens", NewsDigest.searchName("Siemens Aktiengesellschaft"))
+        assertEquals("Henkel", NewsDigest.searchName("Henkel AG & Co. KGaA"))
+        assertEquals("Atlassian", NewsDigest.searchName("Atlassian Corporation"))
+        assertEquals("Alphabet", NewsDigest.searchName("Alphabet Inc. Class A"))
+        assertEquals("Deutsche Telekom", NewsDigest.searchName("Deutsche Telekom AG"))
+        assertEquals("Fresenius", NewsDigest.searchName("Fresenius SE"))
+    }
+
+    @Test fun `the two forms the app held for Booking now search the same words`() {
+        assertEquals(NewsDigest.searchName("Booking Holdings Inc."), NewsDigest.searchName("Booking Holdings"))
+    }
+
+    @Test fun `no name means no name`() {
+        assertEquals(null, NewsDigest.searchName(""))
+        assertEquals(null, NewsDigest.searchName(null))
+    }
 }
