@@ -7358,6 +7358,174 @@ function toggleScoreBreakdown(elId){
   var el=document.getElementById(elId);
   if(el)el.style.display=(el.style.display==='none'?'block':'none');
 }
+// ── EVERY SCORE, ONE SWIPE APART ─────────────────────────────────────────────
+// The stock page's scores as a row of chips over a strip of cards: tap a chip,
+// or swipe the cards sideways, and the card shows how the stock reached that
+// score — the same bucket / points / why table the pullback and momentum
+// scores always had, extended to every score. One card's height instead of a
+// stack of panels.
+function scoreRowsHtml(rows){
+  if(!rows||!rows.length)return '<div style="font-size:10px;color:var(--t3);padding:8px 2px">No breakdown stored for this score in this scan.</div>';
+  var h='<div style="font-family:monospace;font-size:10px">';
+  h+='<div style="display:grid;grid-template-columns:1.35fr 0.75fr 2.2fr;gap:6px;padding:4px 4px;border-bottom:1px solid var(--bd);font-weight:700;color:var(--t3);font-size:8px"><div>PART</div><div style="text-align:right">POINTS</div><div>WHY</div></div>';
+  rows.forEach(function(r){
+    var col=r.status==='pass'?'var(--gn)':r.status==='partial'?'#d97706':r.status==='info'?'var(--t2)':'var(--rd)';
+    h+='<div style="display:grid;grid-template-columns:1.35fr 0.75fr 2.2fr;gap:6px;padding:5px 4px;border-bottom:1px dashed rgba(148,163,184,0.15);align-items:start">';
+    h+='<div style="color:'+col+';font-weight:700">'+escHtml(r.label)+'</div>';
+    h+='<div style="text-align:right;color:'+col+';font-weight:700">'+escHtml(r.pts)+'</div>';
+    h+='<div style="color:var(--t2);font-size:9px;line-height:1.45">'+escHtml(r.why||'')+'</div>';
+    h+='</div>';
+  });
+  return h+'</div>';
+}
+// "bucket|pass|pts|max|why" — pullback, momentum and buy scores.
+function scoreRowsFromBuckets(report){
+  var rows=[];
+  String(report||'').split('\n').forEach(function(line){
+    var p=line.split('|');if(p.length<5)return;
+    rows.push({label:p[0],status:p[1],pts:'+'+p[2]+' / '+p[3],why:p.slice(4).join('|')});
+  });
+  return rows;
+}
+// "Block|pts|max|reasons" — the value score.
+function scoreRowsFromValue(report){
+  var rows=[];
+  String(report||'').split('\n').forEach(function(line){
+    var p=line.split('|');if(p.length<4)return;
+    var pts=Number(String(p[1]).replace('-0','0')),max=Number(p[2]);
+    var penalty=/trap/i.test(p[0]);
+    rows.push({label:p[0],pts:(penalty?(pts<0?String(pts):'0'):'+'+pts)+' / '+(penalty?'−':'')+max,
+      status:penalty?(pts<0?'fail':'pass'):(pts>=max?'pass':pts>0?'partial':'fail'),why:p.slice(3).join('|')});
+  });
+  return rows;
+}
+function scoreTabsFor(s,isHolding){
+  var T=[];
+  var pb=pullbackScoreValue(s),mo=momentumScoreValue(s),bu=Math.round(Number(s.buyScore||0)||0),en=entryScoreValue(s);
+  var lvl=function(v,a,b,hi){return v>=a?hi:v>=b?'#d97706':'var(--t3)'};
+  T.push({id:'pullback',label:'Pullback',val:String(pb),col:lvl(pb,75,60,'var(--bl)'),
+    note:'Buying a dip inside an uptrend.'+(s.pullbackSignal?' Signal: '+s.pullbackSignal+'.':''),
+    rows:scoreRowsFromBuckets(s.pullbackScoreReport||s.buyScoreReport)});
+  T.push({id:'momentum',label:'Momentum',val:String(mo),col:lvl(mo,75,60,'var(--gn)'),
+    note:'Buying strength that is still running.'+(s.momentumSignal?' Signal: '+s.momentumSignal+'.':''),
+    rows:scoreRowsFromBuckets(s.momentumScoreReport)});
+  var best=en===pb?'pullback':en===mo?'momentum':'buy';
+  T.push({id:'entry',label:'Entry',val:String(en),col:lvl(en,75,60,'var(--gn)'),
+    note:'The entry score is simply the best of the three ways in.',
+    rows:[{label:'Pullback',pts:String(pb),status:best==='pullback'?'pass':'info',why:best==='pullback'?'the highest — this is the entry score':'a dip inside an uptrend'},
+          {label:'Momentum',pts:String(mo),status:best==='momentum'?'pass':'info',why:best==='momentum'?'the highest — this is the entry score':'strength still running'},
+          {label:'Buy',pts:String(bu),status:best==='buy'?'pass':'info',why:best==='buy'?'the highest — this is the entry score':'the older combined buy score'}]});
+  var gb=parseGoldenBuyReport(s);
+  if(gb){
+    var ok=gb.filter(function(r){return r.pass}).length;
+    T.push({id:'golden',label:'Setup',val:ok+'/'+gb.length,col:ok===gb.length?'var(--gn)':'var(--t2)',
+      note:'The golden setup is a checklist: every condition must hold.',
+      rows:gb.map(function(r){return {label:r.label,pts:r.pass?'\u2713':'\u2717',status:r.pass?'pass':'fail',why:'is '+r.value+', needs '+r.required}})});
+  }
+  var rk=areaRankValue(s),sc=s.areaScore;
+  if(sc!=null&&isFinite(sc)){
+    T.push({id:'area',label:'Area',val:rk==null?'\u2014':String(Math.round(rk)),col:rk==null?'var(--t2)':rk>=80?'var(--bl)':rk>=50?'var(--t2)':'var(--t3)',
+      note:'How much room the price has to climb back to where it traded over the past year, and how unusual that room is for this stock.',
+      rows:[{label:'Area score',pts:(sc>=0?'+':'')+fmt(sc,1)+'%',status:sc>0?'pass':'fail',
+             why:'over the past year, weighted toward 2\u20137 months ago, the price sat '+fmt(Math.abs(sc),1)+'% '+(sc>=0?'above':'below')+' today'},
+            {label:'Area rank',pts:rk==null?'\u2014':String(Math.round(rk))+' / 100',status:rk==null?'info':rk>=80?'pass':rk>=50?'partial':'fail',
+             why:rk==null?'needs about 18 months of prices':'that gap is bigger than on '+Math.round(rk)+'% of days in the last two years'}]});
+  }
+  if(hasValueData(s)){
+    var vs=Math.round(Number(s.valueScore||0));
+    T.push({id:'value',label:'Value',val:String(vs),col:vs>=80?'var(--gn)':vs>=65?'var(--bl)':vs>=50?'#d97706':'var(--t3)',
+      note:'Cheapness, quality, growth, dividend and nearness to the 52-week low.'+(s.valueRating?' Rating: '+s.valueRating+'.':''),
+      rows:scoreRowsFromValue(s.valueScoreReport)});
+  }
+  var vf=valueFloor(s);
+  if(vf){
+    if(vf.floor){
+      var pr=vf.prem;
+      T.push({id:'floor',label:'Floor',val:(pr>=0?'+':'\u2212')+Math.round(Math.abs(pr))+'%',col:pr<=25?'var(--gn)':pr<=100?'var(--t2)':'var(--t3)',
+        note:'What the shares are worth at the least, and how far the price sits above it.',
+        rows:[{label:'Book value',pts:vf.book>0?fmt(vf.book):'\u2014',status:vf.basis==='book'?'pass':'info',why:'net assets per share in the accounts'+(vf.basis==='book'?' — the higher, so the floor':'')},
+              {label:'No-growth value',pts:vf.earn>0?fmt(vf.earn):'\u2014',status:vf.basis==='earnings'?'pass':'info',why:'a year\u2019s profit (the lower of profit and free cash flow) \u00f7 10%'+(vf.basis==='earnings'?' — the higher, so the floor':'')},
+              {label:'Price vs floor',pts:(pr>=0?'+':'\u2212')+Math.round(Math.abs(pr))+'%',status:pr<=25?'pass':pr<=100?'partial':'fail',why:'the price is '+Math.round(Math.abs(pr))+'% '+(pr>=0?'above':'below')+' the floor of '+fmt(vf.floor)}]});
+    }else if(vf.excluded){
+      T.push({id:'floor',label:'Floor',val:'\u2014',col:'var(--t3)',note:'No value floor: '+vf.excluded+'.',rows:[]});
+    }
+  }
+  var ts=trendStackScore(s);
+  var part=function(label,v,max){var pct=trendSlopePct(s,v),got=Math.round(trendStackPartScore(s,v,max));
+    return {label:label,pts:'+'+got+' / '+max,status:pct==null?'fail':got>=max*0.9?'pass':got>0?'partial':'fail',
+      why:pct==null?'no slope in this scan':'slope '+(pct>0?'+':'')+fmt(pct,3)+'% a day'+(pct<=0?(pct>=-0.02?' — flat, a little credit':' — falling, no points'):'')}};
+  T.push({id:'trend',label:'Trend',val:String(ts),col:ts>=75?'var(--gn)':ts>=50?'#d97706':'var(--t3)',
+    note:'How many of the long and short averages are rising, weighted toward the long ones.',
+    rows:[part('200-day SMA',sma200SlopeValue(s),35),part('200-day EMA',ema200SlopeValue(s),25),part('50-day EMA',ema50SlopeValue(s),25),part('21-day EMA',ema21SlopeValue(s),15)]});
+  if(s.styleScoreReport){
+    var srows=[];
+    String(s.styleScoreReport).split('\n').forEach(function(line){var p=line.split('|');if(p.length<3)return;var v=Number(p[1]);
+      srows.push({label:p[0].replace(/ suitability/i,''),pts:String(Math.round(v))+' / 100',status:v>=70?'pass':v>=50?'partial':'fail',why:p.slice(2).join('|')})});
+    var sw=srows[0]?Math.round(Number(srows[0].pts.split(' ')[0])):0;
+    T.push({id:'style',label:'Style',val:srows.map(function(r){return r.pts.split(' ')[0]}).join('/'),col:'var(--t2)',
+      note:'How well the stock suits swing trading and long-term holding.',rows:srows});
+  }
+  if(isHolding){
+    var ps=s.profitScore||0,cs=s.protectScore||0;
+    T.push({id:'profit',label:'Profit',val:ps+'/58',col:ps>=35?'#f97316':'var(--t3)',
+      note:'Profit booking: 35 or more says take some profit.'+(s.sellIntent?' Verdict: '+s.sellIntent+'.':''),rows:[]});
+    T.push({id:'protect',label:'Protect',val:cs+'/58',col:cs>=35?'#eab308':'var(--t3)',
+      note:'Capital protection: 35 or more says the trend has broken — protect the money.',rows:[]});
+  }
+  return T;
+}
+function scoreTabsHtml(s,isHolding,startId){
+  var T=scoreTabsFor(s,isHolding);
+  var uid='sct-'+(s.symbol||'x').replace(/[^a-zA-Z0-9]/g,'_');
+  var start=0;T.forEach(function(t,i){if(t.id===startId)start=i});
+  var h='<div style="margin-bottom:14px">';
+  h+='<div id="'+uid+'-chips" style="display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding:2px 0 8px">';
+  T.forEach(function(t,i){
+    h+='<span data-col="'+t.col+'" onclick="scoreTabGo(\''+uid+'\','+i+')" style="flex:0 0 auto;cursor:pointer;padding:5px 10px;border-radius:14px;font-size:10px;font-weight:700;white-space:nowrap;'+
+      'border:1px solid '+(i===start?t.col:'var(--bd)')+';background:'+(i===start?'var(--cd)':'transparent')+';color:'+(i===start?t.col:'var(--t3)')+'">'+
+      escHtml(t.label)+' <b style="font-family:monospace;color:'+t.col+'">'+escHtml(t.val)+'</b></span>';
+  });
+  h+='</div>';
+  h+='<div id="'+uid+'-track" data-start="'+start+'" onscroll="scoreTabSync(\''+uid+'\')" style="display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;-webkit-overflow-scrolling:touch;align-items:flex-start">';
+  T.forEach(function(t){
+    h+='<div style="flex:0 0 100%;box-sizing:border-box;scroll-snap-align:start;padding:10px;background:var(--cd);border:1px solid var(--bd);border-radius:8px">';
+    h+='<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px"><b style="font-size:11px;color:'+t.col+'">'+escHtml(t.label)+'</b>'+
+       '<span style="font-size:20px;font-weight:800;font-family:monospace;color:'+t.col+'">'+escHtml(t.val)+'</span></div>';
+    h+='<div style="font-size:9px;color:var(--t3);line-height:1.45;margin-bottom:6px">'+escHtml(t.note||'')+'</div>';
+    if(t.rows&&t.rows.length)h+=scoreRowsHtml(t.rows);
+    else if(t.id!=='floor')h+='<div style="font-size:9px;color:var(--t3)">No per-part breakdown is stored for this score.</div>';
+    h+='</div>';
+  });
+  h+='</div></div>';
+  return h;
+}
+function scoreTabGo(uid,i,instant){
+  var t=document.getElementById(uid+'-track');if(!t||!t.children[i])return;
+  var x=t.children[i].offsetLeft-t.children[0].offsetLeft;
+  if(instant)t.scrollLeft=x;else try{t.scrollTo({left:x,behavior:'smooth'})}catch(e){t.scrollLeft=x}
+  scoreTabMark(uid,i);
+}
+function scoreTabSync(uid){
+  var t=document.getElementById(uid+'-track');if(!t||!t.children.length)return;
+  var w=t.children[0].offsetWidth+8;
+  scoreTabMark(uid,Math.max(0,Math.min(t.children.length-1,Math.round(t.scrollLeft/w))));
+}
+function scoreTabMark(uid,i){
+  var c=document.getElementById(uid+'-chips');if(!c)return;
+  Array.prototype.forEach.call(c.children,function(ch,j){
+    var on=j===i,col=ch.getAttribute('data-col')||'var(--t2)';
+    ch.style.borderColor=on?col:'var(--bd)';ch.style.background=on?'var(--cd)':'transparent';ch.style.color=on?col:'var(--t3)';
+  });
+  var a=c.children[i];
+  if(a){var l=a.offsetLeft-c.offsetLeft;if(l<c.scrollLeft||l+a.offsetWidth>c.scrollLeft+c.clientWidth)c.scrollLeft=Math.max(0,l-20)}
+}
+// After the page is drawn: open on the chosen card without a visible scroll.
+function scoreTabsSettle(){
+  Array.prototype.forEach.call(document.querySelectorAll('[id$="-track"][data-start]'),function(t){
+    var n=Number(t.getAttribute('data-start')||0);
+    if(n>0)scoreTabGo(t.id.replace(/-track$/,''),n,true);
+  });
+}
 function renderPointBreakdown(title,score,signal,report,color){
   if(!report)return '';
   var h='<div style="margin-top:8px">';
@@ -17720,21 +17888,10 @@ function showDetail(idx,focus){
   // this stock — burying that under four screens of indicators would put the
   // reading above the decision.
   b+=detailTradeBlock(s);
-  // Score boxes — portfolio: buy + profit + protect; discovery: buy only
+  // Every score as a swipeable card — see scoreTabsHtml. Holdings also get
+  // profit booking and capital protection.
   var isPortfolioStock=!!s._t212||PORTFOLIO.holdings.some(function(h){return h.symbol===s.symbol||h.symbol===s.symbol.replace('.NS','')});
-  b+='<div style="display:flex;gap:8px;margin-bottom:14px">';
-  var pbScore=pullbackScoreValue(s),moScore=momentumScoreValue(s);
-  var pbCol=pbScore>=75?'var(--bl)':pbScore>=60?'#fbbf24':'var(--t3)';
-  var moCol=moScore>=75?'var(--gn)':moScore>=60?'#fbbf24':'var(--t3)';
-  b+='<div style="flex:1;padding:12px;background:rgba(37,99,235,.08);border-radius:8px;text-align:center"><div style="font-size:8px;font-weight:700;color:'+pbCol+';letter-spacing:.4px">PULLBACK POINTS</div><div style="font-size:32px;font-weight:800;font-family:monospace;color:'+pbCol+'">'+pbScore+'</div><div style="font-size:9px;color:'+pbCol+';font-weight:600">'+escHtml(s.pullbackSignal||'')+'</div></div>';
-  b+='<div style="flex:1;padding:12px;background:var(--gg);border-radius:8px;text-align:center"><div style="font-size:8px;font-weight:700;color:'+moCol+';letter-spacing:.4px">MOMENTUM POINTS</div><div style="font-size:32px;font-weight:800;font-family:monospace;color:'+moCol+'">'+moScore+'</div><div style="font-size:9px;color:'+moCol+';font-weight:600">'+escHtml(s.momentumSignal||'')+'</div></div>';
-  if(isPortfolioStock){
-    var pCol=s.profitScore>=35?'#f97316':'var(--t3)';
-    b+='<div style="flex:1;padding:12px;background:rgba(249,115,22,.08);border-radius:8px;text-align:center"><div style="font-size:8px;font-weight:700;color:'+pCol+';letter-spacing:.4px">PROFIT BOOKING</div><div style="font-size:32px;font-weight:800;font-family:monospace;color:'+pCol+'">'+(s.profitScore||0)+'</div><div style="font-size:9px;color:'+pCol+';font-weight:600">/58</div></div>';
-    var cCol=s.protectScore>=35?'#eab308':'var(--t3)';
-    b+='<div style="flex:1;padding:12px;background:rgba(234,179,8,.08);border-radius:8px;text-align:center"><div style="font-size:8px;font-weight:700;color:'+cCol+';letter-spacing:.4px">CAPITAL PROTECTION</div><div style="font-size:32px;font-weight:800;font-family:monospace;color:'+cCol+'">'+(s.protectScore||0)+'</div><div style="font-size:9px;color:'+cCol+';font-weight:600">/58</div></div>';
-  }
-  b+='</div>';
+  b+=scoreTabsHtml(s,isPortfolioStock,focus==='value'?'value':'');
 
   // Discovery stocks in the T212 spaces (US/DE) are all buyable — the manual
   // order card resolves ANY symbol against T212's full instrument list, not
@@ -17891,23 +18048,7 @@ function showDetail(idx,focus){
     b+='</div>';
   }catch(e){console.error('wl badge',e)}
 
-  // ── BUY SCORE BREAKDOWN ("Why this score?") ───────────────────────────
-  // Parses the pipe-delimited buyScoreReport string built by StockAnalyzer.kt
-  // into a colored per-bucket table. Toggled by an "ⓘ" badge so the modal
-  // stays compact by default — power-users / calibration mode opens it.
-  var pbReport=s.pullbackScoreReport||s.buyScoreReport||'';
-  var moReport=s.momentumScoreReport||'';
-  if(pbReport||moReport){
-    var bsId2='bsr-'+(s.symbol||'x').replace(/[^a-zA-Z0-9]/g,'_');
-    b+='<div style="margin-bottom:10px;text-align:center">';
-    b+='<span onclick="toggleScoreBreakdown(\''+bsId2+'\')" style="display:inline-block;padding:5px 12px;background:rgba(34,197,94,0.10);border:1px solid rgba(34,197,94,0.40);border-radius:14px;color:var(--gn);cursor:pointer;font-size:10px;font-weight:700" title="See per-bucket point breakdown">ⓘ Why these points?</span>';
-    b+='</div>';
-    b+='<div id="'+bsId2+'" style="display:none;margin-bottom:14px;padding:10px;background:var(--cd);border:1px solid var(--bd);border-radius:8px">';
-    b+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px;line-height:1.5">Per-bucket trace from the live scoring run. Green = fully earned, amber = partial, red = 0 points.</div>';
-    b+=renderPointBreakdown('Pullback Points',pullbackScoreValue(s),s.pullbackSignal||'',pbReport,'var(--bl)');
-    b+=renderPointBreakdown('Momentum Points',momentumScoreValue(s),s.momentumSignal||'',moReport,'var(--gn)');
-    b+='</div>';
-  }
+  // (The pullback and momentum breakdowns now live in the score cards at the top.)
   if(false&&s.buyScoreReport && s.buyScoreReport.length>0){
     var bsId='bsr-'+(s.symbol||'x').replace(/[^a-zA-Z0-9]/g,'_');
     b+='<div style="margin-bottom:10px;text-align:center">';
@@ -18209,15 +18350,11 @@ function showDetail(idx,focus){
   b+=dEnd;
 
   document.getElementById('modal-body').innerHTML=b;
+  setTimeout(scoreTabsSettle,0);
   detSectionBind();
   document.getElementById('modal').classList.add('show');
-  if(focus==='value'){
-    setTimeout(function(){
-      var pane=document.getElementById('value-analysis-panel');
-      var scroller=document.querySelector('#modal .moc');
-      if(pane&&scroller)scroller.scrollTop=Math.max(0,pane.offsetTop-10);
-    },0);
-  }
+  // Opened from a Value cell: the score cards at the top open on the Value card
+  // (scoreTabsHtml), so there is no longer a jump down to the value section.
 
   // Auto-trigger pullback analysis if deep pullback detected (skip if cached)
   if(emaDist<-3&&hasAi&&!(AI_CACHE[s.symbol]&&AI_CACHE[s.symbol].pullback)){
