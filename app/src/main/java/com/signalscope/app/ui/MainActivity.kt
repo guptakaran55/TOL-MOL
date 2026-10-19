@@ -6833,6 +6833,14 @@ class MainActivity : AppCompatActivity() {
             gson.toJson(syms)
         } catch (e: Exception) { "[]" }
 
+        /** An algo's unfulfilled buys — real buys that failed for good — and what each
+         *  would have made by the algo's own rules. No network. */
+        @JavascriptInterface
+        fun unfulfilledEntries(ns: String): String = try {
+            gson.toJson(mapOf("ok" to true,
+                "rows" to com.signalscope.app.trading.UnfulfilledEntries.forNs(applicationContext, ns)))
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
+
         /** Price feeds judged stopped ("CRZK.DE") — the value floor leaves them out. No network. */
         @JavascriptInterface
         fun stoppedFeeds(): String = try {

@@ -125,6 +125,12 @@ object ManualIntervention {
         // it the next pass replays the same candles and re-creates the trade it just
         // deleted. With it, the symbol flat-starts if the gate ever re-seats it.
         val hadPaper = paperOpen != null
+        // A position whose real buy never filled was never in the account: "sold
+        // by you" would be untrue. (Such buys are normally moved out of the book on
+        // their own — see [UnfulfilledEntries].)
+        val neverBought = live == null && paperOpen != null && T212LiveStore.load(ctx).trades.any {
+            it.ns == ns && it.paperTradeId == paperOpen.id && it.liveQtyFilled <= 0.0 && it.qty <= 0.0
+        }
         StrategyLabStore.unenroll(ctx, sym, ns)
 
         // ── 4. Hand the seat on, keeping its capital. Capital is deliberately NOT
@@ -137,7 +143,8 @@ object ManualIntervention {
             val st = MacdGateStore.load(ctx, ns)
             if (st.enabled && st.slots.any { it.symbol?.equals(sym, true) == true }) {
                 seatTo = MacdGateEngine.handOn(ctx, ns, sym,
-                    "sold by you — paper trade dropped (${"%+.2f".format(discarded)}% discarded)")
+                    (if (neverBought) "real buy never filled" else "sold by you") +
+                        " — paper trade dropped (${"%+.2f".format(discarded)}% discarded)")
                 seatFreed = true
             }
         } catch (e: Exception) { Log.w(TAG, "seat release failed", e) }

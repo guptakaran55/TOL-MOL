@@ -12853,6 +12853,7 @@ function algosDetail(b){
   h+=algosWhatIf(ns);
   h+=algosGate(ns);
   h+=algosLedger(ns,ledgerData);
+  h+=algosUnfulfilled(ns);
   h+='<div style="display:flex;gap:8px;justify-content:space-between;align-items:center;margin-top:4px">';
   h+='<span style="display:flex;gap:12px;align-items:center">';
   h+='<span onclick="algosDelete(\''+ns+'\',\''+escHtml(b.name).replace(/\x27/g,"")+'\')" style="cursor:pointer;font-size:10px;color:var(--rd);font-weight:700">🗑 Delete</span>';
@@ -13851,6 +13852,38 @@ function algosGate(ns){
 // always visible, so they are not duplicated in two places under two names.
 // [pre] lets algosCard pass the ledger it already fetched instead of a second
 // bridge call for the same file.
+// ── UNFULFILLED: REAL BUYS THAT COULD NOT ENTER, AND WHAT THEY WOULD HAVE MADE ──
+// Taken out of the book so the seat goes on at once; kept here with the reason,
+// and followed with the algo's own exits — the cost (or saving) of missing them.
+function algosUnfulfilled(ns){
+  if(typeof Android==='undefined'||!Android.unfulfilledEntries)return '';
+  var rows=[];try{rows=(JSON.parse(Android.unfulfilledEntries(ns)||'{}').rows)||[]}catch(e){}
+  if(!rows.length)return '';
+  var known=rows.filter(function(r){return r.shadowPct!=null&&isFinite(r.shadowPct)});
+  var sumPct=known.reduce(function(a,r){return a+Number(r.shadowPct)},0);
+  var sumMoney=known.reduce(function(a,r){return a+Number(r.shadowPct)/100*Number(r.amount||0)},0);
+  var col=function(v){return v>=0?'var(--gn)':'var(--rd)'};
+  var pct=function(v){return (v>=0?'+':'\u2212')+Math.abs(Number(v)).toFixed(2)+'%'};
+  var when=function(ms){var d=new Date(ms);return d.toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'})+' '+('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)};
+  var cur=/^us/.test(ns)?'$':'\u20ac';
+  var h='<details data-dk="alg-unf-'+ns+'" style="margin-bottom:8px"><summary style="cursor:pointer;font-size:9px;font-weight:800;color:var(--t2)">\u26D4 UNFULFILLED \u00b7 '+rows.length+' missed buy'+(rows.length===1?'':'s')+
+    (known.length?' \u00b7 would have made <span style="color:'+col(sumPct)+'">'+pct(sumPct)+'</span>'+(sumMoney?' <span style="color:'+col(sumMoney)+'">('+(sumMoney>=0?'+':'\u2212')+cur+Math.abs(sumMoney).toFixed(2)+')</span>':''):'')+'</summary>';
+  h+='<div style="font-size:9px;color:var(--t3);margin:4px 2px 6px;line-height:1.5">Real buys that could not enter. Taken out of the book so the seat goes on; followed here with the algo\u2019s own exits.</div>';
+  rows.forEach(function(r){
+    var v=r.shadowPct, st=r.shadowStatus;
+    var made=(v==null||!isFinite(v))?'<span style="color:var(--t3)">'+(st==='UNKNOWN'?'not known \u2014 '+escHtml(r.shadowNote||''):'checked at the next pass')+'</span>'
+      :st==='OPEN'?'<b style="color:'+col(v)+'">'+pct(v)+'</b> so far \u00b7 would still be held'
+      :'<b style="color:'+col(v)+'">'+pct(v)+'</b> \u00b7 would have sold '+(r.shadowExitTs?when(r.shadowExitTs*1000):'')+(r.shadowExitReason?' \u00b7 '+escHtml(r.shadowExitReason):'');
+    h+='<div style="border:1px solid var(--bd);border-left:3px solid var(--am);border-radius:6px;background:var(--cd);padding:6px 8px;margin-bottom:5px;font-size:9px;line-height:1.5">'+
+      '<div style="display:flex;gap:6px;align-items:baseline"><b style="font-size:11px;color:var(--t1)">'+escHtml(r.symbol)+'</b>'+
+        '<span style="color:var(--t3)">'+when(r.decidedAt)+' \u00b7 signal '+Number(r.signalPrice||0).toFixed(2)+(r.amount?' \u00b7 '+cur+Number(r.amount).toFixed(0):'')+'</span></div>'+
+      '<div style="color:var(--t2)"><b>Why not:</b> '+escHtml(r.reason||'')+'</div>'+
+      '<div style="color:var(--t2)"><b>Would have made:</b> '+made+'</div>'+
+      '<div style="color:var(--t3)">'+escHtml(r.paperWas||'')+(r.seatTo?' \u00b7 seat \u2192 '+escHtml(r.seatTo):'')+'</div>'+
+      '</div>';
+  });
+  return h+'</details>';
+}
 function algosLedger(ns,pre){
   var r=pre;
   if(!r){try{r=JSON.parse(Android.bucketLedger(ns)||'{}')}catch(e){return ''}}

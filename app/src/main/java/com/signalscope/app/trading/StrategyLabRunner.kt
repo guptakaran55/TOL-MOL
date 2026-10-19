@@ -1521,6 +1521,47 @@ object StrategyLabRunner {
         }
     }
 
+    /** What a trade the algo could not keep would have made — see [shadowTrade]. */
+    data class Shadow(val ok: Boolean, val open: Boolean = false, val pct: Double = 0.0,
+                      val exitTs: Long = 0L, val exitPrice: Double = 0.0, val exitReason: String = "",
+                      val note: String = "")
+
+    /**
+     * A BUY THE ACCOUNT MISSED, FOLLOWED ON BY THE ALGO'S OWN RULES.
+     *
+     * Replays [symbol] on the same feed and config a pass uses, starting flat at
+     * the bar the algo bought on ([entryTs]), and reads the trade that opens
+     * there: still open (with its mark) or closed (with its exit and reason).
+     * Read-only — nothing is booked. For [UnfulfilledEntries].
+     */
+    fun shadowTrade(ctx: Context, ns: String, symbol: String, entryTs: Long): Shadow {
+        val sym = symbol.trim().uppercase()
+        if (sym.isBlank() || entryTs <= 0L) return Shadow(false, note = "no entry to follow")
+        return try {
+            val cfg = StrategyLabStore.activeConfig(ctx, ns)
+            val plan = FeedPlan.plan(cfg, ns)
+            if (!plan.ok) return Shadow(false, note = "feed unusable")
+            val res = fetchCandlesFor(ctx, ns, sym, Spaces.exchangeOf(ns), plan)
+            if (res !is YahooFinanceClient.CandleResult.Success) return Shadow(false, note = "no price data")
+            val nowSec = System.currentTimeMillis() / 1000
+            val closed = res.candles.filter {
+                FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
+            }
+            val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
+            if (candles.size < 50) return Shadow(false, note = "warming up")
+            val run = StrategyLabEngine.runLiveClosed(sym, candles, cfg, plan.sourceSec, entryTs)
+            if (run.error != null) return Shadow(false, note = run.error!!)
+            val t = run.trades.firstOrNull { it.entryTs == entryTs }
+                ?: return Shadow(false, note = "the strategy no longer reproduces this entry")
+            if (t.status == "OPEN") Shadow(true, open = true, pct = t.pctReturn)
+            else Shadow(true, open = false, pct = t.pctReturn, exitTs = t.exitTs ?: 0L,
+                exitPrice = t.exitPrice ?: 0.0, exitReason = t.exitReason)
+        } catch (e: Exception) {
+            Log.w(TAG, "[$ns] $sym shadow replay failed", e)
+            Shadow(false, note = e.message ?: "replay failed")
+        }
+    }
+
     /**
      * Completed, cleaned bars for [symbol] on the feed a given config needs — the
      * same planning, provider choice, delay and cleaning a pass uses — for an

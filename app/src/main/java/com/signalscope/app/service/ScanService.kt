@@ -736,6 +736,12 @@ class ScanService : Service() {
             val hs = com.signalscope.app.trading.T212HandSales.sweep(applicationContext)
             if (hs.isNotBlank()) Log.i(TAG, "Hand sales: $hs")
         } catch (e: Exception) { Log.w(TAG, "hand-sale sweep failed: ${e.message}") }
+        // REAL BUYS THAT FAILED FOR GOOD: out of the book with the seat handed on,
+        // and followed in each algo's Unfulfilled list with what they would have made.
+        try {
+            val uf = com.signalscope.app.trading.UnfulfilledEntries.sweep(applicationContext)
+            if (uf.isNotBlank()) Log.i(TAG, "Unfulfilled: $uf")
+        } catch (e: Exception) { Log.w(TAG, "unfulfilled sweep failed: ${e.message}") }
         // …and the same for India's algos, priced from the day's Zerodha fills.
         try {
             val hz = com.signalscope.app.trading.ZerodhaHandSales.sweep(applicationContext)
