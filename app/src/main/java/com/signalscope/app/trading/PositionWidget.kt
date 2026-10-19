@@ -51,6 +51,48 @@ class PositionWidget : AppWidgetProvider() {
         /** The refresh finished (or failed) — back to the "updated HH:MM" line. */
         fun clearRefreshing() { refreshingSince = 0L }
 
+        private val TILE_TXT = intArrayOf(R.id.wp_ix0_txt, R.id.wp_ix1_txt, R.id.wp_ix2_txt)
+        private val TILE_IMG = intArrayOf(R.id.wp_ix0_img, R.id.wp_ix1_img, R.id.wp_ix2_img)
+
+        /**
+         * One tile per index, in [IndexStrip.INDICES] order: "DAX +0.42%", the
+         * change in green or red, and the session's line. A session that is not
+         * today on its own exchange's clock (a weekend, a holiday, before the
+         * open) says which day it is, so an old line never passes for a live one.
+         * Empty until the first reading has arrived; an index with no reading yet
+         * shows its name and a dash rather than hiding the other two.
+         */
+        private fun indexTiles(ctx: Context): List<Pair<CharSequence, android.graphics.Bitmap?>> {
+            val st = IndexStrip.latest(ctx) ?: return emptyList()
+            val dm = ctx.resources.displayMetrics
+            val w = (110 * dm.density).toInt()
+            val h = (20 * dm.density).toInt()
+            if (st.readings.isEmpty()) return emptyList()
+            return IndexStrip.INDICES.take(3).map { ix ->
+                val r = st.readings.firstOrNull { it.key == ix.key }
+                    ?: return@map ("${ix.label} —" as CharSequence) to null
+                val sb = android.text.SpannableStringBuilder(r.label).append(' ')
+                val pct = String.format(java.util.Locale.US, "%+.2f%%", r.pct).replace('-', '−')
+                val from = sb.length
+                sb.append(pct)
+                sb.setSpan(android.text.style.ForegroundColorSpan(
+                    if (r.pct >= 0.0) 0xFF34D399.toInt() else 0xFFF87171.toInt()), from, sb.length, 0)
+                sb.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), from, sb.length, 0)
+                val zone = MarketHours.zoneOf(ix.space) ?: java.time.ZoneId.of("UTC")
+                val today = java.time.LocalDate.now(zone).toString()
+                if (r.day.isNotEmpty() && r.day != today) {
+                    val wd = try {
+                        java.time.LocalDate.parse(r.day).dayOfWeek
+                            .getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.UK)
+                    } catch (e: Exception) { r.day }
+                    val f2 = sb.length
+                    sb.append(" ").append(wd)
+                    sb.setSpan(android.text.style.ForegroundColorSpan(0x99FFFFFF.toInt()), f2, sb.length, 0)
+                }
+                (sb as CharSequence) to IndexStrip.sparkline(r, w, h, dm.density)
+            }
+        }
+
         /** Redraw every placed copy of the widget. A no-op when none is placed. */
         fun update(ctx: Context, s: PositionRadar.Summary?) {
             try {
@@ -79,8 +121,17 @@ class PositionWidget : AppWidgetProvider() {
             // A refresh that never reported back (the app was killed mid-way) must
             // not leave the widget saying "refreshing…" for ever.
             val busy = refreshingSince > 0L && System.currentTimeMillis() - refreshingSince < 3 * 60_000L
+            val markets = indexTiles(ctx)
             for (id in ids) {
                 val v = RemoteViews(ctx.packageName, R.layout.widget_positions)
+                if (markets.isEmpty()) v.setViewVisibility(R.id.wp_indices, View.GONE)
+                else {
+                    v.setViewVisibility(R.id.wp_indices, View.VISIBLE)
+                    markets.forEachIndexed { i, (text, img) ->
+                        v.setTextViewText(TILE_TXT[i], text)
+                        if (img != null) v.setImageViewBitmap(TILE_IMG[i], img)
+                    }
+                }
                 v.setOnClickPendingIntent(R.id.wp_root, open)
                 v.setOnClickPendingIntent(R.id.wp_refresh, refresh)
                 v.setTextViewText(R.id.wp_time, if (busy) "refreshing…" else s?.let {

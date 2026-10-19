@@ -65,6 +65,79 @@
         android:maxLines="2"
         android:ellipsize="end" />
 
+    <!-- THE MARKETS TODAY: DAX, Sensex and Nasdaq-100 — the day's change and a
+         tiny line of the session, dashed at the previous close. -->
+    <LinearLayout
+        android:id="@+id/wp_indices"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:orientation="vertical">
+            <TextView
+                android:id="@+id/wp_ix0_txt"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#E6FFFFFF"
+                android:textSize="10sp"
+                android:singleLine="true" />
+            <ImageView
+                android:id="@+id/wp_ix0_img"
+                android:layout_width="match_parent"
+                android:layout_height="20dp"
+                android:scaleType="fitXY"
+                android:contentDescription="DAX today" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:orientation="vertical">
+            <TextView
+                android:id="@+id/wp_ix1_txt"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#E6FFFFFF"
+                android:textSize="10sp"
+                android:singleLine="true" />
+            <ImageView
+                android:id="@+id/wp_ix1_img"
+                android:layout_width="match_parent"
+                android:layout_height="20dp"
+                android:scaleType="fitXY"
+                android:contentDescription="Sensex today" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+            <TextView
+                android:id="@+id/wp_ix2_txt"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#E6FFFFFF"
+                android:textSize="10sp"
+                android:singleLine="true" />
+            <ImageView
+                android:id="@+id/wp_ix2_img"
+                android:layout_width="match_parent"
+                android:layout_height="20dp"
+                android:scaleType="fitXY"
+                android:contentDescription="Nasdaq-100 today" />
+        </LinearLayout>
+    </LinearLayout>
+
     <ListView
         android:id="@+id/wp_list"
         android:layout_width="match_parent"

@@ -593,6 +593,9 @@ class ScanService : Service() {
         try { com.signalscope.app.trading.PositionWidget.markRefreshing(applicationContext) } catch (_: Exception) {}
         serviceScope.launch {
             try {
+                // The markets strip too, fresh — the tap asked for the picture as it is now.
+                try { com.signalscope.app.trading.IndexStrip.refresh(applicationContext, force = true) }
+                catch (e: Exception) { Log.w(TAG, "index strip failed: ${e.message}") }
                 com.signalscope.app.trading.PositionRadar.refresh(applicationContext, priceMaxAgeMs = 60_000L)
             } catch (e: Exception) {
                 Log.w(TAG, "widget refresh failed: ${e.message}")
@@ -814,6 +817,10 @@ class ScanService : Service() {
         // only; it places and cancels nothing.
         try {
             withContext(Dispatchers.IO) {
+                // DAX, Sensex and Nasdaq-100 for the widget's strip — three small
+                // requests, at most every ten minutes, drawn with the summary below.
+                try { com.signalscope.app.trading.IndexStrip.refresh(applicationContext) }
+                catch (e: Exception) { Log.w(TAG, "index strip failed: ${e.message}") }
                 com.signalscope.app.trading.PositionRadar.refresh(applicationContext)
             }
         } catch (e: Exception) { Log.w(TAG, "position summary failed: ${e.message}") }
