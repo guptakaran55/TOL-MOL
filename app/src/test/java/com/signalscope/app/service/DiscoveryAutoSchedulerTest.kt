@@ -10,7 +10,8 @@ import java.time.ZonedDateTime
  * WHEN EACH MARKET'S AUTOMATIC SCAN RUNS, and when a missed one is made up.
  * Germany at 09:17, once Xetra's delayed prices carry the open; the US a minute
  * after New York's bell (on New York's clock, so the weeks Europe and America
- * change clocks apart cannot move it off the open); India after its close.
+ * change clocks apart cannot move it off the open); India a minute after its
+ * own bell. Every market at its open.
  */
 class DiscoveryAutoSchedulerTest {
 
@@ -41,9 +42,17 @@ class DiscoveryAutoSchedulerTest {
         assertEquals(berlin(12, 9, 17), DiscoveryAutoScheduler.nextSlotMs("dax", berlin(9, 11, 0)))
     }
 
-    @Test fun `India still scans after its own close`() {
-        assertEquals(at("Asia/Kolkata", 2026, 10, 12, 16, 15),
-            DiscoveryAutoScheduler.nextSlotMs("nifty500", at("Asia/Kolkata", 2026, 10, 12, 9, 0)))
+    @Test fun `India scans a minute after its own open`() {
+        // 09:16 in India is 05:46 in Germany in summer.
+        assertEquals(at("Asia/Kolkata", 2026, 10, 12, 9, 16),
+            DiscoveryAutoScheduler.nextSlotMs("nifty500", at("Asia/Kolkata", 2026, 10, 12, 8, 0)))
+        assertEquals(berlin(12, 5, 46),
+            DiscoveryAutoScheduler.nextSlotMs("nifty500", at("Asia/Kolkata", 2026, 10, 12, 8, 0)))
+    }
+
+    @Test fun `a missed India scan is not made up after its close`() {
+        assertNull(DiscoveryAutoScheduler.owedAt("nifty500", at("Asia/Kolkata", 2026, 10, 12, 15, 45),
+            lastCompleteAt = at("Asia/Kolkata", 2026, 10, 9, 9, 40), lastTry = 0L, tries = 0))
     }
 
     // ── catching up a missed one ──

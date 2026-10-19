@@ -3312,9 +3312,13 @@ class ZerodhaAutoLoginReceiver : android.content.BroadcastReceiver() {
  * with Xetra three hours into the session — and every number read off them (a
  * stock's sheet, its MACD line) was as old as the scan.
  *
- * WHEN EACH ONE RUNS, and why they differ:
- *  • India, 16:15 IST — after the close. Unchanged: it was placed there so the
- *    day's candle is finished and the table is ready for the next morning.
+ * EVERY MARKET AT ITS OWN OPEN — the user's rule (19 Oct 2026): the table you
+ * buy from during the session should carry that session's opening trades.
+ *  • India, 09:16 IST — a minute after the bell. It used to run at 16:15, after
+ *    the close, so the day's candle was finished; but a table built the evening
+ *    before is a session old by the time you can act on it. The price data
+ *    arrives with next to no delay, as in the US. The scan takes about half an
+ *    hour (514 stocks), so it is complete by about 09:45.
  *  • Germany, 09:17 Berlin — as soon as the open is in the data. Xetra prices
  *    reach the app about a quarter of an hour late, so 09:17 is the first
  *    moment the day's opening trades are there to score.
@@ -3352,7 +3356,7 @@ object DiscoveryAutoScheduler {
     private val SLOTS = listOf(
         // India's request code is the one its single alarm always had, so the
         // alarm armed by the previous install is replaced rather than doubled.
-        Slot("nifty500", "NIFTY 500", "Asia/Kolkata", 16 * 60 + 15, 22 * 60, 0x5C0E,
+        Slot("nifty500", "NIFTY 500", "Asia/Kolkata", 9 * 60 + 16, 15 * 60 + 30, 0x5C0E,
             ScanService.ACTION_DISCOVERY_NIFTY500_AUTO),
         Slot("dax", "DAX 100", "Europe/Berlin", 9 * 60 + 17, 17 * 60 + 30, 0x5C0F,
             ScanService.ACTION_DISCOVERY_DAX_AUTO),
