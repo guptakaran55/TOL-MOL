@@ -378,24 +378,6 @@ class ZerodhaClient(private val config: ConfigManager) {
         data class Failure(val message: String) : GttListResult()
     }
 
-    // GTT Execution Analysis (for calibration insights)
-    data class GttExecutionStats(
-        val symbol: String,
-        val totalGtts: Int,
-        val executedCount: Int,
-        val activeCount: Int,
-        val cancelledCount: Int,
-        val executionRate: Double,  // executed / total
-        val avgTriggerDeviation: Double?  // avg difference between trigger and last price
-    )
-
-    data class GttExecutionSummary(
-        val bySymbol: List<GttExecutionStats>,  // per-stock breakdown
-        val totalGtts: Int,
-        val totalExecuted: Int,
-        val overallExecutionRate: Double
-    )
-
     sealed class GttModifyResult {
         data class Success(val id: Long, val newTriggerPrice: Double) : GttModifyResult()
         data class Failure(val message: String) : GttModifyResult()
@@ -465,62 +447,6 @@ class ZerodhaClient(private val config: ConfigManager) {
         } catch (e: Exception) {
             Log.e(TAG, "GTT fetch error", e)
             GttListResult.Failure(e.message ?: "Unknown error")
-        }
-    }
-
-    /**
-     * Analyze GTT execution history for trigger weight calibration.
-     * Returns per-symbol stats: execution rate, trigger accuracy, etc.
-     * Called from MainActivity to generate calibration insights.
-     */
-    fun analyzeGttExecutionHistory(): GttExecutionSummary? {
-        val result = fetchGttTriggers()
-        return when (result) {
-            is GttListResult.Success -> {
-                val gtts = result.triggers
-                if (gtts.isEmpty()) {
-                    return GttExecutionSummary(emptyList(), 0, 0, 0.0)
-                }
-
-                // Group by symbol and calculate stats
-                val bySymbol = gtts.groupBy { it.tradingsymbol }.map { (symbol, gttList) ->
-                    val executed = gttList.count { it.status == "triggered" }
-                    val active = gttList.count { it.status == "active" }
-                    val cancelled = gttList.count { it.status == "cancelled" || it.status == "expired" }
-
-                    // Calculate avg deviation between trigger price and last price
-                    // (indicates if trigger weights are hitting at expected levels)
-                    val deviations = gttList.mapNotNull { gtt ->
-                        if (gtt.status == "triggered") {
-                            val pctDev = ((gtt.lastPrice - gtt.triggerPrice) / gtt.triggerPrice * 100)
-                            pctDev
-                        } else null
-                    }
-                    val avgDeviation = if (deviations.isNotEmpty()) deviations.average() else null
-
-                    GttExecutionStats(
-                        symbol = symbol,
-                        totalGtts = gttList.size,
-                        executedCount = executed,
-                        activeCount = active,
-                        cancelledCount = cancelled,
-                        executionRate = if (gttList.isNotEmpty()) executed.toDouble() / gttList.size else 0.0,
-                        avgTriggerDeviation = avgDeviation
-                    )
-                }.sortedByDescending { it.executionRate }
-
-                val totalGtts = gtts.size
-                val totalExecuted = gtts.count { it.status == "triggered" }
-
-                GttExecutionSummary(
-                    bySymbol = bySymbol,
-                    totalGtts = totalGtts,
-                    totalExecuted = totalExecuted,
-                    overallExecutionRate = if (totalGtts > 0) totalExecuted.toDouble() / totalGtts else 0.0
-                )
-            }
-            is GttListResult.Expired,
-            is GttListResult.Failure -> null
         }
     }
 

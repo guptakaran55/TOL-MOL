@@ -5882,7 +5882,6 @@ function render(){
   if(STATE.tab==='watchlist')return renderWatchlist();
   if(STATE.tab==='value')return renderValue();
   if(STATE.tab==='sectors')return renderSectors();
-  if(STATE.tab==='gttcal')return renderGttCal();
 
   var stocks=STATE.data,tab=STATE.tab,cur=STATE.currency;
   if(tab==='setups')ensureSetupsDefaults();
@@ -6003,7 +6002,7 @@ function render(){
   // Algos tab only for German stocks (DE). US/IN excluded — T212 can't trade USD
   // for a EUR-resident account, so algo-trading there isn't usable. (Crypto has its
   // own tab bar and keeps Algos.)
-  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb,'tcp'],['sectors','Sectors',nSec,'tcb'],['gttcal','GTT Cal','','tcp']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
+  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb,'tcp'],['sectors','Sectors',nSec,'tcb']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
   tabs.forEach(function(t){
     var icon='';
     if(t[0]==='setups')icon='\uD83C\uDFAF ';
@@ -7043,7 +7042,7 @@ function renderWatchlist(){
   var entries=watchlistEntriesForSpace(SPACE);
   var cur=STATE.currency;
   // Tab strip — without it the user gets stranded on the watchlist tab with
-  // no way back. Same shape as renderGttCal / renderPortfolio.
+  // no way back. Same shape as renderPortfolio.
   var h=topBar();
   var stocks=STATE.data;
   var nT=stocks.length;
@@ -7056,7 +7055,7 @@ function renderWatchlist(){
   // Algos belongs in this strip wherever it exists: without it the watchlist tab
   // is a one-way trip in DE/BN/IN — and now that the manual candidates live here,
   // the 🔍 sends you to a chart whose algo you then cannot navigate back to.
-  var tabsW=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','🤖 Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPbW,'tcp'],['sectors','Sectors',nSecW,'tcb'],['gttcal','GTT Cal','','tcp']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
+  var tabsW=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','🤖 Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPbW,'tcp'],['sectors','Sectors',nSecW,'tcb']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
   tabsW.forEach(function(t){
     var icon='';if(t[0]==='setups')icon='🎯 ';if(t[0]==='value')icon='💰 ';if(t[0]==='sectors')icon='📈 ';if(t[0]==='pullback')icon='📉 ';
     h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+icon+t[1];
@@ -16869,7 +16868,7 @@ function renderPortfolio(){
   // with the same DE-only filter as the main bar (\u00A7render). Omitting it made the
   // tab vanish the moment you opened Portfolio, which read as a disappearing
   // feature rather than a different tab strip.
-  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb2,'tcp'],['sectors','Sectors',nSec2,'tcb'],['gttcal','GTT Cal','','tcp']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
+  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['algos','Algos',algosTabCount(),'tca'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb2,'tcp'],['sectors','Sectors',nSec2,'tcb']].filter(function(t){return t[0]!=='algos'||hasAlgosTab();});
   tabs.forEach(function(t){
     var icon='';if(t[0]==='setups')icon='\uD83C\uDFAF ';if(t[0]==='value')icon='\uD83D\uDCB0 ';if(t[0]==='sectors')icon='\uD83D\uDCC8 ';if(t[0]==='pullback')icon='\uD83D\uDCC9 ';if(t[0]==='algos')icon='\uD83E\uDD16 ';
     h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+icon+t[1];
@@ -17328,7 +17327,7 @@ function renderSectors(){
   // Tabs
   h+='<div class="tabs">';
   var nPb3=stocks.filter(pullbackFilter).length;
-  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb3,'tcp'],['sectors','Sectors',nSec,'tcb'],['gttcal','GTT Cal','','tcp']];
+  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb3,'tcp'],['sectors','Sectors',nSec,'tcb']];
   tabs.forEach(function(t){
     var icon='';if(t[0]==='setups')icon='\uD83C\uDFAF ';if(t[0]==='value')icon='\uD83D\uDCB0 ';if(t[0]==='sectors')icon='\uD83D\uDCC8 ';if(t[0]==='pullback')icon='\uD83D\uDCC9 ';
     h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+icon+t[1];
@@ -17413,7 +17412,7 @@ function renderValue(){
   h+='<div class="tabs">';
   var nSec3=sectorRowsHere().length;
   var nPb4=stocks.filter(pullbackFilter).length;
-  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb4,'tcp'],['sectors','Sectors',nSec3,'tcb'],['gttcal','GTT Cal','','tcp']];
+  var tabs=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPb4,'tcp'],['sectors','Sectors',nSec3,'tcb']];
   tabs.forEach(function(t){
     var icon='';if(t[0]==='setups')icon='\uD83C\uDFAF ';if(t[0]==='value')icon='\uD83D\uDCB0 ';if(t[0]==='sectors')icon='\uD83D\uDCC8 ';if(t[0]==='pullback')icon='\uD83D\uDCC9 ';
     h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+icon+t[1];
@@ -17479,106 +17478,6 @@ function renderValue(){
   }
 
   document.getElementById('app').innerHTML=h;
-}
-
-// GTT Calibration — execution metrics to improve trigger weights
-function renderGttCal(){
-  var h=topBar();
-  // Tab strip — without this the user lands on GTT Cal with no way back to
-  // any other tab, forcing app reopen. Mirrors the strip every other render
-  // function builds (renderPortfolio, renderValue, etc.).
-  var stocks=STATE.data;
-  var nT=stocks.length;
-  var nP=portfolioTabCount();
-  var nSe=stocks.filter(setupsFilter).length;
-  var nPbG=stocks.filter(pullbackFilter).length;
-  var nVG=stocks.filter(function(s){return s.valueScore>0}).length;
-  var nSecG=sectorRowsHere().length;
-  h+='<div class="tabs">';
-  var tabsG=[['discovery','Discovery',nT,'tcb'],['portfolio','Portfolio',nP,'tcp'],['watchlist','Watchlist',watchlistTabCount(),'tcp'],['setups','Setups',nSe,'tca'],['pullback','Pullback',nPbG,'tcp'],['sectors','Sectors',nSecG,'tcb'],['gttcal','GTT Cal','','tcp']];
-  tabsG.forEach(function(t){
-    var icon='';if(t[0]==='setups')icon='🎯 ';if(t[0]==='value')icon='💰 ';if(t[0]==='sectors')icon='📈 ';if(t[0]==='pullback')icon='📉 ';
-    h+='<div class="tab'+(STATE.tab===t[0]?' a':'')+'" onclick="setTab(\''+t[0]+'\')">'+icon+t[1];
-    if(t[2]!=='')h+='<span class="tc '+t[3]+'">'+t[2]+'</span>';
-    h+='</div>';
-  });
-  h+='</div>';
-  // GTT Cal is Zerodha-specific — show a clear placeholder in the US space
-  // instead of attempting a Zerodha API call that would either fail or leak
-  // IN-space GTT data into the T212 view.
-  if(isT212Space()){
-    h+='<div style="padding:32px 16px;text-align:center"><div style="font-size:24px;margin-bottom:8px">'+spaceFlag()+'</div><b style="color:var(--t1);font-size:13px">GTT Calibration is Zerodha-only</b>'+
-       '<div style="font-size:11px;color:var(--t2);max-width:280px;margin:12px auto 0;line-height:1.6">Trading 212 doesn\'t have native GTT/OCO orders, so this calibration view is N/A in this space. Tap the workspace flag to switch to India and see your Zerodha GTT execution rates.</div></div>';
-    document.getElementById('app').innerHTML=h;
-    return;
-  }
-  // Spinner lives INSIDE #gtt-result so it gets cleanly overwritten when the
-  // data injects. (Previously it sat outside and persisted forever after the
-  // data table rendered — visible in user screenshot 2026-04-29.)
-  h+='<div id="gtt-result" style="padding:8px"><div style="font-size:11px;color:var(--t2);line-height:1.5;text-align:center"><div class="sp" style="width:20px;height:20px;margin:20px auto;border-width:2px"></div><div>Fetching GTT execution history...</div></div></div>';
-  document.getElementById('app').innerHTML=h;
-
-  // Fetch GTT data from Kotlin
-  if(typeof Android!=='undefined'&&Android.fetchGttExecutionData){
-    // In the background — a slow Zerodha reply used to freeze the whole page.
-    androidAsync('fetchGttExecutionData',[],function(dataJson){
-    if(!document.getElementById('gtt-result'))return;   // moved on meanwhile
-    try{
-      var data=JSON.parse(dataJson);
-      if(data.error){
-        document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">'+data.error+'</div>';
-        return;
-      }
-
-      var h2='<div style="padding:8px">';
-      // Overall stats
-      h2+='<div style="background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:12px;margin-bottom:12px">';
-      h2+='<div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:8px">GTT EXECUTION SUMMARY</div>';
-      h2+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">';
-      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Total GTTs</div><div style="font-size:16px;font-weight:800;color:var(--t1)">'+data.totalGtts+'</div></div>';
-      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Executed</div><div style="font-size:16px;font-weight:800;color:var(--gn)">'+data.totalExecuted+'</div></div>';
-      h2+='<div style="text-align:center"><div style="font-size:8px;color:var(--t3);font-weight:700">Success Rate</div><div style="font-size:16px;font-weight:800;color:var(--bl)">'+data.overallExecutionRate+'%</div></div>';
-      h2+='</div></div>';
-
-      // Per-symbol breakdown
-      if(data.bySymbol.length>0){
-        h2+='<div style="font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.4px;margin-bottom:6px">BY SYMBOL (sorted by execution rate)</div>';
-        h2+='<div style="overflow-x:auto;-webkit-overflow-scrolling:touch">';
-        h2+='<table style="width:100%;font-size:10px">';
-        h2+='<thead><tr style="background:var(--bg2);font-weight:700">';
-        h2+='<th style="padding:6px 4px;text-align:left;color:var(--t3)">Symbol</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--t3)">Total</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--gn)">Executed</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--t3)">Active</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--rd)">Cancelled</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--bl)">Rate</th>';
-        h2+='<th style="padding:6px 4px;text-align:center;color:var(--am)">Avg Dev %</th>';
-        h2+='</tr></thead><tbody>';
-
-        data.bySymbol.forEach(function(stat){
-          h2+='<tr style="border-bottom:1px solid var(--bd)">';
-          h2+='<td style="padding:6px 4px;font-weight:700;color:var(--t1)">'+stat.symbol+'</td>';
-          h2+='<td style="padding:6px 4px;text-align:center">'+stat.totalGtts+'</td>';
-          h2+='<td style="padding:6px 4px;text-align:center;color:var(--gn);font-weight:700">'+stat.executedCount+'</td>';
-          h2+='<td style="padding:6px 4px;text-align:center">'+stat.activeCount+'</td>';
-          h2+='<td style="padding:6px 4px;text-align:center;color:var(--rd)">'+stat.cancelledCount+'</td>';
-          h2+='<td style="padding:6px 4px;text-align:center;color:var(--bl);font-weight:700">'+stat.executionRate+'%</td>';
-          h2+='<td style="padding:6px 4px;text-align:center;color:var(--am)">'+stat.avgTriggerDeviation+'</td>';
-          h2+='</tr>';
-        });
-        h2+='</tbody></table></div>';
-      }else{
-        h2+='<div style="text-align:center;color:var(--t3);padding:20px;font-size:11px">No GTT history available yet. GTTs will appear here once you place them in Zerodha.</div>';
-      }
-      h2+='</div>';
-      document.getElementById('gtt-result').innerHTML=h2;
-    }catch(e){
-      document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Error: '+e.message+'</div>';
-    }
-    });
-  }else{
-    document.getElementById('gtt-result').innerHTML='<div style="color:#dc2626;padding:12px;text-align:center;font-size:11px">Android bridge not available</div>';
-  }
 }
 
 // ===== DETAIL MODAL =====

@@ -1956,7 +1956,6 @@ class MainActivity : AppCompatActivity() {
                         "searchSymbolsForSpace" -> searchSymbolsForSpace(a[0].asString, a[1].asString)
                         "t212GermanRef" -> t212GermanRef(a[0].asString, a[1].asDouble)
                         "t212Fills" -> t212Fills(a[0].asInt)
-                        "fetchGttExecutionData" -> fetchGttExecutionData()
                         "macdLadder" -> macdLadderJson(a[0].asString, a[1].asString)
                         "floorRunNow" -> floorRunNow(a[0].asString)
                         "algoTakeProfit" -> gson.toJson(com.signalscope.app.trading.AlgoTakeProfit
@@ -8959,41 +8958,6 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun clearGttActivityLog() {
             com.signalscope.app.data.GttActivityLog.clear(applicationContext)
-        }
-
-        /** Fetch GTT execution history for calibration insights */
-        @JavascriptInterface
-        fun fetchGttExecutionData(): String {
-            return try {
-                val summary = com.signalscope.app.network.ZerodhaClient(config).analyzeGttExecutionHistory()
-                if (summary == null) {
-                    "{\"error\": \"Failed to fetch GTT data\"}"
-                } else {
-                    // Convert to JSON for JavaScript
-                    val json = org.json.JSONObject()
-                    json.put("totalGtts", summary.totalGtts)
-                    json.put("totalExecuted", summary.totalExecuted)
-                    json.put("overallExecutionRate", String.format("%.1f", summary.overallExecutionRate * 100))
-
-                    val bySymbolArray = org.json.JSONArray()
-                    summary.bySymbol.forEach { stat ->
-                        val obj = org.json.JSONObject()
-                        obj.put("symbol", stat.symbol)
-                        obj.put("totalGtts", stat.totalGtts)
-                        obj.put("executedCount", stat.executedCount)
-                        obj.put("activeCount", stat.activeCount)
-                        obj.put("cancelledCount", stat.cancelledCount)
-                        obj.put("executionRate", String.format("%.1f", stat.executionRate * 100))
-                        obj.put("avgTriggerDeviation", if (stat.avgTriggerDeviation != null) String.format("%.2f", stat.avgTriggerDeviation) else "—")
-                        bySymbolArray.put(obj)
-                    }
-                    json.put("bySymbol", bySymbolArray)
-                    json.toString()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "GTT execution data fetch failed", e)
-                "{\"error\": \"${e.message}\"}"
-            }
         }
 
         /** Called from detail modal — analyzes why a stock has pulled back */
