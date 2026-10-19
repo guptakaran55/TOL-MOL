@@ -1517,6 +1517,7 @@ function openNotificationList(){
   var r={entries:[]};
   try{r=JSON.parse(Android.notificationLog()||'{}')}catch(e){}
   NOTIF_LIST={entries:r.entries||[],seenAt:Number(r.seenAt||0)};
+  NOTIF_MARKET=null;
   try{Android.notificationSeen()}catch(e){}
   renderNotificationList();
   // The bell's count is now zero; redraw the bar under the sheet.
@@ -1575,30 +1576,89 @@ function notifClearAll(){
     renderNotificationList();
   });
 }
+// ── BY MARKET, AND COMPACT ─────────────────────────────────────────────────
+// Tabs per market over the list, opening on the market you are looking at. A
+// notification's market is where its tap leads (an algo, a holding, a chart),
+// or, failing that, the market its text names; the rest — warnings about the
+// whole Trading 212 account, say — are "Other". Each card is one block: the
+// open button sits in the right-hand column instead of a line of its own, and a
+// long message shows two lines until tapped.
+var NOTIF_MARKET=null;
+var NOTIF_MARKETS=[['all','All',''],['de','Germany','\uD83C\uDDE9\uD83C\uDDEA'],['us','US','\uD83C\uDDFA\uD83C\uDDF8'],
+  ['in','India','\uD83C\uDDEE\uD83C\uDDF3'],['binance','Crypto','\u20BF'],['other','Other','\u2699\uFE0F']];
+function notifMarket(e){
+  var l=(e&&e.link)||{};
+  var b=String(l.space||'').toLowerCase()||String(l.ns||'').toLowerCase().split('__')[0];
+  if(b==='de'||b==='us'||b==='in'||b==='binance')return b;
+  var t=String((e&&e.title)||'')+' '+String((e&&e.text)||'');
+  if(/\uD83C\uDDE9\uD83C\uDDEA|German|Xetra|\.DE\b/.test(t))return 'de';
+  if(/\uD83C\uDDEE\uD83C\uDDF3|India|NSE\b|Zerodha|NIFTY|\.NS\b/.test(t))return 'in';
+  if(/\uD83C\uDDFA\uD83C\uDDF8|\bUSA\b|NASDAQ|New York/.test(t))return 'us';
+  if(/crypto|Binance|USDC\b/i.test(t))return 'binance';
+  return 'other';
+}
+function notifFlag(m){for(var i=0;i<NOTIF_MARKETS.length;i++)if(NOTIF_MARKETS[i][0]===m)return NOTIF_MARKETS[i][2];return ''}
+function notifPick(m){NOTIF_MARKET=m;renderNotificationList()}
+function notifToggle(el){
+  var on=el.getAttribute('data-open')==='1';
+  el.setAttribute('data-open',on?'0':'1');
+  el.style.webkitLineClamp=on?'2':'unset';el.style.display=on?'-webkit-box':'block';
+}
+function notifOpenShort(l){
+  if(!l)return '';
+  if(l.ns)return 'algo';if(l.symbol)return 'chart';if(l.watchSymbol)return 'list';if(l.holding)return 'holding';if(l.tab)return 'open';
+  return '';
+}
 function renderNotificationList(){
   var es=NOTIF_LIST.entries||[];
-  var h='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'+
+  var counts={all:es.length},fresh={all:0};
+  es.forEach(function(e){var m=notifMarket(e);counts[m]=(counts[m]||0)+1;if(e.at>NOTIF_LIST.seenAt){fresh[m]=(fresh[m]||0)+1;fresh.all++}});
+  if(NOTIF_MARKET==null){var here=String(SPACE||'').toLowerCase();NOTIF_MARKET=counts[here]?here:'all'}
+  if(NOTIF_MARKET!=='all'&&!counts[NOTIF_MARKET])NOTIF_MARKET='all';
+  var h='<div style="position:sticky;top:-14px;margin:-14px -14px 0;padding:14px 14px 6px;background:var(--bg);z-index:1;border-bottom:1px solid var(--bd)">';
+  h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'+
     '<div style="font-size:14px;font-weight:800;flex:1">\uD83D\uDD14 Notifications</div>'+
     (es.length?'<span onclick="notifClearAll()" style="cursor:pointer;font-size:10px;color:var(--t3);border:1px solid var(--bd);border-radius:6px;padding:4px 9px">Clear</span>':'')+
     '<span onclick="closeNotificationList()" style="cursor:pointer;font-size:18px;color:var(--t2);padding:0 4px">\u2715</span></div>';
+  if(es.length){
+    h+='<div style="display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:2px">';
+    NOTIF_MARKETS.forEach(function(mk){
+      var n=counts[mk[0]]||0;if(mk[0]!=='all'&&!n)return;
+      var on=NOTIF_MARKET===mk[0],f=fresh[mk[0]]||0;
+      h+='<span onclick="notifPick(\''+mk[0]+'\')" style="flex:0 0 auto;cursor:pointer;padding:4px 10px;border-radius:14px;font-size:10px;font-weight:800;white-space:nowrap;'+
+        (on?'background:var(--pu);color:#fff;border:1px solid var(--pu)':'background:var(--cd);color:var(--t2);border:1px solid var(--bd)')+'">'+
+        (mk[2]?mk[2]+' ':'')+mk[1]+' <span style="opacity:.75;font-family:monospace">'+n+'</span>'+
+        (f?'<span style="display:inline-block;width:6px;height:6px;border-radius:3px;background:'+(on?'#fff':'var(--pu)')+';margin-left:4px;vertical-align:middle"></span>':'')+'</span>';
+    });
+    h+='</div>';
+  }
+  h+='</div>';
   if(!es.length){
     h+='<div style="font-size:11px;color:var(--t3);padding:24px 4px;text-align:center">Nothing yet. Every notification the app sends from now on is kept here for 30 days.</div>';
   }
   var lastDay='';
   es.forEach(function(e,i){
+    var m=notifMarket(e);
+    if(NOTIF_MARKET!=='all'&&m!==NOTIF_MARKET)return;
     var day=new Date(e.at).toDateString();
     if(day!==lastDay){
       lastDay=day;
-      h+='<div style="font-size:9px;font-weight:800;color:var(--t3);margin:10px 2px 4px;text-transform:uppercase;letter-spacing:.04em">'+escHtml(notifWhen(e.at).replace(/ \d\d:\d\d$/,''))+'</div>';
+      h+='<div style="font-size:9px;font-weight:800;color:var(--t3);margin:9px 2px 4px;text-transform:uppercase;letter-spacing:.04em">'+escHtml(notifWhen(e.at).replace(/ \d\d:\d\d$/,''))+'</div>';
     }
-    var fresh=e.at>NOTIF_LIST.seenAt, lab=notifOpenLabel(e.link);
-    h+='<div style="padding:8px 10px;margin-bottom:6px;border:1px solid '+(fresh?'rgba(124,58,237,.45)':'var(--bd)')+';border-radius:8px;background:'+(fresh?'rgba(124,58,237,.06)':'var(--cd)')+'">'+
-      '<div style="display:flex;gap:8px;align-items:baseline">'+
-        // A result in the title is coloured: a gain green, a loss red.
-        '<div style="flex:1;font-size:11px;font-weight:800;color:var(--t1)">'+escHtml(e.title||'').replace(/([+\-−])(\d+(?:\.\d+)?%)/,function(m,s){return '<span style="color:'+(s==='+'?'var(--gn)':'var(--rd)')+'">'+m+'</span>'})+'</div>'+
-        '<div style="font-size:9px;color:var(--t3);white-space:nowrap">'+escHtml(notifWhen(e.at).replace(/^(Today|Yesterday) /,''))+'</div></div>'+
-      (e.text?'<div style="font-size:10px;color:var(--t2);line-height:1.45;margin-top:3px;white-space:pre-wrap">'+escHtml(e.text)+'</div>':'')+
-      (lab?'<div style="margin-top:6px"><span onclick="notifOpen('+i+')" style="cursor:pointer;display:inline-block;font-size:10px;font-weight:800;color:var(--pu);border:1px solid rgba(124,58,237,.45);border-radius:6px;padding:4px 10px">'+lab+' \u203A</span></div>':'')+
+    var isNew=e.at>NOTIF_LIST.seenAt, lab=notifOpenShort(e.link);
+    var title=String(e.title||'');
+    // On "All", each card carries its market's flag — unless the title starts with one.
+    var flag=(NOTIF_MARKET==='all'&&!/^\uD83C[\uDDE6-\uDDFF]/.test(title))?notifFlag(m):'';
+    h+='<div style="display:flex;align-items:stretch;margin-bottom:5px;border:1px solid '+(isNew?'rgba(124,58,237,.45)':'var(--bd)')+';border-radius:8px;background:'+(isNew?'rgba(124,58,237,.06)':'var(--cd)')+';overflow:hidden">'+
+      '<div style="flex:1;min-width:0;padding:6px 8px 6px 9px">'+
+        '<div style="display:flex;gap:6px;align-items:baseline">'+
+          // A result in the title is coloured: a gain green, a loss red.
+          '<div style="flex:1;min-width:0;font-size:11px;font-weight:800;color:var(--t1);line-height:1.3">'+(flag?flag+' ':'')+escHtml(title).replace(/([+\-−])(\d+(?:\.\d+)?%)/,function(mm,sg){return '<span style="color:'+(sg==='+'?'var(--gn)':'var(--rd)')+'">'+mm+'</span>'})+'</div>'+
+          '<div style="font-size:9px;color:var(--t3);white-space:nowrap">'+escHtml(notifWhen(e.at).replace(/^(Today|Yesterday) /,''))+'</div></div>'+
+        (e.text?'<div onclick="notifToggle(this)" data-open="0" style="font-size:10px;color:var(--t2);line-height:1.4;margin-top:2px;white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer">'+escHtml(e.text)+'</div>':'')+
+      '</div>'+
+      (lab?'<div onclick="notifOpen('+i+')" title="'+escHtml(notifOpenLabel(e.link))+'" style="flex:0 0 44px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border-left:1px solid var(--bd);color:var(--pu)">'+
+        '<span style="font-size:18px;font-weight:800;line-height:1">\u203A</span><span style="font-size:8px;font-weight:800;margin-top:1px">'+lab+'</span></div>':'')+
       '</div>';
   });
   var w=document.getElementById('notif-list');
