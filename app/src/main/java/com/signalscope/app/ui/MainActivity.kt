@@ -6807,6 +6807,12 @@ class MainActivity : AppCompatActivity() {
             gson.toJson(syms)
         } catch (e: Exception) { "[]" }
 
+        /** Price feeds judged stopped ("CRZK.DE") — the value floor leaves them out. No network. */
+        @JavascriptInterface
+        fun stoppedFeeds(): String = try {
+            gson.toJson(com.signalscope.app.network.FeedHealth.stoppedSymbols())
+        } catch (e: Exception) { "[]" }
+
         /** When the automatic Discovery scan for [space] next runs, as epoch ms; "0" = none. */
         @JavascriptInterface
         fun discoveryNextAuto(space: String): String = try {

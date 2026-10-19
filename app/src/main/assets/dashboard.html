@@ -4373,6 +4373,60 @@ function valueRatingShort(rating){
   if(rating==='NOT ATTRACTIVE')return 'LOW';
   return 'N/A';
 }
+// ── THE VALUE FLOOR ──────────────────────────────────────────────────────────
+// What the shares are worth at the least, from the company's own figures, and
+// how far the price sits above it. The floor is the HIGHER of two estimates:
+//   • book value per share — the net assets in the accounts (price ÷ P/B);
+//   • no-growth earnings value — a year's profit per share ÷ 10%: what the
+//     business is worth if it never grows again. The profit counted is the
+//     LOWER of net profit and free cash flow, so profit that never turned into
+//     cash does not count.
+// Profit per share is price ÷ P/E, which keeps it in the share's own currency —
+// a company reporting in dollars and quoted in euros would otherwise be off by
+// the exchange rate.
+// Left out: banks, insurers, asset managers and property firms, whose book
+// values and profits do not compare; a stock whose price feed has stopped; and
+// any stock with neither estimate. Kept apart from the Value score on purpose.
+var VALUE_FLOOR_RETURN=0.10;
+var STOPPED_FEEDS=null,STOPPED_FEEDS_AT=0;
+function stoppedFeedSet(){
+  var now=Date.now();
+  if(STOPPED_FEEDS&&now-STOPPED_FEEDS_AT<60000)return STOPPED_FEEDS;
+  var m={};
+  try{if(typeof Android!=='undefined'&&Android.stoppedFeeds)(JSON.parse(Android.stoppedFeeds()||'[]')||[]).forEach(function(k){m[String(k).toUpperCase()]=1})}catch(e){}
+  STOPPED_FEEDS=m;STOPPED_FEEDS_AT=now;return m;
+}
+function valueFloorExcluded(s){
+  return /financial services|real estate/i.test(String(s.sector||''))||
+    /bank|insurance|reit|real estate|asset management|capital markets|credit services|mortgage/i.test(String(s.industry||''));
+}
+function valueFloor(s){
+  if(!s)return null;
+  var p=Number(s.price||0);if(!(p>0))return null;
+  if(valueFloorExcluded(s))return {excluded:'a bank, insurer or property firm — book value and profit do not compare'};
+  var sym=String(s.symbol||'').toUpperCase(),st=stoppedFeedSet();
+  if(st[sym]||st[sym+'.DE']||st[sym+'.NS'])return {excluded:'its price feed has stopped'};
+  var pb=Number(s.priceToBook||0),pe=Number(s.trailingPe||0);
+  var book=pb>0?p/pb:0;
+  var eps=pe>0?p/pe:0;
+  var ni=s.netIncome!=null?Number(s.netIncome):null,fcf=s.freeCashflow!=null?Number(s.freeCashflow):null;
+  var cashShare=(ni!=null&&ni>0&&fcf!=null&&isFinite(fcf))?Math.min(1,fcf/ni):1;
+  var earn=(eps>0&&cashShare>0)?eps*cashShare/VALUE_FLOOR_RETURN:0;
+  if(!(book>0)&&!(earn>0))return null;
+  var floor=Math.max(book,earn);
+  return {floor:floor,book:book,earn:earn,basis:earn>=book?'earnings':'book',prem:(p/floor-1)*100};
+}
+function valueFloorPrem(s){var f=valueFloor(s);return f&&f.floor?f.prem:null}
+// For sorting: higher = nearer its floor (or further below it).
+function valueFloorSortValue(s){var p=valueFloorPrem(s);return p==null?null:-p}
+function valueFloorCell(s){
+  var f=valueFloor(s);
+  if(!f||!f.floor)return '<span title="'+escHtml(f&&f.excluded?'No value floor: '+f.excluded:'No value floor: no book value or profit to work from')+'" style="font-size:10px;color:var(--t3)">\u2014</span>';
+  var pr=f.prem,col=pr<=25?'var(--gn)':pr<=100?'var(--t2)':'var(--t3)';
+  return '<div style="line-height:1.1;min-width:30px" title="Value floor '+fmt(f.floor)+': the higher of book value ('+(f.book>0?fmt(f.book):'\u2014')+') and no-growth earnings value ('+(f.earn>0?fmt(f.earn):'\u2014')+'). The price is '+Math.round(Math.abs(pr))+'% '+(pr>=0?'above':'below')+' it.">'+
+    '<span style="font-weight:800;font-size:11px;color:'+col+'">'+(pr>=0?'+':'\u2212')+Math.round(Math.abs(pr))+'%</span>'+
+    '<div style="font-size:7px;color:var(--t3)">'+(f.basis==='book'?'book':'earnings')+'</div></div>';
+}
 function valueScoreMini(s){
   if(!hasValueData(s))return '<span title="Value data was not available in this scan" style="font-size:10px;color:var(--t3)">\u2014</span>';
   var score=Math.round(Number(s.valueScore||0));
@@ -5623,7 +5677,7 @@ function doVSort(k){if(VALUE_SORT.sortK===k)VALUE_SORT.sortA=!VALUE_SORT.sortA;e
 // capital-protect, value) without spending horizontal space.
 var SORT_GROUPS={
   discovery:[
-    ['Scores',[['pullbackScore','Pullback'],['areaRank','Area rank'],['areaScore','Area score %'],['momentumScore','Momentum'],['valueScore','Value buy'],['entryScore','Entry'],['trendStackScore','Trend stack']]],
+    ['Scores',[['pullbackScore','Pullback'],['areaRank','Area rank'],['areaScore','Area score %'],['momentumScore','Momentum'],['valueScore','Value buy'],['valueFloor','Value floor (nearest)'],['entryScore','Entry'],['trendStackScore','Trend stack']]],
     ['Levels & risk',[['zone','S/R Zone'],['rrRatio','Risk : Reward'],['rocPct','ROC %'],['riskInAtrs','Risk (ATRs)']]],
     ['Price & momentum',[['price','Price'],['priceVel','Change %'],['macdSlope','MACD slope'],['swingScore','Style (swing)']]],
     ['Name',[['symbol','Stock (A–Z)']]]
@@ -5851,7 +5905,7 @@ function render(){
   var sk=STATE.sortK,sa=STATE.sortA;
   // Zone (S/R thermometer position) needs a derived sort value
   var zoneValD=function(x){if(!x||!x.support||!x.resistance||x.resistance<=x.support||!x.price)return null;return (x.price-x.support)/(x.resistance-x.support)};
-  f.sort(function(a,b){var va,vb;if(sk==='zone'){va=zoneValD(a);vb=zoneValD(b)}else if(sk==='valueScore'){va=hasValueData(a)?a.valueScore:null;vb=hasValueData(b)?b.valueScore:null}else if(sk==='pullbackScore'){va=pullbackScoreValue(a);vb=pullbackScoreValue(b)}else if(sk==='momentumScore'){va=momentumScoreValue(a);vb=momentumScoreValue(b)}else if(sk==='entryScore'){va=entryScoreValue(a);vb=entryScoreValue(b)}else if(sk==='trendStackScore'){va=trendStackScore(a);vb=trendStackScore(b)}else if(sk==='ema200Slope'){va=ema200SlopeValue(a);vb=ema200SlopeValue(b)}else if(sk==='sma200Slope'){va=sma200SlopeValue(a);vb=sma200SlopeValue(b)}else if(sk==='ema50Slope'){va=ema50SlopeValue(a);vb=ema50SlopeValue(b)}else if(sk==='ema21Slope'){va=ema21SlopeValue(a);vb=ema21SlopeValue(b)}else{va=a[sk];vb=b[sk]}if(va==null&&vb==null)return 0;if(va==null)return 1;if(vb==null)return-1;return sa?(va>vb?1:-1):(va<vb?1:-1)});
+  f.sort(function(a,b){var va,vb;if(sk==='zone'){va=zoneValD(a);vb=zoneValD(b)}else if(sk==='valueScore'){va=hasValueData(a)?a.valueScore:null;vb=hasValueData(b)?b.valueScore:null}else if(sk==='valueFloor'){va=valueFloorSortValue(a);vb=valueFloorSortValue(b)}else if(sk==='pullbackScore'){va=pullbackScoreValue(a);vb=pullbackScoreValue(b)}else if(sk==='momentumScore'){va=momentumScoreValue(a);vb=momentumScoreValue(b)}else if(sk==='entryScore'){va=entryScoreValue(a);vb=entryScoreValue(b)}else if(sk==='trendStackScore'){va=trendStackScore(a);vb=trendStackScore(b)}else if(sk==='ema200Slope'){va=ema200SlopeValue(a);vb=ema200SlopeValue(b)}else if(sk==='sma200Slope'){va=sma200SlopeValue(a);vb=sma200SlopeValue(b)}else if(sk==='ema50Slope'){va=ema50SlopeValue(a);vb=ema50SlopeValue(b)}else if(sk==='ema21Slope'){va=ema21SlopeValue(a);vb=ema21SlopeValue(b)}else{va=a[sk];vb=b[sk]}if(va==null&&vb==null)return 0;if(va==null)return 1;if(vb==null)return-1;return sa?(va>vb?1:-1):(va<vb?1:-1)});
   FILTERED=f;
 
   var nSe=stocks.filter(setupsFilter).length;
@@ -6063,12 +6117,14 @@ function render(){
     // Signal remains in the detail modal; Value opens the same breakdown previously reached from the Value tab.
     // ROC is the app's own: room left to the nearest resistance, a price figure \u2014
     // the same one the watchlist and the floor algo use.
-    var cols=[['symbol','Stock'],['price','Price'],['trend','Trend'],['pullbackScore','Pull'],['areaRank','Area'],['momentumScore','Momo'],['valueScore','Value'],['macdSlope','MACD'],['zone','S/R'],['rocPct','ROC'],['rrRatio','R:R'],['priceVel','Chg%'],['swingScore','Style'],['riskInAtrs','Risk']];
+    var cols=[['symbol','Stock'],['price','Price'],['trend','Trend'],['pullbackScore','Pull'],['areaRank','Area'],['momentumScore','Momo'],['valueScore','Value'],['valueFloor','Floor'],['macdSlope','MACD'],['zone','S/R'],['rocPct','ROC'],['rrRatio','R:R'],['priceVel','Chg%'],['swingScore','Style'],['riskInAtrs','Risk']];
     cols.forEach(function(c){
       if(c[0]==='rocPct'){
         h+='<th onclick="doSort(\'rocPct\')" title="ROC: room to the nearest resistance, (resistance \u2212 price) \u00F7 price.">ROC'+(STATE.sortK==='rocPct'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
       }else if(c[0]==='areaRank'){
         h+='<th onclick="doSort(\'areaRank\')" title="Area score rank, 0–100 against the stock’s own earlier scores. Small figure: how far the last 12 months sat above (+) or below (−) today on average.">Area'+(STATE.sortK==='areaRank'?(STATE.sortA?' ▲':' ▼'):'')+'</th>';
+      }else if(c[0]==='valueFloor'){
+        h+='<th onclick="doSort(\'valueFloor\')" title="Value floor: how far the price sits above what the company is worth at the least — the higher of its book value and its value if profits never grow. Nearest first.">Floor'+(STATE.sortK==='valueFloor'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
       }else if(c[0]==='trend'){
         h+='<th onclick="doSort(\'trendStackScore\')" title="Trend Stack Score: 200S + 200E + 50E + 21E slopes">Trend'+(STATE.sortK==='trendStackScore'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
       }else{
@@ -6106,6 +6162,7 @@ function render(){
       h+='<td>'+pointPill('Mo',momentumScoreValue(s),75,60,'var(--gn)')+'</td>';
       // Value score
       h+='<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueScoreMini(s)+'</td>';
+      h+='<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueFloorCell(s)+'</td>';
       // MACD (chart + phase + slope)
       h+='<td><div style="display:flex;align-items:center;gap:2px">';
       h+='<div>'+macdSparkSvg((SETUPS_LENS==='hook'||SETUPS_LENS==='turn'||SETUPS_LENS==='both')&&s.smoothMacdCurve?s.smoothMacdCurve:s.macdCurve,s.macdPhase,44,16)+'</div>';
@@ -16942,7 +16999,7 @@ function renderValue(){
 
   if(STATE.search){var q=STATE.search.toLowerCase();vStocks=vStocks.filter(function(s){return rowSearchText(s.symbol,s.name,s.valueRating,s.sector,s.industry).indexOf(q)>=0})}
   var vk=VALUE_SORT.sortK,va=VALUE_SORT.sortA;
-  vStocks.sort(function(a,b){var x,y;if(vk==='pullbackScore'){x=pullbackScoreValue(a);y=pullbackScoreValue(b)}else if(vk==='momentumScore'){x=momentumScoreValue(a);y=momentumScoreValue(b)}else{x=a[vk];y=b[vk]}if(x==null)return 1;if(y==null)return-1;return va?(x>y?1:-1):(x<y?1:-1)});
+  vStocks.sort(function(a,b){var x,y;if(vk==='pullbackScore'){x=pullbackScoreValue(a);y=pullbackScoreValue(b)}else if(vk==='valueFloor'){x=valueFloorSortValue(a);y=valueFloorSortValue(b)}else if(vk==='momentumScore'){x=momentumScoreValue(a);y=momentumScoreValue(b)}else{x=a[vk];y=b[vk]}if(x==null)return 1;if(y==null)return-1;return va?(x>y?1:-1):(x<y?1:-1)});
   FILTERED=vStocks;
 
   var h=topBar();
@@ -16983,6 +17040,7 @@ function renderValue(){
     h+='<th onclick="doVSort(\'symbol\')">Stock'+vSA('symbol')+'</th>';
     h+='<th onclick="doVSort(\'price\')">Price'+vSA('price')+'</th>';
     h+='<th onclick="doVSort(\'valueScore\')">Value'+vSA('valueScore')+'</th>';
+    h+='<th onclick="doVSort(\'valueFloor\')" title="Value floor: how far the price sits above the higher of book value and no-growth earnings value. Nearest first.">Floor'+vSA('valueFloor')+'</th>';
     h+='<th onclick="doVSort(\'trailingPe\')">PE'+vSA('trailingPe')+'</th>';
     h+='<th onclick="doVSort(\'priceToBook\')">PB'+vSA('priceToBook')+'</th>';
     h+='<th onclick="doVSort(\'evToEbitda\')">EV/EB'+vSA('evToEbitda')+'</th>';
@@ -17004,6 +17062,7 @@ function renderValue(){
       h+='<br/><span class="sig '+rCls+'">'+s.valueRating+'</span></div></td>';
       h+='<td style="font-weight:700;font-size:12px">'+cur+fmt(s.price)+'</td>';
       h+='<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueScoreMini(s)+'</td>';
+      h+='<td>'+valueFloorCell(s)+'</td>';
       h+='<td>'+(s.trailingPe!=null?'<span style="color:'+(s.trailingPe<15?'var(--gn)':s.trailingPe<25?'var(--t1)':'var(--rd)')+'">'+fmt(s.trailingPe,1)+'</span>':'\u2014')+'</td>';
       h+='<td>'+(s.priceToBook!=null?'<span style="color:'+(s.priceToBook<1.5?'var(--gn)':s.priceToBook<3?'var(--t1)':'var(--rd)')+'">'+fmt(s.priceToBook,1)+'</span>':'\u2014')+'</td>';
       h+='<td>'+(s.evToEbitda!=null?'<span style="color:'+(s.evToEbitda<8?'var(--gn)':s.evToEbitda<12?'var(--t1)':'var(--rd)')+'">'+fmt(s.evToEbitda,1)+'</span>':'\u2014')+'</td>';
@@ -18008,6 +18067,15 @@ function showDetail(idx,focus){
       b+='<div style="margin-top:4px"><div style="font-size:7px;color:var(--t3);display:flex;justify-content:space-between"><span>52W Low: '+cur+fmt(s.fiftyTwoWeekLow)+'</span><span>52W High: '+cur+fmt(s.fiftyTwoWeekHigh)+'</span></div>';
       b+='<div style="width:100%;height:6px;background:linear-gradient(90deg,var(--gn),var(--am),var(--rd));border-radius:3px;margin-top:2px;position:relative">';
       b+='<div style="position:absolute;left:'+pctPos.toFixed(0)+'%;top:-2px;width:2px;height:10px;background:var(--t1);border-radius:1px;transform:translateX(-50%)"></div></div></div>';
+    }
+    // THE VALUE FLOOR — separate from the score above.
+    var vf=valueFloor(s);
+    if(vf&&vf.floor){
+      var vfp=vf.prem;
+      b+='<div style="margin-top:7px;font-size:9px;color:var(--t2);line-height:1.55"><b style="color:var(--t1)">Value floor '+cur+fmt(vf.floor)+'</b> — the higher of book value ('+(vf.book>0?cur+fmt(vf.book):'\u2014')+') and its value if profits never grow ('+(vf.earn>0?cur+fmt(vf.earn):'\u2014')+'). '+
+        'The price is <b style="color:'+(vfp<=25?'var(--gn)':vfp<=100?'var(--t1)':'var(--t3)')+'">'+Math.round(Math.abs(vfp))+'% '+(vfp>=0?'above':'below')+'</b> it.</div>';
+    }else if(vf&&vf.excluded){
+      b+='<div style="margin-top:7px;font-size:9px;color:var(--t3)">No value floor: '+escHtml(vf.excluded)+'.</div>';
     }
     if(s.valueScoreReport){
       b+='<div style="margin-top:8px;border-top:1px dashed var(--bd);padding-top:7px;font-family:monospace;font-size:8px;color:var(--t2);line-height:1.5">';

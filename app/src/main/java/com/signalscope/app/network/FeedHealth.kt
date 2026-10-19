@@ -162,6 +162,12 @@ object FeedHealth {
         return synchronized(verdicts) { verdicts[key(feedSymbol)]?.lastTradeSec ?: 0L }
     }
 
+    /** Every feed symbol judged stopped right now ("CRZK.DE"). */
+    fun stoppedSymbols(): List<String> {
+        load()
+        return synchronized(verdicts) { verdicts.keys.toList() }
+    }
+
     /** The same for an app symbol on an exchange ("PFSE", "DE"). */
     fun stoppedSince(symbol: String, exchange: String): Long =
         stoppedSince(YahooFinanceClient.toYahooSymbol(symbol.trim().uppercase(), exchange))
