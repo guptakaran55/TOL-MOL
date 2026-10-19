@@ -127,4 +127,42 @@ class RvGateTest {
         assertFalse(RvGate.decide(Side.SELL, 102.0, 0.0, 0.0, 4.0, null, 0L, 5L).go)
         assertTrue(RvGate.decide(Side.SELL, 102.0, 0.0, 0.0, 4.0, null, 0L, 45L).go)
     }
+
+    // ── TODAY'S SHAPE FROM SEVERAL DAYS OF BARS ─────────────────────────────
+    // The gate now asks for five days of 15-minute bars (one day never cleared the
+    // feed's 50-bar rule, so it always came back empty) and must use today's only.
+
+    private val open = 1_792_396_800L                     // today 09:00, in seconds
+    private fun bar(start: Long, o: Double, h: Double, l: Double, c: Double) =
+        com.signalscope.app.data.CandleData(start, o, h, l, c, 1000L)
+    private val earlier = (1..4).flatMap { d ->           // four earlier days, far wider ranges
+        (0 until 34).map { i -> bar(open - d * 86_400L + i * 900L, 90.0, 120.0, 80.0, 95.0) } }
+    private val today = listOf(
+        bar(open, 100.0, 102.0, 99.0, 101.0),
+        bar(open + 900, 101.0, 104.0, 100.5, 103.0),
+        bar(open + 1800, 103.0, 103.5, 101.5, 102.0))
+
+    @Test fun `only today's bars set the range`() {
+        val (hi, lo, _) = RvGate.todayShape(earlier + today, open, open + 3600, 0L, 102.5)
+        assertEquals(104.0, hi, 1e-9)
+        assertEquals(99.0, lo, 1e-9)
+    }
+
+    @Test fun `velocity is the live price against the last finished bar`() {
+        // At 10:00 all three bars (to 09:45) have finished: last close 102.0.
+        val (_, _, v) = RvGate.todayShape(earlier + today, open, open + 3600, 0L, 102.5)
+        assertEquals(0.5, v!!, 1e-9)
+    }
+
+    @Test fun `a delayed feed counts a bar only once it has arrived`() {
+        // Germany's bars arrive 15 minutes late: at 09:58 only the 09:00 and 09:15
+        // bars are in (the 09:30 one arrives at 10:00), so the reference is 103.0.
+        val (_, _, v) = RvGate.todayShape(earlier + today, open, open + 3500, 900L, 102.5)
+        assertEquals(-0.5, v!!, 1e-9)
+    }
+
+    @Test fun `nothing of today's means no shape at all`() {
+        val (hi, lo, v) = RvGate.todayShape(earlier, open, open + 3600, 0L, 102.5)
+        assertEquals(0.0, hi, 1e-9); assertEquals(0.0, lo, 1e-9); assertEquals(null, v)
+    }
 }

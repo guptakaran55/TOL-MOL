@@ -507,8 +507,12 @@ object MarkToMarket {
         // candles as well, so the regular-session close is still available by
         // filtering — no second call, and no need to choose between seeing the
         // pre-market and being able to act.
+        // FIVE DAYS, not one: the feed's download rule discards any reply under 50
+        // bars, and a morning's 5-minute bars stay under 50 until early afternoon —
+        // so the "1d" request came back empty every morning. Only the newest bars
+        // are used below, so the extra days change nothing else.
         val r = YahooFinanceClient.fetchCandlesAt(
-            symbol, Spaces.exchangeOf(ns), "5m", "1d", includePrePost = us)
+            symbol, Spaces.exchangeOf(ns), "5m", "5d", includePrePost = us)
         val candles = (r as? YahooFinanceClient.CandleResult.Success)?.candles ?: return null
         if (candles.isEmpty()) return null
         if (!us) return Polled(candles.last().close, 0.0)

@@ -184,21 +184,40 @@ object RvGate {
         val atr = try { DailyVolatility.of(symbol, exch)?.atr ?: 0.0 } catch (e: Exception) { 0.0 }
         var high = 0.0; var low = 0.0; var velocity: Double? = null
         try {
-            val res = YahooFinanceClient.fetchCandles15mRange(symbol.trim(), exch, "1d")
+            // FIVE DAYS, NOT ONE — AND ONLY TODAY'S ARE USED. The price feed's
+            // download rule throws away any reply under 50 bars, and one day of
+            // 15-minute bars never has 50 (34 at most in Germany, 26 in the US). So
+            // asking for "1d" came back empty every time: from 14 Oct the gate never
+            // saw today's range or direction, held orders only through the first 20
+            // minutes, and then let everything through "not held back blind". Found
+            // by its own record on 19 Oct. Five days clears the rule on any morning.
+            val res = YahooFinanceClient.fetchCandles15mRange(symbol.trim(), exch, "5d")
             val cs = (res as? YahooFinanceClient.CandleResult.Success)?.candles.orEmpty()
-            val openSec = openMs / 1000L
-            val today = cs.filter { it.timestamp >= openSec && it.close > 0.0 }
-            if (today.isNotEmpty()) {
-                high = today.maxOf { it.high.takeIf { h -> h > 0.0 } ?: it.close }
-                low = today.minOf { it.low.takeIf { l -> l > 0.0 } ?: it.close }
-                val nowSec = now / 1000L
-                val lag = if (base == "de") FeedDelay.XETRA_SEC else 0L
-                val done = today.filter { FeedDelay.isComplete(it.timestamp, 15 * 60L, nowSec, 0L, lag) }
-                val ref = done.lastOrNull()?.close ?: today.first().open.takeIf { it > 0.0 }
-                if (live != null && ref != null && ref > 0.0) velocity = live - ref
-            }
+            val lag = if (base == "de") FeedDelay.XETRA_SEC else 0L
+            val shape = todayShape(cs, openMs / 1000L, now / 1000L, lag, live)
+            high = shape.first; low = shape.second; velocity = shape.third
+            if (cs.isEmpty()) Log.w(TAG, "$symbol: no 15-minute prices came back (${res::class.simpleName})")
         } catch (e: Exception) { Log.w(TAG, "$symbol 15-minute prices failed: ${e.message}") }
         return Reading(live, high, low, atr, velocity, mins)
+    }
+
+    /**
+     * Today's high, low and velocity from 15-minute [bars] that may reach back
+     * several days: only bars from [openSec] (today's open) count. Velocity is
+     * [live] against the close of the last bar that has finished and arrived
+     * ([lagSec] = the feed's delay), or today's opening price before one has.
+     * (0, 0, null) when nothing of today's is there. Pure — tested.
+     */
+    internal fun todayShape(bars: List<com.signalscope.app.data.CandleData>, openSec: Long, nowSec: Long,
+                            lagSec: Long, live: Double?): Triple<Double, Double, Double?> {
+        val today = bars.filter { it.timestamp >= openSec && it.close > 0.0 }
+        if (today.isEmpty()) return Triple(0.0, 0.0, null)
+        val high = today.maxOf { it.high.takeIf { h -> h > 0.0 } ?: it.close }
+        val low = today.minOf { it.low.takeIf { l -> l > 0.0 } ?: it.close }
+        val done = today.filter { FeedDelay.isComplete(it.timestamp, 15 * 60L, nowSec, 0L, lagSec) }
+        val ref = done.lastOrNull()?.close ?: today.first().open.takeIf { it > 0.0 }
+        val velocity = if (live != null && ref != null && ref > 0.0) live - ref else null
+        return Triple(high, low, velocity)
     }
 
     /**
