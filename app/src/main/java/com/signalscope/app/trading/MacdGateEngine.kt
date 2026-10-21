@@ -53,7 +53,7 @@ object MacdGateEngine {
         }
         return when (Spaces.baseOf(ns)) {
             "binance" -> BN_UNIVERSE
-            "de" -> com.signalscope.app.service.DAX_SYMBOLS.map { it.removeSuffix(".DE") }
+            "de" -> com.signalscope.app.service.deScreenedUniverse(ctx).map { it.removeSuffix(".DE") }
             else -> com.signalscope.app.service.NASDAQ_100_SYMBOLS
         }
     }
@@ -248,9 +248,56 @@ object MacdGateEngine {
     // ── Daily evaluation (§10.7 steps EJECT + FILL) ─────────────────────────
     /** Runs at most once per UTC day. Called at the start of every runner pass;
      *  cheap no-op on all but the first pass of the day. */
+    /**
+     * COLLAPSE SEATS THAT NO LONGER CORRESPOND TO ANYTHING.
+     *
+     * With ranking off, the seat count IS the universe size — one per name. Shrink
+     * the symbol list and the surplus seats are left behind holding cash, and the
+     * headline return is then divided by a capital base the user never chose. A
+     * one-coin algo showing two seats of €250 is reporting its performance against
+     * twice the money it can actually deploy.
+     *
+     * ONLY EVER COLLAPSES EMPTY ONES, and the capital is CARRIED, never discarded:
+     * the money in a retired seat is real and belongs to the algo. Dropping it
+     * would silently book a loss that never happened.
+     *
+     * Never touches a seat holding a position — that is the reshape the save path
+     * already refuses, and for the same reason.
+     */
+    private fun collapseSurplusSeats(ctx: Context, ns: String, universeSize: Int): Boolean {
+        val st = MacdGateStore.load(ctx, ns)
+        if (!st.enabled || st.slots.isEmpty()) return false
+        val want = MacdGateStore.effectiveHoldN(st, universeSize.coerceAtLeast(1))
+        if (st.slots.size <= want) return false
+        val held = st.slots.count { it.symbol != null }
+        if (held > want) return false          // cannot shrink past what is invested
+        // Keep the held ones first, then whichever empties are needed to reach want.
+        val keep = (st.slots.filter { it.symbol != null } +
+                    st.slots.filter { it.symbol == null }).take(want)
+        val retiredCash = st.slots.sumOf { it.capital } - keep.sumOf { it.capital }
+        if (keep.isEmpty()) return false
+        val merged = keep.toMutableList()
+        merged[merged.size - 1] = merged.last().copy(capital = merged.last().capital + retiredCash)
+        val note = "${today()} seats ${st.slots.size} → $want (universe is $universeSize " +
+            "with ranking off) — ${"%.2f".format(retiredCash)} carried into the remaining seat"
+        MacdGateStore.save(ctx, ns,
+            MacdGateStore.appendLog(st.copy(slots = merged), note))
+        Log.w(TAG, "[$ns] $note")
+        return true
+    }
+
     fun evaluate(ctx: Context, ns: String) {
         val st0 = MacdGateStore.load(ctx, ns)
         if (!st0.enabled) return
+        // Done BEFORE the day guard, so a stale seat layout is corrected even on a
+        // day the evaluation itself has already run — otherwise a universe shrunk
+        // this morning keeps its surplus seat until tomorrow.
+        try {
+            if (collapseSurplusSeats(ctx, ns, universeFor(ctx, ns).size)) {
+                // Re-read: the layout just changed underneath us.
+                if (MacdGateStore.load(ctx, ns).lastEvalDay == today()) return
+            }
+        } catch (e: Exception) { Log.w(TAG, "[$ns] seat collapse failed", e) }
         if (st0.lastEvalDay == today()) return
         Log.i(TAG, "[$ns] daily gate evaluation starting")
 
@@ -280,6 +327,14 @@ object MacdGateEngine {
         if (complete.isEmpty()) { progress(ns, "done", 0, 0); return }
         val asOf = complete.values.flatten().maxOfOrNull { it.date }
             ?: run { progress(ns, "done", 0, 0); return }
+        // NOT ON A SERIES THAT IS A DAY BEHIND. The day is left unevaluated and the
+        // next pass tries again, rather than deciding the seats on the close
+        // before last and locking that in until tomorrow.
+        if (!ScreenerRunner.dailyDataCurrent(spaceFor(ns), asOf)) {
+            Log.w(TAG, "[$ns] daily prices end at $asOf — the last session is missing; evaluation retried next pass")
+            progress(ns, "done", 0, 0)
+            return
+        }
 
         // 2. Rank (Part A) + slope per symbol from the SAME bars.
         // §10 — screenerLookbackDays from the config when present (config > default),
@@ -357,10 +412,132 @@ object MacdGateEngine {
         progress(ns, "done", 0, 0)
     }
 
+    /**
+     * FILL EMPTY SEATS NOW, from the ranking already in hand.
+     *
+     * Seats used to be assigned only inside [evaluate], which runs once per UTC
+     * day and refuses to run twice. So a seat freed after it had run — by a name
+     * ejected for a flat slope, or by you selling one by hand — sat as cash until
+     * the next day rolled over. On a five-seat algo that is a fifth of the capital
+     * idle for up to twenty-four hours, and the log shows it happening most days.
+     *
+     * COSTS NOTHING AND DECIDES NOTHING NEW. It re-uses the stored ranking, the
+     * stored slopes and the same three rules the daily fill applies — highest
+     * rank, slope above zero, not already held. No screen, no fetch, no new
+     * opinion: it is the same answer that pass already computed, applied to a
+     * seat that emptied afterwards.
+     *
+     * IT DOES NOT BUY. Seating a name enrols it; the strategy still has to fire
+     * its own entry on a closed bar before any order exists. So this shortens the
+     * queue, it does not pull a trade forward.
+     *
+     * REFUSES A STALE RANKING. A ranking is a fact about a particular day, and
+     * seating from one two days old would be acting on evidence the app itself
+     * would no longer stand behind — exactly the thing waiting for the next
+     * evaluation was protecting against.
+     *
+     * @return how many seats were filled.
+     */
+    fun refillFreeSeats(ctx: Context, ns: String): Int {
+        val st0 = MacdGateStore.load(ctx, ns)
+        if (!st0.enabled) return 0
+        if (st0.slots.none { it.symbol == null }) return 0
+        if (st0.lastRanking.isEmpty()) return 0
+        // Today's ranking, or yesterday's — the latter because the evaluation runs
+        // on the UTC day and a European evening sits in the previous one, which is
+        // precisely when seats free.
+        val fresh = st0.lastEvalDay == today() ||
+            st0.lastEvalDay == LocalDate.now(ZoneOffset.UTC).minusDays(1).toString()
+        if (!fresh) return 0
+
+        var st = st0
+        val slots = st.slots.toMutableList()
+        val held = slots.mapNotNull { it.symbol?.uppercase() }.toMutableSet()
+        // Names this algo let go TODAY are not candidates to be re-seated today.
+        // Without this a name ejected for a flat slope, or one you sold by hand,
+        // would be handed straight back into the seat it just left — which reads
+        // as the app arguing with your decision.
+        val releasedToday = st.log.filter { it.startsWith(today()) }
+            .mapNotNull { line ->
+                Regex("""^\S+\s+(\S+)\s+(?:ejected flat|sold by hand)""").find(line)?.groupValues?.get(1)
+            }.map { it.uppercase() }.toSet()
+
+        var filled = 0
+        for (i in slots.indices) {
+            if (slots[i].symbol != null) continue
+            val pick = st.lastRanking.firstOrNull {
+                val u = it.uppercase()
+                u !in held && u !in releasedToday && (st.lastSlopes[it] ?: -1.0) > 0.0
+            } ?: continue
+            val now = System.currentTimeMillis()
+            slots[i] = MacdGateStore.Slot(pick, slots[i].capital, now, 0, false)
+            held.add(pick.uppercase())
+            try { StrategyLabStore.enroll(ctx, pick, exchangeFor(ns), ns) }
+            catch (e: Exception) { Log.w(TAG, "enroll $pick", e) }
+            st = MacdGateStore.openEnrollment(st, i, pick, st.lastRanking.indexOf(pick) + 1,
+                st.lastScores?.get(pick), st.lastSlopes[pick], now)
+            st = MacdGateStore.appendLog(st, "${today()} $pick took the freed seat " +
+                "(rank #${st.lastRanking.indexOf(pick) + 1}, slope>0) — no waiting for the next evaluation")
+            filled++
+        }
+        if (filled > 0) {
+            MacdGateStore.save(ctx, ns, st.copy(slots = slots))
+            Log.i(TAG, "[$ns] refilled $filled freed seat(s) from the stored ranking")
+        }
+        return filled
+    }
+
     // ── Trade-close hook (§10.8 live translation) ───────────────────────────
     /** Compound the slot's capital by the trade's net return; if the symbol was
      *  flagged and is now flat with the slope still ≤0, release the slot and
      *  migrate its capital one-for-one into the best cached-eligible name. */
+    /**
+     * HAND THE SEAT ON after YOU ended a position — a take-profit tap, a sale
+     * from the stock page, or shares sold in the broker's own app.
+     *
+     * A strategy's own exit keeps the seat on the same name: the algo buys it
+     * again on its next fresh signal. A sale you made is different — you have
+     * decided against the name for now — so the seat goes straight to the next
+     * contender in the last ranking whose daily slope is rising, never the one
+     * just sold, rather than sitting on it or waiting empty for tomorrow's
+     * evaluation. With no contender the seat waits in cash and the daily
+     * evaluation fills it. Capital stays with the seat, whatever it was.
+     *
+     * Call AFTER the trade is closed (and compounded, where it is booked).
+     * @return the stock that took the seat, or null.
+     */
+    fun handOn(ctx: Context, ns: String, symbol: String, why: String): String? {
+        val st0 = MacdGateStore.load(ctx, ns)
+        if (!st0.enabled) return null
+        val idx = st0.slots.indexOfFirst { it.symbol?.equals(symbol, true) == true }
+        if (idx < 0) return null
+        if (inPosition(ctx, ns, symbol)) return null        // still held on paper: not ours to move
+        val now = System.currentTimeMillis()
+        val slots = st0.slots.toMutableList()
+        val held = slots.mapNotNull { it.symbol?.uppercase() }.toMutableSet()
+        held.remove(symbol.uppercase())
+        val replacement = st0.lastRanking.firstOrNull {
+            !it.equals(symbol, true) && it.uppercase() !in held && (st0.lastSlopes[it] ?: -1.0) > 0.0
+        }
+        try { StrategyLabStore.unenroll(ctx, symbol, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $symbol", e) }
+        setWindingDown(ctx, ns, symbol, false)
+        var st = MacdGateStore.closeEnrollment(st0, idx, symbol, "sold_by_you", now)
+        slots[idx] = MacdGateStore.Slot(replacement, slots[idx].capital, now, 0, false)
+        if (replacement != null) {
+            try { StrategyLabStore.enroll(ctx, replacement, exchangeFor(ns), ns) }
+            catch (e: Exception) { Log.w(TAG, "enroll $replacement", e) }
+            st = MacdGateStore.openEnrollment(st, idx, replacement,
+                st.lastRanking.indexOf(replacement) + 1,
+                st.lastScores?.get(replacement), st.lastSlopes[replacement], now)
+            st = MacdGateStore.appendLog(st, "${today()} $symbol $why → $replacement takes the seat")
+        } else {
+            st = MacdGateStore.appendLog(st, "${today()} $symbol $why → seat waits in cash (no rising contender)")
+        }
+        MacdGateStore.save(ctx, ns, st.copy(slots = slots))
+        Log.w(TAG, "[$ns] seat of $symbol handed on ($why) → ${replacement ?: "cash"}")
+        return replacement
+    }
+
     fun onTradeClosed(ctx: Context, ns: String, symbol: String, netPctReturn: Double) {
         val st0 = MacdGateStore.load(ctx, ns)
         if (!st0.enabled) return

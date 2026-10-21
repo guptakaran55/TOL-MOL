@@ -1,0 +1,188 @@
+{
+  "strategy": "macd",
+  "dataset": "nse500_kite_60m_2020-08_2026-08",
+  "monthlyReinvestMode": true,
+  "reinvestStrategy": "daily_macd_natural",
+  "monthlyReinvestTopN": 5,
+  "reinvestSlopeSmoothing": 5,
+  "reinvestSlopeConfirmDays": 1,
+  "slippagePct": 0.2,
+  "resample": "1D",
+  "exitBars": "240min",
+  "trendFilter": {
+    "mode": "off",
+    "threshold": 0.3
+  },
+  "vwap": {
+    "rsiLength": 4,
+    "oversold": 20,
+    "overbought": 80,
+    "minDevPct": 0.3,
+    "skipOpenBars": 5,
+    "long": true,
+    "short": true,
+    "stopLoss": {
+      "enabled": true,
+      "pct": 1
+    },
+    "maxBars": {
+      "enabled": false,
+      "bars": 60
+    },
+    "eodExit": true
+  },
+  "orb": {
+    "rangeMinutes": 15,
+    "riskReward": 2,
+    "stopMode": "midpoint",
+    "maxPerDay": 1,
+    "long": true,
+    "short": true,
+    "eodExit": true
+  },
+  "warmupBars": 240,
+  "notional": 1000,
+  "macd": {
+    "fast": 12,
+    "slow": 26,
+    "signal": 9
+  },
+  "entry": {
+    "mode": "ALL",
+    "slopeFlipUp": {
+      "enabled": true,
+      "smoothing": 2,
+      "persistent": true
+    },
+    "slopePositive": {
+      "enabled": true
+    },
+    "macdCrossUp": {
+      "enabled": false
+    },
+    "macdAboveSignal": {
+      "enabled": false
+    },
+    "macdAboveZero": {
+      "enabled": false
+    },
+    "accelPositive": {
+      "enabled": true,
+      "minSigma": 0.7
+    },
+    "sustainSlope": {
+      "enabled": true,
+      "bars": 20
+    },
+    "earlyRecovery": {
+      "enabled": true,
+      "pct": 60,
+      "lookback": 22,
+      "confirmVelocity": true
+    },
+    "velocity": {
+      "enabled": false,
+      "lookback": 10,
+      "threshold": 0.5
+    }
+  },
+  "gates": {
+    "adx": {
+      "enabled": false,
+      "min": 20,
+      "period": 14
+    },
+    "sma": {
+      "enabled": true,
+      "length": 50,
+      "kind": "ema"
+    },
+    "emaSlope": {
+      "enabled": false,
+      "length": 16,
+      "lookback": 10,
+      "min": 0.1
+    }
+  },
+  "exit": {
+    "mode": "ANY",
+    "slopeFlipDown": {
+      "enabled": false,
+      "smoothing": 2,
+      "persistent": false
+    },
+    "fastMacdExit": {
+      "enabled": false
+    },
+    "slopeRetrace": {
+      "enabled": false,
+      "pct": 40,
+      "confirmVelocity": true
+    },
+    "macdCrossDown": {
+      "enabled": false
+    },
+    "macdBelowZero": {
+      "enabled": false
+    },
+    "accelNegative": {
+      "enabled": true,
+      "minSigma": 1.0
+    },
+    "velocity": {
+      "enabled": false,
+      "lookback": 10,
+      "threshold": 0
+    },
+    "stopLoss": {
+      "enabled": true,
+      "pct": 4
+    },
+    "takeProfit": {
+      "enabled": false,
+      "pct": 1.6
+    },
+    "maxBars": {
+      "enabled": false,
+      "bars": 100
+    },
+    "macdDistance": {
+      "enabled": true,
+      "pct": 30
+    },
+    "minHoldBars": 0,
+    "session": {
+      "enabled": false,
+      "flattenAtClose": false,
+      "noEntryAfter": "15:30"
+    }
+  },
+  "_meta": {
+    "generated_local": "2026-09-10T00:00:00",
+    "label": "UNCONFIRMED LEAD \u2014 NSE daily-clock deceleration exit, do not treat as a champion",
+    "status": "NOT a validated champion. One dataset, one confirmatory perturbation pass. Read this note before using it, and especially before pointing real capital at it.",
+    "lineage": "Extends B_SLOW_240m-120m_STOCKS-conservative. Entry block, gates, MACD periods, stop loss and macdDistance are UNCHANGED from that champion \u2014 this config differs from it in exactly three places: (1) resample/exitBars moved from 240min/120min to 1D/240min, (2) exit.slopeFlipDown is OFF, (3) exit.accelNegative is ON with minSigma 1.0, replacing the slope-flip exit rather than adding to it (OR'ing the two was tested and only truncates winners).",
+    "what_accelNegative_minSigma_means": "Exit once the MACD deceleration (change in the MACD slope) falls below -minSigma standard deviations of that symbol's OWN acceleration swing over its last 200 bars -- the same scale-free construction as entry.accelPositive.minSigma, mirrored to the downside. minSigma=0 preserves the old bare 'accel<0' behaviour (fires on ~50% of bars, unusably trigger-happy); minSigma=1.0 is the value that held under perturbation here.",
+    "validated_walkforward_slip0.20": {
+      "nse500_2020_26": {
+        "cagr_pct": 42.79,
+        "trades": 331,
+        "max_drawdown_pct_of_peak": 14.0,
+        "calmar": 3.05,
+        "vs_champion_on_same_clock_no_decel": {
+          "cagr_pct": 19.47,
+          "calmar": 2.57
+        }
+      }
+    },
+    "perturbation_nse_2020_26_seats5_sm5_cd1_slip0.20_reference": "7 of 7 knob settings held (seat count 3 and 8, slope smoothing 3 and 7, confirm-days 2, slippage 0.30) -- CAGR delta ranged +13.2 to +25.5, Calmar improved or held in every case. This is the strongest perturbation result of anything tested this project.",
+    "did_NOT_reproduce": "Same daily-clock config tested on nasdaq100 2022-26 and 2016-21, and on germany daily -- 5/7 and 3/7 perturbation holds respectively, with CAGR swinging negative on ordinary knob changes (8 seats, smoothing 7). Treat this as an India-specific effect, not a universal one, until a SECOND clean NSE dataset confirms it independently.",
+    "known_gap_before_this_is_trustworthy": "NSE 2015-20 (the only other Kite NSE era with enough symbols to test) carries 34 symbols with zero or missing closes and cannot serve as that second confirmation. NSE 2010-15 is unusable outright (Kite has no 60-min equity history before 2015). A fresh, clean Kite pull of a second multi-year NSE window is the single thing that would move this from 'lead' to 'champion'.",
+    "not_ported_to_android": "exit.accelNegative.minSigma exists only in strategy_lab.py (desktop). The Android engine (StrategyLabEngine.kt) still has ONLY the bare 'accel<0' rule with no sigma scaling -- loading this config there would silently run the catastrophic bare version (measured -18 to -19 CAGR points on the champion's own intraday clock), not this one. Do not load this JSON into the Android app until the same minSigma logic is ported and reproduction-tested there.",
+    "see": "RESULTS_MATRIX_decel_exit.md for the full sweep, the sigma-symmetry calibration, and why intraday clocks fail with this exit.",
+    "android_engine_support": "SUPPORTED as of the 2026-09-13 change to StrategyLabEngine.kt / StrategyLabConfig.kt: exit.accelNegative.minSigma is parsed and applied, with exitAccelSigma computed alongside accelSigma. Gated by 5 passing tests including the golden parity snapshot (unchanged) and a regression test pinning minSigma=0 to the historical bare rule.",
+    "android_feed_plan": "FeedPlan picks a 60m base for this 1D/240min pair (60 tiles evenly into both 1440 and 240) giving ~504 trading days against a 240-bar daily warmup, so plan().ok is true. If the India space is ever moved off Yahoo the planner re-checks this automatically.",
+    "cross_platform_numbers_NOT_verified": "The 42.79% CAGR figure is from the DESKTOP engine on the nse500_kite_60m_2020-08_2026-08 CSV cache. The Android engine is a port and its own test suite proves internal consistency, but the two have NOT been run against identical bars for this config. Expect small differences from feed source and bar alignment; treat the desktop number as the reference, not a prediction of live Android output."
+  },
+  "_config_name": "NSE daily decel exit (LEAD)"
+}

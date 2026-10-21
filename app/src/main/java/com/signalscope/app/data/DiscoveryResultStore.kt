@@ -84,6 +84,16 @@ object DiscoveryResultStore {
         }
     }
 
+    /**
+     * When this market's last FINISHED scan was saved, 0 if never. A file date, not
+     * a read: the automatic scheduler asks this every time the service starts,
+     * and on the main thread, where parsing a scan several hundred stocks long
+     * every time would be a stall for one number.
+     */
+    fun lastCompleteAt(context: Context, market: String): Long = try {
+        completeFileFor(context, market).lastModified()
+    } catch (e: Exception) { 0L }
+
     fun loadLatestComplete(context: Context, market: String): DiscoveryScanResult? {
         return try {
             val file = completeFileFor(context, market)

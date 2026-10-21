@@ -49,8 +49,15 @@ class ConfigManager(context: Context) {
         "signalscope_credentials", Context.MODE_PRIVATE
     ).also { newPrefs ->
         // One-time migration: if old encrypted store still has credentials, copy them over
+        //
+        // ONCE MEANS ONCE. It used to re-run on every settings read whenever the
+        // Zerodha key was blank — and settings are read hundreds of times a day,
+        // on every order and every background check, each time opening the
+        // phone's slow hardware key vault. The attempt is now recorded, so a blank
+        // key costs nothing after the first try.
         try {
-            if (newPrefs.getString("ZERODHA_API_KEY", "").isNullOrEmpty()) {
+            if (!newPrefs.getBoolean("creds_migration_done", false) &&
+                newPrefs.getString("ZERODHA_API_KEY", "").isNullOrEmpty()) {
                 val oldEncrypted = createEncryptedPrefs(context)
                 val keysToMigrate = listOf(
                     "ZERODHA_API_KEY", "ZERODHA_API_SECRET",
@@ -71,6 +78,9 @@ class ConfigManager(context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Migration from encrypted prefs failed (expected on first install or corrupted keystore)", e)
         }
+        // Recorded whatever happened: a store that failed to open once will fail
+        // the same way next time, and retrying it is the cost being removed.
+        try { newPrefs.edit().putBoolean("creds_migration_done", true).apply() } catch (_: Exception) {}
     }
 
     /**
@@ -172,6 +182,83 @@ class ConfigManager(context: Context) {
             "https://kite.zerodha.com/connect/login?v=3&api_key=$zerodhaApiKey"
         else ""
 
+    // ── UNATTENDED DAILY LOGIN ────────────────────────────────────────────
+    // Kite kills the access token every morning and only an interactive login
+    // mints a new one — which for a user in Germany lands around 5am local.
+    // With these three extra facts the phone can do that login by itself before
+    // the Indian open. They live in the same private prefs as every other
+    // credential here (app sandbox, MODE_PRIVATE — see the store's own note:
+    // Keystore encryption was causing more credential loss on MIUI than it was
+    // worth). This is a LOGIN password, so the sandbox is the whole defence:
+    // anyone with root or an unlocked phone and a file browser can read it.
+
+    /** Kite client ID, e.g. AB1234. */
+    var zerodhaUserId: String
+        get() = encrypted.getString("ZERODHA_USER_ID", "") ?: ""
+        set(v) = encrypted.edit().putString("ZERODHA_USER_ID", v).apply()
+
+    /** Kite account password (NOT the API secret). */
+    var zerodhaPassword: String
+        get() = encrypted.getString("ZERODHA_PASSWORD", "") ?: ""
+        set(v) = encrypted.edit().putString("ZERODHA_PASSWORD", v).apply()
+
+    /** Base32 seed from Kite profile → Password & Security → External TOTP. */
+    var zerodhaTotpSecret: String
+        get() = encrypted.getString("ZERODHA_TOTP_SECRET", "") ?: ""
+        set(v) = encrypted.edit().putString("ZERODHA_TOTP_SECRET", v).apply()
+
+    var zerodhaAutoLoginEnabled: Boolean
+        get() = prefs.getBoolean("zerodha_auto_login_enabled", false)
+        set(v) = prefs.edit().putBoolean("zerodha_auto_login_enabled", v).apply()
+
+    val canAutoLoginZerodha: Boolean
+        get() = zerodhaAutoLoginEnabled && hasZerodhaCredentials &&
+            zerodhaUserId.isNotBlank() && zerodhaPassword.isNotBlank() &&
+            zerodhaTotpSecret.isNotBlank()
+
+    /** Human-readable outcome of the last attempt, shown on the settings screen. */
+    var zerodhaAutoLoginStatus: String
+        get() = prefs.getString("zerodha_auto_login_status", "") ?: ""
+        set(v) = prefs.edit().putString("zerodha_auto_login_status", v).apply()
+
+    var zerodhaAutoLoginStatusAt: Long
+        get() = prefs.getLong("zerodha_auto_login_status_at", 0L)
+        set(v) = prefs.edit().putLong("zerodha_auto_login_status_at", v).apply()
+
+    /**
+     * Trading date (IST) on which Kite rejected the credentials outright.
+     *
+     * Repeated bad passwords lock a Zerodha account, so one rejection stops
+     * every further automatic attempt until the date rolls over or the user
+     * saves the settings again. Transient failures do NOT set this — they are
+     * exactly what the later slots in the day exist for.
+     */
+    var zerodhaAutoLoginBlockedOn: String
+        get() = prefs.getString("zerodha_auto_login_blocked_on", "") ?: ""
+        set(v) = prefs.edit().putString("zerodha_auto_login_blocked_on", v).apply()
+
+    fun clearZerodhaAutoLoginBlock() { zerodhaAutoLoginBlockedOn = "" }
+
+    // ── WHITELISTED ORDER GATEWAY ─────────────────────────────────────────
+    // Zerodha accepts live orders only from an address registered with them.
+    // This phone reaches that address through a VPN tunnel to a rented box; if
+    // the tunnel drops, traffic silently leaves via the carrier instead and the
+    // broker refuses the order for a reason that looks nothing like the cause.
+
+    /** The address registered with Zerodha. Blank disables the whole check. */
+    var zerodhaWhitelistedIp: String
+        get() = prefs.getString("zerodha_whitelisted_ip", "") ?: ""
+        set(v) = prefs.edit().putString("zerodha_whitelisted_ip", v.trim()).apply()
+
+    /** Last address the outside world reported, for the settings screen. */
+    var lastSeenPublicIp: String
+        get() = prefs.getString("last_seen_public_ip", "") ?: ""
+        set(v) = prefs.edit().putString("last_seen_public_ip", v).apply()
+
+    var lastSeenPublicIpAt: Long
+        get() = prefs.getLong("last_seen_public_ip_at", 0L)
+        set(v) = prefs.edit().putLong("last_seen_public_ip_at", v).apply()
+
     /**
      * The last NSE universe successfully downloaded from the index CSV.
      *
@@ -191,6 +278,26 @@ class ConfigManager(context: Context) {
     var nseUniverseCachedAt: Long
         get() = prefs.getLong("nse_universe_cached_at", 0L)
         set(v) = prefs.edit().putLong("nse_universe_cached_at", v).apply()
+
+    /**
+     * The last GERMAN universe read from the broker's own instrument list.
+     *
+     * Same job as [nseUniverseCached] and the same reason for existing: the
+     * screeners and the gate engine want the universe on the main thread, and
+     * the list behind it is a network read. Without a kept copy every one of
+     * them falls back to the hand-typed list, which is exactly the blind spot
+     * the union was added to close.
+     *
+     * Blank until a German discovery scan has run once. Blank is honest — the
+     * curated list alone is then used, and the status line says so.
+     */
+    var deUniverseCached: String
+        get() = prefs.getString("de_universe_cached", "") ?: ""
+        set(v) = prefs.edit().putString("de_universe_cached", v).apply()
+
+    var deUniverseCachedAt: Long
+        get() = prefs.getLong("de_universe_cached_at", 0L)
+        set(v) = prefs.edit().putLong("de_universe_cached_at", v).apply()
 
     // ── FLAT PER-ORDER FEE, PER SPACE ─────────────────────────────────────
     // The percentage slippage constant models the SPREAD, which scales with the
@@ -282,6 +389,39 @@ class ConfigManager(context: Context) {
         get() = prefs.getBoolean("paper_trade_notifications", true)
         set(v) = prefs.edit().putBoolean("paper_trade_notifications", v).apply()
 
+    /**
+     * WHICH MARKETS MAY SEND PAPER-TRADE NOTIFICATIONS.
+     *
+     * One switch for all four was fine while every market could act on its own
+     * signals. India cannot: the session has to be re-authorised by hand from
+     * this device, the account's IP rules refuse ordinary orders from a phone,
+     * and the fallback is a trigger parked a fraction away from the price. So an
+     * Indian paper trade is not a report of something that happened — it is the
+     * only warning that a decision is available, and it has to reach the user
+     * even when the German and US chatter is unwanted.
+     *
+     * All four by default, which is exactly the behaviour of the single switch
+     * this replaces — nobody's notifications change until they choose.
+     */
+    var paperNotifySpaces: Set<String>
+        get() = prefs.getStringSet("paper_notify_spaces", null)
+            ?: setOf("in", "de", "us", "binance")
+        set(v) = prefs.edit().putStringSet("paper_notify_spaces", v).apply()
+
+    /**
+     * THE PER-MARKET TICK IS THE WHOLE ANSWER. There used to be a master switch
+     * above these — "Notify on PAPER trades" — and it silently outranked both the
+     * four market ticks and every algo's own bell. So an Indian algo could show a
+     * lit bell, with India ticked in Settings, and never produce one notification
+     * because a third switch three screens away was off. That is the same
+     * master-switch shape already removed from live trading, for the same reason:
+     * a control that can only ever countermand more specific ones is not a
+     * control, it is a trap. Untick a market here to silence it; untick an algo's
+     * bell to silence just that algo.
+     */
+    fun paperNotifiesSpace(base: String): Boolean =
+        base.lowercase() in paperNotifySpaces
+
     // ── US PRICE SOURCE ───────────────────────────────────────────────────
     // Yahoo's US quotes are redistributed and can lag badly. Finnhub streams
     // actual trades. Same two-part shape as the India switch: a key, and a
@@ -296,35 +436,65 @@ class ConfigManager(context: Context) {
 
     val hasFinnhubKey: Boolean get() = finnhubApiKey.isNotBlank()
 
-    /** Live tick source for the US space: "yahoo" (default) or "finnhub". */
+    /**
+     * Live tick source for the US space: "finnhub" (default where a key exists)
+     * or "yahoo".
+     *
+     * FINNHUB IS THE DEFAULT NOW. Yahoo's quotes are redistributed and can lag;
+     * Finnhub streams actual executed trades, and it reports them in extended
+     * hours too — which matters because the US session opens at 15:30 in Germany
+     * and the hours before that were previously invisible to every stop the app
+     * runs. Falling back to Yahoo without a key rather than going silent.
+     */
     var usLivePriceSource: String
-        get() = prefs.getString("us_live_price_source", "yahoo") ?: "yahoo"
+        get() = prefs.getString("us_live_price_source", null)
+            ?: (if (hasFinnhubKey) "finnhub" else "yahoo")
         set(v) = prefs.edit().putString("us_live_price_source",
             if (v == "finnhub") "finnhub" else "yahoo").apply()
 
     val useFinnhubLiveTicks: Boolean
         get() = usLivePriceSource == "finnhub" && hasFinnhubKey
 
+    /**
+     * Move an existing install onto the better US feed, ONCE.
+     *
+     * A new default only reaches a fresh install — this phone already has
+     * "yahoo" written down from before there was a choice worth making, so
+     * without this the change would apply to nobody who already uses the app.
+     *
+     * Guarded by its own flag rather than by the value, so a user who afterwards
+     * picks Yahoo on purpose keeps it: the migration can never run twice.
+     */
+    fun migrateUsFeedOnce() {
+        if (prefs.getBoolean("us_feed_migrated_v1", false)) return
+        prefs.edit().putBoolean("us_feed_migrated_v1", true).apply()
+        if (hasFinnhubKey && prefs.getString("us_live_price_source", null) == "yahoo") {
+            usLivePriceSource = "finnhub"
+            android.util.Log.i("ConfigManager",
+                "US live ticks moved from Yahoo to Finnhub (actual trades, extended hours included)")
+        }
+    }
+
     // ── ZERODHA ALGO ORDERS ───────────────────────────────────────────────
-    // Same two-key shape as the Trading 212 side: a master freeze that blocks
-    // everything, and a mirror toggle that says algo orders are wanted at all.
-    // Both are needed, because they answer different questions — "is the system
-    // armed" and "is it allowed to trade right now" — and collapsing them into
-    // one switch removes the ability to stop everything without disarming each
-    // algo individually.
+    // NO GLOBAL SWITCHES HERE ANY MORE. There were two — a master freeze and a
+    // mirror toggle — and the argument for them was that they answered different
+    // questions from the per-algo flag. In practice they answered a question the
+    // user had already answered per algo, and they drifted out of the circuit:
+    // the crypto pair read OFF for months while real orders were going out,
+    // because the algo path never consulted them.
+    //
+    // A control that can be off while the thing it names is happening is worse
+    // than no control, so arming now lives in exactly one place: the algo.
 
-    /** Master freeze for Indian algo orders. Defaults ON. Never flipped in code. */
-    var zerodhaLiveFrozen: Boolean
-        get() = prefs.getBoolean("zerodha_live_frozen", true)
-        set(v) = prefs.edit().putBoolean("zerodha_live_frozen", v).apply()
-
-    /** Whether algos may mirror into real Zerodha orders at all. Defaults OFF. */
-    var zerodhaLiveMirrorEnabled: Boolean
-        get() = prefs.getBoolean("zerodha_live_mirror_enabled", false)
-        set(v) = prefs.edit().putBoolean("zerodha_live_mirror_enabled", v).apply()
-
+    /**
+     * Whether India can place real algo orders. Now a fact about the ACCOUNT, not
+     * a switch: a connected broker plus an algo that has been armed, funded and
+     * given an allowlist. The two global toggles that used to sit here are gone —
+     * they duplicated a decision the algo already owns, and the crypto pair of
+     * them was found reading OFF while real orders were being placed.
+     */
     val canMirrorZerodhaLive: Boolean
-        get() = isZerodhaConnected && zerodhaLiveMirrorEnabled && !zerodhaLiveFrozen
+        get() = isZerodhaConnected
 
     // ── INDIA PRICE SOURCE ────────────────────────────────────────────────
     // Two separate switches on purpose, because they carry different risk and
@@ -419,9 +589,91 @@ class ConfigManager(context: Context) {
     // OFF by default. When on, NEW paper BUY/SELL decisions on the NEWEST closed
     // bar are mirrored into real T212 MARKET orders (a deliberately tiny size),
     // recorded in a separate live ledger. Paper keeps running regardless.
-    var t212LiveMirrorEnabled: Boolean
-        get() = prefs.getBoolean("t212_live_mirror_enabled", false)
-        set(v) = prefs.edit().putBoolean("t212_live_mirror_enabled", v).apply()
+
+    /**
+     * Keep retrying an algo entry that could not be placed — a closed market, or a
+     * ladder that conceded its full range without filling — instead of marking it
+     * ERROR and forgetting it.
+     *
+     * OPT-IN, and deliberately NOT "retry until filled". Every attempt re-checks
+     * that the entry signal still stands on the newest closed bar, and the attempt
+     * is abandoned the moment it does not. Unbounded chasing would fill only the
+     * orders the market ran away from — and every exit rule measures from the
+     * SIGNAL price, so the further a fill drifts above it the tighter the real stop
+     * becomes. Chasing hardest exactly when price is escaping is how a 4% stop
+     * quietly becomes a 1% one.
+     */
+    /**
+     * The currency the Trading 212 account settles in. Everything bought in a
+     * different currency is converted at both ends of the round trip, and the
+     * broker charges for each conversion.
+     */
+    var accountCurrency: String
+        get() = prefs.getString("account_currency", "EUR") ?: "EUR"
+        set(v) = prefs.edit().putString("account_currency", v.uppercase()).apply()
+
+    /**
+     * Trading 212's FX conversion charge, as a percentage of ONE conversion.
+     * A round trip converts twice — once buying, once selling — so the cost a
+     * trade actually carries is double this.
+     *
+     * Applied only where the instrument's currency differs from [accountCurrency]:
+     * a euro account buying German stocks converts nothing and pays nothing, while
+     * the same account buying US stocks pays it on both legs. That is the entire
+     * reason US algos were excluded before — the cost was real and unmodelled, so
+     * a Nasdaq backtest would have flattered itself. Modelled, the exclusion has no
+     * reason to exist.
+     *
+     * ADDITIVE, unlike the flat fee. A flat fee and a slippage percentage are two
+     * descriptions of the same friction, so the app makes them exclusive. This is a
+     * genuinely separate charge that applies on top of whichever of those is in
+     * force, and netting it against them would understate the true cost.
+     */
+    var fxConversionPct: Double
+        get() = prefs.getFloat("fx_conversion_pct", 0.15f).toDouble()
+        set(v) = prefs.edit().putFloat("fx_conversion_pct", v.toFloat()).apply()
+
+    /**
+     * MINIMUM MEDIAN DAILY TURNOVER for a name to be screened in this space, in
+     * the market's OWN currency. 0 switches the filter off.
+     *
+     * Per space because one number cannot mean the same thing in euros, dollars
+     * and rupees — see the calibration on each default in [Liquidity].
+     *
+     * -1 IS THE UNSET MARKER, not a value. It has to be distinguishable from a
+     * deliberate zero: a user who switches the filter off must not have the
+     * default quietly reinstated on the next read, which is what a 0-default
+     * would do.
+     */
+    fun minTurnoverFor(space: String): Double {
+        val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+        val v = prefs.getLong("min_turnover_$base", -1L)
+        return if (v >= 0L) v.toDouble()
+               else com.signalscope.app.screener.Liquidity.defaultFor(base)
+    }
+
+    fun setMinTurnover(space: String, value: Double) {
+        val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+        prefs.edit().putLong("min_turnover_$base",
+            value.coerceAtLeast(0.0).toLong()).apply()
+    }
+
+    /** The last exchange rate that passed its sanity check, per pair ("EURUSD"),
+     *  as instrument units per account unit, and when it was read. See FxRates. */
+    fun fxLastGood(pair: String): Pair<Double, Long>? {
+        val r = prefs.getFloat("fx_rate_$pair", 0f).toDouble()
+        val at = prefs.getLong("fx_rate_at_$pair", 0L)
+        return if (r > 0.0 && at > 0L) r to at else null
+    }
+
+    fun setFxLastGood(pair: String, rate: Double, at: Long) {
+        prefs.edit().putFloat("fx_rate_$pair", rate.toFloat())
+            .putLong("fx_rate_at_$pair", at).apply()
+    }
+
+    var t212RetryUnfilledEntries: Boolean
+        get() = prefs.getBoolean("t212_retry_unfilled_entries", false)
+        set(v) = prefs.edit().putBoolean("t212_retry_unfilled_entries", v).apply()
 
     /** Account-currency amount spent on each live mirrored T212 BUY. Hard-capped
      *  small — this is a real-money test size, not a position sizer. */
@@ -432,26 +684,14 @@ class ConfigManager(context: Context) {
             v.coerceIn(1.0, 3000.0).toFloat()
         ).apply()
 
-    /**
-     * MASTER FREEZE over T212 live entries — the switch that used to be a
-     * hardcoded `const val LIVE_FROZEN = true` in T212LiveMirror.
-     *
-     * Frozen by default and deliberately separate from [t212LiveMirrorEnabled]:
-     * that flag says "this account may mirror", this one says "the execution layer
-     * is trusted enough to send an order". Both, plus a per-algo live flag, plus
-     * the per-algo allowlist, must agree before any real stock order is placed.
-     * Four independent gates is not paranoia when one wrong tick is a real loss.
-     *
-     * Prove the chain with the Live Test Bench before turning this off — the bench
-     * runs the same executor with the same reconciliation, one manual trade at a
-     * time, and it exists precisely so this switch is not the first real order.
-     */
-    var t212LiveFrozen: Boolean
-        get() = prefs.getBoolean("t212_live_frozen", true)
-        set(v) = prefs.edit().putBoolean("t212_live_frozen", v).apply()
+    // The T212 master freeze lived here and is gone for the same reason as the
+    // Indian one. What replaces it is not fewer checks but honest ones: an algo
+    // must be armed, funded, and list the exact ticker before a single order
+    // leaves. The Live Test Bench is still the right way to prove the chain
+    // before arming an algo for the first time.
 
     val canMirrorT212Live: Boolean
-        get() = hasT212Credentials && t212LiveMirrorEnabled && !t212LiveFrozen
+        get() = hasT212Credentials
 
     // ═══════════════════════════════════════════════════════
     // BINANCE CREDENTIALS + LIVE MIRROR  (crypto space)
@@ -473,9 +713,6 @@ class ConfigManager(context: Context) {
     val hasBinanceCredentials: Boolean
         get() = binanceApiKey.isNotBlank() && binanceApiSecret.isNotBlank()
 
-    var binanceLiveMirrorEnabled: Boolean
-        get() = prefs.getBoolean("binance_live_mirror_enabled", false)
-        set(v) = prefs.edit().putBoolean("binance_live_mirror_enabled", v).apply()
 
     /** Quote amount spent on each live mirrored BUY. Kept separate from the
      * paper notional so the user can shadow the exact same signals with a
@@ -534,7 +771,7 @@ class ConfigManager(context: Context) {
     }
 
     val canMirrorBinanceLive: Boolean
-        get() = hasBinanceCredentials && binanceLiveMirrorEnabled
+        get() = hasBinanceCredentials
 
     // ═══════════════════════════════════════════════════════
     // SPACE / WORKSPACE  (which broker space the UI is currently in)
@@ -585,15 +822,16 @@ class ConfigManager(context: Context) {
         get() = prefs.getInt("scan_interval_min", 15)
         set(v) = prefs.edit().putInt("scan_interval_min", v).apply()
 
-    /** Sell score threshold for moderate sell notification (default 45) */
-    var sellScoreAlertThreshold: Int
-        get() = prefs.getInt("sell_threshold", 45)
-        set(v) = prefs.edit().putInt("sell_threshold", v).apply()
-
-    /** Sell score threshold for strong sell notification (default 65) */
-    var strongSellAlertThreshold: Int
-        get() = prefs.getInt("strong_sell_threshold", 65)
-        set(v) = prefs.edit().putInt("strong_sell_threshold", v).apply()
+    // REMOVED: sellScoreAlertThreshold / strongSellAlertThreshold.
+    //
+    // The README still describes these as configurable alert thresholds, and they
+    // had stored values with sensible defaults — but NOTHING read them. Not the
+    // scanner, not the notifier, not the settings screen. They were a promise the
+    // app stopped keeping at some point and nobody noticed, because a setting that
+    // is written and never read fails silently and looks exactly like one that
+    // works. Deleted rather than wired up: the sell decision now lives in the
+    // scorecards and the exit rules, which is a better place for it than a pair of
+    // loose numbers.
 
     /** Only scan during Indian market hours (9:15 AM - 3:30 PM IST, weekdays) */
     var scanDuringMarketHoursOnly: Boolean
@@ -883,6 +1121,86 @@ class ConfigManager(context: Context) {
         get() = prefs.getBoolean("t212_auto_trailing_enabled", true)
         set(v) = prefs.edit().putBoolean("t212_auto_trailing_enabled", v).apply()
 
+    /**
+     * Where Indian candles come from: "yahoo" or "kite".
+     *
+     * Both are kept deliberately. Zerodha's historical data rides on the same paid
+     * subscription as the live stream, and that can lapse between months — a
+     * strategy that stops seeing candles is far worse than one running on a
+     * second-best feed. So this is a switch, not a migration, and a Kite failure
+     * falls back to Yahoo rather than going dark.
+     *
+     * Yahoo remains the default. It costs nothing and works for every user;
+     * exchange bars are the upgrade, not the baseline.
+     */
+    var indiaCandleSource: String
+        get() = prefs.getString("india_candle_source", "yahoo") ?: "yahoo"
+        set(v) = prefs.edit().putString("india_candle_source",
+            if (v.equals("kite", true)) "kite" else "yahoo").apply()
+
+    /**
+     * How many names the watcher follows per space.
+     *
+     * THIS IS A BANDWIDTH DIAL, not just a list length. Every candidate costs one
+     * price download per space per tick — the engine check is not cached, unlike
+     * the daily screen — so the number here multiplies by three spaces and by
+     * every tick of the day. Fifteen is about 45 downloads a pass; thirty is 90.
+     *
+     * Raise it to see more opportunities, lower it if the feed starts refusing
+     * requests. A throttled feed does not announce itself: the signal check simply
+     * returns nothing and the name quietly stops being watched, which looks like
+     * a calm market rather than a missed alert.
+     */
+    var watcherDepth: Int
+        get() = prefs.getInt("watcher_depth", 30)
+        set(v) = prefs.edit().putInt("watcher_depth", v.coerceIn(5, 60)).apply()
+
+    // ── PORTFOLIO-WIDE STRATEGY EXITS ────────────────────────────────────────
+    // Runs the space's watcher strategy against EVERYTHING you hold at the
+    // broker, not just what the app bought. Two switches on purpose, because
+    // telling you and acting for you are different sizes of decision.
+
+    /**
+     * Judge every holding by the strategy and say something when it wants out.
+     *
+     * ON by default. It only ever notifies, once per holding per day, and a
+     * portfolio nobody is judging was the gap this exists to close.
+     */
+    var portfolioStrategyExitsEnabled: Boolean
+        get() = prefs.getBoolean("portfolio_strategy_exits", true)
+        set(v) = prefs.edit().putBoolean("portfolio_strategy_exits", v).apply()
+
+    /**
+     * Tick sizes learned from a broker rejection, per symbol.
+     *
+     * The app has no instrument table, and most NSE equities tick at 0.05 — so a
+     * hard-coded 0.05 looked right until it met one that ticks at 0.50, whose
+     * every protective stop was then rejected. The broker names the required tick
+     * in its refusal; this remembers it so the mistake is made once per
+     * instrument rather than on every pass, for ever.
+     *
+     * Stored as a flat "SYM=tick" list: a handful of entries, read rarely.
+     */
+    fun learnedTickSize(symbol: String): Double? {
+        val k = symbol.uppercase()
+        return prefs.getString("learned_ticks", "")?.split(';')
+            ?.firstOrNull { it.startsWith("$k=") }
+            ?.substringAfter('=')?.toDoubleOrNull()?.takeIf { it > 0.0 }
+    }
+
+    fun rememberTickSize(symbol: String, tick: Double) {
+        val k = symbol.uppercase()
+        val kept = (prefs.getString("learned_ticks", "") ?: "")
+            .split(';').filter { it.isNotBlank() && !it.startsWith("$k=") }
+        prefs.edit().putString("learned_ticks", (kept + "$k=$tick").joinToString(";")).apply()
+    }
+
+    // NO AUTO-SELL SETTING HERE, on purpose. The switch existed in a draft of
+    // this and was removed rather than shipped dark: a setting that is written and
+    // never read is indistinguishable from one that works, which is exactly how
+    // two dead alert thresholds survived in this file for months. When the selling
+    // path is built and tested, the switch arrives with it.
+
     /** T212 chandelier multiplier with the TIGHTER curve (SL is sole exit so
      *  trails closer to lock profits on the upside). Mirrors the shared
      *  `slChandelierAtrMultiple` shape; uses T212-prefixed config getters. */
@@ -1080,6 +1398,9 @@ class ConfigManager(context: Context) {
         }
         apply(listOf("zerodha_api_key", "ZERODHA_API_KEY"), "Zerodha key") { zerodhaApiKey = it }
         apply(listOf("zerodha_api_secret", "ZERODHA_API_SECRET"), "Zerodha secret") { zerodhaApiSecret = it }
+        apply(listOf("zerodha_user_id", "ZERODHA_USER_ID"), "Zerodha client ID") { zerodhaUserId = it }
+        apply(listOf("zerodha_password", "ZERODHA_PASSWORD"), "Zerodha password") { zerodhaPassword = it }
+        apply(listOf("zerodha_totp_secret", "ZERODHA_TOTP_SECRET"), "Zerodha TOTP seed") { zerodhaTotpSecret = it }
         apply(listOf("t212_api_key", "T212_API_KEY"), "T212 key") { t212ApiKey = it }
         apply(listOf("t212_api_secret", "T212_API_SECRET"), "T212 secret") { t212ApiSecret = it }
         apply(listOf("binance_api_key", "BINANCE_API_KEY"), "Binance key") { binanceApiKey = it }

@@ -242,7 +242,8 @@ object ReinvestEngine {
             .setContentIntent(pi).setAutoCancel(true)
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
             .build()
-        nm.notify(9100 + ns.hashCode().mod(100), n)
+        com.signalscope.app.data.NotificationLog.post(ctx, nm, 9100 + ns.hashCode().mod(100), n,
+            com.signalscope.app.data.NotificationLog.Link(ns = ns))
     }
 
     /** Make the lab's enrolled set exactly [basket]: enroll joiners, drop leavers. */

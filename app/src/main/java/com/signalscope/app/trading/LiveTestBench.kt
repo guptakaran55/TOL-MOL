@@ -149,7 +149,8 @@ object LiveTestBench {
         // PatientExecutor checks that where the price and the pool are both known.
         val exitCaveat = ""
         val ys = YahooFinanceClient.toYahooSymbol(sym, if (space.equals("DE", true)) "DE" else "US")
-        val r = PatientExecutor.buy(config, orderTarget, ys, space, amount, a.price, onProgress)
+        val r = PatientExecutor.buy(config, orderTarget, ys, space, amount, a.price,
+            onProgress = onProgress)
         val quote = a.price
         if (!r.ok || r.filled <= 0.0) {
             return Outcome(false, "execute", r.error ?: (r.note.ifBlank { "nothing filled" }),

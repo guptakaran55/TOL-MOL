@@ -58,6 +58,7 @@ object ValueAnalyzer {
         sectorMedianPe: Double? = null,
         w: ScoringWeights = ScoringWeights()
     ): ValueResult {
+        if (isFund(fundamentals.quoteType, fundamentals.sector)) return fundResult(fundamentals)
         val pe = fundamentals.trailingPe
         val fwdPe = fundamentals.forwardPe
         val pb = fundamentals.priceToBook
@@ -339,13 +340,39 @@ object ValueAnalyzer {
                 fiftyTwoWeekHigh = stock.fiftyTwoWeekHigh,
                 sharesOutstanding = stock.sharesOutstanding,
                 sector = stock.sector,
-                industry = stock.industry
+                industry = stock.industry,
+                quoteType = if (stock.sector == FUND_SECTOR) "ETF" else null
             ),
             currentPrice = stock.price,
             sectorMedianPe = sectorMedianPe,
             w = w
         )
     }
+
+    /** Sector label a fund carries, so a later rescore from the saved row still knows. */
+    const val FUND_SECTOR = "ETF"
+
+    private val FUND_TYPES = setOf("ETF", "MUTUALFUND", "FUTURE", "INDEX", "CURRENCY")
+
+    fun isFund(quoteType: String?, sector: String? = null): Boolean =
+        (quoteType != null && quoteType.uppercase() in FUND_TYPES) || sector == FUND_SECTOR
+
+    /** ETFs, funds and futures: their "PE" or "52W low" is the basket's, not a
+     *  company's, so the value score would be noise. Rated N/A, which keeps them
+     *  out of the Value list; momentum and entry scoring still apply. */
+    private fun fundResult(f: YahooFinanceClient.FundamentalData) = ValueResult(
+        valueScore = 0, valueRating = "N/A",
+        trailingPe = null, forwardPe = null, priceToBook = null, evToEbitda = null,
+        debtToEquity = null, roce = null, revenueGrowth = null, earningsGrowth = null,
+        grossMargins = null, operatingMargins = null, profitMargins = null,
+        dividendYield = f.dividendYield, operatingCashflow = null, freeCashflow = null,
+        netIncome = null, totalRevenue = null, totalCash = null, totalDebt = null,
+        currentRatio = null, annualRevenueGrowth = null, annualNetIncomeGrowth = null,
+        fiftyTwoWeekLow = f.fiftyTwoWeekLow, fiftyTwoWeekHigh = f.fiftyTwoWeekHigh,
+        sharesOutstanding = null, sector = FUND_SECTOR, industry = f.industry,
+        sectorMedianPe = null, hasBuyback = false,
+        valueScoreReport = "Fund|0|0|ETFs and funds have no company accounts — value scoring doesn't apply"
+    )
 
     private fun chooseGrowth(current: Double?, annual: Double?): Double? = when {
         current != null && current.isFinite() -> current

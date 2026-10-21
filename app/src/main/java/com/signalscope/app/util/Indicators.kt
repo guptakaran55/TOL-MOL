@@ -454,6 +454,24 @@ object Indicators {
     data class SupportResistance(val support: Double, val resistance: Double)
 
     /**
+     * The same two levels, plus HOW MANY TIMES price actually turned at each.
+     *
+     * ZERO MEANS NO CLUSTER BACKED IT — the level is the fallback pivot
+     * arithmetic off the latest bar, not a price this stock has ever reversed
+     * from. The two are worth very different amounts and the old return shape
+     * could not tell them apart, so every caller had to present a guess with the
+     * same confidence as a level tested three times.
+     *
+     * The plain [findSupportResistance] still returns just the prices and is
+     * unchanged in behaviour — this is the same computation, reporting more of
+     * what it already worked out.
+     */
+    data class SupportResistanceDetail(
+        val support: Double, val resistance: Double,
+        val supportTouches: Int, val resistanceTouches: Int
+    )
+
+    /**
      * Estimate a good lookback window based on swing-point density.
      * Runs a quick low-resolution pivot scan over the last 120 days;
      * many pivots → short natural cycle → short lookback.
@@ -489,7 +507,15 @@ object Indicators {
         lows: List<Double>,
         closes: List<Double>,
         lookback: Int = -1  // -1 = auto (adaptive); positive value overrides
-    ): SupportResistance {
+    ): SupportResistance = findSupportResistanceDetailed(highs, lows, closes, lookback)
+        .let { SupportResistance(it.support, it.resistance) }
+
+    fun findSupportResistanceDetailed(
+        highs: List<Double>,
+        lows: List<Double>,
+        closes: List<Double>,
+        lookback: Int = -1  // -1 = auto (adaptive); positive value overrides
+    ): SupportResistanceDetail {
         val n = closes.size
         val lb = if (lookback > 0) min(lookback, n - 10) else estimateAdaptiveLookback(highs, lows)
         val price = closes.last()
@@ -577,7 +603,8 @@ object Indicators {
         // Role reversal: a broken support cluster well above current price acts as resistance
         supClusters.filter { it.price >= price + minDistance * 2 }.forEach { resCandidates.add(it) }
 
-        val resistance = resCandidates.maxByOrNull { score(it) }?.price
+        val resPick = resCandidates.maxByOrNull { score(it) }
+        val resistance = resPick?.price
             ?: run {
                 // Fallback: raw pivot R1, then the all-time max in window
                 val pivot = (rHighs.last() + rLows.last() + rCloses.last()) / 3
@@ -591,16 +618,21 @@ object Indicators {
         // Role reversal: a broken resistance well below current price acts as support
         resClusters.filter { it.price <= price - minDistance * 2 }.forEach { supCandidates.add(it) }
 
-        val support = supCandidates.maxByOrNull { score(it) }?.price
+        val supPick = supCandidates.maxByOrNull { score(it) }
+        val support = supPick?.price
             ?: run {
                 val pivot = (rHighs.last() + rLows.last() + rCloses.last()) / 3
                 val s1 = 2 * pivot - rHighs.last()
                 if (s1 < price) s1 else rLows.min()
             }
 
-        return SupportResistance(
+        return SupportResistanceDetail(
             support = Math.round(support * 100.0) / 100.0,
-            resistance = Math.round(resistance * 100.0) / 100.0
+            resistance = Math.round(resistance * 100.0) / 100.0,
+            // A FALLBACK REPORTS ZERO TOUCHES, which is the honest count: nothing
+            // turned there, the number was derived from the latest bar.
+            supportTouches = supPick?.touches ?: 0,
+            resistanceTouches = resPick?.touches ?: 0
         )
     }
 

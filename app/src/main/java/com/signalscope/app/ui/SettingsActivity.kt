@@ -55,10 +55,28 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etZerodhaToken: EditText
     private lateinit var tvZerodhaStatus: TextView
     private lateinit var layoutZerodhaToken: View
-    private lateinit var switchPaperNotifications: Switch
+
+    // ── Zerodha unattended daily login ──
+    private lateinit var etZerodhaUserId: EditText
+    private lateinit var etZerodhaPassword: EditText
+    private lateinit var etZerodhaTotpSecret: EditText
+    private lateinit var switchZerodhaAutoLogin: Switch
+    private lateinit var btnZerodhaAutoLoginTest: Button
+    private lateinit var tvZerodhaAutoLoginStatus: TextView
+
+    // ── Whitelisted order gateway ──
+    private lateinit var etZerodhaWhitelistedIp: EditText
+    private lateinit var btnCheckExitAddress: Button
+    private lateinit var tvExitAddressStatus: TextView
+    private lateinit var etGatewayTestSymbol: EditText
+    private lateinit var btnGatewayTest: Button
+    private lateinit var tvGatewayTestResult: TextView
+    private lateinit var cbPaperIn: android.widget.CheckBox
+    private lateinit var cbPaperDe: android.widget.CheckBox
+    private lateinit var cbPaperUs: android.widget.CheckBox
+    private lateinit var cbPaperBn: android.widget.CheckBox
     private lateinit var etFinnhubKey: EditText
     private lateinit var switchFinnhubLiveTicks: Switch
-    private lateinit var switchZerodhaLiveMirror: Switch
     private lateinit var etFlatFeeUs: EditText
     private lateinit var etFlatFeeDe: EditText
     private lateinit var etFlatFeeIn: EditText
@@ -101,9 +119,13 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     // ── Trading 212 fields (US space) ──
+    private lateinit var switchKiteCandles: Switch
+    private lateinit var etWatcherDepth: EditText
+    private lateinit var etAccountCurrency: EditText
+    private lateinit var etFxConversionPct: EditText
+    private lateinit var switchRetryUnfilled: Switch
     private lateinit var etT212ApiKey: EditText
     private lateinit var etT212ApiSecret: EditText
-    private lateinit var switchT212LiveMirror: Switch
     private lateinit var etT212LiveAmount: EditText
     private lateinit var btnT212Test: Button
     private lateinit var tvT212Status: TextView
@@ -111,7 +133,6 @@ class SettingsActivity : AppCompatActivity() {
     // ── Binance fields (Crypto space) ──
     private lateinit var etBinanceApiKey: EditText
     private lateinit var etBinanceApiSecret: EditText
-    private lateinit var switchBinanceLiveMirror: Switch
     private lateinit var etBinanceLiveQuoteOrderSize: EditText
     private lateinit var btnBinanceTest: Button
     private lateinit var tvBinanceStatus: TextView
@@ -306,6 +327,25 @@ class SettingsActivity : AppCompatActivity() {
         btnZerodhaLogin = addButton("🔗 Open Zerodha Login")
         tvZerodhaStatus = addStatus()
 
+        addSubHeading("Price data for Indian names")
+        switchKiteCandles = Switch(this).apply {
+            text = "Use Zerodha candles instead of Yahoo"
+        }
+        inner.addView(switchKiteCandles)
+        inner.addView(TextView(this).apply {
+            text = "Off by default. On, the strategy is evaluated on the exchange's own bars " +
+                   "rather than Yahoo's — the same paid Zerodha subscription that gives you the " +
+                   "live tick stream also provides this history.\n\n" +
+                   "Safe to leave on if the subscription lapses: the app falls back to Yahoo " +
+                   "for any name Zerodha will not answer for, so the strategy keeps running " +
+                   "rather than going blind. Each fallback is written to the log, so a lapsed " +
+                   "subscription shows up as an explanation instead of a mystery.\n\n" +
+                   "Affects India only. Germany, the US and crypto are unchanged."
+            textSize = 11f
+            setPadding(0, 4, 0, 10)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
         // Token paste section
         layoutZerodhaToken = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
@@ -315,6 +355,92 @@ class SettingsActivity : AppCompatActivity() {
         etZerodhaToken = addField("Paste full URL or token here")
         btnZerodhaToken = addButton("✓ Submit Token")
         inner.addView(layoutZerodhaToken)
+
+        // ── Unattended daily login ──
+        addSubHeading("Log in by itself every morning")
+        inner.addView(TextView(this).apply {
+            text = "Zerodha throws the session away every morning and only a real login " +
+                   "brings it back — which from Germany means being awake around 5am. " +
+                   "With this on, the phone does that login by itself at 07:20 India time " +
+                   "(about 03:50 here in summer), well before the market opens. Two more " +
+                   "tries stand behind the first in case the network was down, and they " +
+                   "cost nothing when the first one worked.\n\n" +
+                   "Needs external TOTP switched on in your Kite profile → Password & " +
+                   "Security. Save the seed it shows you and paste it below.\n\n" +
+                   "You will not be woken: a failure arrives as a silent notification you " +
+                   "will see at breakfast, with hours left to connect by hand."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        inner.addView(TextView(this).apply {
+            text = "This stores your actual Zerodha LOGIN PASSWORD and second-factor seed " +
+                   "on this phone, in the app's private storage — same place as every " +
+                   "other key here, which is safe from other apps but not from anyone " +
+                   "holding an unlocked phone. Leave this off if that isn't a trade you " +
+                   "want to make."
+            textSize = 10f
+            setPadding(0, 2, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#b45309"))
+        })
+        addLabel("Kite Client ID (e.g. AB1234)")
+        etZerodhaUserId = addField("Enter Kite client ID")
+        addLabel("Kite login password  —  NOT the API secret")
+        etZerodhaPassword = addField("Enter Kite password", isPassword = true)
+        addLabel("External TOTP seed (base32 string from Kite profile)")
+        etZerodhaTotpSecret = addField("Paste TOTP seed", isPassword = true)
+        switchZerodhaAutoLogin = Switch(this).apply {
+            text = "Renew the Zerodha session automatically each morning"
+        }
+        inner.addView(switchZerodhaAutoLogin)
+        btnZerodhaAutoLoginTest = addButton("🔁 Try auto-login now")
+        tvZerodhaAutoLoginStatus = addStatus()
+
+        // ── Whitelisted order gateway ──
+        addSubHeading("Order gateway — the address Zerodha trusts")
+        inner.addView(TextView(this).apply {
+            text = "Zerodha accepts live orders only from an address registered with " +
+                   "them, and a mobile carrier can never give you a fixed one. This " +
+                   "phone gets a fixed address by tunnelling to a rented gateway.\n\n" +
+                   "Put that address here and every live order is checked against it " +
+                   "first. If the tunnel has dropped and the phone is back on the " +
+                   "carrier, the order is refused here instead of being sent and " +
+                   "rejected — with a notification saying exactly why.\n\n" +
+                   "Leave blank to switch the check off entirely. Existing GTT " +
+                   "triggers sit at the broker and are never affected by any of this."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("Whitelisted address (as registered in the Kite Connect console)")
+        etZerodhaWhitelistedIp = addField("e.g. 94.237.74.152")
+        btnCheckExitAddress = addButton("🌐 What address am I on right now?")
+        tvExitAddressStatus = addStatus()
+
+        // ── Live order path test ──
+        addSubHeading("Will Zerodha actually take my orders?")
+        inner.addView(TextView(this).apply {
+            text = "Places a REAL order for one share, priced 10% under the last trade " +
+                   "— far too low to fill — and cancels it seconds later. Both a normal " +
+                   "order and an after-market one, so you see the whole path.\n\n" +
+                   "Safe with the market shut: Zerodha checks your address before it " +
+                   "looks at the order, so a refusal about market hours or funds still " +
+                   "proves you got through. It reports Zerodha's exact words and tells " +
+                   "you which kind of 'no' you got.\n\n" +
+                   "If a cancel ever fails it says so in capitals with the order number. " +
+                   "Take that seriously and cancel it in the Kite app."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("Test with which company? (any liquid NSE symbol)")
+        etGatewayTestSymbol = addField("SBIN")
+        btnGatewayTest = addButton("🧪 Test the live order path")
+        tvGatewayTestResult = addStatus().apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+        }
 
         // ── India price source ──
         // Two switches, not one, because live ticks and candles are billed
@@ -366,14 +492,11 @@ class SettingsActivity : AppCompatActivity() {
             setPadding(0, 8, 0, 4)
             setTextColor(android.graphics.Color.parseColor("#b45309"))
         })
-        switchZerodhaLiveMirror = Switch(this).apply {
-            text = "Enable REAL Zerodha orders for Indian algos"
-        }
-        inner.addView(switchZerodhaLiveMirror)
         inner.addView(TextView(this).apply {
-            text = "Real money. This is only one of four gates — the master freeze on the Algos " +
-                   "tab, each algo's own switch and its allowlist must all agree too. NSE has no " +
-                   "fractional shares, so a seat budget below one share places no order at all."
+            text = "Real orders for India are armed on the ALGO, not here. An algo must be " +
+                   "switched live, given a budget, and list the exact company before anything " +
+                   "is placed. NSE has no fractional shares, so a seat budget below one share " +
+                   "places no order at all."
             textSize = 10f
             setPadding(0, 2, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
@@ -413,12 +536,11 @@ class SettingsActivity : AppCompatActivity() {
             setPadding(0, 8, 0, 4)
             setTextColor(android.graphics.Color.parseColor("#b45309"))
         })
-        switchT212LiveMirror = Switch(this).apply {
-            text = "Enable LIVE mirror for US paper signals (real T212 orders)"
-        }
-        inner.addView(switchT212LiveMirror)
         inner.addView(TextView(this).apply {
-            text = "Real money. Only the latest closed 15-min bar can place an order. T212 fills settle asynchronously — confirm actual fills in the T212 app. If a symbol also has a manual SL/target leg, the mirror's sell can be refused (shares reserved)."
+            text = "Real orders for stocks are armed on the ALGO, not here. Only the latest " +
+                   "closed bar can place one. Fills settle asynchronously, so confirm them in " +
+                   "the Trading 212 app. If a name already has a manual stop or target leg, the " +
+                   "sell can be refused because the shares are reserved."
             textSize = 10f
             setPadding(0, 2, 0, 6)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
@@ -431,6 +553,41 @@ class SettingsActivity : AppCompatActivity() {
             setTextColor(android.graphics.Color.BLACK)
         }
         inner.addView(etT212LiveAmount)
+
+        // ── COSTS AND RETRY, both Trading 212's and neither previously here ──
+        //
+        // Both were reachable only from a control buried in the Algos tab, which
+        // made them invisible to anyone looking where settings live. Currency
+        // conversion in particular is a real charge on every US round trip and
+        // belongs beside the broker that levies it.
+        addSubHeading("Currency conversion & order retry")
+        inner.addView(TextView(this).apply {
+            text = "T212 settles in your account currency, so anything priced in another one " +
+                   "converts twice per round trip — once buying, once selling — and each " +
+                   "conversion is charged. German stock in a euro account converts nothing; " +
+                   "US stock converts both ways."
+            textSize = 11f
+            setPadding(0, 4, 0, 8)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+        addLabel("Account currency (what T212 settles in)")
+        etAccountCurrency = addField("EUR")
+        addLabel("Conversion charge per conversion (%) — a round trip costs double this")
+        etFxConversionPct = addField("0.15")
+        switchRetryUnfilled = Switch(this).apply {
+            text = "Keep retrying an entry the market would not fill"
+        }
+        inner.addView(switchRetryUnfilled)
+        inner.addView(TextView(this).apply {
+            text = "Off by default. When on, a buy that could not be filled — a shut market, or " +
+                   "a ladder that conceded its whole range — is retried while the entry signal " +
+                   "STILL stands, and abandoned the moment it does not. Exits are always " +
+                   "retried regardless of this; only buys are optional, because chasing a buy " +
+                   "adds risk while chasing a sell removes it."
+            textSize = 11f
+            setPadding(0, 4, 0, 10)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
 
         // Binance section (Crypto space)
         // ── US price source ──
@@ -473,13 +630,10 @@ class SettingsActivity : AppCompatActivity() {
         addLabel("API Secret (BINANCE_API_SECRET)")
         etBinanceApiSecret = addField("Paste Binance API secret", isPassword = true)
 
-        switchBinanceLiveMirror = Switch(this).apply {
-            text = "Enable LIVE mirror for Binance paper signals"
-            setPadding(0, 12, 0, 0)
-        }
-        inner.addView(switchBinanceLiveMirror)
         inner.addView(TextView(this).apply {
-            text = "Paper never stops. When this is ON, only the latest closed Binance bar can place real Spot orders. Older catch-up/backfill signals remain paper-only."
+            text = "Real orders for crypto are armed on the ALGO, not here. Paper never stops. " +
+                   "Only the latest closed bar can place a real order; older catch-up signals " +
+                   "stay paper-only."
             textSize = 10f
             setPadding(32, 4, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#64748b"))
@@ -496,7 +650,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // ── Scan config section ──
         // ── Flat per-order fee ──
-        addSection("💸 Flat fee per order (all algos)")
+        addSection("💸 Broker costs per space  (flat fee per order)")
         inner.addView(TextView(this).apply {
             text = "The slippage % already models the spread, which scales with the position. " +
                    "Brokerage and exchange charges do not — they are a fixed amount per order, " +
@@ -525,7 +679,7 @@ class SettingsActivity : AppCompatActivity() {
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
         })
 
-        addSection("Scan Configuration")
+        addSection("⚙️ Scanning & alerts  (all spaces)")
 
         addLabel("Scan interval:")
         spinnerInterval = Spinner(this)
@@ -535,8 +689,23 @@ class SettingsActivity : AppCompatActivity() {
         spinnerInterval.adapter = intervals
         inner.addView(spinnerInterval)
 
+        addLabel("Watcher depth — names followed per market")
+        etWatcherDepth = addField("30")
+        inner.addView(TextView(this).apply {
+            text = "How far down each screener ranking the watcher keeps looking. " +
+                   "This is a bandwidth dial as much as a list length: every name costs one " +
+                   "price download per market per pass, so 30 across three markets is about " +
+                   "90 a pass where 15 was 45.\n\n" +
+                   "Raise it to catch more opportunities. Lower it if entries start being missed — " +
+                   "a throttled feed says nothing, it just returns no data, and a name then " +
+                   "goes quiet exactly as though the market were calm."
+            textSize = 11f
+            setPadding(0, 4, 0, 10)
+            setTextColor(android.graphics.Color.parseColor("#94a3b8"))
+        })
+
         switchMarketHours = Switch(this).apply {
-            text = "Scan during market hours only (9:15–15:30 IST)"
+            text = "Scan during Indian market hours only (9:15–15:30 IST)"
             setPadding(0, 16, 0, 0)
         }
         inner.addView(switchMarketHours)
@@ -547,24 +716,48 @@ class SettingsActivity : AppCompatActivity() {
         }
         inner.addView(switchVibrate)
 
-        switchPaperNotifications = Switch(this).apply {
-            text = "Notify on PAPER trades (all spaces)"
-            setPadding(0, 8, 0, 0)
-        }
-        inner.addView(switchPaperNotifications)
+        // NO MASTER SWITCH HERE ANY MORE. "Notify on PAPER trades" used to sit
+        // above these ticks and silently outrank all four of them — and every
+        // algo's own bell with it. An Indian algo could show a lit bell, with
+        // India ticked below, and never notify once. Same shape as the live
+        // master switches already removed, same reason: a control whose only
+        // power is to countermand more specific ones is a trap, not a control.
         inner.addView(TextView(this).apply {
-            text = "Off = only REAL money interrupts you: broker fills, an unfilled ladder, a " +
-                   "ledger mismatch. Paper opens and closes stop notifying across every space — " +
-                   "they still happen and are still recorded on each algo's card.\n" +
-                   "Worth turning off once several algos are running: a steady drip of " +
-                   "notifications that never need action is how the ones that do get ignored."
+            text = "Notify on PAPER trades"
+            textSize = 14f
+            setPadding(0, 12, 0, 2)
+        })
+        // PER MARKET, because a paper alert is not worth the same in each one.
+        // Germany and the US place their own orders, so it reports something
+        // already done. India places nothing without the user — the session must
+        // be re-authorised by hand and the account refuses ordinary orders from a
+        // phone — so there the same alert is the only prompt they will get. One
+        // switch for all four forced a choice between silence and noise.
+        cbPaperIn = android.widget.CheckBox(this).apply {
+            text = "🇮🇳  India — you place every order yourself"; textSize = 12f; setPadding(24, 0, 0, 0) }
+        cbPaperDe = android.widget.CheckBox(this).apply {
+            text = "🇩🇪  Germany"; textSize = 12f; setPadding(24, 0, 0, 0) }
+        cbPaperUs = android.widget.CheckBox(this).apply {
+            text = "🇺🇸  USA"; textSize = 12f; setPadding(24, 0, 0, 0) }
+        cbPaperBn = android.widget.CheckBox(this).apply {
+            text = "🪙  Crypto"; textSize = 12f; setPadding(24, 0, 0, 0) }
+        inner.addView(cbPaperIn); inner.addView(cbPaperDe)
+        inner.addView(cbPaperUs); inner.addView(cbPaperBn)
+        inner.addView(TextView(this).apply {
+            text = "Unticked = only REAL money interrupts you from that market: broker fills, an " +
+                   "unfilled ladder, a ledger mismatch. Paper opens and closes stop notifying — " +
+                   "they still happen and are still recorded on each algo's card. Untick all four " +
+                   "for silence; each algo also has its own bell, which can mute just that one.\n" +
+                   "Tick the markets you want. India is worth keeping on even when the rest are " +
+                   "off: nothing is placed there without you, so a paper trade is the only notice " +
+                   "that a decision is open — and it arrives as a prompt, not a report."
             textSize = 10f
             setPadding(0, 2, 0, 8)
             setTextColor(android.graphics.Color.parseColor("#94a3b8"))
         })
 
         // ── Automated GTT / Trailing SL section ──
-        addSection("🤖 Automated GTT & Trailing SL  (15:20 IST daily tick)")
+        addSection("🤖 Automatic stop management  (per broker — see each block)")
 
         inner.addView(TextView(this).apply {
             text = "Daily ticks run at 15:20 IST (Zerodha / NSE) and 17:45 Berlin + 16:20 NY (Trading 212).\n" +
@@ -578,7 +771,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // ── 🇮🇳 Zerodha (Indian space) sub-section ───────────────────────────
         inner.addView(TextView(this).apply {
-            text = "🇮🇳 Zerodha (Indian space)"
+            text = "🇮🇳 Zerodha — India  ·  runs once daily after 15:20 IST"
             textSize = 14f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(0, 20, 0, 6)
@@ -694,7 +887,7 @@ class SettingsActivity : AppCompatActivity() {
         //   - Higher daily ATR on most US large-caps: −15% floor breathes
         //     where Zerodha's −10% would noise out
         inner.addView(TextView(this).apply {
-            text = "🇺🇸 Trading 212 (US / DE space)"
+            text = "🇺🇸🇩🇪 Trading 212 — US & Germany  ·  runs on its own daily alarm"
             textSize = 14f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(0, 32, 0, 6)
@@ -1696,6 +1889,24 @@ class SettingsActivity : AppCompatActivity() {
 
         btnZerodhaToken.setOnClickListener { submitZerodhaToken() }
 
+        btnZerodhaAutoLoginTest.setOnClickListener { testZerodhaAutoLogin() }
+
+        btnCheckExitAddress.setOnClickListener { checkExitAddressNow() }
+
+        // Real money touches the broker here, so it asks first. Every other
+        // button on this screen is a read; this one is not.
+        btnGatewayTest.setOnClickListener {
+            val sym = etGatewayTestSymbol.text.toString().trim().ifBlank { "SBIN" }.uppercase()
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Place a real test order?")
+                .setMessage("One share of $sym at 10% under the last trade, cancelled " +
+                        "immediately afterwards. It is a genuine instruction to Zerodha " +
+                        "for the few seconds it exists.\n\nGo ahead?")
+                .setPositiveButton("Place it") { _, _ -> runGatewayTest(sym) }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
         // ── Trading 212 connection test ──────────────────────────────────────
         // Saves the API key first (so the test reflects what's typed, not what
         // was saved last time), then ping /equity/account/cash on a background
@@ -1783,16 +1994,22 @@ class SettingsActivity : AppCompatActivity() {
         etZerodhaApiKey.setText(config.zerodhaApiKey)
         etZerodhaApiSecret.setText(config.zerodhaApiSecret)
 
+        etZerodhaUserId.setText(config.zerodhaUserId)
+        etZerodhaPassword.setText(config.zerodhaPassword)
+        etZerodhaTotpSecret.setText(config.zerodhaTotpSecret)
+        switchZerodhaAutoLogin.isChecked = config.zerodhaAutoLoginEnabled
+        refreshAutoLoginStatus()
+        etZerodhaWhitelistedIp.setText(config.zerodhaWhitelistedIp)
+        refreshExitAddressStatus()
+
         // T212 credentials (US space)
         etT212ApiKey.setText(config.t212ApiKey)
         etT212ApiSecret.setText(config.t212ApiSecret)
-        switchT212LiveMirror.isChecked = config.t212LiveMirrorEnabled
         etT212LiveAmount.setText(config.t212LivePerTradeAmount.toString())
 
         // Binance credentials + live mirror (Crypto space)
         etBinanceApiKey.setText(config.binanceApiKey)
         etBinanceApiSecret.setText(config.binanceApiSecret)
-        switchBinanceLiveMirror.isChecked = config.binanceLiveMirrorEnabled
         etBinanceLiveQuoteOrderSize.setText("%.2f".format(config.binanceLiveQuoteOrderSize))
 
         // Interval spinner
@@ -1835,10 +2052,19 @@ class SettingsActivity : AppCompatActivity() {
         etT212SlTimeDecay10dFactor.setText("%.2f".format(config.t212SlTimeDecay10dFactor))
         etT212SlTimeDecay20dFactor.setText("%.2f".format(config.t212SlTimeDecay20dFactor))
         switchAutoTrailingTarget.isChecked = config.autoTrailingTargetEnabled
-        switchPaperNotifications.isChecked = config.paperTradeNotifications
+        config.paperNotifySpaces.let { sp ->
+            cbPaperIn.isChecked = "in" in sp
+            cbPaperDe.isChecked = "de" in sp
+            cbPaperUs.isChecked = "us" in sp
+            cbPaperBn.isChecked = "binance" in sp
+        }
         etFinnhubKey.setText(config.finnhubApiKey)
         switchFinnhubLiveTicks.isChecked = config.usLivePriceSource == "finnhub"
-        switchZerodhaLiveMirror.isChecked = config.zerodhaLiveMirrorEnabled
+        switchKiteCandles.isChecked = config.indiaCandleSource.equals("kite", true)
+        etWatcherDepth.setText(config.watcherDepth.toString())
+        etAccountCurrency.setText(config.accountCurrency)
+        etFxConversionPct.setText("%.2f".format(config.fxConversionPct))
+        switchRetryUnfilled.isChecked = config.t212RetryUnfilledEntries
         etFlatFeeUs.setText("%.2f".format(config.flatFeeUs))
         etFlatFeeDe.setText("%.2f".format(config.flatFeeDe))
         etFlatFeeIn.setText("%.2f".format(config.flatFeeIn))
@@ -2112,6 +2338,19 @@ class SettingsActivity : AppCompatActivity() {
         config.zerodhaApiKey = etZerodhaApiKey.text.toString().trim()
         config.zerodhaApiSecret = etZerodhaApiSecret.text.toString().trim()
 
+        // Unattended daily login. Saving is the user saying "these are right now",
+        // which is the one signal that clears a credential-rejection block — the
+        // alternative is a wrong password locking the feature out until midnight
+        // even after it has been fixed.
+        config.zerodhaUserId = etZerodhaUserId.text.toString().trim()
+        config.zerodhaPassword = etZerodhaPassword.text.toString()
+        config.zerodhaTotpSecret = etZerodhaTotpSecret.text.toString().trim()
+        config.zerodhaAutoLoginEnabled = switchZerodhaAutoLogin.isChecked
+        config.clearZerodhaAutoLoginBlock()
+        config.zerodhaWhitelistedIp = etZerodhaWhitelistedIp.text.toString().trim()
+        // Picks up a switch turned on (arms the chain) or off (cancels it).
+        com.signalscope.app.service.ZerodhaAutoLoginScheduler.ensureScheduled(this)
+
         // Trading 212 (US space)
         config.t212ApiKey = etT212ApiKey.text.toString().trim()
         config.t212ApiSecret = etT212ApiSecret.text.toString().trim()
@@ -2120,11 +2359,9 @@ class SettingsActivity : AppCompatActivity() {
         // Binance (Crypto space)
         config.binanceApiKey = etBinanceApiKey.text.toString().trim()
         config.binanceApiSecret = etBinanceApiSecret.text.toString().trim()
-        config.t212LiveMirrorEnabled = switchT212LiveMirror.isChecked
         config.t212LivePerTradeAmount =
             (etT212LiveAmount.text.toString().toDoubleOrNull() ?: 20.0).coerceIn(1.0, 3000.0)
 
-        config.binanceLiveMirrorEnabled = switchBinanceLiveMirror.isChecked
         config.binanceLiveQuoteOrderSize =
             (etBinanceLiveQuoteOrderSize.text.toString().toDoubleOrNull() ?: 10.0)
                 .coerceIn(5.0, 10_000.0)
@@ -2203,10 +2440,27 @@ class SettingsActivity : AppCompatActivity() {
         config.autoTrailingTargetEnabled = switchAutoTrailingTarget.isChecked
         // A fee cannot be negative, and a blank box means "no fee" rather than
         // "keep whatever was there" — the setter clamps at zero either way.
-        config.paperTradeNotifications = switchPaperNotifications.isChecked
+        config.paperNotifySpaces = buildSet {
+            if (cbPaperIn.isChecked) add("in")
+            if (cbPaperDe.isChecked) add("de")
+            if (cbPaperUs.isChecked) add("us")
+            if (cbPaperBn.isChecked) add("binance")
+        }
         config.finnhubApiKey = etFinnhubKey.text.toString()
         config.usLivePriceSource = if (switchFinnhubLiveTicks.isChecked) "finnhub" else "yahoo"
-        config.zerodhaLiveMirrorEnabled = switchZerodhaLiveMirror.isChecked
+        // A blank or unparseable box KEEPS the stored value rather than resetting it
+        // to zero. Zero here is a claim that conversion is free, and a stray keystroke
+        // should not be able to make every US backtest look better than it is.
+        // Clamped in the setter, and a blank or unreadable entry keeps what was
+        // there — a stray keystroke should not silently narrow what is watched.
+        config.indiaCandleSource = if (switchKiteCandles.isChecked) "kite" else "yahoo"
+        etWatcherDepth.text.toString().trim().toIntOrNull()
+            ?.let { config.watcherDepth = it }
+        etAccountCurrency.text.toString().trim().uppercase()
+            .takeIf { it.isNotBlank() }?.let { config.accountCurrency = it }
+        etFxConversionPct.text.toString().trim().toDoubleOrNull()
+            ?.takeIf { it >= 0.0 }?.let { config.fxConversionPct = it }
+        config.t212RetryUnfilledEntries = switchRetryUnfilled.isChecked
         config.flatFeeUs = etFlatFeeUs.text.toString().toDoubleOrNull() ?: 0.0
         config.flatFeeDe = etFlatFeeDe.text.toString().toDoubleOrNull() ?: 0.0
         config.flatFeeIn = etFlatFeeIn.text.toString().toDoubleOrNull() ?: 0.0
@@ -2271,6 +2525,144 @@ class SettingsActivity : AppCompatActivity() {
                         tvZerodhaStatus.setTextColor(android.graphics.Color.parseColor("#dc2626"))
                     }
                 }
+            }
+        }
+    }
+
+    /** Last automatic attempt, so a morning that went wrong is visible here too. */
+    private fun refreshAutoLoginStatus() {
+        val msg = config.zerodhaAutoLoginStatus
+        if (msg.isBlank()) {
+            tvZerodhaAutoLoginStatus.visibility = View.GONE
+            return
+        }
+        val fmt = java.text.SimpleDateFormat("EEE dd MMM, HH:mm", java.util.Locale.US)
+        val stamp = fmt.format(java.util.Date(config.zerodhaAutoLoginStatusAt))
+        val good = msg.startsWith("Connected")
+        tvZerodhaAutoLoginStatus.text =
+            (if (good) "✅ " else "❌ ") + "$msg  ($stamp)"
+        tvZerodhaAutoLoginStatus.setTextColor(android.graphics.Color.parseColor(
+            if (good) "#059669" else "#dc2626"))
+        tvZerodhaAutoLoginStatus.visibility = View.VISIBLE
+    }
+
+    /**
+     * Runs the real thing on demand — the same code the 07:20 alarm runs, against
+     * the values typed in right now. Worth doing once at a civilised hour: a seed
+     * pasted with a missing character otherwise announces itself at 3:50am.
+     */
+    private fun testZerodhaAutoLogin() {
+        config.zerodhaApiKey = etZerodhaApiKey.text.toString().trim()
+        config.zerodhaApiSecret = etZerodhaApiSecret.text.toString().trim()
+        config.zerodhaUserId = etZerodhaUserId.text.toString().trim()
+        config.zerodhaPassword = etZerodhaPassword.text.toString()
+        config.zerodhaTotpSecret = etZerodhaTotpSecret.text.toString().trim()
+        config.clearZerodhaAutoLoginBlock()
+
+        btnZerodhaAutoLoginTest.isEnabled = false
+        tvZerodhaAutoLoginStatus.text = "Signing in to Zerodha..."
+        tvZerodhaAutoLoginStatus.setTextColor(android.graphics.Color.parseColor("#475569"))
+        tvZerodhaAutoLoginStatus.visibility = View.VISIBLE
+
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                com.signalscope.app.network.ZerodhaAutoLogin.run(config)
+            }
+            withContext(Dispatchers.Main) {
+                btnZerodhaAutoLoginTest.isEnabled = true
+                config.zerodhaAutoLoginStatusAt = System.currentTimeMillis()
+                config.zerodhaAutoLoginStatus = when (result) {
+                    is com.signalscope.app.network.ZerodhaAutoLogin.Result.Success ->
+                        "Connected as ${result.userName}"
+                    is com.signalscope.app.network.ZerodhaAutoLogin.Result.Rejected ->
+                        "Rejected: ${result.message}"
+                    is com.signalscope.app.network.ZerodhaAutoLogin.Result.Retryable ->
+                        "Failed: ${result.message}"
+                }
+                refreshAutoLoginStatus()
+                if (result is com.signalscope.app.network.ZerodhaAutoLogin.Result.Success) {
+                    tvZerodhaStatus.text = "✅ Zerodha connected — ${result.userName}"
+                    tvZerodhaStatus.setTextColor(android.graphics.Color.parseColor("#059669"))
+                    tvZerodhaStatus.visibility = View.VISIBLE
+                }
+            }
+        }
+    }
+
+    /** Last known answer, so the screen says something useful before you tap. */
+    private fun refreshExitAddressStatus() {
+        val seen = config.lastSeenPublicIp
+        if (seen.isBlank()) {
+            tvExitAddressStatus.visibility = View.GONE
+            return
+        }
+        val expected = config.zerodhaWhitelistedIp.trim()
+        val good = expected.isNotBlank() && seen.equals(expected, ignoreCase = true)
+        val fmt = java.text.SimpleDateFormat("EEE dd MMM, HH:mm", java.util.Locale.US)
+        val stamp = fmt.format(java.util.Date(config.lastSeenPublicIpAt))
+        tvExitAddressStatus.text = when {
+            expected.isBlank() -> "Last seen as $seen  ($stamp) — no address set, check is off"
+            good               -> "✅ On the whitelisted address  ($stamp)"
+            else               -> "❌ Seen as $seen, not $expected — tunnel is down  ($stamp)"
+        }
+        tvExitAddressStatus.setTextColor(android.graphics.Color.parseColor(
+            when {
+                expected.isBlank() -> "#94a3b8"
+                good               -> "#059669"
+                else               -> "#dc2626"
+            }))
+        tvExitAddressStatus.visibility = View.VISIBLE
+    }
+
+    /**
+     * Asks the outside world what address it sees, bypassing the cache — the
+     * whole point of pressing it is to find out about a change you just made.
+     */
+    private fun checkExitAddressNow() {
+        config.zerodhaWhitelistedIp = etZerodhaWhitelistedIp.text.toString().trim()
+        btnCheckExitAddress.isEnabled = false
+        tvExitAddressStatus.text = "Asking the internet..."
+        tvExitAddressStatus.setTextColor(android.graphics.Color.parseColor("#475569"))
+        tvExitAddressStatus.visibility = View.VISIBLE
+
+        scope.launch {
+            val seen = withContext(Dispatchers.IO) {
+                com.signalscope.app.network.ExitAddressCheck.currentAddress(force = true)
+            }
+            withContext(Dispatchers.Main) {
+                btnCheckExitAddress.isEnabled = true
+                if (seen == null) {
+                    tvExitAddressStatus.text =
+                        "⚠️ Couldn't reach any address service — no network, or the " +
+                        "tunnel is up but carrying nothing"
+                    tvExitAddressStatus.setTextColor(
+                        android.graphics.Color.parseColor("#b45309"))
+                    return@withContext
+                }
+                config.lastSeenPublicIp = seen
+                config.lastSeenPublicIpAt = System.currentTimeMillis()
+                refreshExitAddressStatus()
+            }
+        }
+    }
+
+    private fun runGatewayTest(symbol: String) {
+        config.zerodhaWhitelistedIp = etZerodhaWhitelistedIp.text.toString().trim()
+        btnGatewayTest.isEnabled = false
+        tvGatewayTestResult.text = "Talking to Zerodha..."
+        tvGatewayTestResult.setTextColor(android.graphics.Color.parseColor("#475569"))
+        tvGatewayTestResult.visibility = View.VISIBLE
+
+        scope.launch {
+            val report = withContext(Dispatchers.IO) {
+                com.signalscope.app.network.OrderGatewayTest.run(config, symbol = symbol)
+            }
+            withContext(Dispatchers.Main) {
+                btnGatewayTest.isEnabled = true
+                tvGatewayTestResult.text = report.asText()
+                tvGatewayTestResult.setTextColor(android.graphics.Color.parseColor(
+                    if (report.passed) "#059669" else "#dc2626"))
+                refreshExitAddressStatus()
             }
         }
     }

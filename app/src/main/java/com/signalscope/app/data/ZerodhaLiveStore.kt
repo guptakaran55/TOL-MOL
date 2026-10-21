@@ -52,7 +52,30 @@ object ZerodhaLiveStore {
         val buyAt: Long = 0L,
         val sellAt: Long = 0L,
         val manualClosedAt: Long = 0L,
-        val error: String = ""
+        val error: String = "",
+        /** The strategy's exit could not go through and is waiting to be retried.
+         *  False on every row written before this existed — see the retry sweep. */
+        val exitHeld: Boolean = false,
+        /** Retries of that exit so far; capped so a stock that cannot be sold is
+         *  not churned every quarter hour. */
+        val exitTries: Int = 0,
+        /** When the account was first seen holding none of these shares; the row
+         *  is closed only when a SECOND reading, a pass later, agrees. 0 = not seen. */
+        val goneSeenAt: Long = 0L,
+        /**
+         * THE ADOPTED-EXIT VERDICT for a position the engine no longer tracks.
+         *
+         * Blank or null = nothing to say: either the strategy still holds this
+         * trade itself, or the adopted rules were applied cleanly. A message means
+         * the rules could NOT be applied, which leaves the position on its hard
+         * stop alone — the one thing the user has to be told rather than left to
+         * infer from an absence.
+         *
+         * NULLABLE for the reason every other late field here is: Gson builds
+         * these through Unsafe and never runs a Kotlin default, so a row written
+         * before this existed arrives with it absent.
+         */
+        val adoptedNote: String? = null,
     ) {
         val isManual: Boolean get() = status == "MANUAL_CLOSED"
         val isLive: Boolean get() = status == "OPEN" || status == "PENDING" || status == "EXITING"

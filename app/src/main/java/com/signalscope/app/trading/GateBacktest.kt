@@ -256,7 +256,11 @@ object GateBacktest {
      * CSV backtest — which has one feed and is parity-verified against the Python
      * lab — is untouched.
      */
-    fun run(data: List<SymbolData>, p: Params, walkFrom: Long? = null): Report {
+    /** @param onProgress walked-day ticks (done, total). The walk is one blocking call over
+     *  hundreds of trading days; with no signal the UI cannot tell slow from hung, which is
+     *  exactly how the 400-symbol NSE run read. Optional, so every existing caller is unchanged. */
+    fun run(data: List<SymbolData>, p: Params, walkFrom: Long? = null,
+            onProgress: ((Int, Int) -> Unit)? = null): Report {
         // Two names are needed to RANK them against each other. They are not
         // needed to run the gate: with selection off every symbol owns a seat and
         // the ranking is never consulted, which is a legitimate way to study one
@@ -290,8 +294,15 @@ object GateBacktest {
         // screen() returns the FULL ranked list (only the topN() helper truncates),
         // so rank + score are available for the enrollment audit — the old
         // .map { it.symbol } threw them away.
+        // PREPARED ONCE, not per day. StockScreener.screen re-sorts every symbol's whole history
+        // and rebuilds its SMA on every call; called once per trading day over a few hundred
+        // symbols that is hundreds of thousands of redundant sorts, which is what made this look
+        // hung rather than slow. Prepared does the same arithmetic off pre-sorted arrays and is
+        // pinned to screen()'s exact output by StockScreenerPreparedTest.
+        val screenCfg = ScreenerConfig(topN = p.topN)
+        val prepared = StockScreener.Prepared(screenCfg, universe)
         fun rankedFullAsOf(day: Long): List<RankedSymbol> =
-            StockScreener.screen(ScreenerConfig(topN = p.topN), universe, LocalDate.ofEpochDay(day))
+            prepared.screen(screenCfg, LocalDate.ofEpochDay(day))
         fun rankedAsOf(day: Long): List<String> = rankedFullAsOf(day).map { it.symbol }
         fun slopeAsOf(sym: String, day: Long): Double? {
             val s = bySym[sym.uppercase()] ?: return null
@@ -336,7 +347,7 @@ object GateBacktest {
                 if (t0Day < 0) {
                     val basket = rankedAsOf(t).take(p.topN)
                     if (basket.isEmpty()) continue
-                    for (s in basket) { balances[s] = p.notional; since[s] = t }
+                    for (s in basket) { balances[s] = p.notional; since[s] = t + 1 }   // screened on t's close → owns trades from t+1
                     injected = p.notional * basket.size; t0Day = t; prevScreen = t
                     logLine("${d(t)} INIT basket=${basket.size} injected=${"%.0f".format(injected)}")
                     markEquity(balances.values.sum()); continue
@@ -380,7 +391,7 @@ object GateBacktest {
                 val joiners = newBasket.filter { nb -> balances.keys.none { it.equals(nb, true) } }
                 if (joiners.isNotEmpty() && pool > 0) {
                     val share = pool / joiners.size
-                    for (s in joiners) { balances[s] = share; since[s] = t }
+                    for (s in joiners) { balances[s] = share; since[s] = t + 1 }
                     logLine("${d(t)} rebalance: -${leavers.size} +${joiners.size} pool=${"%.0f".format(pool)}")
                 }
                 prevScreen = t
@@ -437,8 +448,13 @@ object GateBacktest {
                 if (walkFrom != null && walkFrom > allDays.first() + lookbackDays)
                     "No overlap between the screener history and the engine's data window."
                 else "Dataset shorter than the ${lookbackDays}-day screener lookback — no T0.")
+        val walkDays = allDays.count { it >= t0Fixed }
+        var walked = 0
         for (day in allDays) {
             if (day < t0Fixed) continue
+            // Report every 10th day: frequent enough that a stall is obvious, rare enough that the
+            // JS bridge hop is not itself a cost in a tight loop.
+            if (onProgress != null && (++walked == 1 || walked % 10 == 0 || walked == walkDays)) onProgress(walked, walkDays)
             if (slots.isEmpty()) {
                 repeat(p.holdN) { slots.add(Slot(null, p.notional, day, 0, false)) }
                 injected = p.notional * p.holdN; t0Day = day
@@ -494,7 +510,12 @@ object GateBacktest {
                         it.symbol.uppercase() !in held && (slopeAsOf(it.symbol, day) ?: -1.0) > 0.0
                     } ?: continue
                     val pick = pickR.symbol
-                    s.symbol = pick; s.sinceDay = day; s.negDays = 0; s.flagged = false
+                    // CHOSEN WITH TODAY'S CLOSE, SO IT OWNS TRADES FROM TOMORROW. The ranking and the
+                    // slope gate both read this day's closing bar, which does not exist until the
+                    // session is over — crediting a trade that entered during it let the screen pick
+                    // names with hindsight of the very day they then traded (the desktop lab carried
+                    // the same flaw: ~8 CAGR points on NSE daily, 5–19 on the intraday champions).
+                    s.symbol = pick; s.sinceDay = day + 1; s.negDays = 0; s.flagged = false
                     held.add(pick.uppercase())
                     openEnroll[si] = OpenEnroll(si, pick, day, pickR.rank, pickR.score,
                         slopeAsOf(pick, day) ?: 0.0)

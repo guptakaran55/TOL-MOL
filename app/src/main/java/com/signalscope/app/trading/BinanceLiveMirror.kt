@@ -32,16 +32,50 @@ object BinanceLiveMirror {
     )
 
     private fun liveCfgFor(ctx: Context, config: ConfigManager, ns: String): LiveCfg {
+        // ONE ROAD TO REAL MONEY, and it runs through the algo.
+        //
+        // The legacy bare crypto space is retired for ENTRIES. It used to be armed
+        // by a switch in Settings, which was the whole problem: that switch looked
+        // like a master control and had not been in the circuit since algos gained
+        // their own, so it read OFF while real orders were being placed. A control
+        // that lies about whether money can move is worse than no control.
+        //
+        // Exits are NOT routed through here and are deliberately never gated —
+        // see mirrorExit. Retiring an entry path must never strand a position that
+        // path already opened.
         if (!Spaces.isBucket(ns)) return LiveCfg(
-            enabled = config.binanceLiveMirrorEnabled,
-            allows = { config.binanceLiveAllows(it) },
-            quoteSize = { perTradeQuoteSize(ctx, config, it) })
+            enabled = false,
+            allows = { false },
+            quoteSize = { 0.0 })
         val b = com.signalscope.app.data.BucketStore.get(ctx, ns)
         val allow = (b?.liveAllowlist ?: emptyList()).map { it.uppercase() }.toSet()
-        val per = if (b != null && b.symbols.isNotEmpty() && b.liveBudget > 0.0)
-            b.liveBudget / b.symbols.size else 0.0
+        // ── ONE ORDER'S SIZE = BUDGET ÷ SEATS, not ÷ symbols ────────────────
+        //
+        // Crypto divided by the SYMBOL COUNT while stocks and the gate both divide
+        // by the SEAT COUNT. With ranking off the two agree, so the difference hid
+        // — until the universe was trimmed from two coins to one and the size per
+        // order silently doubled, from 200 to 500, with nothing changed by hand.
+        // The same split everywhere means the number can be predicted from the
+        // card rather than discovered from a fill.
+        //
+        // Seats also govern how much is at risk AT ONCE: one seat means one order
+        // may commit the whole budget, which is correct and worth knowing.
+        //
+        // WITHOUT THE GATE, ONE SEAT PER COIN. A Manual algo has no gate, but its
+        // never-armed gate state still says "rank, hold 5" — so eight coins each
+        // ordered a fifth of the budget, 1.6 times the money allocated.
+        val gate = com.signalscope.app.data.MacdGateStore.load(ctx, ns)
+        val seats = if (b == null) 1
+            else if (!gate.enabled) b.symbols.size.coerceAtLeast(1)
+            else com.signalscope.app.data.MacdGateStore.effectiveHoldN(gate, b.symbols.size.coerceAtLeast(1))
+        val per = if (b != null && b.liveBudget > 0.0)
+            b.liveBudget / seats.coerceAtLeast(1) else 0.0
         return LiveCfg(
-            enabled = (b?.live == true) && config.hasBinanceCredentials,
+            // BUDGET IS PART OF THE GATE, not just the size. Without this an algo
+            // armed with a zero budget still bought, because the order size is
+            // floored at the exchange minimum further down — so "no money
+            // allocated" quietly became "spend the smallest amount possible".
+            enabled = (b?.live == true) && (b.liveBudget > 0.0) && config.hasBinanceCredentials,
             allows = { allow.isNotEmpty() && it.uppercase() in allow },
             quoteSize = { per })
     }

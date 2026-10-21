@@ -139,6 +139,64 @@ object YahooFinanceClient {
         data class Error(val message: String) : CandleResult()
     }
 
+    /** Fewest bars a chart reply may hold and still count as a series. */
+    private const val MIN_BARS = 50
+
+    /** The symbol a point-in-time request actually goes out under — the live
+     *  line for one that moved on the feed, see [SymbolRenames.feedSuccessor]. */
+    private fun onFeed(yahooSymbol: String): String =
+        com.signalscope.app.data.SymbolRenames.feedSuccessor(yahooSymbol) ?: yahooSymbol
+
+    /**
+     * ONE CHART REQUEST — OR TWO, SPLICED, FOR A LINE THAT MOVED ON THE FEED.
+     *
+     * [fetch] makes a single request for the symbol it is handed, keeps only a
+     * series of at least the length it is handed, and records feed health under
+     * the name it is handed (none, for null).
+     *
+     * For an ordinary symbol that is exactly the request it always was. For one
+     * the feed has moved, the live line supplies every bar it has and the frozen
+     * line fills in the history the live one does not carry yet; the minimum is
+     * applied to the joined series, since neither half is expected to reach it on
+     * its own. Feed health is read off the LIVE line but filed under the name the
+     * rest of the app asks by — the frozen line is known to be frozen, and that
+     * is precisely the fact this splice exists to make irrelevant.
+     */
+    private fun chartFor(
+        yahooSymbol: String,
+        fetch: (requestSymbol: String, minBars: Int, observeAs: String?) -> CandleResult
+    ): CandleResult {
+        val next = com.signalscope.app.data.SymbolRenames.feedSuccessor(yahooSymbol)
+            ?: return fetch(yahooSymbol, MIN_BARS, yahooSymbol)
+        val newer = fetch(next, 0, yahooSymbol)
+        if (newer is CandleResult.RateLimited) return newer
+        val older = fetch(yahooSymbol, 0, null)
+        val a = (older as? CandleResult.Success)?.candles.orEmpty()
+        val b = (newer as? CandleResult.Success)?.candles.orEmpty()
+        val joined = spliceLines(a, b)
+        Log.d(TAG, "$yahooSymbol: ${a.size} bars on the frozen line + ${b.size} on $next -> ${joined.size}")
+        if (joined.size < MIN_BARS) return if (older is CandleResult.RateLimited) older else CandleResult.NoData
+        return CandleResult.Success(joined,
+            (newer as? CandleResult.Success)?.name ?: (older as? CandleResult.Success)?.name)
+    }
+
+    /**
+     * Two lines of the same share as one series: every bar of the [newer] line,
+     * and the [older] line's bars at every time the newer one has none. Pure.
+     *
+     * Merged by time rather than cut at a date because Yahoo's move was not
+     * clean — the new line's daily series has holes the old one still fills (12
+     * to 14 Oct, for Pfisterer), while its intraday series has taken over
+     * outright. Where both carry a bar the newer wins, since the old line is the
+     * one that stopped.
+     */
+    internal fun spliceLines(older: List<CandleData>, newer: List<CandleData>): List<CandleData> {
+        if (newer.isEmpty()) return older
+        if (older.isEmpty()) return newer
+        val taken = newer.mapTo(HashSet()) { it.timestamp }
+        return (older.filter { it.timestamp !in taken } + newer).sortedBy { it.timestamp }
+    }
+
     sealed class NiftyUniverseResult {
         data class Success(val symbols: List<String>, val sourceUrl: String) : NiftyUniverseResult()
         data class Failure(val message: String) : NiftyUniverseResult()
@@ -295,7 +353,10 @@ object YahooFinanceClient {
     /**
      * Fetch only the last 5 days of daily candles (for incremental cache refresh).
      */
-    private fun fetchRecentCandles(yahooSymbol: String): CandleResult {
+    private fun fetchRecentCandles(yahooSymbol: String): CandleResult =
+        chartFor(yahooSymbol) { s, min, obs -> fetchRecentOnce(s, min, obs) }
+
+    private fun fetchRecentOnce(yahooSymbol: String, minBars: Int, observeAs: String?): CandleResult {
         return try {
             val url = HttpUrl.Builder()
                 .scheme("https")
@@ -322,7 +383,7 @@ object YahooFinanceClient {
                     429 -> CandleResult.RateLimited
                     200 -> {
                         val body = resp.body?.string() ?: return CandleResult.NoData
-                        parseYahooResponse(body, yahooSymbol)
+                        parseYahooResponse(body, yahooSymbol, minBars, observeAs)
                     }
                     else -> CandleResult.NoData
                 }
@@ -333,8 +394,29 @@ object YahooFinanceClient {
     }
 
     /** Fetch 60 days of 15-minute candles for intraday paper simulations. */
-    fun fetchCandles15m(symbol: String, exchange: String = "NSE"): CandleResult =
-        fetchCandlesInternal(symbol, exchange, range = "60d", interval = "15m")
+    /**
+     * @param includePrePost ask for pre-market and after-hours bars as well.
+     *
+     * WITHOUT IT THERE ARE NO BARS AFTER THE BELL, and a gate that reads this
+     * series then concludes the newest completed bar is stale and holds — which
+     * is exactly how enabling extended-hours entries changed nothing: the venue
+     * was open, the order was allowed, and the trend check had no data to form
+     * an opinion from, so it waited for a bar that was never going to arrive.
+     */
+    /** Ten years of monthly bars — for the monthly MACD dot on watcher alerts.
+     *  The month in progress arrives as its last bar; callers drop it. */
+    fun fetchCandlesMonthly(symbol: String, exchange: String = "NSE"): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = "10y", interval = "1mo")
+
+    /** Fifteen-minute bars over a SHORT range — ten days is enough for the
+     *  15-minute and hourly MACD, at a sixth of the download of the usual 60. */
+    fun fetchCandles15mRange(symbol: String, exchange: String, range: String): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = range, interval = "15m", includePrePost = false)
+
+    fun fetchCandles15m(symbol: String, exchange: String = "NSE",
+                        includePrePost: Boolean = false): CandleResult =
+        fetchCandlesInternal(symbol, exchange, range = "60d", interval = "15m",
+            includePrePost = includePrePost)
 
     /**
      * Generic OHLCV fetch for the CONFIG-DRIVEN engine feed (FeedPlan). Yahoo
@@ -351,8 +433,10 @@ object YahooFinanceClient {
      * payer look like it fell.
      */
     fun fetchCandlesAt(
-        symbol: String, exchange: String, interval: String, range: String
-    ): CandleResult = fetchCandlesInternal(symbol, exchange, range = range, interval = interval)
+        symbol: String, exchange: String, interval: String, range: String,
+        includePrePost: Boolean = false
+    ): CandleResult = fetchCandlesInternal(symbol, exchange, range = range,
+        interval = interval, includePrePost = includePrePost)
 
     /**
      * Fetch 2 years of daily candles for a stock.
@@ -362,8 +446,13 @@ object YahooFinanceClient {
      * @param symbol  Trading symbol e.g. "RELIANCE" or "AAPL"
      * @param exchange "NSE", "BSE", "NASDAQ", or "DE"/"XETRA" — determines Yahoo suffix
      */
-    fun fetchCandles(symbol: String, exchange: String = "NSE"): CandleResult {
-        val yahooSymbol = toYahooSymbol(symbol, exchange)
+    fun fetchCandles(symbol: String, exchange: String = "NSE"): CandleResult =
+        chartFor(toYahooSymbol(symbol, exchange)) { s, min, obs ->
+            fetchCandlesOnce(symbol, exchange, s, min, obs)
+        }
+
+    private fun fetchCandlesOnce(symbol: String, exchange: String, yahooSymbol: String,
+                                 minBars: Int, observeAs: String?): CandleResult {
         val maxAttempts = 3
 
         var lastError: Exception? = null
@@ -411,7 +500,7 @@ object YahooFinanceClient {
                         }
                         200 -> {
                             val body = resp.body?.string() ?: return@use CandleResult.NoData
-                            parseYahooResponse(body, yahooSymbol)
+                            parseYahooResponse(body, yahooSymbol, minBars, observeAs)
                         }
                         else -> {
                             Log.w(TAG, "Yahoo Finance HTTP ${resp.code} for $yahooSymbol")
@@ -453,12 +542,18 @@ object YahooFinanceClient {
      * this is real-time (measured ~0s lag); for Xetra it carries the exchange's
      * ~15-minute delay — callers needing true DE real-time should prefer
      * Tradegate and treat this as fallback. Returns null on any failure.
+     *
+     * AND NULL FOR A FEED THAT HAS STOPPED (see [FeedHealth]). A frozen line
+     * still answers with a price — the last one it ever had — and every caller
+     * here treats the answer as the market: an order ladder anchored a week
+     * behind could never reach a fill, and a sale built on it would rest above a
+     * price long gone. No answer sends them to their other sources instead.
      */
     fun fetchLivePrice(yahooSymbol: String): Double? {
         return try {
             val url = HttpUrl.Builder()
                 .scheme("https").host("query1.finance.yahoo.com")
-                .addPathSegments("v8/finance/chart/$yahooSymbol")
+                .addPathSegments("v8/finance/chart/${onFeed(yahooSymbol)}")
                 .addQueryParameter("range", "1d")
                 .addQueryParameter("interval", "1m")
                 .addQueryParameter("includePrePost", "false")
@@ -472,6 +567,11 @@ object YahooFinanceClient {
                 val body = resp.body?.string() ?: return null
                 val meta = JSONObject(body).getJSONObject("chart")
                     .getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+                FeedHealth.observe(yahooSymbol, meta)
+                if (FeedHealth.stoppedSince(yahooSymbol) > 0L) {
+                    Log.w(TAG, "fetchLivePrice($yahooSymbol): the feed has stopped — no price given")
+                    return null
+                }
                 val p = meta.optDouble("regularMarketPrice", Double.NaN)
                 if (p.isNaN() || p <= 0.0) null else p
             }
@@ -481,17 +581,51 @@ object YahooFinanceClient {
         }
     }
 
+    /** The exchange's own regular-session bounds, epoch seconds. */
+    data class Session(val start: Long, val end: Long) {
+        fun isOpenAt(sec: Long): Boolean = sec >= start && sec < end
+    }
+
     /**
-     * Is the symbol's REGULAR trading session open right now? Uses the chart
-     * meta's currentTradingPeriod (exchange-reported session bounds), so it
-     * handles time zones and holidays for free. null = couldn't determine —
-     * callers should treat null as "unknown", not "closed".
+     * The symbol's REGULAR session window as the exchange reports it.
+     *
+     * WHY THIS RATHER THAN A SESSION CALENDAR IN THE APP. Parking an order until
+     * "the next open" needs a real answer to when that is, and the hand-written
+     * version of this is a table of open/close times per market that is wrong on
+     * every public holiday — which is precisely a day when an order would be
+     * parked, wake into a shut market, and have to work out what to do next.
+     * The exchange's own bounds handle time zones, half-days and holidays for
+     * free, and cost nothing extra: [fetchMarketOpen] was already reading this
+     * exact object and throwing away everything except the yes/no.
+     *
+     * NOTE THAT THE WINDOW MOVES. Yahoo reports the CURRENT period, so after a
+     * close it keeps naming the session that just ended until it rolls forward
+     * to the next one, some hours later. Callers must therefore treat a window
+     * whose start is already past as "not yet known" and ask again later, rather
+     * than computing tomorrow by adding 24 hours — that arithmetic is wrong
+     * across weekends, which is the case it would meet first.
      */
-    fun fetchMarketOpen(yahooSymbol: String): Boolean? {
+    fun fetchRegularSession(yahooSymbol: String): Session? =
+        fetchTradingWindow(yahooSymbol, includeExtended = false)
+
+    /**
+     * The window a venue will actually accept orders in.
+     *
+     * WITH [includeExtended] IT SPANS PRE-MARKET TO AFTER-HOURS, which for US
+     * equities is roughly 10:00 to 01:00 CET rather than 15:30 to 22:00. Trading
+     * 212 runs those sessions on its more liquid US names, so an entry that fires
+     * on an evening bar has somewhere to go instead of waiting for tomorrow.
+     *
+     * FALLS BACK TO THE REGULAR BOUNDS WHERE A VENUE PUBLISHES NO EXTENDED ONES,
+     * which is most of them — Xetra among them. That fallback is what keeps this
+     * safe to call anywhere: asking for extended hours on a market that has none
+     * returns exactly what asking for regular hours would.
+     */
+    fun fetchTradingWindow(yahooSymbol: String, includeExtended: Boolean): Session? {
         return try {
             val url = HttpUrl.Builder()
                 .scheme("https").host("query1.finance.yahoo.com")
-                .addPathSegments("v8/finance/chart/$yahooSymbol")
+                .addPathSegments("v8/finance/chart/${onFeed(yahooSymbol)}")
                 .addQueryParameter("range", "1d")
                 .addQueryParameter("interval", "1m")
                 .build()
@@ -502,11 +636,70 @@ object YahooFinanceClient {
             client.newCall(request).execute().use { resp ->
                 if (resp.code != 200) return null
                 val body = resp.body?.string() ?: return null
-                val regular = JSONObject(body).getJSONObject("chart")
+                val meta = JSONObject(body).getJSONObject("chart")
                     .getJSONArray("result").getJSONObject(0).getJSONObject("meta")
-                    .getJSONObject("currentTradingPeriod").getJSONObject("regular")
+                // Free: the reply that answers "is it open" also says whether the
+                // name has traded in the session it is open for.
+                FeedHealth.observe(yahooSymbol, meta)
+                val period = meta.getJSONObject("currentTradingPeriod")
+                val regular = period.getJSONObject("regular")
+                var start = regular.getLong("start")
+                var end = regular.getLong("end")
+                if (includeExtended) {
+                    // Widened, never narrowed. A malformed or missing pre/post
+                    // block must not be able to shrink the window below the
+                    // regular session and quietly stop trading altogether.
+                    period.optJSONObject("pre")?.optLong("start", 0L)
+                        ?.takeIf { it in 1 until start }?.let { start = it }
+                    period.optJSONObject("post")?.optLong("end", 0L)
+                        ?.takeIf { it > end }?.let { end = it }
+                }
+                Session(start, end)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "fetchTradingWindow($yahooSymbol) failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Is the symbol's REGULAR trading session open right now? Uses the chart
+     * meta's currentTradingPeriod (exchange-reported session bounds), so it
+     * handles time zones and holidays for free. null = couldn't determine —
+     * callers should treat null as "unknown", not "closed".
+     */
+    fun fetchMarketOpen(yahooSymbol: String, includeExtended: Boolean = false): Boolean? {
+        return try {
+            val url = HttpUrl.Builder()
+                .scheme("https").host("query1.finance.yahoo.com")
+                .addPathSegments("v8/finance/chart/${onFeed(yahooSymbol)}")
+                .addQueryParameter("range", "1d")
+                .addQueryParameter("interval", "1m")
+                .build()
+            val request = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json")
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (resp.code != 200) return null
+                val body = resp.body?.string() ?: return null
+                val meta = JSONObject(body).getJSONObject("chart")
+                    .getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+                // Free: the reply that answers "is it open" also says whether the
+                // name has traded in the session it is open for.
+                FeedHealth.observe(yahooSymbol, meta)
+                val period = meta.getJSONObject("currentTradingPeriod")
+                val regular = period.getJSONObject("regular")
+                var start = regular.getLong("start")
+                var end = regular.getLong("end")
+                if (includeExtended) {
+                    period.optJSONObject("pre")?.optLong("start", 0L)
+                        ?.takeIf { it in 1 until start }?.let { start = it }
+                    period.optJSONObject("post")?.optLong("end", 0L)
+                        ?.takeIf { it > end }?.let { end = it }
+                }
                 val now = System.currentTimeMillis() / 1000
-                now >= regular.getLong("start") && now < regular.getLong("end")
+                now >= start && now < end
             }
         } catch (e: Exception) {
             Log.w(TAG, "fetchMarketOpen($yahooSymbol) failed: ${e.message}")
@@ -526,8 +719,10 @@ object YahooFinanceClient {
      * the screener is split-sensitive. Falls back to raw close if adjclose is
      * absent (e.g. very new listings). ~2 years of history per the spec.
      */
-    fun fetchDailyAdjusted(symbol: String, exchange: String): CandleResult {
-        val yahooSymbol = toYahooSymbol(symbol, exchange)
+    fun fetchDailyAdjusted(symbol: String, exchange: String): CandleResult =
+        chartFor(toYahooSymbol(symbol, exchange)) { s, min, obs -> fetchDailyAdjustedOnce(s, min, obs) }
+
+    private fun fetchDailyAdjustedOnce(yahooSymbol: String, minBars: Int, observeAs: String?): CandleResult {
         return try {
             val url = HttpUrl.Builder()
                 .scheme("https").host("query1.finance.yahoo.com")
@@ -545,7 +740,7 @@ object YahooFinanceClient {
                 if (resp.code == 429) return CandleResult.RateLimited
                 if (resp.code != 200) return CandleResult.NoData
                 val body = resp.body?.string() ?: return CandleResult.NoData
-                parseYahooAdjusted(body, yahooSymbol)
+                parseYahooAdjusted(body, yahooSymbol, minBars, observeAs)
             }
         } catch (e: Exception) {
             Log.w(TAG, "fetchDailyAdjusted($yahooSymbol) failed: ${e.message}")
@@ -553,16 +748,30 @@ object YahooFinanceClient {
         }
     }
 
-    /** Parse the chart response reading adjclose (split-adjusted). Only the close
-     *  matters to the screener, so OHLC are all set to the adjusted close. */
-    private fun parseYahooAdjusted(body: String, symbol: String): CandleResult {
+    /**
+     * Parse the chart response reading adjclose (split-adjusted).
+     *
+     * THE RANGE IS NOW CARRIED TOO. This used to set open, high and low all equal
+     * to the adjusted close, on the grounds that the screener only reads closes —
+     * true at the time, and it silently ruled out every study built on true range
+     * for the whole universe. The squeeze scan refused all 105 German names on
+     * its first run for exactly that reason: bars with no range at all.
+     *
+     * The high and low are ADJUSTED BY THE SAME FACTOR as the close, not taken
+     * raw. Mixing a raw high with an adjusted close would put the day's range in
+     * a different currency to the day's price across any split, and the error
+     * would be invisible except as strange volatility years back.
+     */
+    private fun parseYahooAdjusted(body: String, symbol: String, minBars: Int = MIN_BARS,
+                                   observeAs: String? = symbol): CandleResult {
         return try {
             val result = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+            if (observeAs != null) FeedHealth.observe(observeAs, result.optJSONObject("meta"))
             val timestamps = result.optJSONArray("timestamp") ?: return CandleResult.NoData
             val indicators = result.getJSONObject("indicators")
             val rawClose = indicators.optJSONArray("quote")?.optJSONObject(0)?.optJSONArray("close")
             val adj = indicators.optJSONArray("adjclose")?.optJSONObject(0)?.optJSONArray("adjclose")
-            if (timestamps.length() < 10) return CandleResult.NoData
+            if (minBars > 0 && timestamps.length() < 10) return CandleResult.NoData
             val candles = ArrayList<CandleData>()
             for (i in 0 until timestamps.length()) {
                 // Prefer adjusted; fall back to raw when adjclose is null for a bar.
@@ -572,10 +781,25 @@ object YahooFinanceClient {
                     else -> continue
                 }
                 if (v.isNaN() || v <= 0.0) continue
-                candles.add(CandleData(timestamps.getLong(i), v, v, v, v, 0L))
+                // Scale the raw range onto the adjusted close. Falls back to a
+                // flat bar when the provider gives no usable high/low, which the
+                // squeeze scan detects and declines to score rather than reading
+                // as zero volatility.
+                val q = indicators.optJSONArray("quote")?.optJSONObject(0)
+                val rc = rawClose?.takeIf { !it.isNull(i) }?.optDouble(i) ?: 0.0
+                val f = if (rc > 0.0) v / rc else 1.0
+                val rh = q?.optJSONArray("high")?.takeIf { !it.isNull(i) }?.optDouble(i) ?: 0.0
+                val rl = q?.optJSONArray("low")?.takeIf { !it.isNull(i) }?.optDouble(i) ?: 0.0
+                val ro = q?.optJSONArray("open")?.takeIf { !it.isNull(i) }?.optDouble(i) ?: 0.0
+                val hi = if (rh > 0.0 && !rh.isNaN()) rh * f else v
+                val lo = if (rl > 0.0 && !rl.isNaN()) rl * f else v
+                val op = if (ro > 0.0 && !ro.isNaN()) ro * f else v
+                val vol = q?.optJSONArray("volume")?.takeIf { !it.isNull(i) }?.optLong(i) ?: 0L
+                candles.add(CandleData(timestamps.getLong(i), op,
+                    maxOf(hi, v), minOf(lo, v), v, vol))
             }
-            if (candles.size < 50) CandleResult.NoData
-            else CandleResult.Success(candles, null)
+            if (candles.isEmpty() || candles.size < minBars) CandleResult.NoData
+            else CandleResult.Success(LatestSession.fill(candles, result.optJSONObject("meta")), null)
         } catch (e: Exception) {
             Log.e(TAG, "parseYahooAdjusted error for $symbol", e)
             CandleResult.Error("Parse error: ${e.message}")
@@ -586,9 +810,26 @@ object YahooFinanceClient {
         symbol: String,
         exchange: String,
         range: String,
-        interval: String
+        interval: String,
+        /**
+         * Include pre-market and after-hours prints.
+         *
+         * OPT-IN, AND ONLY FOR THE LIVE MARK. Strategy candles must stay
+         * regular-session: every backtest, every MACD, every bar the engine has
+         * ever reasoned about was built without extended hours, and quietly
+         * mixing them in would change what the strategy sees rather than what the
+         * stop sees. Those are different questions and only one of them is being
+         * answered here.
+         */
+        includePrePost: Boolean = false
+    ): CandleResult = chartFor(toYahooSymbol(symbol, exchange)) { s, min, obs ->
+        fetchCandlesInternalOnce(symbol, exchange, range, interval, includePrePost, s, min, obs)
+    }
+
+    private fun fetchCandlesInternalOnce(
+        symbol: String, exchange: String, range: String, interval: String,
+        includePrePost: Boolean, yahooSymbol: String, minBars: Int, observeAs: String?
     ): CandleResult {
-        val yahooSymbol = toYahooSymbol(symbol, exchange)
         val maxAttempts = 3
 
         var lastError: Exception? = null
@@ -607,7 +848,7 @@ object YahooFinanceClient {
                     .addPathSegments("v8/finance/chart/$yahooSymbol")
                     .addQueryParameter("range", range)
                     .addQueryParameter("interval", interval)
-                    .addQueryParameter("includePrePost", "false")
+                    .addQueryParameter("includePrePost", if (includePrePost) "true" else "false")
                     .addQueryParameter("events", "")
                     .build()
 
@@ -640,7 +881,7 @@ object YahooFinanceClient {
                         }
                         200 -> {
                             val body = resp.body?.string() ?: return@use CandleResult.NoData
-                            parseYahooResponse(body, yahooSymbol)
+                            parseYahooResponse(body, yahooSymbol, minBars, observeAs)
                         }
                         else -> {
                             Log.w(TAG, "Yahoo Finance HTTP ${resp.code} for $yahooSymbol")
@@ -720,7 +961,8 @@ object YahooFinanceClient {
      * Parse Yahoo Finance v8 chart API JSON response into CandleData list.
      * Mirrors Python's fetch_index_chart_data() parsing logic.
      */
-    private fun parseYahooResponse(body: String, symbol: String): CandleResult {
+    private fun parseYahooResponse(body: String, symbol: String, minBars: Int = MIN_BARS,
+                                   observeAs: String? = symbol): CandleResult {
         return try {
             val json = JSONObject(body)
             val chart = json.getJSONObject("chart")
@@ -730,6 +972,7 @@ object YahooFinanceClient {
 
             val result = resultArray.getJSONObject(0)
             val meta = result.optJSONObject("meta")
+            if (observeAs != null) FeedHealth.observe(observeAs, meta)
             fun metaName(key: String): String? {
                 val value = meta?.optString(key, "")?.trim().orEmpty()
                 return value.takeIf { it.isNotBlank() && !it.equals(symbol, ignoreCase = true) }
@@ -748,7 +991,7 @@ object YahooFinanceClient {
             val closes = quote.optJSONArray("close")
             val volumes = quote.optJSONArray("volume")
 
-            if (closes == null || timestamps == null || timestamps.length() < 10) {
+            if (closes == null || timestamps == null || (minBars > 0 && timestamps.length() < 10)) {
                 Log.w(TAG, "Yahoo Finance: no usable timestamps for $symbol")
                 return CandleResult.NoData
             }
@@ -770,13 +1013,13 @@ object YahooFinanceClient {
                 )
             }
 
-            if (candles.size < 50) {
+            if (candles.isEmpty() || candles.size < minBars) {
                 Log.w(TAG, "Too few candles for $symbol: ${candles.size}")
                 return CandleResult.NoData
             }
 
             Log.d(TAG, "Yahoo Finance: $symbol — ${candles.size} candles")
-            CandleResult.Success(candles, displayName)
+            CandleResult.Success(LatestSession.fill(candles, meta), displayName)
 
         } catch (e: Exception) {
             Log.e(TAG, "Yahoo Finance parse error for $symbol", e)
@@ -820,7 +1063,9 @@ object YahooFinanceClient {
         val sharesOutstanding: Long? = null,
         val sector: String? = null,
         val industry: String? = null,
-        val name: String? = null
+        val name: String? = null,
+        /** "EQUITY", "ETF", "MUTUALFUND", "FUTURE"… — a fund has no accounts to score. */
+        val quoteType: String? = null
     )
 
     // ── Symbol autocomplete (Yahoo's `/v1/finance/search` endpoint) ──────────
@@ -1064,7 +1309,8 @@ object YahooFinanceClient {
                 sharesOutstanding = keyStats.rawLong("sharesOutstanding"),
                 sector = profile?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() },
                 industry = profile?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() },
-                name = displayName
+                name = displayName,
+                quoteType = price?.optString("quoteType", "")?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
             )
 
             Log.d(TAG, "Fundamentals: $symbol — PE=${data.trailingPe} PB=${data.priceToBook} D/E=${data.debtToEquity}")
@@ -1091,8 +1337,14 @@ object YahooFinanceClient {
 
         return when (exchange.uppercase()) {
             "BSE" -> "$symbol.BO"
-            "NASDAQ", "NYSE", "US" -> symbol
-            "DE", "XETRA", "GERMANY" -> "$symbol.DE"
+            "NASDAQ", "NYSE", "US" -> com.signalscope.app.data.SymbolRenames.current(symbol, "US")
+            // THE LAST LINE OF DEFENCE ON A RENAME. Every other place that could
+            // hold a retired symbol has been corrected at the source, but this is
+            // the single funnel a bare symbol passes through on its way to the
+            // price feed — so anything that was written to disk under the old name
+            // and missed still asks the feed the right question and comes back with
+            // bars instead of "may be delisted". Costs a map lookup per call.
+            "DE", "XETRA", "GERMANY" -> "${com.signalscope.app.data.SymbolRenames.currentDe(symbol)}.DE"
             else -> "$symbol.NS" // default to NSE
         }
     }

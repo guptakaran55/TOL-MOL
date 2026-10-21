@@ -22,17 +22,23 @@ object BucketStore {
     private const val TAG = "BucketStore"
     private val gson = Gson()
 
-    // Only DE (German, paper — T212 live frozen) and BINANCE (crypto, real opt-in)
-    // support algos. US and IN are intentionally excluded: T212 transacts only in
-    // the user's home currency (EUR for a Germany-resident account), so USD equity
-    // algo-trading isn't usable — no point offering the tab there.
-    // India joins as a PAPER space: the algo machinery (screener, gate, seats,
-    // ledger, replay) is space-agnostic and its bars already come from the same
-    // fetcher. What it deliberately does NOT get is a live order mirror —
-    // Zerodha order placement is a separate build with its own arming gates, and
-    // shipping the paper half first is what lets the strategy be judged before
-    // any of it can spend money.
-    val BUCKETABLE_SPACES = listOf("de", "binance", "in")
+    // DE (German), BINANCE (crypto), IN (India) and US all support algos.
+    //
+    // US WAS EXCLUDED, AND IS NOT ANY MORE. The original reason was that Trading
+    // 212 settles in the account's home currency, so a USD position converts at
+    // both ends and the charge for that was not modelled anywhere — a Nasdaq
+    // backtest would therefore have flattered itself by however much the
+    // conversions cost. That was a real objection to the NUMBERS, not to the
+    // mechanism: order placement itself works, and the broker applies the
+    // conversion automatically. Now that the round-trip conversion cost is
+    // modelled (see StrategyLabStore.activeConfig), the objection is answered and
+    // there is no reason left to withhold the tab.
+    //
+    // India remains a PAPER space in practice: the algo machinery (screener, gate,
+    // seats, ledger, replay) is space-agnostic, but it deliberately has NO live
+    // order mirror — Zerodha placement is a separate build with its own arming
+    // gates, so nothing here can spend money there.
+    val BUCKETABLE_SPACES = listOf("de", "binance", "in", "us")
     fun isBucketable(space: String) = Spaces.baseOf(space) in BUCKETABLE_SPACES
 
     // Binance is NOT auto-migrated: the bare "binance" lab keeps running its
@@ -58,6 +64,20 @@ object BucketStore {
         val live: Boolean = false,
         val liveBudget: Double = 0.0,
         val liveAllowlist: List<String> = emptyList(),
+        /**
+         * MAY THIS ALGO INTERRUPT YOU when its paper side opens or closes?
+         *
+         * Nullable on purpose, and for the same reason as the cost overrides
+         * below: Gson bypasses constructors, so a non-null default would never
+         * apply to an algo saved before this field existed and every one of them
+         * would arrive silently muted. Null means "not chosen" and is read as ON,
+         * so nobody's notifications change until they say so.
+         *
+         * Sits UNDER the market checkbox in Settings rather than beside it: the
+         * market decides whether this kind of alert is wanted at all, and this
+         * decides which algos within it are worth hearing from.
+         */
+        val notify: Boolean? = null,
         // ── COST OVERRIDES, per algo ──────────────────────────────────────
         // The config JSON states the friction the strategy was designed and
         // validated against. These let you ask "what if it were worse?" without
@@ -153,8 +173,12 @@ object BucketStore {
         // 3b/monthly screener ranks the full set and holds top-N (Slots). German
         // stores bare tickers (no ".DE"); crypto is the fixed 2-coin set.
         val defaultSyms = when (base) {
-            "de" -> com.signalscope.app.service.DAX_SYMBOLS.map { it.removeSuffix(".DE").uppercase() }
+            "de" -> com.signalscope.app.service.deScreenedUniverse(ctx)
+                .map { it.removeSuffix(".DE").uppercase() }
             "binance" -> listOf("BTCUSDC", "ETHUSDC")
+            "us" -> com.signalscope.app.service.NASDAQ_100_SYMBOLS.map { it.uppercase() }
+            "in" -> com.signalscope.app.service.NIFTY_500_YAHOO_SYMBOLS
+                .map { it.removeSuffix(".NS").uppercase() }
             else -> emptyList()
         }
         // MODE DEFAULT = 3b wherever a gate can actually run (de / binance). The
@@ -170,6 +194,50 @@ object BucketStore {
                        smoothing = if (base == "binance") 2 else 5)
         save(ctx, base, s.copy(buckets = s.buckets + b))
         return b
+    }
+
+    // ── THE CRYPTO 50-DAY HOLD, READY TO SWITCH ON ─────────────────────────────
+
+    /** The eight coins the desktop backtest ran (spec §2), as Binance USDC pairs. */
+    val SMA_HOLD_COINS = listOf("ADAUSDC", "BNBUSDC", "BTCUSDC", "DOGEUSDC",
+                                "ETHUSDC", "LINKUSDC", "SOLUSDC", "XRPUSDC")
+
+    /**
+     * The hold as an algo: its config, its coins enrolled one seat each, Manual
+     * mode — no MACD gate, the average is the whole rule — and SWITCHED OFF.
+     * Nothing runs until it is switched on, and nothing real is bought until it
+     * is armed like any other algo.
+     */
+    fun createSmaHold(ctx: Context): Bucket {
+        val s = load(ctx, "binance")
+        val id = "b" + (System.currentTimeMillis() % 100000000L).toString(36)
+        val b = Bucket(id = id, name = "Hold above SMA50 · daily", space = "binance",
+            symbols = SMA_HOLD_COINS, mode = Mode.MANUAL,
+            capital = 100.0 * SMA_HOLD_COINS.size, holdN = SMA_HOLD_COINS.size, smoothing = 2)
+        save(ctx, "binance", s.copy(buckets = s.buckets + b))
+        StrategyLabStore.setConfig(ctx, com.signalscope.app.trading.StrategyLabConfig.SMA_HOLD_JSON,
+            "crypto_hold_sma50_daily.json", b.ns)
+        for (c in SMA_HOLD_COINS) StrategyLabStore.enroll(ctx, c, "BINANCE", b.ns)
+        StrategyLabStore.setEnabled(ctx, false, b.ns)
+        MacdGateStore.mutate(ctx, b.ns) {
+            it.copy(enabled = false, useScreenerSelection = false, holdN = SMA_HOLD_COINS.size)
+        }
+        Log.i(TAG, "created the 50-day hold ${b.ns} (${SMA_HOLD_COINS.size} coins, off)")
+        return b
+    }
+
+    /** Once per install the hold appears in the crypto tab. Deleting it is respected. */
+    @Synchronized
+    fun ensureSmaHoldSeeded(ctx: Context) {
+        val marker = java.io.File(ctx.filesDir, "seeded_sma50_hold.done")
+        if (marker.exists()) return
+        try {
+            val have = list(ctx, "binance").any {
+                StrategyLabStore.load(ctx, it.ns).configJson?.contains("\"smaHold\"") == true
+            }
+            if (!have) createSmaHold(ctx)
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "50-day hold seed failed", e) }
     }
 
     fun update(ctx: Context, bucket: Bucket) {

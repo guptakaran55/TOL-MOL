@@ -28,6 +28,17 @@ data class StrategyLabConfig(
      * it describes the broker rather than the strategy.
      */
     val flatFeeRoundTripPct: Double = 0.0,
+    /**
+     * Where the resample grid is anchored, in seconds east of UTC midnight. Not read from the
+     * strategy JSON — injected by StrategyLabStore.activeConfig from the space, like the fees.
+     *
+     * The desktop lab anchors every bucket at the exchange's local midnight. For UTC-stamped
+     * German data and New York's whole-hour offsets that grid coincides with the epoch one, but
+     * India's +5:30 does not: an epoch-anchored 240-min grid starts NSE blocks at 05:30, 09:30,
+     * 13:30 IST, so the day's first "4-hour" block holds the 09:15 hour alone. Its close then
+     * drives entries, fills and the stop as though it were a whole block. 0 = epoch grid.
+     */
+    val barAnchorSec: Long = 0L,
     val macdFast: Int = 12,
     val macdSlow: Int = 26,
     val macdSignal: Int = 9,
@@ -43,8 +54,19 @@ data class StrategyLabConfig(
     val slopeConfirmDaysOverride: Int? = null,  // reinvestSlopeConfirmDays
     val screenerLookbackOverride: Int? = null,  // screenerLookbackDays
     val reinvestStrategy: String? = null,       // e.g. "daily_macd_natural" (mode 3b)
-    val source: String = "preset"        // "preset" or the uploaded filename
+    val source: String = "preset",       // "preset" or the uploaded filename
+    /**
+     * WHICH RULE SET THE ENGINE RUNS. "macd" is everything above. [SMA_HOLD] is
+     * the crypto trend hold (Android spec "Crypto Hold above 50-day SMA", desktop
+     * backtests of 19 Oct 2026): hold while the daily close is above its simple
+     * average, sell on a daily close at or below it. None of the MACD, gate or
+     * exit fields apply to it — [fromJson] sets them all inert.
+     */
+    val strategy: String = "macd",
+    /** [SMA_HOLD] only: the average's length in completed daily closes. */
+    val holdSmaLength: Int = 50
 ) {
+    val isSmaHold: Boolean get() = strategy.equals(SMA_HOLD, ignoreCase = true)
     data class Cond(val enabled: Boolean = false)
 
     data class EntryCfg(
@@ -94,6 +116,20 @@ data class StrategyLabConfig(
         val macdCrossDownEnabled: Boolean = false,
         val macdBelowZeroEnabled: Boolean = false,
         val accelNegativeEnabled: Boolean = false,
+        /**
+         * Sigma floor for the deceleration exit. DEFAULT 0.0 ON PURPOSE.
+         *
+         * 0.0 reproduces the historical bare rule (`exitAccel < 0`) byte for byte, so every
+         * config written before this field existed behaves exactly as it did. Note this is
+         * NOT the entry side's default of 1.0 — mirroring that here would silently re-tune
+         * any config that had already enabled accelNegative.
+         *
+         * k > 0 requires the deceleration to exceed k standard deviations of this symbol's
+         * OWN acceleration swing before it fires. The bare rule triggers on ~50% of bars,
+         * which is why every champion has kept it off; the scaled form is what made it
+         * usable. See RESULTS_MATRIX_decel_exit.md in the backtest repo.
+         */
+        val accelNegativeMinSigma: Double = 0.0,
         val velocityEnabled: Boolean = false,
         val velocityLookback: Int = 10,
         val velocityThreshold: Double = 0.0,
@@ -115,6 +151,9 @@ data class StrategyLabConfig(
 
     /** Plain-words, read-only summary for the UI (no editable fields). */
     fun summary(): String {
+        if (isSmaHold) return "Timeframe: 1 day (UTC close) · \$${notional.toInt()} · slip ${slippagePct}%\n" +
+            "Hold while the daily close is above its $holdSmaLength-day simple average; " +
+            "sell on a daily close at or below it.\nNo stop, no target — the average is the only exit."
         val core = buildList {
             if (entry.slopeFlipUpEnabled) add("slope flip up" + if (entry.slopeFlipUpPersistent) " (armed)" else "")
             if (entry.slopePositiveEnabled) add("slope positive")
@@ -138,7 +177,8 @@ data class StrategyLabConfig(
             if (exit.slopeRetraceEnabled) add("slope retrace ${exit.slopeRetracePct}%")
             if (exit.macdCrossDownEnabled) add("MACD cross down")
             if (exit.macdBelowZeroEnabled) add("MACD<0")
-            if (exit.accelNegativeEnabled) add("accel<0")
+            if (exit.accelNegativeEnabled)
+                add(if (exit.accelNegativeMinSigma > 0) "decel<${exit.accelNegativeMinSigma}σ" else "accel<0")
             if (exit.velocityEnabled) add("velocity≤${exit.velocityThreshold}%")
             if (exit.stopLossEnabled) add("stop -${exit.stopLossPct}%")
             if (exit.takeProfitEnabled) add("target +${exit.takeProfitPct}%")
@@ -160,6 +200,63 @@ data class StrategyLabConfig(
     companion object {
         /** The validated champion preset (§7) — symbol-free, the default until a config is uploaded. */
         fun preset(): StrategyLabConfig = StrategyLabConfig(source = "preset")
+
+        /** [strategy] value of the crypto daily trend hold. */
+        const val SMA_HOLD = "smaHold"
+
+        /**
+         * The crypto hold as tested: 50-day SMA on UTC daily closes, 0.2% per round
+         * trip (Binance's 0.1% a side), 100 USDC a coin. What a new hold algo is
+         * given, and the record of the tested claim — edit a copy, not this.
+         */
+        const val SMA_HOLD_JSON = """{
+  "strategy": "smaHold",
+  "resample": "1D",
+  "exitBars": "same",
+  "sma": { "kind": "sma", "length": 50 },
+  "notional": 100,
+  "slippagePct": 0.2,
+  "_meta": "Hold while the daily UTC close is above its 50-day simple average; sell on a daily close at or below it. Decided just after 00:00 UTC, acted on at once. No stop, no target. Desktop backtests 19 Oct 2026: BTC+ETH 2021-04..2026-08 +16%/yr (hold -0.5%), worst drop -52% (hold -77%); 8 coins +22%/yr (hold -2%)."
+}"""
+
+        /**
+         * The hold's own reader. Refuses the variants the desktop tests showed to
+         * be worse rather than running them: an EMA instead of the SMA, an
+         * average built on intraday candles, a stop or a target on top.
+         */
+        private fun smaHoldFromJson(root: JSONObject, source: String): ParseResult {
+            val resample = str(root, "resample", "1D")
+            if (FeedPlan.frameMinutes(resample, 1440) != 1440)
+                return ParseResult.Rejected("The 50-day average rule runs on DAILY closes only — " +
+                    "\"$resample\" would make it an average of intraday bars, which lost about 38% a year in testing.")
+            val exitBars = str(root, "exitBars", "same")
+            if (!exitBars.equals("same", true) && FeedPlan.frameMinutes(exitBars, 1440) != 1440)
+                return ParseResult.Rejected("The average rule is checked once a day — exitBars must be \"same\".")
+            val smaO = obj(root, "sma")
+            if (!str(smaO, "kind", "sma").equals("sma", true))
+                return ParseResult.Rejected("Only a SIMPLE average is supported — the EMA lost to it in every test.")
+            val length = int(smaO, "length", 50)
+            if (length < 2) return ParseResult.Rejected("sma.length must be at least 2.")
+            val exitO = obj(root, "exit")
+            if (bool(obj(exitO, "stopLoss"), "enabled", false) || bool(obj(exitO, "takeProfit"), "enabled", false))
+                return ParseResult.Rejected("The average rule has no stop or target — neither was part of what was tested.")
+            val d = StrategyLabConfig()
+            return ParseResult.Ok(StrategyLabConfig(
+                resample = "1D", exitBars = "same",
+                // Feed planning and the "warming up" checks count this.
+                warmupBars = length,
+                notional = num(root, "notional", 100.0),
+                slippagePct = num(root, "slippagePct", 0.2),
+                // EVERYTHING MACD-SHAPED OFF. Code that reads these directly — the
+                // real-money stop checks, the gate — must find nothing to act on.
+                entry = EntryCfg(slopeFlipUpEnabled = false, accelPositiveEnabled = false,
+                    sustainSlopeEnabled = false, earlyRecoveryEnabled = false),
+                gates = GatesCfg(smaEnabled = false),
+                exit = ExitCfg(slopeFlipDownEnabled = false, stopLossEnabled = false,
+                    takeProfitEnabled = false, macdDistanceEnabled = false),
+                macdFast = d.macdFast, macdSlow = d.macdSlow, macdSignal = d.macdSignal,
+                source = source, strategy = SMA_HOLD, holdSmaLength = length))
+        }
 
         sealed class ParseResult {
             data class Ok(val config: StrategyLabConfig) : ParseResult()
@@ -193,8 +290,10 @@ data class StrategyLabConfig(
             val root = try { JSONObject(jsonText) } catch (e: Exception) {
                 return ParseResult.Rejected("Not valid JSON: ${e.message}")
             }
+            if (root.optString("strategy", "macd").equals(SMA_HOLD, ignoreCase = true))
+                return smaHoldFromJson(root, source)
             if (!root.optString("strategy", "macd").equals("macd", ignoreCase = true)) {
-                return ParseResult.Rejected("Only the 'macd' strategy is supported.")
+                return ParseResult.Rejected("Only the 'macd' and '$SMA_HOLD' strategies are supported.")
             }
             val entryO = obj(root, "entry") ?: return ParseResult.Rejected("Missing 'entry' object.")
             val exitO = obj(root, "exit") ?: return ParseResult.Rejected("Missing 'exit' object.")
@@ -273,6 +372,7 @@ data class StrategyLabConfig(
                     macdCrossDownEnabled = bool(obj(exitO, "macdCrossDown"), "enabled", false),
                     macdBelowZeroEnabled = bool(obj(exitO, "macdBelowZero"), "enabled", false),
                     accelNegativeEnabled = bool(obj(exitO, "accelNegative"), "enabled", false),
+                    accelNegativeMinSigma = num(obj(exitO, "accelNegative"), "minSigma", 0.0),
                     velocityEnabled = bool(obj(exitO, "velocity"), "enabled", false),
                     velocityLookback = int(obj(exitO, "velocity"), "lookback", 10),
                     velocityThreshold = num(obj(exitO, "velocity"), "threshold", 0.0),

@@ -68,6 +68,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -83,6 +84,26 @@
         <receiver
             android:name=".service.T212DailyTrailReceiver"
             android:exported="false" />
+
+        <!-- AlarmManager receiver: renews the daily Kite session before the Indian
+             open, so an owner in Europe never has to log in at 5am local time. -->
+        <receiver
+            android:name=".service.ZerodhaAutoLoginReceiver"
+            android:exported="false" />
+
+        <!-- The home-screen positions widget. Drawn from the summary the background
+             pass builds; it refreshes when the app pushes one, never on a timer. -->
+        <receiver
+            android:name=".trading.PositionWidget"
+            android:exported="false"
+            android:label="Tol-Mol positions">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/position_widget_info" />
+        </receiver>
 
         <!-- FileProvider for sharing PDFs from cache -->
         <provider

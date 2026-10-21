@@ -2,8 +2,8 @@ package com.signalscope.app.trading
 
 import android.util.Log
 import com.signalscope.app.data.ConfigManager
+import com.signalscope.app.network.FeedHealth
 import com.signalscope.app.network.Trading212Client
-import com.signalscope.app.network.TradegateClient
 import com.signalscope.app.network.YahooFinanceClient
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -84,21 +84,36 @@ object PatientExecutor {
      * market traded at $333.67; the +0.5×ATR cap can never bridge a 5% gap, so the
      * order was doomed at placement). DE → Tradegate (real-time); anything → live
      * Yahoo; else the caller's ref.
+     *
+     * A FEED THAT HAS STOPPED IS NOT A PRICE (see FeedHealth). Yahoo then gives
+     * no live quote at all, rather than the last one it ever had: a sale anchored
+     * on Pfisterer's frozen 66.60 would have rested its whole ladder above a
+     * market at 59 and filled nothing. The venue quote is then checked against
+     * the broker's own valuation instead, and the broker's price stands in for
+     * the feed's before the caller's guess does.
      */
     private fun freshRef(
-        client: Trading212Client, ticker: String, yahooSymbol: String,
+        config: ConfigManager, client: Trading212Client, ticker: String, yahooSymbol: String,
         space: String, uiRef: Double
     ): Double {
-        val yahooLive = YahooFinanceClient.fetchLivePrice(yahooSymbol.trim())
+        val ys = yahooSymbol.trim()
+        val yahooLive = YahooFinanceClient.fetchLivePrice(ys)
+        val stopped = FeedHealth.stoppedSince(ys) > 0L
         if (space.equals("DE", true)) {
             val isin = when (val r = client.fetchInstrumentMetadata(setOf(ticker))) {
                 is Trading212Client.T212Result.Success -> r.data[ticker]?.isin
                 else -> null
             }
-            val tg = isin?.let { TradegateClient.fetchQuote(it, yahooLive ?: uiRef) }
+            val tg = isin?.let {
+                GermanRealtime.checkedQuote(config.appContext, it, ys, ticker,
+                    yahooLive ?: uiRef, feedStale = stopped)
+            }
             if (tg != null) return tg.mid
         }
-        return yahooLive ?: uiRef
+        if (yahooLive != null) return yahooLive
+        if (stopped) BrokerHoldings.t212Price(config.appContext, ticker, space)
+            .takeIf { it > 0.0 }?.let { return it }
+        return uiRef
     }
 
     /**
@@ -113,17 +128,108 @@ object PatientExecutor {
         return client.resolveT212Ticker(sym, spc)
     }
 
-    /** Throws when the symbol's regular session is closed. A patient ladder is
-     *  meaningless after hours: no rung can fill, so it walks to the cap and
-     *  leaves either nothing or a stale worst-price limit resting into tomorrow's
-     *  open (observed live with MELI at 22:55 CET). Unknown state → proceed. */
-    private fun requireMarketOpen(yahooSymbol: String) {
-        if (YahooFinanceClient.fetchMarketOpen(yahooSymbol.trim()) == false)
+    /**
+     * Throws when the symbol has no session open to trade into. Unknown → proceed.
+     *
+     * US NAMES MAY USE EXTENDED HOURS; EVERYWHERE ELSE IS UNCHANGED. Trading 212
+     * runs pre-market and after-hours sessions on its more liquid US stocks, so
+     * an entry decided on an evening bar has somewhere to go rather than waiting
+     * for the next open. Xetra has no such session, and asking for one there
+     * returns the regular bounds anyway — so this is US-only by effect as much
+     * as by the flag.
+     *
+     * THE ORIGINAL OBJECTION STILL STANDS AND IS WORTH KEEPING IN VIEW: a ladder
+     * walks from a good price toward a worse one, and a thin book fills none of
+     * it, so it can reach its cap having bought nothing (observed live on MELI at
+     * 22:55 CET). What makes that survivable is the cleanup at the end of the
+     * loop — an unfilled ladder cancels its last resting order and says so if the
+     * cancel failed, so the worst case is a wasted pass rather than a stale limit
+     * waiting to be hit at tomorrow's open.
+     */
+    /**
+     * Throws when the name's price feed has stopped — for a BUY only.
+     *
+     * Read straight after [requireMarketOpen], whose reply is what judged it, so
+     * the verdict is as fresh as the question. A sale is never refused for this:
+     * getting out of a name the app can no longer see is the one trade that
+     * stays sensible.
+     *
+     * Why refuse at all: everything that would look after the position once
+     * bought — its stop, its target, its value — reads the same frozen price, and
+     * the signal that asked for the buy was drawn on it. Pfisterer was bought on
+     * 14 Oct exactly like this, a week into its feed being frozen.
+     */
+    private fun requireLiveFeed(config: ConfigManager, yahooSymbol: String, space: String) {
+        val ys = yahooSymbol.trim()
+        val since = FeedHealth.stoppedSince(ys)
+        if (since <= 0L) return
+        val sym = ys.uppercase().substringBefore('.')
+        try {
+            LabNotifier.feedStopped(config.appContext, space.lowercase(), sym, ys, since, held = false)
+        } catch (e: Exception) { Log.w(TAG, "feed alarm failed", e) }
+        throw IllegalArgumentException(
+            "Not buying $sym: its price feed ($ys) has shown no trade since " +
+            "${FeedHealth.describe(since)} although the market is open, so nothing could watch " +
+            "a stop or a target on it. Nothing was placed.")
+    }
+
+    private fun requireMarketOpen(yahooSymbol: String, space: String) {
+        val extended = space.uppercase() == "US"
+        if (YahooFinanceClient.fetchMarketOpen(yahooSymbol.trim(), extended) == false)
             throw IllegalArgumentException(
-                "Market for $yahooSymbol is closed — a patient ladder can't fill after hours " +
+                "Market for $yahooSymbol is closed" +
+                (if (extended) " — including its pre-market and after-hours sessions" else "") +
+                " — a patient ladder can't fill into a shut venue " +
                 "(every step would just rest, ending at the worst price for nothing). " +
                 "Retry during market hours, or use Buy now / Sell now if you want an order resting for the open.")
     }
+
+    /**
+     * The price this executor would trade against RIGHT NOW, for callers that
+     * must decide whether to trade at all before dispatching a ladder.
+     *
+     * Exposed deliberately rather than letting the caller fetch its own quote.
+     * A gate that approves a purchase on one price source while the ladder buys
+     * off another is not a gate — on German names this reads a Tradegate mid and
+     * the plain Yahoo quote can differ by more than the entire ceiling being
+     * enforced, so the check would pass on a number nothing was ever going to
+     * pay. Same function, same answer, one source of truth.
+     */
+    fun currentRef(config: ConfigManager, ticker: String, yahooSymbol: String,
+                   space: String, fallback: Double): Double =
+        try { freshRef(config, Trading212Client(config), ticker, yahooSymbol, space, fallback) }
+        catch (e: Exception) { Log.w(TAG, "currentRef failed", e); fallback }
+
+    /**
+     * The same price, but able to say it does not know.
+     *
+     * [currentRef] answers a question the LADDER asks, where a fallback is right:
+     * it is already committed to trading and needs some number to rest an order
+     * near. A GATE asks the opposite question — may this trade happen at all —
+     * and there a fallback is the worst possible answer, because the fallback
+     * handed in is the signal price itself. The gate then compares the signal
+     * with the signal, finds no movement, and approves a name that has gapped.
+     *
+     * That is not hypothetical: it is the shape of the exact failure the entry
+     * ceiling was written to prevent, reappearing on the path that runs when the
+     * feed is busy — which at an opening bell is most of them.
+     *
+     * Null means unknown. A caller that can afford to wait must wait.
+     */
+    fun currentRefOrNull(config: ConfigManager, ticker: String, yahooSymbol: String,
+                         space: String): Double? =
+        try {
+            // A sentinel no real quote can equal, so "the fallback came back" is
+            // distinguishable from "a price came back".
+            val probe = -1.0
+            val v = freshRef(config, Trading212Client(config), ticker, yahooSymbol, space, probe)
+            if (v > 0.0 && v != probe) v else null
+        } catch (e: Exception) { Log.w(TAG, "currentRefOrNull failed", e); null }
+
+    /** The same ATR the ladder sizes its concessions with, for callers that need
+     *  to express a limit in the units this executor actually thinks in. */
+    fun dailyAtr(yahooSymbol: String, space: String, refPrice: Double): Double =
+        estimateAtr(yahooSymbol, space, refPrice)
 
     /** 14-day ATR in price units; 1.5%-of-price fallback. */
     private fun estimateAtr(yahooSymbol: String, space: String, refPrice: Double): Double {
@@ -225,14 +331,30 @@ object PatientExecutor {
         onProgress: ((Map<String, Any?>) -> Unit)? = null,
         targetQty: Double? = null,
         claimedByOthers: Double = 0.0
+    ): Result =
+        // HELD FOR THE WHOLE LADDER, so a resting target cannot be put back on
+        // this stock halfway through the sale — see [SellGuard].
+        SellGuard.selling(ticker) {
+            sellLadder(config, ticker, yahooSymbol, space, quantity, refPrice,
+                onProgress, targetQty, claimedByOthers)
+        }
+
+    private fun sellLadder(
+        config: ConfigManager, ticker: String, yahooSymbol: String, space: String,
+        quantity: Double, refPrice: Double,
+        onProgress: ((Map<String, Any?>) -> Unit)?,
+        targetQty: Double?,
+        claimedByOthers: Double
     ): Result {
         val t = ticker.trim()
         return try {
             if (quantity <= 0.0) throw IllegalArgumentException("No held quantity to sell")
             if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
             val client = Trading212Client(config)
-            requireMarketOpen(yahooSymbol)
-            val ref = freshRef(client, t, yahooSymbol, space, refPrice)
+            // `space` rather than a normalised copy: the sell path has no such
+            // local, and the gate normalises what it is given.
+            requireMarketOpen(yahooSymbol, space)
+            val ref = freshRef(config, client, t, yahooSymbol, space, refPrice)
             val atr = estimateAtr(yahooSymbol, space, ref)
             // HYBRID ladder: the concession schedule (+START×ATR shrinking to
             // −FLOOR×ATR) applies to a FRESH market quote at every rung, so a moving
@@ -336,7 +458,7 @@ object PatientExecutor {
                 val qty = minOf(left, inPool)
                 if (qty <= 0.0) { filledAny = true; break@rung }
                 if (remaining > 0) lastKnownRemaining = remaining
-                val mkt = freshRef(client, t, yahooSymbol, space, lastMarket)
+                val mkt = freshRef(config, client, t, yahooSymbol, space, lastMarket)
                 lastMarket = mkt
                 val price = Math.max(Math.round((mkt + offsets[i] * atr) * 100.0) / 100.0, hardFloor)
                 prog(onProgress, mapOf(
@@ -431,9 +553,23 @@ object PatientExecutor {
 
     // ── BUY ─────────────────────────────────────────────────────────────────
 
+    /**
+     * @param maxPrice an ABSOLUTE per-share limit this ladder may never bid above,
+     *   0 = none. Distinct from the internal cap, and the distinction is the whole
+     *   point of the parameter: the internal one is `fresh quote + half an ATR`,
+     *   which is anchored to wherever the market IS. That is right for a ladder
+     *   chasing a moving price within a session, and useless as protection against
+     *   a gap — the anchor moves with the gap, so the cap moves with it too, and a
+     *   name that opened 6% above its signal is bought 6% high by a cap that is
+     *   working exactly as designed. A caller that cares where the price is
+     *   relative to its SIGNAL has to say so, and this is how.
+     */
     fun buy(
         config: ConfigManager, symbol: String, yahooSymbol: String, space: String,
         cashAmount: Double, refPrice: Double,
+        // BEFORE the callback, so callers that pass their progress handler as a
+        // trailing lambda keep binding it to the callback rather than to this.
+        maxPrice: Double = 0.0,
         onProgress: ((Map<String, Any?>) -> Unit)? = null
     ): Result {
         val spc = if (space.uppercase() == "DE") "DE" else "US"
@@ -442,7 +578,8 @@ object PatientExecutor {
             if (cashAmount <= 0.0) throw IllegalArgumentException("Enter an amount greater than 0")
             if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
             val client = Trading212Client(config)
-            requireMarketOpen(yahooSymbol)
+            requireMarketOpen(yahooSymbol, spc)
+            requireLiveFeed(config, yahooSymbol, spc)
             val raw = symbol.trim()
             val ticker = if (raw.contains("_")) raw else {
                 val sym = raw.uppercase()
@@ -450,12 +587,29 @@ object PatientExecutor {
                     ?: throw IllegalArgumentException("Couldn't resolve \"$sym\": ${client.resolveFailureReason(sym, spc)}")
             }
             tickerForMsg = ticker
-            val ref = freshRef(client, ticker, yahooSymbol, space, refPrice)
+            val ref = freshRef(config, client, ticker, yahooSymbol, space, refPrice)
+            // REFUSE BEFORE PLACING ANYTHING. The market is already above the limit
+            // the caller set, so no rung of this ladder could fill under it — and a
+            // ladder that rests orders it does not want filled is how a stale limit
+            // ends up sitting into the next session.
+            if (maxPrice > 0.0 && ref > maxPrice)
+                return Result(ok = false, ticker = ticker, filled = 0.0,
+                    note = "price ${"%.2f".format(ref)} is above the ${"%.2f".format(maxPrice)} " +
+                           "limit this entry may pay — nothing placed",
+                    refPrice = ref)
+            var lastFailure: String? = null
             val atr = estimateAtr(yahooSymbol, space, ref)
             // Concessions (0 → +BUY_MAX×ATR) apply to a FRESH quote each rung so a
             // rising market can't strand the order below reality. The absolute cap is
             // fixed at t=0 — if the market runs past it we cancel rather than chase.
-            val hardCap = Math.round((ref + BUY_MAX_ATR * atr) * 100.0) / 100.0
+            // WHICHEVER BINDS FIRST. The caller's limit is measured from its signal
+            // and does not move; this one is measured from the market and does. A
+            // ladder that clears the gate on the opening quote can still walk half
+            // an ATR upward while it runs, straight back through the limit that
+            // just approved it — so the limit has to live inside the loop too, not
+            // only in front of it.
+            val atrCap = Math.round((ref + BUY_MAX_ATR * atr) * 100.0) / 100.0
+            val hardCap = if (maxPrice > 0.0) Math.min(atrCap, maxPrice) else atrCap
             val offsets = ArrayList<Double>()
             var off = 0.0
             while (off <= BUY_MAX_ATR + 1e-9) { offsets.add(off); off += STEP_ATR }
@@ -491,7 +645,7 @@ object PatientExecutor {
                 if (ownedNow >= 0) lastKnownOwned = ownedNow
                 val need = targetShares - boughtSoFar
                 if (need <= dustShares || need * ref < MIN_ORDER_VALUE) { filledAny = true; break@rung }
-                val mkt = freshRef(client, ticker, yahooSymbol, space, lastMarket)
+                val mkt = freshRef(config, client, ticker, yahooSymbol, space, lastMarket)
                 lastMarket = mkt
                 val price = Math.min(Math.round((mkt + offsets[i] * atr) * 100.0) / 100.0, hardCap)
                 prog(onProgress, mapOf(
@@ -513,7 +667,20 @@ object PatientExecutor {
                             }
                             is Trading212Client.T212Result.Failure -> {
                                 if (r.httpCode == 429 && rate < 2) { rate++; Thread.sleep(ORDER_RATE_BACKOFF_MS); continue@place }
+                                // ONLY A FAILURE THAT ACTUALLY ENDED THE RUNG.
+                                //
+                                // The precision reject below is a NORMAL internal
+                                // step — every US fractional order is offered at
+                                // five decimals, refused, and re-offered at three,
+                                // which works. Recording it made the app report
+                                // "the broker said: invalid quantity precision" as
+                                // though that were why nothing was bought, when in
+                                // fact six orders had been placed perfectly well
+                                // and simply found no seller after hours. A
+                                // transient step dressed as the outcome is worse
+                                // than no explanation at all.
                                 if (r.message.contains("precision", true)) continue@prec
+                                lastFailure = r.message
                                 break@prec
                             }
                             is Trading212Client.T212Result.NotConfigured -> break@rung
@@ -535,7 +702,9 @@ object PatientExecutor {
 
             Result(ok = filledAny, ticker = ticker, filled = bought,
                 remaining = (targetShares - bought).coerceAtLeast(0.0),
-                note = if (filledAny) "filled" else "unfilled", staleOrder = staleOrderWarning,
+                note = if (filledAny) "filled"
+                       else "unfilled" + (lastFailure?.let { " — the broker said: $it" } ?: ""),
+                staleOrder = staleOrderWarning,
                 orderIds = placedIds, refPrice = ref, atr = atr)
         } catch (e: Exception) {
             Log.e(TAG, "patient buy failed", e)

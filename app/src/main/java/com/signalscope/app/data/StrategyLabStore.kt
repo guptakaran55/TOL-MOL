@@ -95,7 +95,9 @@ object StrategyLabStore {
         val trades: List<LedgerTrade> = emptyList(),
         val audit: List<Audit> = emptyList(),
         val statuses: Map<String, SymbolStatus> = emptyMap(),
-        val lastRunAt: Long = 0L
+        val lastRunAt: Long = 0L,
+        /** The bar grid this book's timestamps were made on (StrategyLabConfig.barAnchorSec). */
+        val barAnchorSec: Long = 0L
     )
 
     // ── Namespacing ───────────────────────────────────────────────────────
@@ -154,7 +156,10 @@ object StrategyLabStore {
         // Remove BEFORE the overlay so a row that is both removed and re-supplied
         // in newTrades keeps the fresh version.
         removeIds.forEach { map.remove(it) }
-        newTrades.forEach { map[it.id] = it }
+        // A CLOSED TRADE IS NEVER REOPENED. A pass that read the book before a
+        // trade was closed by hand (the take-profit button) still carries it as
+        // open; writing that back would resurrect a position already sold.
+        newTrades.forEach { if (!(map[it.id]?.status == "CLOSED" && it.status != "CLOSED")) map[it.id] = it }
         val existing = s.audit.map { it.id }.toHashSet()
         val audit = (s.audit + newAudits.filter { it.id !in existing }).takeLast(maxAudit)
         val curBase = (s.baselines as? Map<String, Long>) ?: emptyMap()
@@ -168,6 +173,23 @@ object StrategyLabStore {
         ), ns)
     }
 
+    /** Close one OPEN trade by hand, recording how — and touch nothing else: not
+     *  the watermark, the baseline or the enrollment, so the algo carries on
+     *  exactly as before. False if the trade was not open any more. */
+    @Synchronized
+    fun closeByHand(ctx: Context, ns: String, closed: LedgerTrade, audit: Audit): Boolean {
+        var done = false
+        mutate(ctx, ns) { s ->
+            if (s.trades.none { it.id == closed.id && it.status == "OPEN" }) s
+            else {
+                done = true
+                s.copy(trades = s.trades.map { if (it.id == closed.id) closed else it },
+                    audit = (s.audit + audit).takeLast(500))
+            }
+        }
+        return done
+    }
+
     /** The flat-start baseline bar ts for a symbol (0 = no baseline yet). */
     fun baselineFor(ctx: Context, symbol: String, ns: String = "us"): Long =
         ((load(ctx, ns).baselines as? Map<String, Long>) ?: emptyMap())[symbol.uppercase()] ?: 0L
@@ -177,11 +199,14 @@ object StrategyLabStore {
     fun activeConfig(ctx: Context, ns: String = "us"): StrategyLabConfig {
         val st = load(ctx, ns)
         val raw = st.configJson
-        val base = if (raw == null) StrategyLabConfig.preset()
+        val parsed = if (raw == null) StrategyLabConfig.preset()
             else when (val r = StrategyLabConfig.fromJson(raw, st.configSource)) {
                 is StrategyLabConfig.Companion.ParseResult.Ok -> r.config
                 is StrategyLabConfig.Companion.ParseResult.Rejected -> StrategyLabConfig.preset()
             }
+        // Bars are grouped on the exchange's own clock, as the desktop lab groups them. Only India
+        // needs it: its +5:30 offset is the one that does not land on the epoch grid.
+        val base = parsed.copy(barAnchorSec = gridFor(ctx, ns, st))
         // COSTS ARE RESOLVED HERE, AND ONLY HERE.
         //
         // This is the single function every engine gets its config from — the
@@ -199,39 +224,83 @@ object StrategyLabStore {
             val cm = com.signalscope.app.data.ConfigManager(ctx)
             val bucket = try { BucketStore.get(ctx, ns) } catch (e: Exception) { null }
 
-            // A per-algo fee of 0.0 is a real answer ("this algo pays no flat
-            // fee"), so only a NULL falls through to the space setting.
-            val feeCash = bucket?.flatFeeOverride ?: cm.flatFeeFor(ns)
-
-            // THE FEE IS MEASURED AGAINST WHAT A SEAT ACTUALLY BUYS, not against
-            // the config file's notional. Those are different numbers whenever
-            // capital is split over seats — with 1000 over 5 seats a position is
-            // 200, and charging a flat fee against 1000 understates it fivefold.
-            // Getting this wrong makes a fee look survivable that in fact is not.
+            // THE CHARGES ARE MEASURED AGAINST WHAT ONE SEAT ACTUALLY BUYS, not
+            // against the algo's total capital. Those differ the moment money is
+            // split over seats — 1000 over 5 seats is a 200 position — and a fixed
+            // cash charge measured against the wrong one understates itself by the
+            // seat count. That is the whole weight of Zerodha's depository fee.
             val seats = (bucket?.holdN ?: 1).coerceAtLeast(1)
             val positionValue = when {
                 bucket != null && bucket.capital > 0.0 -> bucket.capital / seats
                 base.notional > 0.0 -> base.notional
                 else -> 0.0
             }
-            val feePct = if (feeCash > 0.0 && positionValue > 0.0)
-                (2.0 * feeCash / positionValue) * 100.0 else 0.0
 
-            // EXCLUSIVE, NOT CUMULATIVE. A flat fee and a percentage are two ways
-            // of describing the same friction, and charging both meant a config's
-            // 0.20% was silently added to a fee typed in to replace it — which is
-            // exactly how a small fee turned into a catastrophic-looking backtest.
-            // Whichever is set on the algo wins outright.
-            val slip = when {
-                bucket?.slippagePctOverride != null -> bucket.slippagePctOverride!!
-                feeCash > 0.0 -> 0.0
-                else -> base.slippagePct
-            }
-            val effFeePct = if (bucket?.slippagePctOverride != null) 0.0 else feePct
+            // ── WHAT THE BROKER TAKES ────────────────────────────────────────
+            // Modelled per broker from their published price list rather than
+            // approximated by a number typed into a box. A single "fee per order"
+            // could not express any of what Zerodha actually charges: a tax on one
+            // leg only, a flat cash depository fee on the sell alone, and GST
+            // levied on some of the others but not on the taxes.
+            val broker = com.signalscope.app.trading.TradingCosts.brokerCosts(
+                ns, cm.accountCurrency, cm.fxConversionPct)
+            val brokerPct = broker.totalPct(positionValue)
 
-            if (slip == base.slippagePct && effFeePct == 0.0) base
-            else base.copy(slippagePct = slip, flatFeeRoundTripPct = effFeePct)
+            // ── ANYTHING THE USER ADDS ON TOP ────────────────────────────────
+            // Still honoured, still per order, still charged on both legs — but it
+            // is now EXTRA rather than the whole model, and it defaults to nothing.
+            // A fee typed in to stand for charges the app now models itself would
+            // count them twice, which the algo card says out loud when it is set.
+            val extraCash = bucket?.flatFeeOverride ?: cm.flatFeeFor(ns)
+            val extraPct = if (extraCash > 0.0 && positionValue > 0.0)
+                (2.0 * extraCash / positionValue) * 100.0 else 0.0
+
+            // ── SPREAD ───────────────────────────────────────────────────────
+            // ADDED TO THE BROKER'S CHARGES, NOT TRADED AGAINST THEM. These used
+            // to be exclusive, on the reasoning that a flat fee and a percentage
+            // were two descriptions of one friction — which was true only while
+            // the "fee" was a hand-made stand-in for everything. Now that the
+            // price list is modelled properly they are plainly different things:
+            // STT is a tax and the spread is the market, and a trade pays both.
+            val slip = bucket?.slippagePctOverride ?: base.slippagePct
+
+            // THE ESCAPE HATCH, UNCHANGED IN MEANING. A percentage set on the algo
+            // card says "charge exactly this and nothing else" — the way to test a
+            // what-if, or to overrule the model entirely without editing anything.
+            val totalFeePct = if (bucket?.slippagePctOverride != null) 0.0
+                              else brokerPct + extraPct
+
+            if (slip == base.slippagePct && totalFeePct == 0.0) base
+            else base.copy(slippagePct = slip, flatFeeRoundTripPct = totalFeePct)
         } catch (e: Exception) { base }
+    }
+
+    /** Seconds east of UTC at which a space's bar grid SHOULD start (StrategyLabConfig.barAnchorSec). */
+    fun barAnchorFor(ns: String): Long =
+        if (com.signalscope.app.trading.Spaces.baseOf(ns) == "in") 19_800L else 0L
+
+    /**
+     * The grid this book may run on NOW — which is not always the one it should run on.
+     *
+     * A trade is identified by its symbol and its entry bar's timestamp, and moving the grid moves
+     * every timestamp. Switched under an OPEN position, the engine would report that position under
+     * a new id: the book would hold it twice, the original never closing. So a book moves to its
+     * target grid only while it holds nothing, and at that moment its watermarks and baselines are
+     * cleared so the next run is a clean flat start on the new clock — exactly what Reset does, minus
+     * the ledger, which is kept as history. Until then it stays on the grid it was built on and its
+     * open positions finish under the rules they were opened under.
+     */
+    private fun gridFor(ctx: Context, ns: String, st: State): Long {
+        val target = barAnchorFor(ns)
+        if (st.barAnchorSec == target) return target
+        if (st.trades.any { it.status == "OPEN" }) return st.barAnchorSec
+        val after = mutate(ctx, ns) { cur ->
+            if (cur.barAnchorSec == target || cur.trades.any { it.status == "OPEN" }) cur
+            else cur.copy(barAnchorSec = target, watermarks = emptyMap(), baselines = emptyMap())
+        }
+        if (after.barAnchorSec == target)
+            Log.i(TAG, "[$ns] bar grid moved to anchor ${target}s — flat book, tracking restarts on the new clock")
+        return after.barAnchorSec
     }
 
     fun setEnabled(ctx: Context, on: Boolean, ns: String = "us"): State = mutate(ctx, ns) {

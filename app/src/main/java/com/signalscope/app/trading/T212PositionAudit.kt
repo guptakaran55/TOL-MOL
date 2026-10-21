@@ -99,7 +99,10 @@ object T212PositionAudit {
         val expectedQty: Double,
         val actualQty: Double,
         val deltaQty: Double,
-        val actualValue: Double
+        val actualValue: Double,
+        /** A shortfall: when it was first seen short — carried from check to check
+         *  while it lasts. 0 on the other kinds. */
+        val firstSeenAt: Long = 0L
     )
 
     data class Report(
@@ -108,7 +111,10 @@ object T212PositionAudit {
         val error: String = "",
         val positionsSeen: Int = 0,
         val rowsChecked: Int = 0,
-        val drifts: List<Drift> = emptyList()
+        val drifts: List<Drift> = emptyList(),
+        /** Ticker → when it was first seen short. Survives a failed read, so a
+         *  rate-limited check does not restart the clock. Null on older files. */
+        val firstShort: Map<String, Long>? = null
     ) {
         /** Only a SHORTFALL against an algo's own position is an alarm. EXTRA (a
          *  holding no algo claims) and OVERLAP (the broker holds more of a name an
@@ -117,7 +123,30 @@ object T212PositionAudit {
          *  alarm because the true size is unknown, not merely different. */
         val critical: List<Drift> get() = drifts.filter { it.kind !in setOf("EXTRA", "OVERLAP", "DUST") }
         val hasCritical: Boolean get() = critical.isNotEmpty()
+
+        /**
+         * SEEN SHORT ON TWO CHECKS IN A ROW — the only shortfalls worth a
+         * notification. One sighting is very often a sale at Trading 212 that the
+         * app has not booked YET: this check runs at the start of a pass, and a
+         * target that filled since the last one is booked later in that same pass
+         * (MRK, 19 Oct: seen short at 15:46, booked at 15:52). The next check
+         * comes within [RECHECK_MS], so a real one is told a quarter of an hour later.
+         */
+        val confirmedCritical: List<Drift> get() = critical.filter { isConfirmed(it, checkedAt) }
     }
+
+    /** A shortfall seen once is checked again this soon, not after the usual hour. */
+    const val RECHECK_MS = 15 * 60_000L
+
+    /** The second sighting must come at least this long after the first, so a
+     *  "check now" a minute later — before the pass that books the sale — does
+     *  not confirm what is only a sale waiting to be recorded. */
+    const val CONFIRM_AFTER_MS = 10 * 60_000L
+
+    fun isConfirmed(d: Drift, checkedAt: Long): Boolean =
+        d.firstSeenAt > 0L && checkedAt - d.firstSeenAt >= CONFIRM_AFTER_MS
+
+    private val SHORT_KINDS = setOf("MISSING", "MISMATCH", "STUCK")
 
     private fun file(ctx: Context) = File(ctx.filesDir, "t212_position_audit.json")
 
@@ -144,6 +173,7 @@ object T212PositionAudit {
      */
     fun run(ctx: Context): Report {
         val config = ConfigManager(ctx)
+        val priorFirst: Map<String, Long> = (last(ctx).firstShort as Map<String, Long>?).orEmpty()
         if (!config.hasT212Credentials) {
             return Report(ok = false, checkedAt = System.currentTimeMillis(),
                 error = "No T212 API key saved.").also { store(ctx, it) }
@@ -152,9 +182,9 @@ object T212PositionAudit {
             is Trading212Client.T212Result.Success -> r.data
             is Trading212Client.T212Result.Failure ->
                 return Report(ok = false, checkedAt = System.currentTimeMillis(),
-                    error = r.message).also { store(ctx, it) }
+                    error = r.message, firstShort = priorFirst).also { store(ctx, it) }
             else -> return Report(ok = false, checkedAt = System.currentTimeMillis(),
-                error = "T212 not configured").also { store(ctx, it) }
+                error = "T212 not configured", firstShort = priorFirst).also { store(ctx, it) }
         }
 
         // FREE CASH, cached while we are already on the network. The commitment
@@ -168,7 +198,22 @@ object T212PositionAudit {
             }
         } catch (e: Exception) { Log.w(TAG, "free-cash read failed: ${e.message}") }
 
-        val open = T212LiveStore.load(ctx).trades.filter { it.status in LIVE_STATUSES && it.qty > 0.0 }
+        // ONLY ROWS THAT COULD BE AT TRADING 212 IN THE FIRST PLACE.
+        //
+        // This compared EVERY row in the store against a Trading 212 portfolio,
+        // including Indian positions that a missing guard elsewhere had written in
+        // here. Zerodha holdings can never appear in a Trading 212 account, so each
+        // one was reported as a position the broker had lost — thirteen of them,
+        // under a banner saying the ledger could not be trusted.
+        //
+        // Kept as a filter here as well as fixing the writer, because an audit that
+        // can be broken by a bad row elsewhere is not an audit. This one now
+        // answers a question it can actually answer: of the things claimed to be at
+        // Trading 212, what is missing.
+        val open = T212LiveStore.load(ctx).trades.filter {
+            it.status in LIVE_STATUSES && it.qty > 0.0 &&
+                com.signalscope.app.trading.Spaces.baseOf(it.ns).let { b -> b == "de" || b == "us" }
+        }
         // A leg that started and never reported: the ledger quantity is an ORDER
         // estimate, not a holding, so no quantity comparison can be trusted for it.
         // Reported on its own terms instead of being silently compared.
@@ -238,7 +283,15 @@ object T212PositionAudit {
                 deltaQty = p.quantity, actualValue = value))
         }
 
-        val rep = Report(ok = true, checkedAt = System.currentTimeMillis(),
+        // When each shortfall was first seen: carried over while it lasts, so the
+        // second check can tell a lasting gap from a sale not yet booked.
+        val seenAt = System.currentTimeMillis()
+        val dated = drifts.map { d ->
+            if (d.kind in SHORT_KINDS) d.copy(firstSeenAt = priorFirst[d.ticker] ?: seenAt) else d
+        }
+        drifts.clear(); drifts.addAll(dated)
+        val rep = Report(ok = true, checkedAt = seenAt,
+            firstShort = dated.filter { it.kind in SHORT_KINDS }.associate { it.ticker to it.firstSeenAt },
             positionsSeen = positions.size, rowsChecked = open.size,
             // Critical first, then biggest exposure — the order you would want to
             // read them in when something is wrong.

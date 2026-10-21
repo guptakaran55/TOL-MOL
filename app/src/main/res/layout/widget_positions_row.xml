@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One position in the widget's list: "🔴 GFT −2.8% · stop 1.1% below (26.74)". -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/wp_row"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:paddingTop="3dp"
+    android:paddingBottom="3dp"
+    android:textColor="#FFFFFFFF"
+    android:textSize="12sp"
+    android:maxLines="2"
+    android:ellipsize="end" />

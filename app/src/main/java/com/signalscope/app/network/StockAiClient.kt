@@ -10,6 +10,10 @@ import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.StringReader
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -19,8 +23,8 @@ import java.util.concurrent.TimeUnit
  * 1. Deep Pullback Analysis — auto-triggered when price drops >3% below EMA(21)
  *    Fetches Google News headlines → sends to LLM → returns probable cause
  *
- * 2. Stock Outlook — manually triggered from detail modal
- *    Fetches news + sends technical context → LLM returns short/long term outlook
+ * 2. Stock Outlook — from the detail modal, and asked by the floor algo
+ *    Fetches news (no technicals) → LLM returns a JSON outlook (see OutlookReply)
  *
  * Supports OpenAI (ChatGPT) and Anthropic (Claude) APIs.
  */
@@ -122,12 +126,28 @@ object StockAiClient {
     // GOOGLE NEWS — fetch recent headlines for a stock
     // ═══════════════════════════════════════════════════════
 
+    /** Headlines as prompt lines, newest first: "2026-10-15 (1 day ago) · title — outlet (+2 more outlets)". */
     fun fetchNewsHeadlines(
         symbol: String,
         maxResults: Int = 8,
         ctx: MarketContext = MarketContext.IN,
         companyName: String? = null
     ): List<String> {
+        val today = LocalDate.now()
+        val zone = ZoneId.systemDefault()
+        return fetchStories(symbol, maxResults, ctx, companyName).map { NewsDigest.line(it, today, zone) }
+    }
+
+    /** "Today is Friday, 16 October 2026." — headline dates mean little to a model that doesn't know it. */
+    private fun todayLine(): String =
+        "Today is ${LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy", Locale.US))}."
+
+    fun fetchStories(
+        symbol: String,
+        maxResults: Int = 8,
+        ctx: MarketContext = MarketContext.IN,
+        companyName: String? = null
+    ): List<NewsDigest.Story> {
         // Clean the ticker: strip every exchange suffix Yahoo appends (Indian
         // .NS/.BO, plus the European venues used by the DE space — .DE/.PA/.AS/
         // .L/.MI/.MC/.SW/.ST/.HE/.OL) and the NSE -EQ series tag. Without this,
@@ -141,7 +161,8 @@ object StockAiClient {
         // human name ("Siemens Energy") surfaces far more coverage than a raw
         // ticker ("ENR"), especially for European names. Fall back to the
         // cleaned ticker when no name was passed.
-        val searchTerm = companyName?.trim()?.takeIf { it.isNotBlank() } ?: cleanSymbol
+        // One form of the name for every caller — see [NewsDigest.searchName].
+        val searchTerm = NewsDigest.searchName(companyName) ?: cleanSymbol
 
         // Region-aware Google News query: append market keyword only when set
         // (IN uses "NSE", US/DE use no suffix because those tickers aren't
@@ -149,11 +170,20 @@ object StockAiClient {
         val baseQuery = if (ctx.newsKeyword.isNotEmpty()) "$searchTerm stock ${ctx.newsKeyword}"
                         else "$searchTerm stock"
         // Recency: Google News's `when:30d` operator restricts results to the
-        // last 30 days server-side. parseRssHeadlines ALSO filters by pubDate
-        // as a hard guarantee in case the operator is ignored on some locales.
+        // last 30 days server-side. NewsDigest ALSO filters by pubDate as a
+        // hard guarantee in case the operator is ignored on some locales.
         val query = "$baseQuery when:30d"
         val url = "https://news.google.com/rss/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}&hl=${ctx.newsHl}&gl=${ctx.newsGl}&ceid=${ctx.newsCeid}"
 
+        // THE SAME LIST FOR HALF AN HOUR. Google's results move minute to minute,
+        // so a portfolio scan and a stock outlook a few minutes apart could read
+        // different headlines about the same company. Within 30 minutes they read
+        // the same feed.
+        synchronized(feedCache) {
+            feedCache[url]?.takeIf { System.currentTimeMillis() - it.first < FEED_CACHE_MS }?.let { (_, items) ->
+                return NewsDigest.digest(items, maxResults, System.currentTimeMillis(), listOf(searchTerm, cleanSymbol))
+            }
+        }
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -163,7 +193,12 @@ object StockAiClient {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return emptyList()
                 val body = response.body?.string() ?: return emptyList()
-                parseRssHeadlines(body, maxResults)
+                // Google's order is relevance, not date — NewsDigest sorts, merges
+                // the same story from many outlets, and drops quote pages.
+                val items = parseRssItems(body)
+                synchronized(feedCache) { feedCache[url] = System.currentTimeMillis() to items }
+                NewsDigest.digest(items, maxResults, System.currentTimeMillis(),
+                    listOf(searchTerm, cleanSymbol))
             }
         } catch (e: Exception) {
             Log.w(TAG, "News fetch failed for $symbol", e)
@@ -172,17 +207,19 @@ object StockAiClient {
     }
 
     /**
-     * Parse RSS <item> titles, now also reading <pubDate> so we can:
-     *   - drop stories older than 30 days (Google News is relevance-ranked, so
-     *     a stale headline can otherwise rank above recent ones),
-     *   - de-duplicate near-identical titles,
-     *   - prefix each kept headline with its date so the LLM can weigh recency.
-     * Items with an UNPARSEABLE/absent date are KEPT (we can't prove they're
-     * stale) — preserves the old behaviour when feeds omit pubDate.
+     * Every RSS <item>, in the feed's order: its title, outlet (<source>), date
+     * and article link. Items with an unparseable or absent date are kept
+     * undated — we can't prove they're stale.
      */
-    private fun parseRssHeadlines(xml: String, max: Int): List<String> {
-        data class Item(val title: String, val timeMs: Long?)
-        val items = mutableListOf<Item>()
+    private const val FEED_CACHE_MS = 30 * 60_000L
+    private val feedCache = HashMap<String, Pair<Long, List<NewsDigest.Item>>>()
+
+    /** Headlines per stock — the same number for the portfolio scan and the outlook,
+     *  so both read the same list. */
+    const val HEADLINES = 12
+
+    private fun parseRssItems(xml: String): List<NewsDigest.Item> {
+        val items = mutableListOf<NewsDigest.Item>()
         try {
             val factory = XmlPullParserFactory.newInstance()
             val parser = factory.newPullParser()
@@ -191,28 +228,30 @@ object StockAiClient {
             var inItem = false
             var currentTag = ""
             var title = ""
+            var source = ""
+            var link = ""
             var timeMs: Long? = null
 
             while (parser.eventType != XmlPullParser.END_DOCUMENT) {
                 when (parser.eventType) {
                     XmlPullParser.START_TAG -> {
                         currentTag = parser.name
-                        if (currentTag == "item") { inItem = true; title = ""; timeMs = null }
+                        if (currentTag == "item") { inItem = true; title = ""; source = ""; link = ""; timeMs = null }
                     }
                     XmlPullParser.TEXT -> {
                         if (inItem && parser.text.isNotBlank()) {
+                            val t = parser.text.trim()
                             when (currentTag) {
-                                "title" -> {
-                                    val t = parser.text.trim()
-                                    if (t.isNotEmpty() && !t.startsWith("<?")) title = t
-                                }
-                                "pubDate" -> timeMs = parsePubDate(parser.text.trim())
+                                "title" -> if (!t.startsWith("<?")) title = t
+                                "source" -> source = t
+                                "link" -> link = t
+                                "pubDate" -> timeMs = parsePubDate(t)
                             }
                         }
                     }
                     XmlPullParser.END_TAG -> {
                         if (parser.name == "item") {
-                            if (title.isNotEmpty()) items.add(Item(title, timeMs))
+                            if (title.isNotEmpty()) items.add(NewsDigest.Item(title, source, timeMs, link))
                             inItem = false
                         }
                         currentTag = ""
@@ -223,21 +262,7 @@ object StockAiClient {
         } catch (e: Exception) {
             Log.w(TAG, "RSS parse error", e)
         }
-
-        val cutoff = System.currentTimeMillis() - 30L * 24 * 60 * 60 * 1000
-        val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-        val seen = HashSet<String>()
-        val out = ArrayList<String>()
-        for (it in items) {
-            if (it.timeMs != null && it.timeMs < cutoff) continue          // older than 30d
-            if (!seen.add(it.title.lowercase(java.util.Locale.US))) continue // exact-title dup
-            out.add(
-                if (it.timeMs != null) "[${dateFmt.format(java.util.Date(it.timeMs))}] ${it.title}"
-                else it.title
-            )
-            if (out.size >= max) break
-        }
-        return out
+        return items
     }
 
     /** RFC-1123 pubDate → epoch ms; null if unparseable (caller keeps the item). */
@@ -260,7 +285,9 @@ object StockAiClient {
         data class Error(val message: String) : AiResult()
     }
 
-    private fun callLlm(config: ConfigManager, systemPrompt: String, userPrompt: String, maxTokens: Int = 500): AiResult {
+    /** [json]: the prompt asks for a JSON object — OpenAI is also held to it by its JSON mode. */
+    private fun callLlm(config: ConfigManager, systemPrompt: String, userPrompt: String, maxTokens: Int = 500,
+                        json: Boolean = false): AiResult {
         val apiKey = config.openaiApiKey
         if (apiKey.isBlank()) return AiResult.Error("No API key configured. Go to Settings → AI Stock Analysis.")
 
@@ -268,7 +295,7 @@ object StockAiClient {
             if (config.llmProvider == "anthropic") {
                 callAnthropic(apiKey, config.llmModel, systemPrompt, userPrompt, maxTokens)
             } else {
-                callOpenAi(apiKey, config.llmModel, systemPrompt, userPrompt, maxTokens)
+                callOpenAi(apiKey, config.llmModel, systemPrompt, userPrompt, maxTokens, json)
             }
         } catch (e: Exception) {
             Log.e(TAG, "LLM call failed", e)
@@ -276,11 +303,13 @@ object StockAiClient {
         }
     }
 
-    private fun callOpenAi(apiKey: String, model: String, system: String, user: String, maxTokens: Int = 500): AiResult {
+    private fun callOpenAi(apiKey: String, model: String, system: String, user: String, maxTokens: Int = 500,
+                           jsonReply: Boolean = false): AiResult {
         val json = JSONObject().apply {
             put("model", model)
             put("max_tokens", maxTokens)
             put("temperature", 0.3)
+            if (jsonReply) put("response_format", JSONObject().put("type", "json_object"))
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", system))
                 put(JSONObject().put("role", "user").put("content", user))
@@ -377,7 +406,9 @@ Evaluate whether this pullback is:
 • STRUCTURAL: Signs of fundamental weakness; news suggests deteriorating business/sector conditions
 • UNCERTAIN: Conflicting signals; need more confirmation before committing
 
-Prioritize recent news over older stories. Be concise (3-4 sentences max). If you're unsure, answer UNCERTAIN rather than guessing."""
+Prioritize recent news over older stories. A headline marked "(+N more outlets)" is ONE story that several outlets covered.
+Be concise (3-4 sentences max). If you rely on a headline, name its outlet and date in words — never bracketed reference numbers.
+If you're unsure, answer UNCERTAIN rather than guessing."""
 
         val trendDesc = if (adx != null) {
             "ADX = ${String.format("%.1f", adx)} (${if (adx > 25) "trending" else if (adx > 15) "emerging trend" else "choppy"})"
@@ -409,8 +440,11 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
             append("$trendDesc\n")
             append("$srDesc\n\n")
 
-            append("─ Recent News Headlines (last 30 days) ─\n")
-            headlines.forEachIndexed { i, h -> append("[${i + 1}] $h\n") }
+            // Bullets, not numbers: the headlines are never shown, so a "[3]" in
+            // the answer would point at nothing the user can see.
+            append("─ Recent News Headlines (last 30 days, newest first) ─\n")
+            append("${todayLine()}\n")
+            headlines.forEach { h -> append("• $h\n") }
 
             append("\nAnalyze critically:\n")
             append("• Based on the news, what is the PRIMARY driver of this pullback?\n")
@@ -448,64 +482,79 @@ Prioritize recent news over older stories. Be concise (3-4 sentences max). If yo
         name: String? = null
     ): AiResult {
         val displayName = name?.trim()?.takeIf { it.isNotBlank() }
-        val headlines = fetchNewsHeadlines(symbol, 12, ctx, name)
+        val stories = fetchStories(symbol, HEADLINES, ctx, name)
+        val today = LocalDate.now()
+        val zone = ZoneId.systemDefault()
 
-        // Allowed verdicts: HOLD is ONLY valid if the stock is currently in the user's portfolio.
-        // Otherwise the LLM must commit to a directional call (BUY / WATCH / AVOID / SELL).
-        val allowedVerdicts = if (isInPortfolio)
-            "STRONG BUY / BUY / HOLD / REDUCE / SELL"
-        else
-            "STRONG BUY / BUY / WATCH / AVOID"
+        // Two calls up, one neutral, two down — whether or not the user owns it.
+        // (It was 2-1-1 for a stock not owned: an unsure model had only one
+        // place to land on the bearish side.)
+        val allowed = OutlookReply.verdicts(isInPortfolio)
+        val guide = if (isInPortfolio) """
+  STRONG BUY — clearly good news that should keep lifting the price: worth adding
+  BUY — good news on balance
+  HOLD — mixed, thin or no clear news: keep it
+  REDUCE — bad news on balance: trim
+  SELL — clearly bad news (fraud, guidance cut, big miss, regulatory action, default): get out"""
+        else """
+  STRONG BUY — clearly good news that should keep lifting the price
+  BUY — good news on balance
+  WATCH — mixed, thin or no clear news
+  AVOID — bad news on balance
+  STRONG AVOID — clearly bad news (fraud, guidance cut, big miss, regulatory action, default)"""
+        val middle = if (isInPortfolio) "HOLD" else "WATCH"
 
-        val holdRule = if (isInPortfolio)
-            "HOLD is allowed because the user currently owns this stock."
-        else
-            "HOLD is NOT a valid verdict — the user does NOT own this stock, so you must commit to a directional call (BUY / WATCH / AVOID). Do not output HOLD under any circumstances."
+        val system = """You are a stock market analyst writing a short, news-based outlook on ${ctx.analystPersona}.
+You are given only the company, today's price, whether the user owns it, and recent headlines. Form your own view; assume no bullish or bearish lean.
 
-        val system = """You are a stock market analyst providing outlook summaries for ${ctx.analystPersona}.
-Form your own independent opinion based PRIMARILY on recent news and publicly known fundamentals.
-Headlines are listed in chronological order (most recent first) — prioritize those heavily over older news.
-Do NOT assume any prior bullish or bearish bias — you are given current price, ownership status, and headlines only. Critically assess both risks and opportunities.
-Do not infer or mention app technical indicators unless they are explicitly present in the news headlines.
+Reading the headlines:
+- Each headline carries its date and age, and they are sorted newest first. Weigh the newest most; treat news more than two weeks old as background.
+- A headline marked "(+N more outlets)" is ONE story that several outlets covered. Wide coverage means it mattered — not that it happened several times.
+- Many headlines are commentary or tips ("Is now the time to buy…", "analyst says…"). Treat those as opinion and weigh real events — results, guidance, orders, deals, regulation, management changes — above them.
+- A legal or regulatory action (a regulator's case, a lawsuit, a probe, a fine) stays relevant until it is resolved: weigh it even when its headline is more than two weeks old, and name it among the risks.
+- Your own background knowledge of the company may be out of date. If you lean on it, say so.
+- Do NOT state support, resistance, target or any other price levels: you know only today's price.
 
-Give a structured response:
-1. SHORT TERM (1-4 weeks): News-driven outlook
-2. LONG TERM (3-12 months): Fundamental narrative from recent news and publicly known context
-3. KEY RISKS: 1-2 bullet points from recent developments
-4. VERDICT: One of: $allowedVerdicts
+Verdict — exactly one of: ${allowed.joinToString(" / ")}$guide
+Confidence — LOW, MEDIUM or HIGH: how firmly the news supports the verdict. Few, old or conflicting headlines mean LOW.
+News — NEW (real developments in the last week or so), REPEAT (mostly older stories or commentary), or NONE (nothing relevant).
 
-$holdRule
-
-Keep each section to 2-3 sentences max. Be specific about price levels when possible."""
+Reply with ONLY a JSON object — no markdown, no code fences — in exactly this shape:
+{"short_term":"1-4 weeks: 2-3 sentences","long_term":"3-12 months: 1-2 sentences — headlines are thin evidence for this, so keep it tentative","risks":["one risk","another risk"],"news":"NEW|REPEAT|NONE","confidence":"LOW|MEDIUM|HIGH","verdict":"one of the verdicts above"}
+When a sentence rests on a headline, put that headline's number in square brackets right after it, e.g. [2]. Use only the numbers listed."""
 
         val user = buildString {
-            append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} (${ctx.marketLabel})\n")
-            append("Current Price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n")
-            append("User currently owns this: ${if (isInPortfolio) "YES" else "NO"}\n\n")
+            append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} — ${ctx.marketLabel}\n")
+            append("${todayLine()}\n")
+            append("Current price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n")
+            append("User owns it: ${if (isInPortfolio) "YES" else "NO"}\n\n")
             // Technical context intentionally withheld here to keep the LLM
             // outlook independent from app-generated SMA/MACD bias.
-            // append("── Minimal Technical Context ──\n")
-            // append("Trend: ...\n")
-            // append("MACD Phase: ...\n\n")
-            if (headlines.isNotEmpty()) {
-                append("── Recent News Headlines (prioritize items from the last 30 days) ──\n")
-                headlines.forEachIndexed { i, h -> append("[${i + 1}] $h\n") }
+            if (stories.isNotEmpty()) {
+                append("Headlines from the last 30 days, newest first:\n")
+                stories.forEachIndexed { i, s -> append("[${i + 1}] ${NewsDigest.line(s, today, zone)}\n") }
             } else {
-                append("(No recent news available via Google News RSS — rely on general market knowledge of this company, and note the absence of news in your response)\n")
+                append("No relevant headlines in the last 30 days. Say so. Without news, lean to $middle unless you know of " +
+                    "something specific — and then say your knowledge may be out of date. Confidence must be LOW.\n")
             }
-            append("\nBased on the above, provide the structured outlook. ")
-            append("Cite headline numbers inline where relevant. ")
-            if (!isInPortfolio) {
-                append("Remember: HOLD is NOT a valid verdict here. ")
-            }
-            append("Do not reference any app-generated scoring.")
+            append("\nReturn the JSON object now. Do not reference any app-generated scoring.")
         }
         // NOTE: cherryPoints / profitScore / protectScore / sellIntent / rrRatio / rsi / ema21PctDiff /
         // priceVel / SMA200 / MACD parameters are deliberately NOT passed to the LLM — per the
         // LLM-outlook rework: keep context minimal (price + ownership + news), drop technicals.
         // The params remain in the signature for backward compat with the JS bridge in MainActivity.
 
-        return callLlm(config, system, user)
+        // The answer goes back as checked JSON (OutlookReply): the panel shows its
+        // sections and numbered, tappable sources; the floor algo reads its verdict.
+        val sources = stories.map { s ->
+            val d = NewsDigest.dateOf(s, zone)
+            OutlookReply.Source(d?.toString() ?: "", d?.let { NewsDigest.age(it, today) } ?: "",
+                s.title, s.source, s.link, s.outlets)
+        }
+        return when (val r = callLlm(config, system, user, maxTokens = 700, json = true)) {
+            is AiResult.Success -> AiResult.Success(OutlookReply.build(r.text, symbol, isInPortfolio, sources, today.toString()))
+            is AiResult.Error -> r
+        }
     }
 
     // ═══════════════════════════════════════════════════════
@@ -535,24 +584,28 @@ Use the provided news headlines to answer specific questions about a company's f
 competitive position, sector trends, revenue/earnings outlook, and business dynamics.
 
 Headlines are listed in chronological order (most recent first) — prioritize recent news heavily.
+A headline marked "(+N more outlets)" is ONE story that several outlets covered.
 If a question cannot be answered from the available news, say so explicitly.
+When you rely on a headline, name its outlet and date in words — never bracketed reference numbers.
 Keep answers concise (2-3 sentences) unless asked for more detail."""
 
         val user = buildString {
             append("Stock: ${if (displayName != null) "$displayName ($symbol)" else symbol} (${ctx.marketLabel})\n")
+            append("${todayLine()}\n")
             append("Current Price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n\n")
 
+            // From the pullback card or the outlook card — whichever the question was asked under.
             if (previousAnalysis.isNotEmpty()) {
-                append("─ Previous Pullback Analysis ─\n")
+                append("─ Earlier analysis of this stock ─\n")
                 append(previousAnalysis + "\n\n")
             }
 
-            append("─ Company News Headlines (last 30 days) ─\n")
-            headlines.forEachIndexed { i, h -> append("[${i + 1}] $h\n") }
+            append("─ Company News Headlines (last 30 days, newest first) ─\n")
+            headlines.forEach { h -> append("• $h\n") }
 
             append("\n─ Your Question ─\n")
             append(userQuestion)
-            append("\n\nAnswer based ONLY on the news provided above. Cite headline numbers inline.")
+            append("\n\nAnswer based ONLY on the news provided above.")
         }
 
         return callLlm(config, system, user)
@@ -665,7 +718,7 @@ Be direct and opinionated. Do NOT hedge excessively."""
             val sym = o.optString("symbol").trim()
             if (sym.isEmpty()) continue
             val nm = o.optString("name").trim().ifBlank { sym }
-            val hls = try { fetchNewsHeadlines(sym, 6, ctx, nm) } catch (e: Exception) { emptyList() }
+            val hls = try { fetchNewsHeadlines(sym, HEADLINES, ctx, nm) } catch (e: Exception) { emptyList() }
             items.add(Item(sym, nm, hls))
             // Be gentle on Google News RSS — small gap between holdings.
             if (i < arr.length() - 1) try { Thread.sleep(150) } catch (_: InterruptedException) {}
@@ -681,16 +734,20 @@ For EACH stock, read its recent headlines (most recent first) and assign exactly
   VERY_POSITIVE — major upside: big beat, cluster of upgrades, large contract/order, buyout or strategic catalyst
 Judge ONLY from the headlines provided — do not invent facts. If a stock has no headlines, verdict = QUIET and conclusion = "No recent news.".
 Be decisive; reserve CRITICAL and VERY_POSITIVE for genuinely strong signals.
+Each headline carries its date and age, newest first. Weigh the newest most; treat routine news more than two weeks old as background.
+A legal or regulatory action (a regulator's case, a lawsuit, a probe, a fine) stays relevant until it is resolved, even when its headline is more than two weeks old.
+The conclusion must name the story the verdict rests on and say how old it is, e.g. "FTC action over hotel ads (11 days ago)".
 
 Output ONLY a JSON object (no markdown, no code fences), exactly this shape:
-{"summary":"<=20 word portfolio-level takeaway","stocks":[{"symbol":"AAA","verdict":"CRITICAL|CAUTION|QUIET|POSITIVE|VERY_POSITIVE","conclusion":"<=22 word plain-English summary of what's happening"}]}"""
+{"summary":"<=20 word portfolio-level takeaway","stocks":[{"symbol":"AAA","verdict":"CRITICAL|CAUTION|QUIET|POSITIVE|VERY_POSITIVE","conclusion":"<=26 word plain-English summary of what's happening, ending with the age of the story it rests on"}]}"""
 
         val user = buildString {
-            append("Portfolio — ${items.size} holdings (${ctx.marketLabel}). Classify every one.\n\n")
+            append("Portfolio — ${items.size} holdings (${ctx.marketLabel}). Classify every one.\n")
+            append("${todayLine()} A headline marked \"(+N more outlets)\" is one story several outlets covered.\n\n")
             items.forEach { it2 ->
                 append("### ${it2.name} (${it2.symbol})\n")
                 if (it2.headlines.isEmpty()) append("(no recent news)\n")
-                else it2.headlines.forEachIndexed { idx, h -> append("[${idx + 1}] $h\n") }
+                else it2.headlines.forEach { h -> append("• $h\n") }
                 append("\n")
             }
             append("Return the JSON object now.")

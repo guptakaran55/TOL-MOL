@@ -69,8 +69,20 @@ object StrategyLabEngine {
         val entryBars: Int = 0,
         val warmBars: Int = 0,
         val firstTradableTs: Long = 0L,
-        val error: String? = null
+        val error: String? = null,
+        /** The 50-day hold only: the reading on the newest completed day. */
+        val holdLast: HoldReading? = null
     )
+
+    /**
+     * What the hold rule saw on one completed day. [sma] is NaN while fewer than
+     * [needed] closes exist ([closes] says how many there are).
+     */
+    data class HoldReading(val barTs: Long, val close: Double, val sma: Double,
+                           val closes: Int, val needed: Int) {
+        val warm: Boolean get() = !sma.isNaN()
+        val above: Boolean get() = warm && close > sma
+    }
 
     // ── EMA (recursive, adjust=false), seeded e[0]=x[0]; span>=2 ──
     private fun ema(x: DoubleArray, span: Int): DoubleArray {
@@ -190,10 +202,12 @@ object StrategyLabEngine {
     fun clampTf(requestedSec: Long, baseSec: Long): Long =
         if (requestedSec in 1 until baseSec) baseSec else requestedSec
 
+    /** @param anchorSec grid origin in seconds east of UTC midnight (see StrategyLabConfig.barAnchorSec). */
     fun resample(
         candles: List<CandleData>,
         periodSec: Long,
-        completeThroughSec: Long? = null
+        completeThroughSec: Long? = null,
+        anchorSec: Long = 0L
     ): List<CandleData> {
         if (periodSec <= 0L || candles.isEmpty()) return candles
         val sorted = candles.sortedBy { it.timestamp }
@@ -203,7 +217,7 @@ object StrategyLabEngine {
         fun keepBucket(start: Long): Boolean =
             completeThroughSec == null || start + periodSec <= completeThroughSec
         for (cd in sorted) {
-            val bucket = (cd.timestamp / periodSec) * periodSec
+            val bucket = Math.floorDiv(cd.timestamp + anchorSec, periodSec) * periodSec - anchorSec
             if (bucket != bStart) {
                 if (bStart >= 0 && keepBucket(bStart)) out.add(CandleData(bStart, o, h, l, c, v))
                 bStart = bucket; o = cd.open; h = cd.high; l = cd.low; c = cd.close; v = cd.volume
@@ -239,6 +253,7 @@ object StrategyLabEngine {
         lateinit var entryAccel: DoubleArray
         lateinit var exitAccel: DoubleArray
         lateinit var accelSigma: DoubleArray
+        lateinit var exitAccelSigma: DoubleArray
         lateinit var runlen: IntArray
         lateinit var trough: DoubleArray
         lateinit var emaSlopeChg: DoubleArray
@@ -261,6 +276,11 @@ object StrategyLabEngine {
         f.entryAccel = diff(f.entrySlope)
         f.exitAccel = diff(f.exitSlope)
         f.accelSigma = rollingStdSample(f.entryAccel, 200, 50)
+        // Exit-side sigma for exit.accelNegative.minSigma. Same statistic as accelSigma but off
+        // the EXIT slope, so a config whose entry and exit smoothing differ gets the right scale
+        // on each side. Computed unconditionally (like accelSigma) — it is one pass over an array
+        // already in hand, and branching on the flag would make the Frame's shape config-dependent.
+        f.exitAccelSigma = rollingStdSample(f.exitAccel, 200, 50)
 
         val runlen = IntArray(f.n)
         for (i in 0 until f.n) runlen[i] = if (f.entrySlope[i] >= 0.0) (if (i > 0) runlen[i - 1] else 0) + 1 else 0
@@ -290,6 +310,16 @@ object StrategyLabEngine {
         val lvlLen = maxOf(2, cfg.gates.smaLength)
         f.level = if (cfg.gates.smaKind.equals("ema", true)) ema(close, lvlLen) else rollingMean(close, lvlLen)
         f.adxArr = adx(f.high, f.low, f.close, maxOf(2, cfg.gates.adxPeriod))
+    }
+
+    /** The deceleration-exit chain on candles that are ALREADY on the entry frame (no
+     *  resampling). Exists so the desktop's golden vectors can be asserted directly. */
+    internal class ExitSeries(val macd: DoubleArray, val exitSlope: DoubleArray,
+                              val exitAccel: DoubleArray, val exitAccelSigma: DoubleArray)
+
+    internal fun exitSeries(candles: List<CandleData>, cfg: StrategyLabConfig): ExitSeries {
+        val f = Frame(candles, cfg); computeIndicators(f)
+        return ExitSeries(f.macd, f.exitSlope, f.exitAccel, f.exitAccelSigma)
     }
 
     // ── fast MACD exit (§3.7) — the ONE series computed on the FINE bars ──
@@ -403,7 +433,18 @@ object StrategyLabEngine {
             else checks.add(Pair(f.macd[i - 1] >= f.macdSignal[i - 1] && f.macd[i] < f.macdSignal[i], "MACD crossed below signal"))
         }
         if (x.macdBelowZeroEnabled) checks.add(Pair(f.macd[i] < 0.0, "MACD below zero"))
-        if (x.accelNegativeEnabled) checks.add(Pair(f.exitAccel[i] < 0.0, "MACD acceleration negative"))
+        if (x.accelNegativeEnabled) {
+            // Mirror of the entry gate (accelPositive), pointed downward. The acceleration
+            // distribution is symmetric about zero — measured at skew +0.01 over 224k bars —
+            // so one sigma serves both directions rather than needing a separate statistic.
+            // minSigma = 0 keeps the original bare `< 0` test and its original label, so
+            // nothing written before this field existed changes behaviour or ledger text.
+            val dec = f.exitAccel[i]
+            val sigma = f.exitAccelSigma[i]
+            val floor = if (x.accelNegativeMinSigma > 0 && !sigma.isNaN()) -(x.accelNegativeMinSigma * sigma) else 0.0
+            val label = if (floor != 0.0) "MACD deceleration %.4f < %.4f".format(dec, floor) else "MACD acceleration negative"
+            checks.add(Pair(dec < floor, label))
+        }
         if (includeVelocity && x.velocityEnabled) {
             val v = f.exitVel[i]; checks.add(Pair(!v.isNaN() && v <= x.velocityThreshold, "velocity below floor"))
         }
@@ -441,15 +482,45 @@ object StrategyLabEngine {
      * incomplete. Drop incomplete resampled buckets for live decisions while
      * keeping [run] unchanged for CSV/backtest parity with the desktop engine.
      */
+    /**
+     * @param entriesFromTs FRESH-START BOUNDARY (0 = off, the historical behaviour).
+     *
+     * No entry may be opened on a bar earlier than this timestamp. Indicators are
+     * still computed over the FULL series — the warmup is load-bearing and is not
+     * touched — so this changes only which bars may open a position, never what the
+     * indicators say on any bar.
+     *
+     * WHY IT EXISTS. A seat that begins tracking mid-move used to inherit a phantom:
+     * the replay walked full history, arrived at the tracking baseline already long,
+     * and the runner then filtered that trade out of the ledger. The position was
+     * therefore neither booked nor released — the engine stayed internally long and
+     * could not open anything new until the phantom closed on its own. The seat was
+     * neither holding nor free.
+     *
+     * Suppressing pre-baseline entries fixes it by construction: with no entry
+     * allowed before the boundary the engine cannot be in a position when it gets
+     * there, so it arrives flat and evaluates the boundary bar like any other.
+     *
+     * IT DOES NOT CHASE. Entry conditions are a pure function of a bar's indicator
+     * state, so a flat engine reaches the identical verdict a holding one would on
+     * the same bar. What changes is that the seat waits for a genuine setup instead
+     * of waiting for a phantom to expire.
+     *
+     * Validated in the desktop lab across 7 datasets: return improved on 6, and
+     * risk-adjusted on 3 with 2 ties. It DEGRADES on narrow universes — DAX-40 lost
+     * 10 CAGR points where the same names widened to 105 gained 20 — so it belongs
+     * on a broad universe. [run] (backtest/CSV parity) never passes this.
+     */
     fun runLiveClosed(
         symbol: String,
         fineCandles: List<CandleData>,
         cfg: StrategyLabConfig,
-        sourcePeriodSec: Long = 15 * 60L
+        sourcePeriodSec: Long = 15 * 60L,
+        entriesFromTs: Long = 0L
     ): RunResult {
         return try {
             val completeThroughSec = fineCandles.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
-            applySlippage(dispatch(symbol, fineCandles, cfg, completeThroughSec), cfg)
+            applySlippage(dispatch(symbol, fineCandles, cfg, completeThroughSec, entriesFromTs), cfg)
         } catch (e: Exception) {
             RunResult(symbol, emptyList(), 0, emptyMap(), 0, fineCandles.size, error = e.message ?: "engine error")
         }
@@ -463,15 +534,90 @@ object StrategyLabEngine {
      * MTF degenerates to single-timeframe, so route to runSingle (native, exits on
      * the same bars). No-op for correctly-grained data.
      */
+    /** Bar-to-bar move beyond this is a corporate action, not a market move (see [backAdjust]). */
+    private const val SPLIT_DROP_RATIO = 0.65    // -35%
+    private const val SPLIT_JUMP_RATIO = 1.50    // +50%, the reverse-split mirror
+
+    /**
+     * Make a price series continuous across splits, bonuses and demergers.
+     *
+     * Kite and most raw feeds serve UNADJUSTED equity prices, so a 1:2 split reads as a -50%
+     * overnight crash. Observed live: RAYMOND 2025-05-13, 1566 -> 551, booked as a "-4% stop
+     * loss" worth -65% on one seat.
+     *
+     * Blocking the TRADE would not be enough. An unrepaired gap poisons every rolling statistic
+     * computed across it — the 200-bar acceleration sigma, the MACD, the EMA gate — for months
+     * after the event. A sigma-scaled exit reading a corrupted sigma is wrong in both directions.
+     *
+     * So repair the series instead: on a discontinuity, scale every EARLIER bar by
+     * (after / before). Only ratios across the join change; the newest bars are never touched,
+     * so live prices and every recent return stay exactly as the feed reported them.
+     *
+     * Mirrors `back_adjust_corporate_actions` in the desktop lab's backtest.py.
+     */
+    fun backAdjust(raw: List<CandleData>): List<CandleData> {
+        if (raw.size < 2) return raw
+        var factor = 1.0
+        val factors = DoubleArray(raw.size) { 1.0 }
+        var touched = false
+        // Newest-first so multiple actions compound onto the oldest bars.
+        for (i in raw.size - 1 downTo 1) {
+            val prev = raw[i - 1].close
+            val cur = raw[i].close
+            if (prev > 0.0 && cur > 0.0) {
+                val r = cur / prev
+                if (r <= SPLIT_DROP_RATIO || r >= SPLIT_JUMP_RATIO) { factor *= r; touched = true }
+            }
+            factors[i - 1] = factor
+        }
+        if (!touched) return raw
+        return raw.mapIndexed { i, c ->
+            val f = factors[i]
+            if (f == 1.0) c else c.copy(open = c.open * f, high = c.high * f, low = c.low * f, close = c.close * f)
+        }
+    }
+
+    /**
+     * Same repair as [backAdjust], for a bare close series.
+     *
+     * The screener's daily bars arrive as parallel arrays, not candles, and they need repairing
+     * for the same reason the engine's do: an unadjusted split wrecks the trailing return, the
+     * annualised volatility and the daily-MACD slope that decides seat kick-out. Repairing the
+     * trades but not the ranking would leave the portfolio picking companies off corrupted scores.
+     *
+     * Returns the input array when nothing needs repairing, so callers can cheaply detect a no-op.
+     */
+    fun backAdjustCloses(closes: DoubleArray): DoubleArray {
+        if (closes.size < 2) return closes
+        var factor = 1.0
+        val factors = DoubleArray(closes.size) { 1.0 }
+        var touched = false
+        for (i in closes.size - 1 downTo 1) {
+            val prev = closes[i - 1]; val cur = closes[i]
+            if (prev > 0.0 && cur > 0.0) {
+                val r = cur / prev
+                if (r <= SPLIT_DROP_RATIO || r >= SPLIT_JUMP_RATIO) { factor *= r; touched = true }
+            }
+            factors[i - 1] = factor
+        }
+        if (!touched) return closes
+        return DoubleArray(closes.size) { closes[it] * factors[it] }
+    }
+
     private fun dispatch(
-        symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig, completeThroughSec: Long?
+        symbol: String, rawIn: List<CandleData>, cfg: StrategyLabConfig, completeThroughSec: Long?,
+        entriesFromTs: Long = 0L
     ): RunResult {
+        // Before the split repair: coins have no corporate actions, and a real
+        // -35% crypto day (BTC, 12 Mar 2020) would be "repaired" into history.
+        if (cfg.isSmaHold) return runHold(symbol, rawIn, cfg, completeThroughSec, entriesFromTs)
+        val raw = backAdjust(rawIn)
         val base = baseGranularitySec(raw)
         val entryTf = clampTf(timeframeSeconds(cfg.resample), base)
         val exitTf = clampTf(timeframeSeconds(cfg.exitBars), base)
         val mtf = cfg.multiTimeframe && exitTf in 1 until entryTf
-        return if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, completeThroughSec)
-               else runSingle(symbol, raw, cfg, entryTf, completeThroughSec)
+        return if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, completeThroughSec, entriesFromTs)
+               else runSingle(symbol, raw, cfg, entryTf, completeThroughSec, entriesFromTs)
     }
 
     /** Subtract slippagePct from each CLOSED trade's % return and recompute its
@@ -501,15 +647,454 @@ object StrategyLabEngine {
         return res.copy(trades = adj)
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // THE EXIT RULES, AS A FUNCTION OF THE POSITION — NOT OF THE LOOP
+    // ════════════════════════════════════════════════════════════════════════
+    // Lifted out of the two replay loops so they can be asked about a position
+    // the engine did NOT open — one bought by hand.
+    //
+    // Nothing in them ever needed the replay. Every branch reads three things:
+    // the entry price, the entry bar, and the MACD reading at that bar. The loop
+    // was merely where those happened to live, which made a position the engine
+    // did not open look impossible to manage when it was only inconvenient.
+    //
+    // BEHAVIOUR IS FROZEN HERE. The expressions and — more importantly — their
+    // ORDER are copied exactly: hard exits, then the minimum-hold gate, then the
+    // indicators, then the rollover, then the session flatten. Order is not
+    // cosmetic. The first branch to yield a reason wins and the rest are never
+    // evaluated, so re-ordering silently changes which rule is credited with an
+    // exit and, where two disagree, on which bar it happens. Six live algos run
+    // this. The parity test is what holds it.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** Single-timeframe exit test for one held position at bar [i]. Requires
+     *  i >= 1: the rollover branch reads the previous bar's slope. */
+    private fun coarseExitReason(
+        f: Frame, i: Int, cfg: StrategyLabConfig,
+        entryPrice: Double, entryIdx: Int, entryMacd: Double,
+        peakSlope: Double, lod: BooleanArray?
+    ): String? {
+        val barsHeld = i - entryIdx
+        val close = f.close[i]
+        val retraceOn = cfg.exit.slopeRetraceEnabled
+        val retraceFrac = cfg.exit.slopeRetracePct / 100.0
+        val sessFlat = cfg.exit.sessionEnabled && cfg.exit.sessionFlattenAtClose
+        var reason: String? = null
+        if (cfg.exit.stopLossEnabled && close <= entryPrice * (1 - cfg.exit.stopLossPct / 100.0)) reason = "stop loss -${g(cfg.exit.stopLossPct)}%"
+        else if (cfg.exit.takeProfitEnabled && close >= entryPrice * (1 + cfg.exit.takeProfitPct / 100.0)) reason = "take profit +${g(cfg.exit.takeProfitPct)}%"
+        else if (cfg.exit.maxBarsEnabled && barsHeld >= cfg.exit.maxBars) reason = "max holding ${cfg.exit.maxBars} bars"
+        else if (barsHeld < cfg.exit.minHoldBars) reason = null
+        else reason = indicatorExit(f, i, entryMacd, cfg, includeVelocity = true, includeSlope = true)
+        if (reason == null && retraceOn && peakSlope > 1e-9 && barsHeld >= cfg.exit.minHoldBars &&
+            f.exitSlope[i] <= retraceFrac * peakSlope && f.exitSlope[i] < f.exitSlope[i - 1]) {
+            reason = "slope retraced to ${g(cfg.exit.slopeRetracePct)}% of peak (rollover exit)"
+        }
+        if (reason == null && sessFlat && lod != null && lod[i]) reason = "session close - flat (no overnight)"
+        return reason
+    }
+
+    /** Multi-timeframe exit test for one held position at fine bar [i], whose
+     *  most recent completed entry candle is [ei]. */
+    private fun fineExitReason(
+        f: Frame, i: Int, ei: Int, newE: Boolean, cfg: StrategyLabConfig,
+        fineClose: DoubleArray, exitVelFine: DoubleArray, fe: FastExit?,
+        entryPrice: Double, entryFineIdx: Int, entryMacd: Double, entryFineMacd: Double,
+        peakSlope: Double, lod: BooleanArray?
+    ): String? {
+        val x = cfg.exit
+        val close = fineClose[i]
+        val held = i - entryFineIdx
+        val retraceOn = x.slopeRetraceEnabled; val retraceFrac = x.slopeRetracePct / 100.0
+        val sessFlat = x.sessionEnabled && x.sessionFlattenAtClose
+        val fastOn = x.fastMacdExitEnabled && x.slopeFlipDownEnabled
+        var reason: String? = null
+        // §6.1 priority: hard exits → min-hold gate → FAST exit → retrace → indicators
+        val fastReason = if (fe != null && held >= x.minHoldBars) fastExitReason(fe, i, entryFineMacd, cfg) else null
+        if (x.stopLossEnabled && close <= entryPrice * (1 - x.stopLossPct / 100.0)) reason = "stop loss -${g(x.stopLossPct)}% (fine bar)"
+        else if (x.takeProfitEnabled && close >= entryPrice * (1 + x.takeProfitPct / 100.0)) reason = "take profit +${g(x.takeProfitPct)}% (fine bar)"
+        else if (x.maxBarsEnabled && held >= x.maxBars) reason = "max holding ${x.maxBars} fine bars"
+        else if (held < x.minHoldBars) reason = null
+        else if (fastReason != null) reason = fastReason
+        else if (retraceOn && newE && peakSlope > 1e-9 && ei >= 1 &&
+            f.exitSlope[ei] <= retraceFrac * peakSlope && f.exitSlope[ei] < f.exitSlope[ei - 1]) {
+            var allowed = !x.slopeRetraceConfirmVelocity || (!exitVelFine[i].isNaN() && exitVelFine[i] <= 0.0)
+            if (x.macdDistanceEnabled && abs(entryMacd) > 1e-12) {
+                val moved = abs(f.macd[ei] - entryMacd) / abs(entryMacd) * 100.0; allowed = allowed && moved >= x.macdDistancePct
+            }
+            if (allowed) reason = "slope retraced to ${g(x.slopeRetracePct)}% of peak (rollover exit)"
+        } else if (x.velocityEnabled && !exitVelFine[i].isNaN() && exitVelFine[i] <= x.velocityThreshold) {
+            var allowed = true
+            if (x.macdDistanceEnabled && abs(entryMacd) > 1e-12 && ei >= 0) {
+                val moved = abs(f.macd[ei] - entryMacd) / abs(entryMacd) * 100.0; allowed = moved >= x.macdDistancePct
+            }
+            if (allowed) reason = "velocity below floor (fine bar)"
+        } else if (newE) {
+            reason = indicatorExit(f, ei, entryMacd, cfg, includeVelocity = false, includeSlope = !fastOn)
+        }
+        if (reason == null && sessFlat && lod != null && lod[i]) reason = "session close - flat (no overnight)"
+        return reason
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ADOPTED POSITIONS — exits for a trade the engine did not open
+    // ════════════════════════════════════════════════════════════════════════
+    // Answers one question: given that YOU are long [entryPrice] since
+    // [entryTs], do this config's exit rules fire, and on which bar?
+    //
+    // It runs the SAME functions the replay runs — not a second implementation
+    // of the same rules, which would drift apart within a release or two and
+    // leave the app quietly exiting hand-bought positions on different terms
+    // than algo ones.
+    //
+    // It opens nothing and closes nothing; it reports. The decision to sell
+    // belongs to the runner, as it does for every other exit.
+    // ════════════════════════════════════════════════════════════════════════
+
+    data class AdoptedExit(
+        val ok: Boolean,
+        val fires: Boolean = false,
+        val reason: String = "",
+        /** The bar the exit fired on, and that bar's close. */
+        val barTs: Long = 0L,
+        val price: Double = 0.0,
+        val barsHeld: Int = 0,
+        /**
+         * False when the entry predates the retained price history, so the MACD
+         * reading at your entry cannot be computed.
+         *
+         * It matters and is surfaced rather than swallowed: the MACD-distance
+         * qualifier is what stops an indicator exit firing before the move has
+         * gone anywhere, and without an entry reading that qualifier is skipped
+         * — so the position exits MORE readily than the strategy would. Safe in
+         * direction, but not the same rules, and the difference should be
+         * visible rather than discovered.
+         */
+        val entryMacdKnown: Boolean = true,
+        val note: String = ""
+    )
+
+    fun adoptedExit(
+        rawIn: List<CandleData>,
+        cfg: StrategyLabConfig,
+        entryPrice: Double,
+        entryTs: Long,
+        sourcePeriodSec: Long = 15 * 60L
+    ): AdoptedExit = if (cfg.isSmaHold) adoptedHold(rawIn, cfg, entryPrice, entryTs, sourcePeriodSec) else try {
+        // Same repair as the replay path — a hand-bought position spanning a split must not be
+        // judged against a corrupted series either. NOTE the asymmetry this creates deliberately:
+        // entryPrice is the REAL fill in unadjusted money, while bars before an action are
+        // rescaled. That only matters if an action happened AFTER the entry, in which case the
+        // stop would be measured against rescaled bars — so the guard below refuses that case
+        // rather than acting on it.
+        val raw = backAdjust(rawIn)
+        if (entryPrice <= 0.0 || raw.size < 10) AdoptedExit(false, note = "not enough data")
+        else if (raw !== rawIn && raw.isNotEmpty() && raw.last().timestamp >= entryTs &&
+                 rawIn.indexOfFirst { it.timestamp >= entryTs }.let { k ->
+                     k >= 0 && k < raw.size && raw[k].close != rawIn[k].close })
+            AdoptedExit(false, note = "a corporate action landed after this entry — the price " +
+                "series was back-adjusted, so a stop measured from your unadjusted fill would be wrong")
+        else {
+            val completeThroughSec = raw.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
+            val base = baseGranularitySec(raw)
+            val entryTf = clampTf(timeframeSeconds(cfg.resample), base)
+            val exitTf = clampTf(timeframeSeconds(cfg.exitBars), base)
+            val mtf = cfg.multiTimeframe && exitTf in 1 until entryTf
+            if (mtf) adoptedMtf(raw, cfg, entryPrice, entryTs, entryTf, exitTf, completeThroughSec)
+            else adoptedSingle(raw, cfg, entryPrice, entryTs, entryTf, completeThroughSec)
+        }
+    } catch (e: Exception) {
+        AdoptedExit(false, note = e.message ?: "adopted exit check failed")
+    }
+
+    private fun adoptedSingle(
+        raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long,
+        entryTf: Long, completeThroughSec: Long?
+    ): AdoptedExit {
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
+        val f = Frame(cd, cfg)
+        if (f.n < 3) return AdoptedExit(false, note = "not enough bars")
+        computeIndicators(f)
+        val lod = if (cfg.exit.sessionEnabled) lastOfDay(f.ts) else null
+
+        // The bar you were holding from: the last one at or before your fill.
+        var entryIdx = -1
+        for (k in 0 until f.n) { if (f.ts[k] <= entryTs) entryIdx = k else break }
+        val known = entryIdx >= 0
+        if (!known) entryIdx = 0
+        val entryMacd = if (known) f.macd[entryIdx] else NaN
+        // NO VERDICT ON A PARTIAL RULESET.
+        //
+        // With no entry bar in the window two rules quietly stop working, and both
+        // fail towards SELLING rather than holding:
+        //
+        //   • the MACD-distance qualifier is skipped entirely, because its guard
+        //     is `abs(entryMacd) > 1e-12` and every comparison against NaN is
+        //     false. The position then exits on the first bare slope flip — the
+        //     qualifier exists precisely to stop that.
+        //   • bars-held counts from the START OF THE WINDOW rather than from your
+        //     entry, so a holding-time limit fires early.
+        //
+        // Reporting this and selling anyway would be the worst of both: an order
+        // placed with real money, labelled "strategy exit", under rules the config
+        // never specified. Refuse instead, and let the caller say so.
+        if (!known && (cfg.exit.macdDistanceEnabled || cfg.exit.maxBarsEnabled))
+            return AdoptedExit(false, entryMacdKnown = false,
+                note = "entry predates the retained price history — the MACD-distance and holding-time rules cannot be applied, so no exit is claimed")
+
+        var peak = if (entryIdx < f.n) f.exitSlope[entryIdx] else 0.0
+        for (i in maxOf(entryIdx + 1, 1) until f.n) {
+            peak = maxOf(peak, f.exitSlope[i])
+            val r = coarseExitReason(f, i, cfg, entryPrice, entryIdx, entryMacd, peak, lod)
+            if (r != null) return AdoptedExit(true, true, r, f.ts[i], f.close[i], i - entryIdx,
+                known, if (known) "" else "entry predates retained history")
+        }
+        return AdoptedExit(true, false, "", f.ts[f.n - 1], f.close[f.n - 1], f.n - 1 - entryIdx,
+            known, if (known) "" else "entry predates retained history")
+    }
+
+    private fun adoptedMtf(
+        raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long,
+        entryTf: Long, exitTf: Long, completeThroughSec: Long?
+    ): AdoptedExit {
+        val fine = resample(raw, exitTf, completeThroughSec, cfg.barAnchorSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
+        if (cd.size < 3 || fine.size < 10) return AdoptedExit(false, note = "not enough bars")
+        val f = Frame(cd, cfg); computeIndicators(f)
+
+        // Same fine→entry-candle mapping the replay builds, so a position is
+        // judged against the identical bar the replay would judge it against.
+        val eEnd = LongArray(f.n) { f.ts[it] + entryTf }
+        val fineTs = LongArray(fine.size) { fine[it].timestamp }
+        val fineClose = DoubleArray(fine.size) { fine[it].close }
+        val fEnd = LongArray(fine.size) { fineTs[it] + exitTf }
+        val eIdxPerFine = IntArray(fine.size) { fi ->
+            var lo = 0; var hi = f.n
+            val key = fEnd[fi]
+            while (lo < hi) { val mid = (lo + hi) ushr 1; if (eEnd[mid] <= key) lo = mid + 1 else hi = mid }
+            lo - 1
+        }
+        val exitVelFine = pctChange(fineClose, maxOf(1, cfg.exit.velocityLookback))
+        val lod = if (cfg.exit.sessionEnabled) lastOfDay(fineTs) else null
+        val fastOn = cfg.exit.fastMacdExitEnabled && cfg.exit.slopeFlipDownEnabled
+        val fe = if (fastOn) computeFastExit(fineClose, cfg) else null
+
+        var entryFineIdx = -1
+        for (k in fine.indices) { if (fineTs[k] <= entryTs) entryFineIdx = k else break }
+        val known = entryFineIdx >= 0
+        if (!known) entryFineIdx = 0
+        val entryE = eIdxPerFine[entryFineIdx]
+        val entryMacd = if (known && entryE >= 0) f.macd[entryE] else NaN
+        val entryFineMacd = if (known) fe?.macd?.get(entryFineIdx) ?: NaN else NaN
+        // Same refusal as the single-timeframe path, and for the same reason —
+        // see [adoptedSingle]. Both entry readings are missing here, so the fast
+        // exit loses its qualifier too.
+        if ((!known || entryE < 0) && (cfg.exit.macdDistanceEnabled || cfg.exit.maxBarsEnabled))
+            return AdoptedExit(false, entryMacdKnown = false,
+                note = "entry predates the retained price history — the MACD-distance and holding-time rules cannot be applied, so no exit is claimed")
+
+        var lastE = if (entryE >= 0) entryE else 0
+        var peak = if (entryE in 0 until f.n) f.exitSlope[entryE] else 0.0
+        for (i in (entryFineIdx + 1) until fine.size) {
+            val ei = eIdxPerFine[i]; val newE = ei > lastE && ei >= 1
+            if (newE) peak = maxOf(peak, f.exitSlope[ei])
+            val r = fineExitReason(f, i, ei, newE, cfg, fineClose, exitVelFine, fe,
+                entryPrice, entryFineIdx, entryMacd, entryFineMacd, peak, lod)
+            if (r != null) return AdoptedExit(true, true, r, fineTs[i], fineClose[i], i - entryFineIdx,
+                known, if (known) "" else "entry predates retained history")
+            if (ei > lastE) lastE = ei
+        }
+        return AdoptedExit(true, false, "", fineTs[fine.size - 1], fineClose[fine.size - 1],
+            fine.size - 1 - entryFineIdx, known, if (known) "" else "entry predates retained history")
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // THE 50-DAY HOLD (strategy "smaHold")
+    // ════════════════════════════════════════════════════════════════════════
+    // Hold while a day's close is above the simple average of the last N
+    // completed closes, that day's included; out on a close at or below it.
+    //
+    // A STATE, NOT AN EVENT: flat-and-above buys, held-and-at-or-below sells. That
+    // is also what makes a missed day self-correcting — the next completed close
+    // says where the position should be, whatever was missed before it.
+    //
+    // Only COMPLETED UTC days count; the still-forming day never does. Fills at the
+    // deciding close, as everywhere in this engine — crypto trades through
+    // midnight, so the next day's open is that same price.
+    //
+    // Deliberately absent, each because the desktop tests found it worse: an EMA,
+    // an intraday check of the live price, a 50-BAR average on intraday candles, a
+    // stop or a target, a buffer or confirmation delay around the line.
+    // ════════════════════════════════════════════════════════════════════════
+
+    private const val DAY_SEC = 86_400L
+
+    /** Complete UTC days from any source grain — 1d klines pass through unchanged. */
+    private fun holdDays(raw: List<CandleData>, completeThroughSec: Long?): List<CandleData> =
+        resample(raw, DAY_SEC, completeThroughSec, 0L)
+
+    /**
+     * Simple average of the [len] closes ending at each index; NaN before that.
+     * Summed afresh per window, oldest first, so no running-sum drift can move
+     * a close that sits right on the line to the other side of it.
+     */
+    internal fun holdSma(close: DoubleArray, len: Int): DoubleArray = DoubleArray(close.size) { i ->
+        if (i < len - 1) NaN else {
+            var s = 0.0
+            for (k in i - len + 1..i) s += close[k]
+            s / len
+        }
+    }
+
+    /** A price at a precision that suits it — DOGE needs more than BTC. Always a dot. */
+    internal fun holdPx(v: Double): String = String.format(java.util.Locale.US,
+        when { v >= 10.0 -> "%.2f"; v >= 0.1 -> "%.4f"; else -> "%.6f" }, v)
+
+    internal fun holdEntryReason(len: Int, close: Double, sma: Double) =
+        "close above SMA$len (${holdPx(close)} vs ${holdPx(sma)})"
+    internal fun holdExitReason(len: Int, close: Double, sma: Double) =
+        "close below SMA$len (${holdPx(close)} vs ${holdPx(sma)})"
+
+    private fun runHold(
+        symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
+        completeThroughSec: Long?, entriesFromTs: Long
+    ): RunResult {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val days = holdDays(raw, completeThroughSec)
+        val n = days.size
+        val close = DoubleArray(n) { days[it].close }
+        val ts = LongArray(n) { days[it].timestamp }
+        val sma = holdSma(close, len)
+        val trades = ArrayList<Trade>()
+        var signals = 0
+        var inTrade = false; var entryIdx = -1; var entryPrice = 0.0; var entryReason = ""
+        for (i in (len - 1) until n) {
+            val c = close[i]; val s = sma[i]
+            if (inTrade) {
+                if (c <= s) {
+                    val pct = pctReturn(entryPrice, c)
+                    trades.add(Trade(symbol, "LONG", "CLOSED", ts[entryIdx], entryPrice, entryReason,
+                        ts[i], c, holdExitReason(len, c, s), pct, cfg.notional * pct / 100.0, i - entryIdx))
+                    inTrade = false
+                }
+                continue
+            }
+            if (c <= s) continue
+            // FRESH-START BOUNDARY, as in the MACD loops. Being a state, the rule
+            // simply enters on the first eligible day that is above the line.
+            if (entriesFromTs > 0L && ts[i] < entriesFromTs) continue
+            signals++
+            inTrade = true; entryIdx = i; entryPrice = c; entryReason = holdEntryReason(len, c, s)
+        }
+        var openCount = 0
+        if (inTrade) {
+            val last = n - 1; val pct = pctReturn(entryPrice, close[last]); openCount = 1
+            trades.add(Trade(symbol, "LONG", "OPEN", ts[entryIdx], entryPrice, entryReason, null, null,
+                "mark-to-market", pct, cfg.notional * pct / 100.0, last - entryIdx))
+        }
+        return RunResult(symbol, trades, signals, emptyMap(), openCount, n,
+            lastBarTs = if (n > 0) ts[n - 1] else 0L,
+            baseSec = baseGranularitySec(raw), entryTfSec = DAY_SEC, exitTfSec = DAY_SEC,
+            entryBars = n, warmBars = len - 1,
+            firstTradableTs = if (n >= len) ts[len - 1] else 0L,
+            holdLast = if (n > 0) HoldReading(ts[n - 1], close[n - 1], sma[n - 1], n, len) else null)
+    }
+
+    /** [adoptedExit] for the hold: the first completed day after the entry that closes at or below the average. */
+    private fun adoptedHold(
+        raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long, sourcePeriodSec: Long
+    ): AdoptedExit = try {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val days = holdDays(raw, raw.maxOfOrNull { it.timestamp + sourcePeriodSec })
+        if (entryPrice <= 0.0 || days.size < len) AdoptedExit(false, note = "fewer than $len daily closes")
+        else {
+            val close = DoubleArray(days.size) { days[it].close }
+            val sma = holdSma(close, len)
+            var entryIdx = -1
+            for (k in days.indices) { if (days[k].timestamp <= entryTs) entryIdx = k else break }
+            // This rule reads nothing from the entry day, so an entry older than the
+            // retained days loses nothing — judged from the first day held.
+            val from = maxOf(entryIdx, 0)
+            var hit: AdoptedExit? = null
+            for (i in maxOf(entryIdx + 1, len - 1) until days.size) {
+                if (close[i] <= sma[i]) {
+                    hit = AdoptedExit(true, true, holdExitReason(len, close[i], sma[i]),
+                        days[i].timestamp, close[i], i - from)
+                    break
+                }
+            }
+            hit ?: AdoptedExit(true, false, "", days.last().timestamp, close.last(), days.size - 1 - from)
+        }
+    } catch (e: Exception) {
+        AdoptedExit(false, note = e.message ?: "adopted exit check failed")
+    }
+
+    /** [reviewPayload] for the hold: daily candles, the average drawn over them, one check per side. */
+    private fun holdReview(
+        symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
+        sourcePeriodSec: Long, maxBars: Int, entriesFromTs: Long
+    ): ReviewPayload = try {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val complete = raw.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
+        val days = holdDays(raw, complete)
+        if (days.size < 5) ReviewPayload(symbol, "not enough daily bars to review")
+        else {
+            val close = DoubleArray(days.size) { days[it].close }
+            val sma = holdSma(close, len)
+            // Replayed the way the live algo runs it — see the MACD review above.
+            fun replay(from: Long) = applySlippage(runHold(symbol, raw, cfg, complete, from), cfg).trades
+            val free = replay(0L)
+            val trades = if (entriesFromTs <= 0L) free
+                else free.filter { it.status == "CLOSED" && (it.exitTs ?: Long.MAX_VALUE) < entriesFromTs } +
+                    replay(entriesFromTs)
+            val entryAt = trades.associateBy { it.entryTs }
+            val exitAt = trades.filter { it.exitTs != null }.associateBy { it.exitTs!! }
+            val out = ArrayList<BarReview>()
+            for (i in maxOf(0, days.size - maxBars) until days.size) {
+                val d = days[i]; val c = close[i]; val s = sma[i]; val warm = !s.isNaN()
+                val above = warm && c > s
+                val pos = trades.firstOrNull { tr ->
+                    tr.entryTs <= d.timestamp && (tr.status == "OPEN" || (tr.exitTs ?: Long.MAX_VALUE) >= d.timestamp)
+                }
+                val vs = if (warm) " (${holdPx(c)} vs ${holdPx(s)})" else ""
+                val enVerdict = when {
+                    !warm -> "still warming up (${i + 1} of $len daily closes)"
+                    above -> "close above SMA$len — in the market (a flat book buys)"
+                    else -> "close at or below SMA$len — out of the market"
+                }
+                val exFires = pos != null && warm && !above
+                val exVerdict = when {
+                    pos == null -> "no open position at this bar"
+                    exFires -> "EXIT fires: close below SMA$len"
+                    else -> "no exit — position holds"
+                }
+                out.add(BarReview(d.timestamp, d.open, d.high, d.low, c, null, null, null, null,
+                    entryMarker = if (entryAt.containsKey(d.timestamp)) 1 else 0,
+                    exitMarker = exitAt[d.timestamp]?.let { if (it.pnlNotional > 0) 1 else 2 } ?: 0,
+                    entryCore = listOf(CheckRow(above, if (warm) "close above SMA$len$vs"
+                        else "SMA$len not formed yet (${i + 1} of $len daily closes)")),
+                    entryRescue = emptyList(), entryGates = emptyList(), entryModeAny = false,
+                    entryVerdict = enVerdict, entryFires = above,
+                    exitInd = listOf(CheckRow(warm && !above, "close at or below SMA$len$vs")),
+                    exitHard = emptyList(), exitDist = null,
+                    exitVerdict = exVerdict, exitFires = exFires, exitHasPos = pos != null,
+                    level = if (warm) s else null))
+            }
+            ReviewPayload(symbol, null, out, trades, "1D", "1D")
+        }
+    } catch (e: Exception) {
+        ReviewPayload(symbol, e.message ?: "review failed")
+    }
+
     // ── single-timeframe (exitBars == "same") ──
     private fun runSingle(
         symbol: String,
         raw: List<CandleData>,
         cfg: StrategyLabConfig,
         entryTf: Long,
-        completeThroughSec: Long? = null
+        completeThroughSec: Long? = null,
+        entriesFromTs: Long = 0L
     ): RunResult {
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         val f = Frame(cd, cfg); if (f.n < 3) return RunResult(symbol, emptyList(), 0, emptyMap(), 0, f.n)
         computeIndicators(f)
         val trades = ArrayList<Trade>(); val gates = HashMap<String, Int>(); var signals = 0
@@ -524,18 +1109,8 @@ object StrategyLabEngine {
             if (inTrade) {
                 peakSlope = maxOf(peakSlope, f.exitSlope[i])
                 val barsHeld = i - entryIdx
-                var reason: String? = null
                 val close = f.close[i]
-                if (cfg.exit.stopLossEnabled && close <= entryPrice * (1 - cfg.exit.stopLossPct / 100.0)) reason = "stop loss -${g(cfg.exit.stopLossPct)}%"
-                else if (cfg.exit.takeProfitEnabled && close >= entryPrice * (1 + cfg.exit.takeProfitPct / 100.0)) reason = "take profit +${g(cfg.exit.takeProfitPct)}%"
-                else if (cfg.exit.maxBarsEnabled && barsHeld >= cfg.exit.maxBars) reason = "max holding ${cfg.exit.maxBars} bars"
-                else if (barsHeld < cfg.exit.minHoldBars) reason = null
-                else reason = indicatorExit(f, i, entryMacd, cfg, includeVelocity = true, includeSlope = true)
-                if (reason == null && retraceOn && peakSlope > 1e-9 && barsHeld >= cfg.exit.minHoldBars &&
-                    f.exitSlope[i] <= retraceFrac * peakSlope && f.exitSlope[i] < f.exitSlope[i - 1]) {
-                    reason = "slope retraced to ${g(cfg.exit.slopeRetracePct)}% of peak (rollover exit)"
-                }
-                if (reason == null && sessFlat && lod != null && lod[i]) reason = "session close - flat (no overnight)"
+                val reason = coarseExitReason(f, i, cfg, entryPrice, entryIdx, entryMacd, peakSlope, lod)
                 if (reason != null) {
                     val pct = pctReturn(entryPrice, close)
                     trades.add(Trade(symbol, "LONG", "CLOSED", entryTs, entryPrice, entryReason, f.ts[i], close, reason,
@@ -544,6 +1119,11 @@ object StrategyLabEngine {
                 }
                 continue
             }
+            // FRESH-START BOUNDARY: no position may be opened before it, so the
+            // engine cannot arrive at it already long. Placed before entrySignal so
+            // a suppressed bar is not counted as a signal either — it is not one,
+            // the strategy simply was not watching yet.
+            if (entriesFromTs > 0L && f.ts[i] < entriesFromTs) continue
             val (fired, reasons) = entrySignal(f, i, cfg)
             if (!fired) continue
             signals++
@@ -572,10 +1152,11 @@ object StrategyLabEngine {
         cfg: StrategyLabConfig,
         entryTf: Long,
         exitTf: Long,
-        completeThroughSec: Long? = null
+        completeThroughSec: Long? = null,
+        entriesFromTs: Long = 0L
     ): RunResult {
-        val fine = resample(raw, exitTf, completeThroughSec)
-        val cd = resample(raw, entryTf, completeThroughSec)
+        val fine = resample(raw, exitTf, completeThroughSec, cfg.barAnchorSec)
+        val cd = resample(raw, entryTf, completeThroughSec, cfg.barAnchorSec)
         val warm = maxOf(1, cfg.warmupBars)
         if (cd.size <= warm || fine.size < 10) return RunResult(symbol, emptyList(), 0, emptyMap(), 0, fine.size)
         val f = Frame(cd, cfg); computeIndicators(f)
@@ -613,39 +1194,20 @@ object StrategyLabEngine {
             val close = fineClose[i]
             if (inTrade) {
                 if (newE) peakSlope = maxOf(peakSlope, f.exitSlope[ei])
-                var reason: String? = null
                 val held = i - entryFineIdx
-                // §6.1 priority: hard exits → min-hold gate → FAST exit → retrace → indicators
-                val fastReason = if (fe != null && held >= x.minHoldBars) fastExitReason(fe, i, entryFineMacd, cfg) else null
-                if (x.stopLossEnabled && close <= entryPrice * (1 - x.stopLossPct / 100.0)) reason = "stop loss -${g(x.stopLossPct)}% (fine bar)"
-                else if (x.takeProfitEnabled && close >= entryPrice * (1 + x.takeProfitPct / 100.0)) reason = "take profit +${g(x.takeProfitPct)}% (fine bar)"
-                else if (x.maxBarsEnabled && held >= x.maxBars) reason = "max holding ${x.maxBars} fine bars"
-                else if (held < x.minHoldBars) reason = null
-                else if (fastReason != null) reason = fastReason
-                else if (retraceOn && newE && peakSlope > 1e-9 && ei >= 1 &&
-                    f.exitSlope[ei] <= retraceFrac * peakSlope && f.exitSlope[ei] < f.exitSlope[ei - 1]) {
-                    var allowed = !x.slopeRetraceConfirmVelocity || (!exitVelFine[i].isNaN() && exitVelFine[i] <= 0.0)
-                    if (x.macdDistanceEnabled && abs(entryMacd) > 1e-12) {
-                        val moved = abs(f.macd[ei] - entryMacd) / abs(entryMacd) * 100.0; allowed = allowed && moved >= x.macdDistancePct
-                    }
-                    if (allowed) reason = "slope retraced to ${g(x.slopeRetracePct)}% of peak (rollover exit)"
-                } else if (x.velocityEnabled && !exitVelFine[i].isNaN() && exitVelFine[i] <= x.velocityThreshold) {
-                    var allowed = true
-                    if (x.macdDistanceEnabled && abs(entryMacd) > 1e-12 && ei >= 0) {
-                        val moved = abs(f.macd[ei] - entryMacd) / abs(entryMacd) * 100.0; allowed = moved >= x.macdDistancePct
-                    }
-                    if (allowed) reason = "velocity below floor (fine bar)"
-                } else if (newE) {
-                    reason = indicatorExit(f, ei, entryMacd, cfg, includeVelocity = false, includeSlope = !fastOn)
-                }
-                if (reason == null && sessFlat && lod != null && lod[i]) reason = "session close - flat (no overnight)"
+                val reason = fineExitReason(f, i, ei, newE, cfg, fineClose, exitVelFine, fe,
+                    entryPrice, entryFineIdx, entryMacd, entryFineMacd, peakSlope, lod)
                 if (reason != null) {
                     val pct = pctReturn(entryPrice, close)
                     trades.add(Trade(symbol, "LONG", "CLOSED", entryTs, entryPrice, entryReason, fineTs[i], close, reason,
                         pct, cfg.notional * pct / 100.0, held))
                     inTrade = false
                 }
-            } else if (newE && ei >= warm) {
+            } else if (newE && ei >= warm && (entriesFromTs <= 0L || fineTs[i] >= entriesFromTs)) {
+                // FRESH-START BOUNDARY, compared on the FINE clock because entryTs is
+                // stamped from fineTs[i] — the same value the ledger stores and
+                // filters on. Comparing the coarse frame here would let an entry
+                // through that the ledger then discarded, reinstating the phantom.
                 val (fired, reasons) = entrySignal(f, ei, cfg)
                 if (fired) {
                     signals++
@@ -691,20 +1253,116 @@ object StrategyLabEngine {
         val entryCore: List<CheckRow>, val entryRescue: List<CheckRow>, val entryGates: List<CheckRow>,
         val entryModeAny: Boolean, val entryVerdict: String, val entryFires: Boolean,
         val exitInd: List<CheckRow>, val exitHard: List<CheckRow>, val exitDist: CheckRow?,
-        val exitVerdict: String, val exitFires: Boolean, val exitHasPos: Boolean
+        val exitVerdict: String, val exitFires: Boolean, val exitHasPos: Boolean,
+        /** A price-scale line drawn over the candles — the 50-day hold's average. */
+        val level: Double? = null
     )
 
     data class ReviewPayload(
         val symbol: String, val error: String? = null,
         val bars: List<BarReview> = emptyList(),
         val trades: List<Trade> = emptyList(),
-        val entryTf: String = "", val exitTf: String = ""
+        val entryTf: String = "", val exitTf: String = "",
+        /**
+         * The bar at which the LEDGER began tracking this symbol (0 = never
+         * enrolled, or no baseline stamped yet). Filled in by the RUNNER, not by
+         * the engine — the engine has no concept of a ledger and must not gain one.
+         *
+         * Everything the chart draws to the LEFT of this is pure replay: trades the
+         * strategy would have taken had it been watching, which it was not. Only
+         * entries strictly AFTER it could ever reach the book. Without it the chart
+         * shows a continuous run of trades and gives no way to tell which of them
+         * the algo actually had a chance at — the exact question a seated name with
+         * an empty ledger raises.
+         */
+        val baselineTs: Long = 0L,
+        /**
+         * When tracking ENDED — the seat was lost or the position handed back —
+         * on the same clock as [baselineTs]; 0 while the algo is still watching.
+         * Entries right of it are replay, exactly like those left of the start.
+         */
+        val trackingEndTs: Long = 0L,
+        /**
+         * THE DAILY GATE'S VERDICT, as a series the chart can shade.
+         *
+         * The entry rules and the gate are two layers, and only one of them was
+         * ever drawn. A chart showing "ENTRY fires here" while the gate had the
+         * name out is not wrong — it answers a different question — but with the
+         * second layer invisible it reads as a trade that should have happened.
+         *
+         * [gateDays] are epoch DAYS and [gateOpen] is the verdict for each, so the
+         * band steps at day boundaries however fine the candles are.
+         *
+         * THREE STATES, BECAUSE TWO CANNOT TELL THE TRUTH FOR A RANKED ALGO.
+         * [gateState] carries one per day:
+         *
+         *   2  SEATED      — this name held a seat, so its entries could be taken.
+         *   1  OUT-RANKED  — the gate would have admitted it, but better-ranked
+         *                    names held every seat. Eligible and not held.
+         *   0  REFUSED     — the daily slope was at or below zero, so no entry was
+         *                    possible however clearly the rules fired.
+         *
+         * With ranking OFF only 2 and 0 ever occur, which is why this began as a
+         * boolean. With ranking ON the middle state is most of the chart, and
+         * collapsing it into either neighbour states the wrong reason with total
+         * confidence — "refused" when it was out-ranked, or "allowed" when nothing
+         * could have been bought. That is why the band used to be withheld
+         * entirely from ranked algos rather than drawn in two colours.
+         *
+         * [gateOpen] is kept as `state == 2` for anything still reading a boolean.
+         */
+        val gateApplies: Boolean = false,
+        val gateDays: List<Long> = emptyList(),
+        val gateOpen: List<Boolean> = emptyList(),
+        val gateState: List<Int> = emptyList(),
+        val gateNote: String = "",
+        /**
+         * TRADES THAT ACTUALLY SPENT MONEY.
+         *
+         * The triangles on this chart are what the strategy WOULD have done, and
+         * until now the only thing marked as real was a position bought through
+         * the Buy button. An order an ALGO mirrored to the broker got no marker at
+         * all — so on a chart of seventy-four replay trades, the two that moved
+         * real cash looked exactly like the seventy-two that did not, and the one
+         * question the chart could not answer was "did this one really happen".
+         *
+         * Prices are what the broker FILLED at, not the bar close the triangle
+         * sits on. The gap between them is the slippage, and it is worth seeing as
+         * a distance rather than inferred from two numbers on different screens.
+         */
+        val realFills: List<RealFill> = emptyList()
+    )
+
+    data class RealFill(
+        val entryTs: Long, val entryPrice: Double,
+        val exitTs: Long = 0L, val exitPrice: Double = 0.0,
+        val pnl: Double = 0.0, val open: Boolean = false,
+        /**
+         * WHY THE REAL SALE HAPPENED, in the words whichever rule used ("take
+         * profit +4%", "MACD slope flipped + to -", "your own order sold it").
+         * Blank when nothing recorded one. The triangles carry the strategy's
+         * reason; this is the reason for the sale that actually moved money,
+         * which is often a different thing — a target or stop resting at the
+         * broker, or your own thumb.
+         */
+        val exitReason: String = "",
+        /** Which part of the app (or you) decided to sell, when it was not
+         *  simply the algo's own rules. Blank = the algo itself. */
+        val exitBy: String = "",
+        /** Sold outside the app's own orders — by hand, or found gone. */
+        val handClosed: Boolean = false
     )
 
     private fun g3(v: Double): String = if (v.isNaN()) "–" else "%.4f".format(v)
 
+    /**
+     * @param entriesFromTs where the algo began tracking this name (0 = never) —
+     *   the same boundary the live loop hands the engine. See the trades below.
+     */
     fun reviewPayload(symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
-                      sourcePeriodSec: Long = 15 * 60L, maxBars: Int = 320): ReviewPayload {
+                      sourcePeriodSec: Long = 15 * 60L, maxBars: Int = 320,
+                      entriesFromTs: Long = 0L): ReviewPayload {
+        if (cfg.isSmaHold) return holdReview(symbol, raw, cfg, sourcePeriodSec, maxBars, entriesFromTs)
         return try {
             // Same resample clamp as the engine's dispatch(), so the chart's bars
             // and the trades drawn on them are built the identical way.
@@ -714,8 +1372,8 @@ object StrategyLabEngine {
             val mtf = cfg.multiTimeframe && exitTfClamped in 1 until entryTf
             val exitTf = if (mtf) exitTfClamped else entryTf
             val complete = raw.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
-            val fine = resample(raw, exitTf, complete)
-            val coarse = if (mtf) resample(raw, entryTf, complete) else fine
+            val fine = resample(raw, exitTf, complete, cfg.barAnchorSec)
+            val coarse = if (mtf) resample(raw, entryTf, complete, cfg.barAnchorSec) else fine
             if (fine.size < 5 || coarse.size < 5) return ReviewPayload(symbol, "not enough bars to review")
             val f = Frame(coarse, cfg); computeIndicators(f)
 
@@ -736,9 +1394,27 @@ object StrategyLabEngine {
             for (i in fine.indices) fineIdxOfTs[fine[i].timestamp] = i
 
             // Trades (for markers + open-position lookups), from the real engine run.
-            val trades = applySlippage(
-                if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, complete) else runSingle(symbol, raw, cfg, entryTf, complete),
+            //
+            // REPLAYED THE WAY THE LIVE ALGO RUNS IT. The live loop tells the engine
+            // where tracking began, so the engine reaches that bar flat and opens only
+            // what it signals afterwards. This replay used to run without that
+            // boundary, so it could still be holding a trade it opened BEFORE the algo
+            // was watching — and from there every later entry, stop and exit shifted.
+            // The chart then drew a whole sequence of trades the algo never had,
+            // sitting between two real fills as if it had failed to act on them.
+            //
+            // The free replay is kept only for trades that FINISHED before tracking
+            // began: what the strategy would have done had it been watching. One still
+            // open at the boundary is precisely the trade the live algo never had, so
+            // it is dropped rather than drawn across the line.
+            fun replay(from: Long) = applySlippage(
+                if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, complete, from)
+                else runSingle(symbol, raw, cfg, entryTf, complete, from),
                 cfg).trades
+            val free = replay(0L)
+            val trades = if (entriesFromTs <= 0L) free
+                else free.filter { it.status == "CLOSED" && (it.exitTs ?: Long.MAX_VALUE) < entriesFromTs } +
+                    replay(entriesFromTs)
             val entryFineTs = trades.associateBy { it.entryTs }
             val exitFineTs = trades.filter { it.exitTs != null }.associateBy { it.exitTs!! }
 
@@ -856,7 +1532,15 @@ object StrategyLabEngine {
             if (x.macdCrossDownEnabled) byMode.add(if (all) CheckRow(f.macd[ei] < f.macdSignal[ei], "MACD below signal")
                                                  else CheckRow(f.macd[ei - 1] >= f.macdSignal[ei - 1] && f.macd[ei] < f.macdSignal[ei], "MACD crosses below signal"))
             if (x.macdBelowZeroEnabled) byMode.add(CheckRow(f.macd[ei] < 0.0, "MACD below zero"))
-            if (x.accelNegativeEnabled) byMode.add(CheckRow(f.exitAccel[ei] < 0.0, "MACD acceleration negative"))
+            if (x.accelNegativeEnabled) {
+                // Same rule as indicatorExit, so the "why did/didn't it trade" card cannot
+                // disagree with the engine that actually decided it.
+                val dec = f.exitAccel[ei]
+                val sg = f.exitAccelSigma[ei]
+                val floor = if (x.accelNegativeMinSigma > 0 && !sg.isNaN()) -(x.accelNegativeMinSigma * sg) else 0.0
+                byMode.add(if (floor != 0.0) CheckRow(dec < floor, "MACD decel ${g3(dec)} < ${g3(floor)}")
+                           else CheckRow(dec < 0.0, "MACD acceleration negative"))
+            }
         }
         if (x.velocityEnabled) { val v = exitVelFine[i]; byMode.add(CheckRow(!v.isNaN() && v <= x.velocityThreshold, "velocity ≤ ${g(x.velocityThreshold)}% (${g3(v)}%)")) }
         ind.addAll(byMode)
