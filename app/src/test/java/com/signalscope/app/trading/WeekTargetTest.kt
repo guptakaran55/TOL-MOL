@@ -90,7 +90,10 @@ class WeekTargetTest {
     }
 
     @Test fun `too close everywhere - no target, and the minimum depends on fees`() {
-        // Month target 100.8 on a 100 fill: 0.8% clears the fee-free 0.5% but not 1%.
+        // Month target 100.8 on a 100 fill: 0.8% clears the fee-free 0.5% but not US 5% or India's 1%.
+        assertEquals(5.0, WeekTarget.minGapFor("us"), 0.0)
+        assertEquals(1.0, WeekTarget.minGapFor("in"), 0.0)
+        assertEquals(0.5, WeekTarget.minGapFor("de"), 0.0)
         val rr = r(99.0, 100.5, 99.0, 101.0)   // month: 101 - 0.2 = 100.8
         val us = WeekTarget.plan(rr, 100.0, null, false, WeekTarget.minGapFor("us"))
         assertFalse(us.ok)
@@ -123,6 +126,82 @@ class WeekTargetTest {
         assertEquals(112.0, rr.week!!.high, 1e-9)
         assertEquals(130.0, rr.month!!.high, 1e-9)
         assertEquals(98.0, rr.month!!.low, 1e-9)
+    }
+
+    // ── US: no short targets ──
+
+    /** Daily bars from closes, each with a one-point range either side. */
+    private fun daily(closes: List<Double>) = closes.mapIndexed { i, c ->
+        com.signalscope.app.screener.DailyBar(java.time.LocalDate.parse("2026-01-01").plusDays(i.toLong()), c, c + 1.0, c - 1.0)
+    }
+    private fun line(from: Double, to: Double, n: Int) = (1..n).map { from + (to - from) * it / n }
+
+    /** The ABNB shape: a slow base, a run to a 190.50 peak, a fall to 158, a recovery to 172. */
+    private val abnb = daily(List(60) { 150.0 + it * 0.2 } + line(161.8, 190.5, 30) + line(190.5, 158.0, 30) + line(158.0, 172.0, 20))
+
+    @Test fun `a US algo buy rests no target - it sells on its own rules`() {
+        val p = WeekTarget.usPlan(watcher = false, bars = abnb, paid = 174.63, priceNow = null, preExisting = false)
+        assertFalse(p.ok)
+        assertTrue(p.why.contains("algo"))
+    }
+
+    @Test fun `standing monthly peaks - broken ones, and a rise still going, are not resistance`() {
+        val peaks = WeekTarget.standingPeaks(abnb)
+        // The base's top (161.8) was closed above in the run: support now, not resistance.
+        // The recovery's last closes are still rising and too recent to be a peak.
+        assertEquals(listOf(190.5), peaks.map { it.close })
+    }
+
+    @Test fun `a US watcher buy rests just under its last monthly peak`() {
+        val p = WeekTarget.usPlan(true, abnb, 174.63, null, false)
+        assertTrue(p.ok)
+        assertEquals("monthpeak", p.kind)
+        assertEquals(WeekTarget.floorCent(190.5 - WeekTarget.monthBuffer(abnb)!!), p.price, 1e-9)
+        assertTrue(p.price < 190.5 && p.price > 188.0)
+        assertEquals("just under its last monthly peak", p.label)
+        assertTrue(p.detail.contains("190.50"))
+    }
+
+    @Test fun `a nearer peak too close for a US sale is passed over for the next one up`() {
+        // A bounce to 178 then a dip to 165: two standing peaks, 178 and 190.50.
+        val two = daily(abnb.take(120).map { it.close } + line(158.0, 178.0, 6) + line(178.0, 165.0, 14))
+        assertEquals(listOf(178.0, 190.5), WeekTarget.standingPeaks(two).map { it.close }.sorted())
+        val p = WeekTarget.usPlan(true, two, 170.0, null, false)
+        assertEquals("monthpeak", p.kind)
+        assertTrue(p.price > 189.0)        // 178 less its buffer is under 5% above 170
+        // Every peak too close: no target, and it says which.
+        val none = WeekTarget.usPlan(true, two, 186.0, null, false)
+        assertFalse(none.ok); assertTrue(none.why.contains("190.50"))
+    }
+
+    @Test fun `above every peak of the year - the projected monthly zone stands in`() {
+        val rising = daily(List(120) { 100.0 + it * 0.5 + (if (it % 2 == 0) 2.0 else -2.0) })
+        val paid = rising.last().close
+        val any = WeekTarget.usPlan(true, rising, paid, null, false, minGapPct = -100.0)
+        assertEquals("monthzone", any.kind)
+        assertEquals(WeekTarget.monthZoneBottom(rising)!!, any.price, 1e-9)
+        val strict = WeekTarget.usPlan(true, rising, paid, null, false, minGapPct = 50.0)
+        assertFalse(strict.ok); assertTrue(strict.why.contains("above every monthly peak"))
+    }
+
+    @Test fun `a US watcher target - no history, or held from before and already past it - none`() {
+        assertFalse(WeekTarget.usPlan(true, null, 174.63, null, false).ok)
+        val past = WeekTarget.usPlan(true, abnb, 174.63, priceNow = 195.0, preExisting = true)
+        assertFalse(past.ok); assertTrue(past.why.contains("already above"))
+    }
+
+    @Test fun `the monthly zone is the campaign algo's own level, rounded down to the cent`() {
+        // 90 rising daily bars: the projection carries the trend a month ahead.
+        val bars = (0 until 90).map { i ->
+            val c = 100.0 + i * 0.5 + (if (i % 2 == 0) 1.0 else -1.0)
+            com.signalscope.app.screener.DailyBar(java.time.LocalDate.parse("2026-01-01").plusDays(i.toLong()), c, c + 1.0, c - 1.0)
+        }
+        val l = CampaignRules.levels(bars, WeekTarget.ZONE_ATR_FRAC, "projected")!!
+        assertEquals("projected", l.source)
+        val z = WeekTarget.monthZoneBottom(bars)!!
+        assertEquals(WeekTarget.floorCent(l.monthRes - l.bufMonth), z, 1e-9)
+        assertTrue(z > bars.last().close)     // a rising stock's zone sits above it
+        assertNull(WeekTarget.monthZoneBottom(bars.take(10)))
     }
 
     @Test fun `nothing resting - place it`() {

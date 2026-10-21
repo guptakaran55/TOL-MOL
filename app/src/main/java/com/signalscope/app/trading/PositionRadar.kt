@@ -115,8 +115,16 @@ object PositionRadar {
                         *  exit — what the widget draws. Null on older summaries. */
                        val rows: List<Row>? = null)
 
-    /** One widget row: the market's flag, the line, and who manages the exit. */
-    data class Row(val flag: String, val text: String, val detail: String)
+    /** One widget row: the market's flag, the line, and who manages the exit —
+     *  plus its market ("DE"/"US"/"IN"/"BN") and [Kind] name, which the widget's
+     *  tabs filter on. Blank on rows saved before the tabs existed. */
+    data class Row(val flag: String, val text: String, val detail: String,
+                   val market: String = "", val kind: String = "")
+
+    /** The tabs' market code for a position's market. */
+    fun marketCode(market: String): String = when (market.uppercase()) {
+        "BINANCE", "BN" -> "BN"; else -> market.uppercase()
+    }
 
     fun flagOf(market: String): String = when (market.uppercase()) {
         "DE" -> "🇩🇪"; "US" -> "🇺🇸"; "IN" -> "🇮🇳"; "BINANCE", "BN" -> "🪙"; else -> ""
@@ -175,7 +183,9 @@ object PositionRadar {
         val all = ordered.map { (k, p) -> line(k, p) }
         val lines = if (all.size <= MAX_LINES) all
                     else all.take(MAX_LINES - 1) + "+${all.size - (MAX_LINES - 1)} more — open the app"
-        val rows = ordered.map { (k, p) -> Row(flagOf(p.market), line(k, p), p.exitBy) }
+        val rows = ordered.map { (k, p) ->
+            Row(flagOf(p.market), line(k, p), p.exitBy, marketCode(p.market), k.name)
+        }
         return Summary(headline, lines, ps.size, now, full = all, rows = rows)
     }
 

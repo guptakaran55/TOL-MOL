@@ -606,6 +606,22 @@ object LabNotifier {
             "t2x-$ns-${tradeKey.ifBlank { symbol }}", openNs = ns)
     }
 
+    /**
+     * PART OF A STOCK SOLD BY YOU AT TRADING 212, taken off the app's positions
+     * in it — see T212HandSales.absorbPartial. One notice per sale, saying which
+     * positions it came out of, so nothing about the app's books changes unseen.
+     */
+    fun partSoldOutsideApp(ctx: Context, ns: String, symbol: String, qty: Double, px: Double,
+                           detail: String, cur: String) {
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
+            "✋ $symbol — ${"%.4f".format(qty)} sold at Trading 212, taken off the app's positions",
+            "Trading 212 held ${"%.4f".format(qty)} fewer $symbol shares than the app's positions on two checks " +
+                "— a sale you made there" + (if (px > 0.0) ", at ${"%.2f".format(px)} $cur" else "") + ". " +
+                "It comes off your watchlist's positions first, oldest first, then an algo's. " + detail +
+                " Stops and targets now cover the shares that are left.",
+            "t2p-$symbol-${System.currentTimeMillis() / 60_000L}", openNs = ns)
+    }
+
     fun exitGuardSet(ctx: Context, ns: String, symbol: String, level: Double, decision: Double,
                      qty: Double, cur: String, tradeKey: String) {
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_LOW, "Stock LIVE trades",

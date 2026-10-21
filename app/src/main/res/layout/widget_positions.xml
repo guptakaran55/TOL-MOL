@@ -157,4 +157,180 @@
         android:textColor="#99FFFFFF"
         android:textSize="11sp"
         android:visibility="gone" />
+
+    <!-- THE TABS, AT THE BOTTOM where a thumb reaches them (20 Oct). A widget
+         cannot scroll sideways, so the kinds of line and the markets are pills to
+         tap, each with its count; the markets sit lowest. The kinds replace the
+         headline that listed those counts. -->
+    <LinearLayout
+        android:id="@+id/wp_ktabs"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal"
+        android:visibility="gone">
+        <TextView
+            android:id="@+id/wp_k0"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_k1"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_k2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_k3"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_k4"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_k5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/wp_mtabs"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:orientation="horizontal"
+        android:visibility="gone">
+        <TextView
+            android:id="@+id/wp_m0"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_m1"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_m2"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_m3"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+        <TextView
+            android:id="@+id/wp_m4"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="5dp"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp"
+            android:background="@drawable/widget_chip_off"
+            android:textColor="#CCFFFFFF"
+            android:textSize="12sp"
+            android:singleLine="true"
+            android:visibility="gone" />
+    </LinearLayout>
 </LinearLayout>

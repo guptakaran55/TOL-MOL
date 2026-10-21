@@ -111,6 +111,26 @@ object T212LiveStore {
         val liveExitValue: Double = 0.0,    // cash actually received on the sell
         val liveExitQty: Double = 0.0,      // shares actually sold (may differ from bought)
         /**
+         * SHARES OF THIS POSITION YOU SOLD YOURSELF, already taken off [qty] and
+         * [liveQtyFilled] — part of a holding sold in Trading 212's app or by a sale
+         * on a stock's page (see T212HandSales). The fill reader rebuilds
+         * [liveQtyFilled] from the buy orders and subtracts this, so it cannot hand
+         * back shares that are gone.
+         */
+        val handSoldQty: Double = 0.0,
+        /**
+         * A TOP-UP's FROZEN PAST — the buys already read back when more was added to
+         * this position (see ManualEntryWatcher.topUp): their order ids, the shares
+         * they bought and those shares' price × quantity and cash. The fill reader
+         * adds these and reads only the newer orders, so an old order that has
+         * scrolled out of Trading 212's history cannot shrink the position.
+         * Null / 0 on every row that was never topped up.
+         */
+        val settledBuyIds: List<Long>? = null,
+        val settledQty: Double = 0.0,
+        val settledPriceValue: Double = 0.0,
+        val settledCashValue: Double = 0.0,
+        /**
          * Shares in [liveExitQty] that this row NEVER OWNED — unclaimed sub-€1 dust
          * the exit had to clear to be a legal order.
          *

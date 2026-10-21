@@ -196,6 +196,50 @@ object BucketStore {
         return b
     }
 
+    // ── THE CRYPTO 50-DAY HOLD, READY TO SWITCH ON ─────────────────────────────
+
+    /** The eight coins the desktop backtest ran (spec §2), as Binance USDC pairs. */
+    val SMA_HOLD_COINS = listOf("ADAUSDC", "BNBUSDC", "BTCUSDC", "DOGEUSDC",
+                                "ETHUSDC", "LINKUSDC", "SOLUSDC", "XRPUSDC")
+
+    /**
+     * The hold as an algo: its config, its coins enrolled one seat each, Manual
+     * mode — no MACD gate, the average is the whole rule — and SWITCHED OFF.
+     * Nothing runs until it is switched on, and nothing real is bought until it
+     * is armed like any other algo.
+     */
+    fun createSmaHold(ctx: Context): Bucket {
+        val s = load(ctx, "binance")
+        val id = "b" + (System.currentTimeMillis() % 100000000L).toString(36)
+        val b = Bucket(id = id, name = "Hold above SMA50 · daily", space = "binance",
+            symbols = SMA_HOLD_COINS, mode = Mode.MANUAL,
+            capital = 100.0 * SMA_HOLD_COINS.size, holdN = SMA_HOLD_COINS.size, smoothing = 2)
+        save(ctx, "binance", s.copy(buckets = s.buckets + b))
+        StrategyLabStore.setConfig(ctx, com.signalscope.app.trading.StrategyLabConfig.SMA_HOLD_JSON,
+            "crypto_hold_sma50_daily.json", b.ns)
+        for (c in SMA_HOLD_COINS) StrategyLabStore.enroll(ctx, c, "BINANCE", b.ns)
+        StrategyLabStore.setEnabled(ctx, false, b.ns)
+        MacdGateStore.mutate(ctx, b.ns) {
+            it.copy(enabled = false, useScreenerSelection = false, holdN = SMA_HOLD_COINS.size)
+        }
+        Log.i(TAG, "created the 50-day hold ${b.ns} (${SMA_HOLD_COINS.size} coins, off)")
+        return b
+    }
+
+    /** Once per install the hold appears in the crypto tab. Deleting it is respected. */
+    @Synchronized
+    fun ensureSmaHoldSeeded(ctx: Context) {
+        val marker = java.io.File(ctx.filesDir, "seeded_sma50_hold.done")
+        if (marker.exists()) return
+        try {
+            val have = list(ctx, "binance").any {
+                StrategyLabStore.load(ctx, it.ns).configJson?.contains("\"smaHold\"") == true
+            }
+            if (!have) createSmaHold(ctx)
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "50-day hold seed failed", e) }
+    }
+
     fun update(ctx: Context, bucket: Bucket) {
         val s = load(ctx, bucket.space)
         save(ctx, bucket.space, s.copy(buckets = s.buckets.map { if (it.id == bucket.id) bucket else it }))

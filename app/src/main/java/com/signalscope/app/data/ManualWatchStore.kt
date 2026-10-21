@@ -156,6 +156,27 @@ object ManualWatchStore {
          */
         val forced: Boolean = false,
         /**
+         * SHARES OF THIS POSITION YOU SOLD YOURSELF, already taken off [filledQty]
+         * (see T212HandSales). The fill reader rebuilds [filledQty] from the buy
+         * orders every pass and subtracts this, so it cannot hand back shares
+         * that are gone.
+         */
+        val soldQty: Double = 0.0,
+        /**
+         * A TOP-UP's FROZEN PAST — see ManualEntryWatcher.topUp. The buy orders
+         * already read back when more was added, the shares they bought, and their
+         * price × quantity (paid and asked). The fill reader adds these and reads
+         * only the newer orders, so an old order scrolled out of Trading 212's
+         * history cannot shrink the position. Null / 0 when never topped up.
+         */
+        val settledIds: List<Long>? = null,
+        val settledQty: Double = 0.0,
+        val settledPriceValue: Double = 0.0,
+        val settledAskValue: Double = 0.0,
+        val settledAskQty: Double = 0.0,
+        /** How many times more was added on the same signal. */
+        val topUps: Int = 0,
+        /**
          * The resting BUY trigger this entry is waiting on (India only, 0 = none).
          *
          * A trigger is a standing instruction, not a position. While this is set

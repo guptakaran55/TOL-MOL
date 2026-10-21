@@ -19,6 +19,14 @@ class BootReceiver : BroadcastReceiver() {
             intent.action == "android.intent.action.QUICKBOOT_POWERON" ||
             intent.action == Intent.ACTION_MY_PACKAGE_REPLACED) {
 
+            // THE POSITIONS WIDGET, REDRAWN AT ONCE. An update that changes its
+            // layout leaves the home screen holding a drawing made for the old one,
+            // which shows as a blank panel until the next pass — up to 15 minutes.
+            try {
+                com.signalscope.app.trading.PositionWidget.update(context,
+                    com.signalscope.app.trading.PositionRadar.latest(context))
+            } catch (e: Exception) { Log.w("BootReceiver", "widget redraw failed", e) }
+
             val config = ConfigManager(context)
             if (config.serviceRunning && config.hasCredentials) {
                 Log.i("BootReceiver", "Restarting ScanService after boot")

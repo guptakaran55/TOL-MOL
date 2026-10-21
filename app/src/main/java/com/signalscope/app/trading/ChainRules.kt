@@ -70,6 +70,19 @@ object ChainRules {
         return (w.last().low - lo) / (hi - lo) <= ZONE
     }
 
+    /**
+     * How many trading days ago the stock last touched its monthly low — 0 when
+     * the newest bar did — looking back at most [maxBack] bars; null if it did
+     * not. Each day is judged as [touchedMonthlyLow] judged it that morning: on
+     * the bars up to and including that day, never a later one.
+     */
+    fun daysSinceMonthlyLow(bars: List<DailyBar>, maxBack: Int): Int? {
+        for (back in 0 until maxBack.coerceAtMost(bars.size)) {
+            if (touchedMonthlyLow(bars.subList(0, bars.size - back))) return back
+        }
+        return null
+    }
+
     /** [n] trading days (Monday to Friday) after [from]. Holidays are not known
      *  here, so a watch may end a day early around one — never late. */
     fun addTradingDays(from: LocalDate, n: Int): LocalDate {

@@ -1128,7 +1128,25 @@ function rvGateChecked(id,dontRemember){
 }
 // Run [now] straight away, or hand the order to the RV gate. [now] receives the
 // gate's reason when the gate says "go".
-function rvGateOrRun(on,kind,args,sym,now){
+function rvGateOrRun(on,kind,args,sym,now,dupOk){
+  // ONE WAITING ORDER PER STOCK AND SIDE, unless you say otherwise. A patient
+  // order can wait up to two trading hours out of sight, and a second tap in that
+  // time placed a second order (PYPL, 19 Oct: two €50 buys, both filled).
+  var sell=/[Ss]ell|algoTp/.test(kind), sp0=String((args&&args.space)||'').toUpperCase();
+  if(!dupOk&&typeof Android!=='undefined'&&Android.rvManualSame&&kind!=='algoTp'){
+    var same=[];try{same=(JSON.parse(Android.rvManualSame(sp0,String(sym||''),sell)||'{}').rows)||[]}catch(e){}
+    if(same.length){
+      var o=same[0], at=function(ms){return new Date(Number(ms)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})};
+      uiConfirm('⚠ '+escHtml(sym)+' already has a patient '+(sell?'sale':'buy')+' waiting',
+        '<div style="font-size:11px;line-height:1.6;color:var(--t2)">'+
+        (sell?'A sale':('A buy'+(Number(o.cash)>0?(' for <b>'+Number(o.cash).toFixed(0)+'</b>'):'')))+
+        ' placed at <b>'+at(o.since)+'</b> is '+(o.status==='ASK'?'waiting for your answer — it ran over its price limit':
+          ('still waiting for the RV gate and starts by <b>'+at(o.startsBy)+'</b> at the latest'))+'.<br/><br/>'+
+        'Continuing places a <b>second</b> order on top of it. To change the first instead, call it off in <b>Waiting orders</b>.</div>',
+        function(ok){ if(ok)rvGateOrRun(on,kind,args,sym,now,true); });
+      return;
+    }
+  }
   if(!on){
     // UNTICKED STILL LEAVES A RECORD: where the price sat and what the gate would
     // have said, written in the background. The order itself starts at once.
@@ -1591,9 +1609,11 @@ function notifMarket(e){
   var b=String(l.space||'').toLowerCase()||String(l.ns||'').toLowerCase().split('__')[0];
   if(b==='de'||b==='us'||b==='in'||b==='binance')return b;
   var t=String((e&&e.title)||'')+' '+String((e&&e.text)||'');
-  if(/\uD83C\uDDE9\uD83C\uDDEA|German|Xetra|\.DE\b/.test(t))return 'de';
+  // Trading 212's own tickers say it too: "SAPd_EQ" is Xetra, "GOOG_US_EQ" New
+  // York \u2014 and the patient-order notices before 20 Oct carried nothing else.
+  if(/\uD83C\uDDE9\uD83C\uDDEA|German|Xetra|\.DE\b|[a-z]_EQ\b/.test(t))return 'de';
   if(/\uD83C\uDDEE\uD83C\uDDF3|India|NSE\b|Zerodha|NIFTY|\.NS\b/.test(t))return 'in';
-  if(/\uD83C\uDDFA\uD83C\uDDF8|\bUSA\b|NASDAQ|New York/.test(t))return 'us';
+  if(/\uD83C\uDDFA\uD83C\uDDF8|\bUSA\b|NASDAQ|New York|_US_EQ\b|\bUS watchlist\b/.test(t))return 'us';
   if(/crypto|Binance|USDC\b/i.test(t))return 'binance';
   return 'other';
 }
@@ -4526,82 +4546,6 @@ function areaCell(s){
     '<span style="font-weight:800;font-size:11px;color:'+col+'">'+(rk==null?'—':Math.round(rk))+'</span>'+
     '<div style="font-size:8px;font-weight:700;color:'+(sc>=0?'var(--gn)':'var(--rd)')+'">'+(sc>=0?'+':'')+fmt(sc,1)+'%</div></div>';
 }
-// Spearman rank correlation between an Area measure and Pullback points across the scanned list,
-// with an optional scatter chart. Ties share their average rank. Two Area measures:
-//  'rank' — the 0–100 rank against the stock's own history;
-//  'pct'  — the plain Area score in %. That scale runs from −100% (a past price can't be below zero)
-//           up without limit, but Spearman only uses the ORDER of the stocks, so it needs no rescaling.
-//           The chart pins the few extreme values to its edges (hollow dots) so they don't squash the rest.
-var AREA_SCATTER=false,AREA_CORR_X='rank';
-function areaPctValue(s){var v=s&&s.areaScore;return (v==null||!isFinite(v))?null:Number(v)}
-function areaXValue(s,mode){return mode==='pct'?areaPctValue(s):areaRankValue(s)}
-function quantileSorted(v,q){var i=(v.length-1)*q,lo=Math.floor(i),hi=Math.ceil(i);return v[lo]+(v[hi]-v[lo])*(i-lo)}
-function rankOrder(v){
-  var idx=v.map(function(_,i){return i}).sort(function(a,b){return v[a]-v[b]}),r=new Array(v.length);
-  for(var i=0;i<idx.length;){var j=i;while(j+1<idx.length&&v[idx[j+1]]===v[idx[i]])j++;for(var k=i;k<=j;k++)r[idx[k]]=(i+j)/2+1;i=j+1}
-  return r;
-}
-function pearsonR(x,y){
-  var n=x.length,mx=0,my=0,i;for(i=0;i<n;i++){mx+=x[i];my+=y[i]}mx/=n;my/=n;
-  var sxy=0,sxx=0,syy=0;for(i=0;i<n;i++){var dx=x[i]-mx,dy=y[i]-my;sxy+=dx*dy;sxx+=dx*dx;syy+=dy*dy}
-  return (sxx>0&&syy>0)?sxy/Math.sqrt(sxx*syy):NaN;
-}
-function areaPullbackCorrelation(stocks,mode){
-  var a=[],p=[];
-  stocks.forEach(function(s){var x=areaXValue(s,mode);if(x!=null){a.push(x);p.push(pullbackScoreValue(s))}});
-  if(a.length<10)return null;
-  return {n:a.length,rho:pearsonR(rankOrder(a),rankOrder(p))};
-}
-function areaScatterSvg(stocks,mode){
-  var W=300,H=150,L=26,B=20,T=6,R=8,pts='',vals=[];
-  stocks.forEach(function(s){var x=areaXValue(s,mode);if(x!=null)vals.push(x)});
-  var x0=0,x1=100;
-  if(mode==='pct'&&vals.length){
-    // Span the middle 96% of stocks (always including 0); anything beyond is pinned to the edge.
-    vals.sort(function(a,b){return a-b});
-    x0=Math.min(0,quantileSorted(vals,0.02));x1=Math.max(0,quantileSorted(vals,0.98));
-    var pad=Math.max(1,(x1-x0)*0.04);x0=Math.floor(x0-pad);x1=Math.ceil(x1+pad);
-  }
-  var px=function(v){return L+(W-L-R)*(Math.max(x0,Math.min(x1,v))-x0)/(x1-x0)},py=function(v){return T+(H-T-B)*(1-Math.max(0,Math.min(100,v))/100)};
-  stocks.forEach(function(s){var x=areaXValue(s,mode);if(x==null)return;var pb=pullbackScoreValue(s),edge=x<x0||x>x1;
-    var shown=mode==='pct'?((x>=0?'+':'−')+fmt(Math.abs(x),1)+'%'):Math.round(x);
-    pts+='<circle cx="'+px(x).toFixed(1)+'" cy="'+py(pb).toFixed(1)+'" r="2.2" '+(edge?'fill="none" stroke="var(--bl)" stroke-width=".9"':'fill="var(--bl)" fill-opacity=".5"')+'><title>'+escHtml(stockSymbolFor(s)||s.symbol)+': Area '+shown+', Pullback '+pb+(edge?' (off the chart, pinned to the edge)':'')+'</title></circle>'});
-  var ax='<line x1="'+L+'" y1="'+(H-B)+'" x2="'+(W-R)+'" y2="'+(H-B)+'" stroke="var(--t3)" stroke-width=".6"/><line x1="'+L+'" y1="'+T+'" x2="'+L+'" y2="'+(H-B)+'" stroke="var(--t3)" stroke-width=".6"/>';
-  if(mode==='pct')ax+='<line x1="'+px(0).toFixed(1)+'" y1="'+T+'" x2="'+px(0).toFixed(1)+'" y2="'+(H-B)+'" stroke="var(--t3)" stroke-width=".6" stroke-dasharray="2 2"/>';
-  var xt=mode==='pct'?[x0,0,x1]:[0,50,100],xl=function(v){return mode==='pct'?((v>0?'+':v<0?'−':'')+Math.abs(v)+'%'):String(v)};
-  var ticks=xt.map(function(v){return '<text x="'+px(v)+'" y="'+(H-B+9)+'" font-size="7" text-anchor="middle" fill="var(--t3)">'+xl(v)+'</text>'}).join('')+
-    [0,50,100].map(function(v){return '<text x="'+(L-3)+'" y="'+(py(v)+2.5)+'" font-size="7" text-anchor="end" fill="var(--t3)">'+v+'</text>'}).join('');
-  var my=(T+H-B)/2;
-  var lab='<text x="'+((L+W-R)/2)+'" y="'+(H-2)+'" font-size="8" text-anchor="middle" fill="var(--t2)">'+(mode==='pct'?'Area score %':'Area rank')+'</text><text x="8" y="'+my+'" font-size="8" text-anchor="middle" fill="var(--t2)" transform="rotate(-90 8 '+my+')">Pullback points</text>';
-  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;max-width:420px;display:block;margin-top:6px">'+ax+ticks+lab+pts+'</svg>';
-}
-function areaCorrWords(c){
-  var m=Math.abs(c.rho);
-  return (m<0.1?'almost no':m<0.3?'a weak':m<0.5?'a moderate':'a strong')+' link (ρ = '+(c.rho>=0?'+':'−')+fmt(m,2)+', '+c.n+' stocks)';
-}
-function areaCorrelationNote(stocks){
-  var cr=areaPullbackCorrelation(stocks,'rank'),cp=areaPullbackCorrelation(stocks,'pct');
-  if(!(cr&&isFinite(cr.rho))&&!(cp&&isFinite(cp.rho)))return '';
-  var mode=AREA_CORR_X;
-  if(mode==='rank'&&!(cr&&isFinite(cr.rho)))mode='pct';
-  if(mode==='pct'&&!(cp&&isFinite(cp.rho)))mode='rank';
-  var c=mode==='pct'?cp:cr,m=Math.abs(c.rho);
-  var what=mode==='pct'?'a higher Area score %':'a higher Area rank';
-  var dir=m<0.1?'':(c.rho>0?what+' tends to come with higher Pullback points.':what+' tends to come with lower Pullback points.');
-  var pill=function(v,label){var on=mode===v;return '<span onclick="AREA_CORR_X=\''+v+'\';renderKeepScroll()" style="cursor:pointer;padding:2px 8px;border-radius:5px;font-weight:700;'+(on?'background:var(--bl);color:#fff':'background:var(--bg2);color:var(--t2)')+'">'+label+'</span>'};
-  var h='<div style="margin:0 8px 6px;padding:6px 10px;border:1px solid var(--bd);border-radius:6px;font-size:10px;color:var(--t2);line-height:1.5">'+
-    '<b style="color:var(--t1)">Area vs Pullback points</b> (rank correlation across the scanned list)<br/>'+
-    '• Area rank: '+(cr&&isFinite(cr.rho)?areaCorrWords(cr):'not enough stocks with a rank yet')+'<br/>'+
-    '• Area score %: '+(cp&&isFinite(cp.rho)?areaCorrWords(cp):'not enough stocks with a score yet')+'<br/>'+
-    '<span onclick="AREA_SCATTER=!AREA_SCATTER;renderKeepScroll()" style="cursor:pointer;color:var(--bl);font-weight:700">'+(AREA_SCATTER?'Hide chart':'Show chart')+'</span>';
-  if(AREA_SCATTER){
-    h+='<div style="display:flex;gap:4px;align-items:center;margin-top:6px"><span style="color:var(--t3)">Chart:</span>'+pill('rank','Area rank')+pill('pct','Area score %')+'</div>'+
-      areaScatterSvg(stocks,mode)+
-      (dir?'<div style="margin-top:3px">'+dir+'</div>':'')+
-      (mode==='pct'?'<div style="margin-top:3px;color:var(--t3)">The % runs from −100% (the past can’t be below zero) up without limit, so it isn’t comparable in size across calm and wild stocks. The link figure only uses the order of the stocks, so that doesn’t affect it. Hollow dots are extremes pinned to the edge of the chart.</div>':'');
-  }
-  return h+'</div>';
-}
 function pointPill(label,value,strongAt,readyAt,color){
   value=Math.round(Number(value)||0);
   var col=value>=strongAt?color:(value>=readyAt?'#fbbf24':'var(--t3)');
@@ -6018,7 +5962,6 @@ function render(){
   h+='<div class="st"><div class="stl">Pull \u226560</div><div class="stv" style="color:var(--bl)">'+nPb60+'</div></div>';
   h+='<div class="st"><div class="stl">Momo \u226560</div><div class="stv" style="color:var(--gn)">'+nMo60+'</div></div>';
   h+='<div class="st"><div class="stl">Setups</div><div class="stv" style="color:var(--am)">'+nSe+'</div></div></div>';
-  if(tab==='discovery')h+=areaCorrelationNote(stocks);
 
   // Last scan timestamp + rescan buttons
   h+='<div style="margin:0 8px 8px;display:flex;align-items:center;justify-content:space-between;gap:6px">';
@@ -12305,14 +12248,18 @@ function positionDriftBanner(){
     return '<div style="border:1px solid var(--bd);border-radius:7px;padding:6px 9px;margin:0 2px 10px;display:flex;align-items:center;gap:8px">'+
       '<span style="font-size:9px;color:#b45309">Could not reconcile: '+escHtml(r.error||'unknown')+'</span><span style="flex:1"></span>'+btn+'</div>';
   }
-  var drifts=r.drifts||[], crit=Number(r.criticalCount||0);
+  var drifts=r.drifts||[], crit=Number(r.criticalCount||0), conf=Number(r.confirmedCount||0);
   if(!drifts.length){
     return '<div style="border:1px solid rgba(34,197,94,.35);background:rgba(34,197,94,.07);border-radius:7px;padding:6px 9px;margin:0 2px 10px;display:flex;align-items:center;gap:8px">'+
       '<span style="font-size:9px;color:var(--gn);font-weight:700">✓ Ledger matches Trading 212</span>'+
       '<span style="font-size:8px;color:var(--t3)">'+r.rowsChecked+' rows · '+r.positionsSeen+' holdings · '+ago+'</span>'+
       '<span style="flex:1"></span>'+btn+'</div>';
   }
-  var hot=crit>0;
+  // RED ONLY ONCE CONFIRMED. A shortfall seen on one check is very often a sale at
+  // Trading 212 — a target that filled, or your own — that the app books on its
+  // next pass; it is re-checked within 15 minutes and stays amber until then.
+  var hot=conf>0, maybe=crit>0&&!hot;
+  var nAbs=drifts.filter(function(d){return d.absorbing}).length;
   var q=function(v){return Number(v||0).toFixed(5).replace(/0+$/,'').replace(/\.$/,'')};
   // Say what was found, not just how many rows there are. "Untracked holdings" was
   // wrong for an OVERLAP row — that name IS tracked, the broker just holds more of
@@ -12324,13 +12271,17 @@ function positionDriftBanner(){
   if(nOv)calm.push(nOv+' shared with your manual trades');
   if(nDu)calm.push(nDu+' dust');
   if(nEx)calm.push(nEx+' manual-only');
-  var h='<div style="border:1px solid '+(hot?'var(--rd)':'var(--bd)')+';background:'+(hot?'rgba(239,68,68,.09)':'var(--cd)')+';border-radius:7px;padding:8px 10px;margin:0 2px 10px">'+
+  var h='<div style="border:1px solid '+(hot?'var(--rd)':maybe?'rgba(245,158,11,.6)':'var(--bd)')+';background:'+(hot?'rgba(239,68,68,.09)':maybe?'rgba(245,158,11,.07)':'var(--cd)')+';border-radius:7px;padding:8px 10px;margin:0 2px 10px">'+
     '<div style="display:flex;align-items:center;gap:8px">'+
-    '<span style="font-size:10px;font-weight:800;color:'+(hot?'var(--rd)':'var(--gn)')+'">'+
-      (hot?('⚠ LEDGER SHORTFALL · '+crit)
+    '<span style="font-size:10px;font-weight:800;color:'+(hot?'var(--rd)':maybe?'#b45309':'var(--gn)')+'">'+
+      (hot?('⚠ LEDGER SHORTFALL · '+conf)
+          :(maybe&&nAbs>=crit)?('✋ SOLD BY YOU AT TRADING 212 · '+crit+' — being taken off')
+          :maybe?('⏳ POSSIBLE SHORTFALL · '+crit+' — re-checking')
           :('✓ No algo position is short'+(calm.length?(' · '+escHtml(calm.join(' · '))):'')))+'</span>'+
     '<span style="flex:1"></span><span style="font-size:8px;color:var(--t3)">'+ago+'</span>&nbsp;'+btn+'</div>';
-  if(hot)h+='<div style="font-size:9px;color:var(--rd);line-height:1.5;margin-top:3px">P&amp;L, seat balances and the next entry size are all computed from the ledger figure. Treat them as unreliable until this is resolved.</div>';
+  if(hot)h+='<div style="font-size:9px;color:var(--rd);line-height:1.5;margin-top:3px">Seen short on two checks in a row. P&amp;L, seat balances and the next entry size are all computed from the ledger figure. Treat them as unreliable until this is resolved.</div>';
+  else if(maybe&&nAbs>=crit)h+='<div style="font-size:9px;color:#b45309;line-height:1.5;margin-top:3px">Trading 212 holds fewer shares than the app’s positions, which means you sold some there. On the next pass the difference comes off those positions — your watchlist’s first, oldest first, then an algo’s — and a notification says which. Nothing is sold or bought by this.</div>';
+  else if(maybe)h+='<div style="font-size:9px;color:#b45309;line-height:1.5;margin-top:3px">Seen on one check only. Usually a sale at Trading 212 — a target that filled, or one you made there — that the app books on its next pass. Checked again within 15 minutes; you are only notified if it is still short then.</div>';
   // EXTRA and OVERLAP are both benign: one account, and you also trade by hand in
   // it. A 24-name manual portfolio listed in full pushed the algos off the screen
   // and buried the two rows that actually mattered, so the benign set collapses.
@@ -12353,6 +12304,10 @@ function positionDriftBanner(){
         '<span style="color:'+(calmRow?'var(--t3)':'var(--rd)')+';font-size:8px">'+lblOf(d)+'</span>'+
         '<span style="flex:1"></span>'+
         '<span style="color:var(--t2)">ledger '+q(d.expectedQty)+' → T212 '+q(d.actualQty)+'</span></div>'+
+        ((!calmRow&&d.absorbing)
+          ?('<div style="color:#b45309;font-size:8px;margin-top:1px">looks like a sale of yours at Trading 212 — being taken off the app’s positions in it (your watchlist’s first, oldest first)</div>'):'')+
+        ((!calmRow&&!d.absorbing&&!d.confirmed&&Number(d.firstSeenAt||0)>0)
+          ?('<div style="color:#b45309;font-size:8px;margin-top:1px">seen once, at '+new Date(Number(d.firstSeenAt)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+' — re-checking before anything is said</div>'):'')+
         // WHERE TO GO AND FIX IT. Naming the owner is only half an answer if the
         // reader still has to guess which panel acts on it, so the row says both.
         (d.algos&&d.algos.length
@@ -12392,7 +12347,11 @@ function positionAuditRun(){
     var r;try{r=JSON.parse(Android.t212PositionAudit(true)||'{}')}catch(e){uiAlert('Error',e.message);return}
     renderKeepScroll();
     if(!r.ok){uiAlert('Could not reconcile',escHtml(r.error||'unknown'));return}
-    var crit=Number(r.criticalCount||0), n=(r.drifts||[]).length;
+    var crit=Number(r.criticalCount||0), conf=Number(r.confirmedCount||0), n=(r.drifts||[]).length;
+    if(crit>0&&conf===0){
+      uiAlert('⏳ Possible mismatch — seen once','<div style="font-size:11px;color:var(--t2);line-height:1.6">'+crit+' position'+(crit===1?' looks':'s look')+' short at Trading 212 on this check only. That is usually a sale there — a target that filled, or one you made — which the app records on its next pass. It is checked again within 15 minutes and only flagged red, with a notification, if it is still short then.</div>');
+      return;
+    }
     uiAlert(crit>0?'⚠ Mismatch found':(n>0?'ⓘ Untracked holdings':'✓ Ledger matches'),
       '<div style="font-size:11px;color:var(--t2);line-height:1.6">Checked <b>'+r.rowsChecked+'</b> open ledger row'+(r.rowsChecked===1?'':'s')+' against <b>'+r.positionsSeen+'</b> Trading 212 holding'+(r.positionsSeen===1?'':'s')+'.<br/><br/>'+
       (crit>0?('<b style="color:var(--rd)">'+crit+' disagree'+(crit===1?'s':'')+' about a position the app owns.</b> The detail is in the banner on the Algos tab.')
@@ -12500,6 +12459,7 @@ function algosCard(b){
   // 💡 figure is a replay and is marked as such so the two are never confused.
   h+='<div onclick="algosToggle(\''+b.ns+'\')" style="cursor:pointer;padding:9px 11px 7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
     '<span style="font-size:13px;font-weight:800;color:var(--t1)">'+escHtml(b.name)+'</span>'+
+    (b.strategy==='smaHold'&&!b.enabled?'<span title="Switched off — nothing is checked or bought" style="font-size:8px;font-weight:800;color:var(--t3);border:1px solid var(--bd);border-radius:8px;padding:0 6px">OFF</span>':'')+
     '<span onclick="event.stopPropagation();algosRename(\''+b.ns+'\',\''+escHtml(b.name).replace(/'/g,"\\'")+'\')" title="Rename this algo" style="cursor:pointer;font-size:10px;color:var(--t3);padding:0 2px">✏️</span>'+
     liveBadge+
     // The bell sits with the live badge on purpose: both answer "what will this
@@ -12547,6 +12507,7 @@ function algosDetail(b){
   // and the reason the tab read as clutter was that they were interleaved unlabelled.
   h+='<div style="font-size:8px;color:var(--t3);line-height:1.55;margin-bottom:8px;border-left:2px solid var(--bd);padding-left:7px">'+
      '<b>BOOK</b> = what this algo actually did on paper · <b>REPLAY</b> (💡) = what the same config would have done over all fetchable history · <b>REAL</b> = what the broker actually executed.</div>';
+  if(b.strategy==='smaHold')h+=algosHoldPanel(b);
   // The facts that came off the collapsed header — wanted once you are already here.
   h+='<div style="font-family:monospace;font-size:8px;color:var(--t3);margin-bottom:8px">'+
      escHtml({MONTHLY:'Monthly reinvest',GATE_3B:'MACD gate 3b',MANUAL:'Manual'}[b.mode]||String(b.mode||''))+
@@ -12677,7 +12638,10 @@ function algosDetail(b){
   // that only rules out SELECTION. The gate is a timing filter and is indifferent
   // to universe size: it is what stops the algo buying while the daily slope is
   // negative, which matters just as much on 2 coins as on 106.
-  var modes=['MANUAL','MONTHLY','GATE_3B'];
+  // The 50-day hold is its own whole rule: a MACD gate or a reinvest walk on top
+  // would be a different, untested strategy, so Manual is the only mode offered.
+  var isHold=(b.strategy==='smaHold');
+  var modes=isHold?['MANUAL']:['MANUAL','MONTHLY','GATE_3B'];
   // Never drop the bucket's CURRENT mode from the list. A <select> that cannot
   // represent its own value silently falls back to the first option, so opening
   // the editor and pressing Save & run would rewrite the mode without a word.
@@ -12715,12 +12679,13 @@ function algosDetail(b){
     h+='<div style="width:56px"><div style="font-size:9px;color:'+(rankOff?'#b45309':'var(--t3)')+'" title="'+(rankOff?'Ignored while ranking is off — one seat per company.':'How many companies this algo holds at once.')+'">Slots'+(rankOff?' ⚑':'')+'</div>'+
        '<input id="alg-n-'+ns+'" type="number" value="'+(b.holdN||5)+'"'+(rankOff?' disabled':'')+' style="width:100%;padding:6px;font-size:11px;font-family:monospace;background:var(--bgC);color:'+(rankOff?'var(--t3)':'var(--t1)')+';border:1px solid '+(rankOff?'rgba(245,158,11,.5)':'var(--bd)')+';border-radius:5px"/></div>';
   }
-  h+='<div style="width:64px"><div style="font-size:9px;color:var(--t3)" title="EMA span on the daily-MACD slope the gate reads. Spec: 5 for stocks, 2 for crypto.">Smooth</div><input id="alg-sm-'+ns+'" type="number" value="'+(b.smoothing||(isCrypto?2:5))+'" style="width:100%;padding:6px;font-size:11px;font-family:monospace;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:5px"/></div>';
+  // Smoothing and ranking are gate settings; the hold has no gate to give them to.
+  if(!isHold)h+='<div style="width:64px"><div style="font-size:9px;color:var(--t3)" title="EMA span on the daily-MACD slope the gate reads. Spec: 5 for stocks, 2 for crypto.">Smooth</div><input id="alg-sm-'+ns+'" type="number" value="'+(b.smoothing||(isCrypto?2:5))+'" style="width:100%;padding:6px;font-size:11px;font-family:monospace;background:var(--bgC);color:var(--t1);border:1px solid var(--bd);border-radius:5px"/></div>';
   // GATE-ONLY MODE, per algo. 3b is three separable parts and the ranking is the
   // one that needs a crowd; the daily gate does not. Switching selection off is
   // what makes a one-company algo legitimate rather than a blocked edge case.
   var selOn=(b.useScreenerSelection!==false);
-  h+='<label style="display:flex;gap:7px;align-items:flex-start;cursor:pointer;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--cd);margin-bottom:8px">'+
+  if(!isHold)h+='<label style="display:flex;gap:7px;align-items:flex-start;cursor:pointer;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--cd);margin-bottom:8px">'+
      '<input id="alg-sel-'+ns+'" type="checkbox"'+(selOn?' checked':'')+' style="margin-top:1px;width:15px;height:15px"/>'+
      '<span><span style="font-size:10px;font-weight:700;color:var(--t1)">Rank and pick the best '+Math.max(1,Number(b.holdN||1))+'</span>'+
      '<div style="font-size:9px;color:var(--t3);line-height:1.45;margin-top:2px">On: score the whole list and hold only the top few. '+
@@ -13852,6 +13817,59 @@ function algosGate(ns){
 // always visible, so they are not duplicated in two places under two names.
 // [pre] lets algosCard pass the ledger it already fetched instead of a second
 // bridge call for the same file.
+// ── THE CRYPTO 50-DAY HOLD: on or off, where each coin stands, what to expect ──
+// One rule, so one panel: the switch, the rule in a sentence, each coin's close
+// against its average as the engine last saw it, and the backtest it came from.
+function algosHoldPanel(b){
+  var ns=b.ns, len=Number(b.holdSmaLength||50), on=!!b.enabled;
+  var led=bridgeOnce('ledger:'+ns,function(){return JSON.parse(Android.bucketLedger(ns)||'{}')})||{};
+  var notes=led.notes||{};
+  // The next decision is the next 00:00 UTC, told on this phone's clock.
+  var now=new Date();
+  var nxt=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+1,0,0,0));
+  var hhmm=('0'+nxt.getHours()).slice(-2)+':'+('0'+nxt.getMinutes()).slice(-2);
+  var inH=Math.max(0,(nxt-now)/3600000);
+  var h='<div style="border:1px solid '+(on?'var(--gn)':'var(--bd)')+';border-radius:7px;padding:8px 9px;margin-bottom:9px;background:var(--cd)">';
+  h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+     '<span style="font-size:10px;font-weight:900;color:var(--t1)">📈 HOLD ABOVE THE '+len+'-DAY AVERAGE</span>'+
+     '<span style="font-size:9px;font-weight:800;color:'+(on?'var(--gn)':'var(--t3)')+'">'+(on?'● ON':'○ OFF')+'</span>'+
+     '<span style="flex:1"></span>'+
+     '<span onclick="algosHoldSwitch(\''+ns+'\','+(on?'false':'true')+')" style="cursor:pointer;font-size:10px;font-weight:800;padding:4px 12px;border-radius:12px;color:#fff;background:'+(on?'#64748b':'#16a34a')+'">'+(on?'⏸ Pause':'▶ Switch on')+'</span></div>';
+  h+='<div style="font-size:9px;color:var(--t2);line-height:1.55;margin:6px 0">Holds a coin while its <b>daily close is above its '+len+'-day simple average</b>, sells on a daily close at or below it, and waits in cash until a close back above. No stop and no target — the average is the only exit. Each coin trades on its own, one seat each. Decided once a day at the <b>00:00 UTC close ('+hhmm+' your time)</b> and acted on straight away — next one in '+inH.toFixed(1)+' h.</div>';
+  h+='<div style="font-family:monospace;font-size:9px;border:1px solid var(--bd);border-radius:5px;background:var(--bgC)">';
+  (b.symbols||[]).forEach(function(s){
+    var n=notes[String(s).toUpperCase()];
+    var t=n?String(n.note||''):(on?'not checked yet — runs on the next pass':'—');
+    var up=/above ✓/.test(t), dn=/below ✗/.test(t);
+    h+='<div style="padding:4px 7px;border-bottom:1px dashed var(--bd);display:flex;gap:6px;align-items:baseline">'+
+       '<span onclick="algosReview(\''+ns+'\',\''+escHtml(s)+'\')" title="Chart with the average drawn on it" style="cursor:pointer;min-width:66px;font-weight:800;color:var(--bl)">'+escHtml(s)+'</span>'+
+       '<span style="color:'+(up?'var(--gn)':dn?'var(--rd)':'var(--t3)')+';line-height:1.4">'+escHtml(t)+'</span></div>';
+  });
+  h+='</div>';
+  h+=on
+    ?'<div style="font-size:8px;color:var(--t3);line-height:1.5;margin-top:5px">Paper trades from here on. Real money follows only if this algo is armed below — live box ticked, a budget, and the coins named — exactly like the other algos. Pause stops new decisions; positions already open stay open.</div>'
+    :'<div style="font-size:9px;color:var(--t2);line-height:1.5;margin-top:5px">Off: nothing is checked and nothing is bought. <b>Switching on checks every coin at once against the latest daily close</b> — a coin above its average is bought on paper straight away, the rest wait for their first close above. Real money only follows if you also arm it below.</div>';
+  h+='<details data-dk="alg-hold-why-'+ns+'" style="margin-top:6px"><summary style="cursor:pointer;font-size:9px;color:var(--t3)">What the backtests showed, and when it lags</summary>'+
+     '<div style="font-size:9px;color:var(--t2);line-height:1.55;margin-top:4px">Desktop backtests, 19 Oct 2026 — daily check, 0.2% per round trip, each coin an equal unrebalanced share:'+
+     '<table style="width:100%;border-collapse:collapse;font-family:monospace;font-size:8px;margin:5px 0">'+
+     '<tr style="color:var(--t3)"><td>data</td><td>algo / yr</td><td>hold / yr</td><td>algo worst</td><td>hold worst</td></tr>'+
+     '<tr><td>BTC+ETH 2021–26</td><td style="color:var(--gn)">+16%</td><td>−0.5%</td><td>−52%</td><td>−77%</td></tr>'+
+     '<tr><td>BTC+ETH 2023–26</td><td style="color:var(--gn)">+31%</td><td>+20%</td><td>−33%</td><td>−57%</td></tr>'+
+     '<tr><td>8 coins 2021–26</td><td style="color:var(--gn)">+22%</td><td>−2%</td><td>−51%</td><td>−87%</td></tr></table>'+
+     'From seven different start dates it made between about +5% and +38% a year, and beat simply holding from every one. It is in the market about half the time, with roughly 20 orders a year per coin.<br/><br/>'+
+     '<b>When it lags:</b> it is crash protection, not a way to beat a steady bull market — 2023 and 2024 were both worse than just holding. 2021–26 was choppy with two crashes, which suits it. Near the line it can flip in and out on consecutive days; that is the rule working as tested, not a fault.<br/><br/>'+
+     '<b>Tax:</b> selling within a year can make a gain taxable — in Germany, coins held over a year are tax-free, and this rule rarely holds that long.</div></details>';
+  h+='</div>';
+  return h;
+}
+function algosHoldSwitch(ns,on){
+  if(typeof Android==='undefined'||!Android.bucketSetEnabled){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  try{var r=JSON.parse(Android.bucketSetEnabled(ns,!!on)||'{}');if(!r.ok){uiAlert('Could not change',escHtml(r.error||''));return}}
+  catch(e){uiAlert('Error',e.message);return}
+  // Switching on starts a pass, which reports its own progress like Run now.
+  if(on)RUNSTATE[ns]={phase:'start',done:0,total:0};
+  renderKeepScroll();
+}
 // ── UNFULFILLED: REAL BUYS THAT COULD NOT ENTER, AND WHAT THEY WOULD HAVE MADE ──
 // Taken out of the book so the seat goes on at once; kept here with the reason,
 // and followed with the algo's own exits — the cost (or saving) of missing them.
@@ -13860,14 +13878,17 @@ function algosUnfulfilled(ns){
   var rows=[];try{rows=(JSON.parse(Android.unfulfilledEntries(ns)||'{}').rows)||[]}catch(e){}
   if(!rows.length)return '';
   var known=rows.filter(function(r){return r.shadowPct!=null&&isFinite(r.shadowPct)});
-  var sumPct=known.reduce(function(a,r){return a+Number(r.shadowPct)},0);
   var sumMoney=known.reduce(function(a,r){return a+Number(r.shadowPct)/100*Number(r.amount||0)},0);
+  var sumAmt=known.reduce(function(a,r){return a+Number(r.amount||0)},0);
+  // The return on the money the misses were for, not a sum of percentages: a
+  // -5% on €200 outweighs a +5% on €100, and the two figures must agree.
+  var sumPct=sumAmt>0?sumMoney/sumAmt*100:known.reduce(function(a,r){return a+Number(r.shadowPct)},0)/(known.length||1);
   var col=function(v){return v>=0?'var(--gn)':'var(--rd)'};
   var pct=function(v){return (v>=0?'+':'\u2212')+Math.abs(Number(v)).toFixed(2)+'%'};
   var when=function(ms){var d=new Date(ms);return d.toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'})+' '+('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)};
   var cur=/^us/.test(ns)?'$':'\u20ac';
   var h='<details data-dk="alg-unf-'+ns+'" style="margin-bottom:8px"><summary style="cursor:pointer;font-size:9px;font-weight:800;color:var(--t2)">\u26D4 UNFULFILLED \u00b7 '+rows.length+' missed buy'+(rows.length===1?'':'s')+
-    (known.length?' \u00b7 would have made <span style="color:'+col(sumPct)+'">'+pct(sumPct)+'</span>'+(sumMoney?' <span style="color:'+col(sumMoney)+'">('+(sumMoney>=0?'+':'\u2212')+cur+Math.abs(sumMoney).toFixed(2)+')</span>':''):'')+'</summary>';
+    (known.length?' \u00b7 would have made '+(sumAmt>0?'<span style="color:'+col(sumMoney)+'">'+(sumMoney>=0?'+':'\u2212')+cur+Math.abs(sumMoney).toFixed(2)+'</span> (<span style="color:'+col(sumPct)+'">'+pct(sumPct)+'</span>)':'<span style="color:'+col(sumPct)+'">'+pct(sumPct)+'</span> a trade'):'')+'</summary>';
   h+='<div style="font-size:9px;color:var(--t3);margin:4px 2px 6px;line-height:1.5">Real buys that could not enter. Taken out of the book so the seat goes on; followed here with the algo\u2019s own exits.</div>';
   rows.forEach(function(r){
     var v=r.shadowPct, st=r.shadowStatus;
@@ -14017,7 +14038,10 @@ function weekTargetLineBody(tg,ns,pid,sym,cur){
     'style="cursor:pointer;font-size:8px;font-weight:800;color:var(--t3);border:1px solid var(--bd);border-radius:4px;padding:0 5px;margin-left:3px">✕ take off</span>';
   var tip=(tg.label==='your own price')
     ? 'The price you set. It waits at Trading 212 as a limit sell, so it fills there even with the phone off — at that price or better — and the sale is booked to this position. Only one sell can wait at Trading 212 per position, so the stop stays watched by the app; any sale the app makes clears this order first.'
-    : 'Fixed at the buy, from where it was bought in its ranges: near its 1-month low or on strength, a tenth of the month’s range short of the month’s high; near its 1-week low, the week’s high. Not set when that is less than 1% above what you paid (0.5% for fee-free German shares). It waits at Trading 212 as a limit sell, so it fills there even with the phone off — at that price or better. Only one sell can wait at Trading 212 per position, so the stop stays watched by the app; any sale the app makes clears this order first.';
+    : (tg.label==='just under its last monthly peak'||tg.label==='its projected monthly resistance zone'
+      ? 'Fixed at the buy, from the daily closes before it: the last monthly peak above the buy that the price has not closed above since — the high a 1-year chart shows — less a month’s ATR buffer, so it sells on the way up. The nearest such peak at least 5% above what you paid; at new highs, with no peak above, its projected monthly resistance zone instead. US shares pay a currency charge each way, so nothing closer is set; algo buys keep none and sell on their own rules. '
+      : 'Fixed at the buy, from where it was bought in its ranges: near its 1-month low or on strength, a tenth of the month’s range short of the month’s high; near its 1-week low, the week’s high. Not set when that is less than 1% above what you paid (0.5% for fee-free German shares). ')+
+      'It waits at Trading 212 as a limit sell, so it fills there even with the phone off — at that price or better. Only one sell can wait at Trading 212 per position, so the stop stays watched by the app; any sale the app makes clears this order first.';
   var head='🎯 Target'+(tg.label?' ('+escHtml(String(tg.label))+')':'');
   if(tg.filled)return '<div style="color:var(--gn);font-size:8px;margin-top:2px">'+head+' sold it at '+cur+Number(tg.fillPrice||px).toFixed(2)+'</div>';
   if(tg.removed)return tg.done?'':'<div style="color:var(--t3);font-size:8px;margin-top:2px">'+head+' — coming off at the next check</div>';
@@ -14185,6 +14209,8 @@ function floorStats(a){
   // After charges: those a sale at the latest price would pay, for what is held.
   var openPnl=0;open.forEach(function(t){openPnl+=Number(t.qty||0)*Number(t.lastPrice||0)-Number(t.cost||0)-Number(t.fees||0)-Number(t.slip||0)});
   var feesPaid=0,slipPaid=0;sold.forEach(function(t){feesPaid+=Number(t.fees||0);slipPaid+=Number(t.slip||0)});
+  // The same sales before any charge or spread — what the market alone gave.
+  var gross=0;sold.forEach(function(t){gross+=Number(t.qty||0)*Number(t.sellPrice||0)-Number(t.cost||0)});
   var wins=sold.filter(function(t){return Number(t.pnl)>0}).length;
   function avg(k){
     var v=T.map(function(t){return t[k]}).filter(function(x){return x!=null&&isFinite(Number(x))}).map(Number);
@@ -14195,7 +14221,7 @@ function floorStats(a){
   // What sold each one — the question the stop and target were added to answer.
   var why={stop:0,target:0,time:0,trend:0};
   sold.forEach(function(t){if(why[t.exitReason]!=null)why[t.exitReason]++});
-  return {open:open,sold:sold,missed:missed,booked:booked,openPnl:openPnl,wins:wins,why:why,feesPaid:feesPaid,slipPaid:slipPaid,
+  return {open:open,sold:sold,missed:missed,booked:booked,openPnl:openPnl,wins:wins,why:why,feesPaid:feesPaid,slipPaid:slipPaid,gross:gross,
     r1:avg('ret1'),r3:avg('ret3'),r5:avg('ret5'),dip:avg('dip'),cap:Number(s.capital||1000),
     resting:(a.orders||[]).filter(function(o){return o.status==='RESTING'}).length};
 }
@@ -14280,6 +14306,7 @@ function campaignDetail(a,cur,st){
     floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
     floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
     floorBtn('⚙ Settings','campaignSettingsDlg(\''+id+'\')')+
+    floorBtn('⬇ Trades','floorTradesExport(\''+id+'\')')+
     floorBtn('🗑 Delete','floorDelete(\''+id+'\')','var(--rd)')+'</div>';
   if(a.lastNote)h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">'+escHtml(a.lastNote)+'</div>';
   var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
@@ -14287,7 +14314,7 @@ function campaignDetail(a,cur,st){
   var ended=(a.campaigns||[]).filter(function(c){return c.state==='ENDED'&&c.legs>0});
   var won=ended.filter(function(c){return c.pnl>0}).length;
   h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
-    cell('BOOKED',sgn(st.booked),st.sold.length+' swings sold · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread')+
+    cell('BOOKED',sgn(st.booked),st.sold.length+' swings sold · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread'+floorBeforeCharges(st,sgn))+
     cell('OPEN',sgn(st.openPnl),st.open.length+' swing'+(st.open.length===1?'':'s')+' held now')+
     cell('CAMPAIGNS',live.length+(s.seats===0?'':' / '+(s.seats||5)),live.filter(function(c){return c.state==='WAITING'}).length+' waiting to start · '+cur+seat.toFixed(0)+' each')+
     cell('ENDED',String(ended.length),ended.length?won+' made money':'none yet')+'</div>';
@@ -14418,6 +14445,7 @@ function chainDetail(a,cur,st){
     floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
     floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
     floorBtn('⚙ Settings','chainSettingsDlg(\''+id+'\')')+
+    floorBtn('⬇ Trades','floorTradesExport(\''+id+'\')')+
     floorBtn('🗑 Delete','floorDelete(\''+id+'\')','var(--rd)')+'</div>';
   if(a.lastNote)h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">'+escHtml(a.lastNote)+'</div>';
   var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
@@ -14426,7 +14454,7 @@ function chainDetail(a,cur,st){
   var cmpTxt=function(x){return x?((x.m>=0?'+':'')+x.m.toFixed(2)+'%'):'—'};
   var cmpSub=function(x){return x?x.n+' halves · '+x.w.toFixed(0)+'% won':'none finished yet'};
   h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
-    cell('BOOKED',sgn(st.booked),st.sold.length+' halves sold · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread')+
+    cell('BOOKED',sgn(st.booked),st.sold.length+' halves sold · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread'+floorBeforeCharges(st,sgn))+
     cell('OPEN',sgn(st.openPnl),st.open.filter(function(t){return t.firstSec>0}).length+' halves held now')+
     cell('SEATS',counted.length+' / '+(s.seats||7),counted.filter(function(c){return c.state==='WATCHING'}).length+' watching · '+cur+seat.toFixed(0)+' each')+'</div>';
   h+='<div style="font-size:9px;font-weight:800;color:var(--t2);margin:6px 0 3px">DID THE NEWS OUTLOOK HELP? — mean result per finished half, after charges</div>'+
@@ -14529,13 +14557,14 @@ function floorDetail(a,cur,st){
     floorBtn(FLOOR_BUSY[id]?'checking…':'↻ Check now','floorRun(\''+id+'\')','var(--bl)')+
     floorBtn(a.enabled?'⏸ Pause':'▶ Resume','floorPause(\''+id+'\','+(!a.enabled)+')')+
     floorBtn('⚙ Settings','floorSettingsDlg(\''+id+'\')')+
+    floorBtn('⬇ Trades','floorTradesExport(\''+id+'\')')+
     floorBtn('🗑 Delete','floorDelete(\''+id+'\')','var(--rd)')+'</div>';
   if(a.lastNote)h+='<div style="font-size:9px;color:var(--t3);margin-bottom:8px">'+escHtml(a.lastNote)+'</div>';
   // Money and results.
   var cell=function(lab,val,sub){return '<div style="flex:1 1 70px;min-width:70px;padding:5px 7px;background:var(--bg);border:1px solid var(--bd);border-radius:6px"><div style="font-size:8px;color:var(--t3);font-weight:800;letter-spacing:.3px">'+lab+'</div><div style="font-family:monospace;font-size:11px;font-weight:800;color:var(--t1)">'+val+'</div>'+(sub?'<div style="font-size:8px;color:var(--t3)">'+sub+'</div>':'')+'</div>'};
   var sgn=function(v){return (v>=0?'+':'−')+cur+Math.abs(v).toFixed(2)};
   h+='<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">'+
-    cell('BOOKED',sgn(st.booked),st.sold.length+' sold · '+st.wins+' won · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread')+
+    cell('BOOKED',sgn(st.booked),st.sold.length+' sold · '+st.wins+' won · after '+cur+st.feesPaid.toFixed(2)+' charges, '+cur+st.slipPaid.toFixed(2)+' spread'+floorBeforeCharges(st,sgn))+
     cell('OPEN',sgn(st.openPnl),st.open.length+' of '+(s.seats||5)+' seats')+
     cell('CAPITAL',cur+Number(s.capital||1000).toFixed(0),(s.seats||5)+' × '+cur+seat.toFixed(0))+
     cell('MISSED',String(st.missed.length),'seats were full')+'</div>';
@@ -14782,6 +14811,16 @@ function floorJournalList(a,cur){
       floorTable(['STOCK','W D 4H','LOOKS','TURN','RESULT','3D','5D'],rows)
     : '<div style="font-size:9px;color:var(--t3);margin:0 0 4px;line-height:1.5">CLOSEST: how near the day’s low came to the floor — below 0 means it traded under it. Amber: within 1%.</div>'+
       floorTable(['STOCK','W D','FLOOR<br/>LOW','CLOSEST','RESULT','3D','5D'],rows));
+}
+// What the same sales made before the market took anything — shown only where it took something.
+function floorBeforeCharges(st,sgn){
+  return (st.feesPaid+st.slipPaid)>0?' · '+sgn(st.gross)+' before them':'';
+}
+function floorTradesExport(id){
+  try{
+    var r=JSON.parse(Android.floorExportTrades(id)||'{}');
+    if(!r.ok)uiAlert('Nothing to export',escHtml(r.error||''));
+  }catch(e){uiAlert('Error',e.message)}
 }
 function floorJournalExport(id){
   try{
@@ -15984,6 +16023,7 @@ function reviewExitTag(reason,by,hand){
     return tag('SL','Stop loss','#b91c1c');
   if(/take profit|take-profit|target|week high|week-high/.test(t))return tag('TP','Take profit','#047857');
   if(/slope flipped|slope negative/.test(t))return tag('MACD','MACD flip','#1d4ed8');
+  if(/close below sma/.test(t))return tag('SMA','Below SMA','#1d4ed8');
   if(/crossed below signal|below signal/.test(t))return tag('X-sig','MACD cross','#1d4ed8');
   if(/macd below zero/.test(t))return tag('M<0','MACD < 0','#1d4ed8');
   if(/deceleration|acceleration negative/.test(t))return tag('Slow','MACD slowing','#1d4ed8');
@@ -16100,7 +16140,9 @@ function renderLabReview(){
   var S=REVIEW.show||(REVIEW.show=Object.assign({},REVIEW_SHOW_DEFAULT));
   function xOf(i){return PX0+(i+0.5)*step}
   // price scale
-  var lo=1e18,hi=-1e18; for(var i=0;i<n;i++){if(bars[i].l<lo)lo=bars[i].l; if(bars[i].h>hi)hi=bars[i].h;}
+  var lo=1e18,hi=-1e18; for(var i=0;i<n;i++){if(bars[i].l<lo)lo=bars[i].l; if(bars[i].h>hi)hi=bars[i].h;
+    // A drawn average must fit too — after a crash it sits above every candle.
+    var lvl=bars[i].level; if(lvl!=null){if(lvl<lo)lo=lvl; if(lvl>hi)hi=lvl;}}
   var pad=(hi-lo)*0.04||1; lo-=pad; hi+=pad;
   function yP(v){return pBot-(v-lo)/(hi-lo)*(pBot-pTop)}
   // macd scale (macd+signal) and slope scale (own, centered)
@@ -16209,6 +16251,15 @@ function renderLabReview(){
     svg+='<line x1="'+cx.toFixed(1)+'" y1="'+yP(c.h).toFixed(1)+'" x2="'+cx.toFixed(1)+'" y2="'+yP(c.l).toFixed(1)+'" stroke="'+col+'" stroke-width="1"/>';
     var yt=yP(Math.max(c.o,c.c)),yb=yP(Math.min(c.o,c.c));
     svg+='<rect x="'+(cx-barW/2).toFixed(1)+'" y="'+yt.toFixed(1)+'" width="'+barW.toFixed(1)+'" height="'+Math.max(1,yb-yt).toFixed(1)+'" fill="'+col+'"/>';
+  }
+  // A LINE THE RULE TRADES AGAINST, drawn over the candles — the 50-day hold's
+  // average. Only payloads that carry one draw it.
+  if(bars.some(function(b){return b.level!=null})){
+    var lv='',lvOn=false;
+    for(var il=0;il<n;il++){var v=bars[il].level;if(v==null){lvOn=false;continue}
+      lv+=(lvOn?' ':'')+xOf(il).toFixed(1)+','+yP(v).toFixed(1);lvOn=true;}
+    if(lv)svg+='<polyline points="'+lv+'" fill="none" stroke="#ea580c" stroke-width="1.6"/>'+
+      '<text x="'+(PX1-3)+'" y="'+(pTop+10)+'" text-anchor="end" font-size="9" font-weight="800" fill="#ea580c">— moving average (the rule’s line)</text>';
   }
   // markers — the TIP sits exactly on the bar's CLOSE, which is the fill price the
   // engine used. (They used to be offset off the low/high, which drew every entry
@@ -16367,6 +16418,9 @@ function renderLabReview(){
   svg+='<line x1="'+PX0+'" y1="'+((mTop+mBot)/2).toFixed(1)+'" x2="'+PX1+'" y2="'+((mTop+mBot)/2).toFixed(1)+'" stroke="rgba(13,148,136,0.5)" stroke-width="0.6" stroke-dasharray="2,3"/>';
   function poly(key,yfun,color,wid){var pts='',started=false;for(var i=0;i<n;i++){var v=bars[i][key];if(v==null){started=false;continue}var xx=xOf(i).toFixed(1)+','+yfun(v).toFixed(1);pts+=(started?' ':'')+xx;started=true;}return pts?'<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="'+wid+'"/>':''}
   svg+=(S.macd?poly('macd',yM,'#64748b',1.3):'')+(S.signal?poly('macdSignal',yM,'#94a3b8',1):'')+(S.entrySlope?poly('entrySlope',yS,'#14b8a6',1.2):'')+(S.exitSlope?poly('exitSlope',yS,'#db2777',1):'');
+  // A rule that reads no MACD says so, rather than leaving an empty panel that looks broken.
+  if(!bars.some(function(b){return b.macd!=null}))
+    svg+='<text x="'+((PX0+PX1)/2)+'" y="'+((mTop+mBot)/2-8)+'" text-anchor="middle" font-size="11" fill="'+AXT+'">This algo reads no MACD — only the moving average drawn above.</text>';
   // ── X axis (time): baseline + evenly spaced timestamp ticks ──
   svg+='<line x1="'+PX0+'" y1="'+(mBot+2)+'" x2="'+PX1+'" y2="'+(mBot+2)+'" stroke="rgba(148,163,184,0.4)" stroke-width="0.6"/>';
   var nlab=Math.min(6,n);
@@ -16405,7 +16459,7 @@ function renderLabReview(){
   if((d.trades||[]).length){
     h+='<div style="padding:8px 12px"><div style="font-size:9px;font-weight:800;color:var(--t2);margin-bottom:4px">TRADES</div><div style="max-height:26vh;overflow-y:auto;border:1px solid var(--bd);border-radius:6px;font-family:monospace;font-size:9px">';
     (d.trades||[]).slice().reverse().forEach(function(t){var op=t.status==='OPEN',pct=Number(t.pctReturn||0),col=pct>=0?'var(--gn)':'var(--rd)',intg=String(t.entryReason||'').indexOf('integral')>=0;
-      h+='<div style="padding:4px 8px;border-bottom:1px dashed var(--bd);display:flex;gap:6px;align-items:center"><span style="padding:0 4px;border-radius:3px;font-size:7px;font-weight:800;background:'+(intg?'#fde68a':'#dbeafe')+';color:'+(intg?'#92400e':'#1e40af')+'">'+(intg?'integral':'flip+accel')+'</span><span style="color:var(--t3);flex:1">'+slFmtTs(t.entryTs)+(op?' · <b style="color:var(--am)">OPEN</b>':' → '+slFmtTs(t.exitTs))+'</span>'+(op?'':reviewTagPill(reviewExitTag(t.exitReason)))+'<span style="color:'+col+';font-weight:800">'+(pct>=0?'+':'')+pct.toFixed(1)+'%</span></div>';});
+      h+='<div style="padding:4px 8px;border-bottom:1px dashed var(--bd);display:flex;gap:6px;align-items:center"><span style="padding:0 4px;border-radius:3px;font-size:7px;font-weight:800;background:'+(intg?'#fde68a':'#dbeafe')+';color:'+(intg?'#92400e':'#1e40af')+'">'+(intg?'integral':(/close above SMA/.test(String(t.entryReason||''))?'SMA':'flip+accel'))+'</span><span style="color:var(--t3);flex:1">'+slFmtTs(t.entryTs)+(op?' · <b style="color:var(--am)">OPEN</b>':' → '+slFmtTs(t.exitTs))+'</span>'+(op?'':reviewTagPill(reviewExitTag(t.exitReason)))+'<span style="color:'+col+';font-weight:800">'+(pct>=0?'+':'')+pct.toFixed(1)+'%</span></div>';});
     h+='</div></div>';
   }
   var _st=ov.scrollTop;

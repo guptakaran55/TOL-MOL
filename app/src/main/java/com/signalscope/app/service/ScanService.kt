@@ -736,6 +736,12 @@ class ScanService : Service() {
             val hs = com.signalscope.app.trading.T212HandSales.sweep(applicationContext)
             if (hs.isNotBlank()) Log.i(TAG, "Hand sales: $hs")
         } catch (e: Exception) { Log.w(TAG, "hand-sale sweep failed: ${e.message}") }
+        // …and PART of a stock sold in Trading 212's app: the difference comes off
+        // the app's positions in it — your watchlist's first, oldest first.
+        try {
+            val ps = com.signalscope.app.trading.T212HandSales.absorbPartial(applicationContext)
+            if (ps.isNotBlank()) Log.i(TAG, "Part sales: $ps")
+        } catch (e: Exception) { Log.w(TAG, "part-sale sweep failed: ${e.message}") }
         // REAL BUYS THAT FAILED FOR GOOD: out of the book with the seat handed on,
         // and followed in each algo's Unfulfilled list with what they would have made.
         try {

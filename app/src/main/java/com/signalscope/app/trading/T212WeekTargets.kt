@@ -14,7 +14,9 @@ import org.json.JSONObject
 /**
  * THE RANGE TARGETS, kept at Trading 212 — [WeekTarget] holds the rule: near the
  * month's low or on strength, a tenth of the month's range short of its high;
- * near the week's low, the week's high.
+ * near the week's low, the week's high. US shares, which pay a currency charge
+ * each way, follow [WeekTarget.usPlan] instead: none for an algo's buy; for the
+ * watcher's, just under the last monthly peak above it that still stands.
  *
  * Runs on every background pass, AFTER the algos and the watchlist have done
  * their selling, so it never puts an order back that a sale on the same pass is
@@ -22,8 +24,8 @@ import org.json.JSONObject
  *
  *   • once the buy has settled, works the target out from the week and month
  *     BEFORE the buy and records it — or records why there is none;
- *   • while the market is open and nothing rests, places one limit sell there,
- *     good until cancelled, for exactly that position's shares;
+ *   • as soon as it is decided, places one limit sell there, good until
+ *     cancelled, for exactly that position's shares — market open or not;
  *   • on every pass checks it is still waiting. Executed: closes the position
  *     everywhere it is recorded (the ledger, the algo's paper record or the
  *     watchlist book) and leaves the alert to the fill reader, which is the one
@@ -222,7 +224,15 @@ object T212WeekTargets {
 
                 val want = ownQty(row)
                 if (want <= 0.0) continue
-                val marketOpen = MarketHours.isRegularSession(Spaces.baseOf(row.ns), now)
+                // NOT HELD BACK FOR THE OPEN (20 Oct). Trading 212 takes a good-till-
+                // cancelled order while the market is shut — the safety stop under
+                // PANW went in at 18:59 New York time on 13 Oct — and a target that
+                // waited for the bell left a position bought late in the day with
+                // nothing resting overnight: GOOG, bought 21:54, would have had its
+                // 371.04 placed only at 15:30 next day. A limit sell above the price
+                // costs nothing to leave waiting, and if the stock opens above it,
+                // it fills at the opening price. Should the broker ever refuse one
+                // while shut, [place] waits for the open instead of hourly retries.
                 val cur = t.orderId > 0L && resting.containsKey(t.orderId)
 
                 // ── 2. DID IT SELL? ─────────────────────────────────────────────
@@ -284,9 +294,9 @@ object T212WeekTargets {
                             it.copy(prevIds = (it.prevIds ?: emptyList()) + it.orderId, orderId = 0L,
                                 goneSince = 0L, note = null)
                         }
-                        if (marketOpen && place(ctx, client, row, t2, want, now)) set++
+                        if (place(ctx, client, row, t2, want, now)) set++
                     }
-                    WeekTarget.Step.REPLACE -> if (marketOpen) {
+                    WeekTarget.Step.REPLACE -> {
                         val cancelled = SellGuard.ifIdle(row.t212Ticker) {
                             client.cancelOrder(t.orderId) is Trading212Client.T212Result.Success
                         } ?: false
@@ -298,7 +308,7 @@ object T212WeekTargets {
                             if (place(ctx, client, row, t2, want, now)) set++
                         }
                     }
-                    WeekTarget.Step.PLACE -> if (marketOpen && now >= t.retryAfter) {
+                    WeekTarget.Step.PLACE -> if (now >= t.retryAfter) {
                         if (place(ctx, client, row, t, want, now)) set++
                     }
                 }
@@ -321,23 +331,49 @@ object T212WeekTargets {
     private fun decide(ctx: Context, row: T212LiveStore.LiveTrade, since: Long, now: Long,
                        redo: Boolean = false): T212TargetStore.Target? {
         val buySec = if (row.buyAt > 0L) row.buyAt / 1000L else row.entryTs
-        val ranges = StrategyLabRunner.rangesBefore(ctx, row.ns, row.symbol, buySec) ?: return null
         val pre = redo || row.buyAt <= 0L || row.buyAt < since
-        // Held from before: whether it is already past the target decides what
-        // happens, so it waits for a price rather than guess.
-        val pxNow = if (pre) (MarkToMarket.priceNow(ctx, row.ns, row.symbol) ?: return null) else null
-        val plan = WeekTarget.plan(ranges, row.liveEntryPrice, pxNow, pre,
-            WeekTarget.minGapFor(Spaces.baseOf(row.ns)))
+        val us = Spaces.baseOf(row.ns) == "us"
+        val watcher = row.ns == com.signalscope.app.data.ManualWatchStore.nsFor("us")
+        val plan = if (us) {
+            // US: an algo's buy keeps none — no prices needed to say so.
+            val bars = if (!watcher) null else (dailyBarsBefore(row.symbol, buySec) ?: return null)
+            val pxNow = if (pre && watcher) (MarkToMarket.priceNow(ctx, row.ns, row.symbol) ?: return null) else null
+            WeekTarget.usPlan(watcher, bars, row.liveEntryPrice, pxNow, pre)
+        } else {
+            val ranges = StrategyLabRunner.rangesBefore(ctx, row.ns, row.symbol, buySec) ?: return null
+            // Held from before: whether it is already past the target decides what
+            // happens, so it waits for a price rather than guess.
+            val pxNow = if (pre) (MarkToMarket.priceNow(ctx, row.ns, row.symbol) ?: return null) else null
+            WeekTarget.plan(ranges, row.liveEntryPrice, pxNow, pre,
+                WeekTarget.minGapFor(Spaces.baseOf(row.ns)))
+        }
         Log.i(TAG, "[${row.ns}] ${row.symbol} target " +
-            (if (plan.ok) "${plan.price} (${plan.label} before the buy; paid ${row.liveEntryPrice})"
+            (if (plan.ok) "${plan.price} (${plan.label}${if (plan.detail.isEmpty()) "" else ": ${plan.detail}"} " +
+                "before the buy; paid ${row.liveEntryPrice})"
              else "none — ${plan.why}") + (if (redo) " [decided again under the range rule]" else ""))
         return T212TargetStore.update(ctx, row.ns, row.paperTradeId, {
             T212TargetStore.Target(ns = row.ns, paperTradeId = row.paperTradeId,
                 symbol = row.symbol.uppercase(), ticker = row.t212Ticker, createdAt = now)
         }) {
             it.copy(price = plan.price, paid = row.liveEntryPrice, note = plan.why.ifBlank { null },
-                kind = plan.kind.ifBlank { null }, rule = WeekTarget.RULE)
+                kind = plan.kind.ifBlank { null }, rule = if (us) WeekTarget.RULE_US else WeekTarget.RULE)
         }
+    }
+
+    /**
+     * A US stock's daily bars that had closed before the buy — New York's
+     * calendar, so a buy during a session never counts that session's own bar.
+     * From the screener's daily cache, so a stock it already ranked today costs
+     * no download. Null when they could not be fetched (decided on a later pass).
+     */
+    private fun dailyBarsBefore(symbol: String, buySec: Long): List<com.signalscope.app.screener.DailyBar>? {
+        val sym = symbol.uppercase()
+        val bars = try {
+            com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars("US", listOf(sym), minBars = 60).first[sym]
+        } catch (e: Exception) { null } ?: return null
+        val zone = MarketHours.zoneOf("us") ?: java.time.ZoneId.of("America/New_York")
+        val buyDay = java.time.Instant.ofEpochSecond(buySec).atZone(zone).toLocalDate()
+        return bars.filter { it.date.isBefore(buyDay) }
     }
 
     /**
@@ -398,9 +434,15 @@ object T212WeekTargets {
             // them — one you set yourself in the broker's app. Only one sell can
             // wait per share, so yours stays and this waits behind it.
             val held = err.contains("selling-equity-not-owned", true) || err.contains("owned: 0", true)
+            // Refused with the market shut: not an error to show, just a broker that
+            // wants the session — tried again on the first check after the open.
+            val shut = !held && !MarketHours.isRegularSession(Spaces.baseOf(row.ns), now)
             T212TargetStore.update(ctx, row.ns, row.paperTradeId, { t }) {
-                it.copy(retryAfter = now + REFUSED_RETRY_MS,
-                    note = if (held)
+                it.copy(retryAfter = if (shut) MarketHours.nextOpenMs(Spaces.baseOf(row.ns), now) ?: (now + REFUSED_RETRY_MS)
+                                     else now + REFUSED_RETRY_MS,
+                    note = if (shut)
+                        "Trading 212 would not take it while the market is shut — it goes in after the open"
+                    else if (held)
                         "another sell order on this stock already holds the shares at Trading 212 " +
                             "(one you set yourself?) — only one can wait, so yours stays and this goes in " +
                             "if that one is cancelled. Checked again every hour"
@@ -555,9 +597,6 @@ object T212WeekTargets {
         Log.w(TAG, "[$ns] ${row.symbol} target set by hand at $px (was ${existing?.price ?: 0.0})")
         val who = ownerLabel(ctx, ns)
         val want = ownQty(row)
-        if (!MarketHours.isRegularSession(Spaces.baseOf(ns), now))
-            return "Target for ${row.symbol} set at ${"%.2f".format(px)}. The market is closed, so it goes in at " +
-                "Trading 212 on the first check after the open. When it sells, the sale is booked to $who."
         if (want > 0.0 && place(ctx, client, row, t, want, now))
             return "Target for ${row.symbol} set at ${"%.2f".format(px)} and waiting at Trading 212. When it sells, " +
                 "the sale is booked to $who like any of its exits."

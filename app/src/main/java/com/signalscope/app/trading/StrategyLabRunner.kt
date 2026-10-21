@@ -204,6 +204,29 @@ object StrategyLabRunner {
         }
     }
 
+    /** How long one algo's download serves the others: one pass across them all. */
+    private const val SHARED_FEED_MS = 60_000L
+
+    /**
+     * [fetchCandlesFor], shared between algos (see [SharedFeed]). Keyed by the
+     * MARKET, not the algo, and by everything that shapes the series — so two
+     * algos share a download only when each would have fetched the same one.
+     * The Indian source is in the key: switching Kite on must not be answered
+     * with bars Yahoo delivered a moment earlier.
+     */
+    private fun fetchShared(
+        ctx: Context, ns: String, symbol: String, exchange: String, plan: FeedPlan.Plan
+    ): YahooFinanceClient.CandleResult {
+        val base = Spaces.baseOf(ns)
+        val source = if (base == "in") com.signalscope.app.data.ConfigManager(ctx).indiaCandleSource.lowercase() else ""
+        val key = listOf(base, symbol.uppercase(), exchange.uppercase(), plan.interval, plan.range,
+            plan.targetBars, plan.capCalendarDays, source).joinToString("|")
+        return SharedFeed.get(key, SHARED_FEED_MS,
+            keep = { r: YahooFinanceClient.CandleResult -> r is YahooFinanceClient.CandleResult.Success }) {
+            fetchCandlesFor(ctx, ns, symbol, exchange, plan)
+        }
+    }
+
     /** Kick a background pass over all enrolled symbols. No-ops if disabled,
      *  nothing to do, or a pass is already in flight for this namespace. */
     fun runAll(ctx: Context, minIntervalMs: Long = 0L, ns: String = "us", onDone: (() -> Unit)? = null) {
@@ -253,10 +276,20 @@ object StrategyLabRunner {
                     try {
                         val anyOpen = com.signalscope.app.data.T212LiveStore.load(ctx)
                             .trades.any { it.status == "OPEN" && it.qty > 0.0 }
-                        val lastAt = T212PositionAudit.last(ctx).checkedAt
-                        if (anyOpen && System.currentTimeMillis() - lastAt > POSITION_AUDIT_MS) {
+                        val prev = T212PositionAudit.last(ctx)
+                        // A shortfall seen once, or a read that failed, is looked at
+                        // again within a quarter of an hour rather than an hour.
+                        val every = if (!prev.firstShort.isNullOrEmpty() || (prev.checkedAt > 0L && !prev.ok))
+                            T212PositionAudit.RECHECK_MS else POSITION_AUDIT_MS
+                        if (anyOpen && System.currentTimeMillis() - prev.checkedAt > every) {
                             val rep = T212PositionAudit.run(ctx)
-                            if (rep.hasCritical) LabNotifier.positionDrift(ctx, rep.critical.size)
+                            // Told only once it has been seen on two checks in a row —
+                            // see [T212PositionAudit.Report.confirmedCritical].
+                            // Nor while a shortfall is being taken off as a sale of
+                            // yours — see [T212HandSales.absorbPartial].
+                            val absorbing = T212HandSales.pendingPartial(ctx)
+                            val alarm = rep.confirmedCritical.filter { it.ticker.uppercase() !in absorbing }
+                            if (alarm.isNotEmpty()) LabNotifier.positionDrift(ctx, alarm.size)
                         }
                     } catch (e: Exception) { Log.w(TAG, "position audit failed", e) }
                 }
@@ -385,7 +418,7 @@ object StrategyLabRunner {
                 return
             }
         }
-        val res = fetchCandlesFor(ctx, ns, symbol, exchange, plan)
+        val res = fetchShared(ctx, ns, symbol, exchange, plan)
         if (res !is YahooFinanceClient.CandleResult.Success) {
             Log.w(TAG, "candle fetch for $symbol: ${res::class.simpleName}")
             StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
@@ -458,8 +491,8 @@ object StrategyLabRunner {
         //
         // 0 on bootstrap (no baseline stamped yet), which is exactly the historical
         // behaviour — and that pass records nothing anyway.
-        val baselineTs = StrategyLabStore.baselineFor(ctx, sym, ns)
-        val run = StrategyLabEngine.runLiveClosed(symbol, candles, cfg, barSec, baselineTs)
+        var baselineTs = StrategyLabStore.baselineFor(ctx, sym, ns)
+        var run = StrategyLabEngine.runLiveClosed(symbol, candles, cfg, barSec, baselineTs)
         if (run.error != null) {
             Log.w(TAG, "engine $symbol: ${run.error}")
             StrategyLabStore.setSymbolStatus(ctx, StrategyLabStore.SymbolStatus(
@@ -468,8 +501,8 @@ object StrategyLabRunner {
         }
 
         val st0 = StrategyLabStore.load(ctx, ns)
-        val prevWm = st0.watermarks[sym] ?: 0L
-        val bootstrap = prevWm == 0L
+        var prevWm = st0.watermarks[sym] ?: 0L
+        var bootstrap = prevWm == 0L
         val lastBarTs = candles.last().timestamp
         // Watermark + baseline must advance on the ENGINE's bar clock (the
         // resampled exit timeframe that entryTs/exitTs are stamped on), NOT the
@@ -484,6 +517,28 @@ object StrategyLabRunner {
         if (!bootstrap && wmBar < prevWm) {
             Log.w(TAG, "[$ns] $sym: engine's newest bar $wmBar is before the watermark $prevWm — ignored")
             return
+        }
+
+        // ── THE 50-DAY HOLD FOLLOWS ITS CURRENT SIGNAL FROM THE FIRST PASS ─────
+        //
+        // The flat start below waits for a FRESH entry, which suits an event (a
+        // MACD flip happens on one bar). The hold rule is a state: "the latest
+        // completed close is above its average" is either true now or not, and its
+        // spec says a first run follows it. Waiting for a fresh cross instead would
+        // sit out a whole uptrend after switching on.
+        //
+        // So tracking starts AT the newest completed day and that day is processed
+        // in this same pass: above the average means a buy now — paper, and real if
+        // the algo is armed — below means flat until a close above. The same newest-
+        // day-only and freshness rules still guard the real order.
+        if (bootstrap && cfg.isSmaHold) {
+            StrategyLabStore.applyRunResult(ctx, sym, emptyList(), emptyList(),
+                (wmBar - 1L).coerceAtLeast(0L), ns, baseline = wmBar)
+            baselineTs = wmBar
+            prevWm = (wmBar - 1L).coerceAtLeast(0L)
+            bootstrap = false
+            run = StrategyLabEngine.runLiveClosed(symbol, candles, cfg, barSec, wmBar)
+            Log.i(TAG, "[$ns] $sym 50-day hold: tracking starts on the newest completed day, following its signal now")
         }
 
         if (bootstrap) {
@@ -599,7 +654,14 @@ object StrategyLabRunner {
                 // at today's price. Exits are deliberately NOT gated: selling on
                 // stale data is still risk-reducing (same asymmetry as the orphan
                 // sweep). Threshold = 3 source bars, lenient enough for Doze jitter.
-                val dataFresh = health.lastBarAgeMin <= STALE_ENTRY_MAX_MIN
+                //
+                // A DAILY RULE IS FRESH ALL DAY. Its decision stands on yesterday's
+                // close until today's closes, so a pass that slept through 00:00 UTC
+                // must still act on waking (spec §7) — the 45-minute test would turn
+                // every late wake into a paper-only position. What still has to hold
+                // is that the newest completed day IS the latest one.
+                val dataFresh = if (cfg.isSmaHold) health.lastBarAgeMin < frameSec / 60L
+                                else health.lastBarAgeMin <= STALE_ENTRY_MAX_MIN
                 if (!dataFresh) Log.w(TAG, "$sym feed stale (${health.lastBarAgeMin}m) — live entries suppressed this tick")
                 // Trade notifications: without them the user is blind to opens and
                 // closes unless the app happens to be on screen. Paper channel is
@@ -850,12 +912,17 @@ object StrategyLabRunner {
         // the row reflects a TRACKED position only.
         val lastTrade = run.trades.lastOrNull()
         val baselineForNote = StrategyLabStore.baselineFor(ctx, sym, ns)
-        val inPos = !bootstrap && lastTrade?.status == "OPEN" &&
+        // The hold reads the BOOK: its first position opens ON the baseline day,
+        // and a position closed by hand is out of the book while the rule is still long.
+        val holdHeld = cfg.isSmaHold && StrategyLabStore.load(ctx, ns).trades
+            .any { it.symbol.equals(sym, true) && it.status == "OPEN" }
+        val inPos = if (cfg.isSmaHold) holdHeld else !bootstrap && lastTrade?.status == "OPEN" &&
             lastTrade.entryTs > baselineForNote
         val untrackedOpen = !bootstrap && lastTrade?.status == "OPEN" &&
             lastTrade.entryTs <= baselineForNote
         val gated = run.gates.values.sum()
         val baseNote = when {
+            cfg.isSmaHold -> holdNote(run.holdLast, holdHeld, lastTrade?.status == "OPEN")
             bootstrap -> "tracking from now · flat start (entries from here on)"
             inPos -> "in position"
             // The strategy would be long, but that entry predates enrollment —
@@ -875,6 +942,25 @@ object StrategyLabRunner {
             baseSec = run.baseSec, entryTfSec = run.entryTfSec, exitTfSec = run.exitTfSec,
             entryBars = run.entryBars, warmBars = run.warmBars,
             firstTradableTs = run.firstTradableTs), ns)
+    }
+
+    /**
+     * The 50-day hold's line for one coin: where the newest completed close stands
+     * against the average, and what the rule does next. [engineLong] is the rule's
+     * own state; [held] is the book's — they differ only after a sale by hand,
+     * when the rule waits for a close below and back above before buying again.
+     */
+    internal fun holdNote(r: StrategyLabEngine.HoldReading?, held: Boolean, engineLong: Boolean): String {
+        if (r == null) return "no completed day yet"
+        if (!r.warm) return "warming up — ${r.closes} of ${r.needed} daily closes"
+        val vs = "close ${StrategyLabEngine.holdPx(r.close)} vs SMA${r.needed} ${StrategyLabEngine.holdPx(r.sma)}"
+        return when {
+            r.above && held -> "$vs · above ✓ — held; sells on a daily close at or below the line"
+            r.above && engineLong -> "$vs · above ✓ — not held (sold by hand); buys again only after a close below and back above"
+            r.above -> "$vs · above ✓ — flat"
+            held -> "$vs · below ✗ — sell due"
+            else -> "$vs · below ✗ — out; buys on the first daily close above"
+        }
     }
 
     // ── Yahoo data-quality guard ────────────────────────────────────────────

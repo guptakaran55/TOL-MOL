@@ -1116,7 +1116,9 @@ object ManualEntryWatcher {
          * it reads as done, and the user stops watching a thing that may never
          * happen.
          */
-        val immediate: Boolean = false
+        val immediate: Boolean = false,
+        /** More was added to a position already bought on this signal — see [topUp]. */
+        val toppedUp: Boolean = false
     )
 
     /**
@@ -1236,7 +1238,15 @@ object ManualEntryWatcher {
             symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
             requestedCash = cash, t212Ticker = ticker, createdAt = System.currentTimeMillis(),
             status = "PENDING", note = fresh.entryReason, forced = forced))
-            ?.let { return alreadyOnSignal(sym, it) }
+            ?.let { standing ->
+                // ALREADY BOUGHT ON THIS SIGNAL: add to that position instead of
+                // refusing. A buy still being placed is still refused — two
+                // ladders at once on one stock is the double tap the claim stops.
+                return if (standing.status == "OPEN" && standing.filledQty > 0.0)
+                    topUp(ctx, base, sym, standing, cash, ticker, yahooSym, t212Space,
+                        fresh.lastClose, config, onProgress)
+                else alreadyOnSignal(sym, standing)
+            }
 
         val r = try {
             PatientExecutor.buy(config, ticker, yahooSym, t212Space, cash, fresh.lastClose) { p ->
@@ -1639,6 +1649,102 @@ object ManualEntryWatcher {
      * a triggered limit fills wherever the book was at that instant — and every
      * exit rule measures from this number.
      */
+    /** One top-up at a time per stock: a second tap mid-ladder must not run a second ladder. */
+    private val topUpBusy = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /**
+     * MORE OF A STOCK ALREADY BOUGHT ON THE SAME SIGNAL, ADDED TO THAT POSITION.
+     *
+     * The watchlist files a position under the bar its buy was decided on, so a
+     * second buy decided on the same bar used to be refused with "use the broker's
+     * app" (S92, 20 Oct 2026) — the opposite of working from the app. Now it
+     * becomes a TOP-UP: one position, more shares, the price averaged over all of
+     * them, the same stop and exit rules, and its target resized to the new size
+     * at the next check (the target pass replaces an order whose size is wrong).
+     *
+     * The first buy must have been read back from Trading 212 first: an average
+     * needs to know what the first shares cost. Those figures are then frozen on
+     * both records (see LiveTrade.settledBuyIds and Entry.settledIds), so an old
+     * order scrolling out of the broker's history cannot shrink the position.
+     */
+    private fun topUp(
+        ctx: Context, base: String, sym: String, standing: ManualWatchStore.Entry, cash: Double,
+        ticker: String, yahooSym: String, t212Space: String, refPrice: Double, config: ConfigManager,
+        onProgress: ((Map<String, Any?>) -> Unit)?
+    ): BuyResult {
+        val ns = ManualWatchStore.nsFor(base)
+        val id = "$sym-${standing.signalBarTs}"
+        fun entryNow() = ManualWatchStore.load(ctx, base).entries.lastOrNull {
+            it.symbol.equals(sym, true) && it.signalBarTs == standing.signalBarTs && it.status == "OPEN"
+        }
+        if (com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)?.status != "OPEN")
+            return BuyResult(false, sym, error = "Not added: the $sym position this would join is no " +
+                "longer open at Trading 212. Nothing was changed.")
+        // The first buy's fill, read back now if it has not been yet.
+        if (com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)?.buyComplete() != true ||
+            (entryNow()?.filledPrice ?: 0.0) <= 0.0) {
+            try { T212LiveMirror.reconcileFills(ctx, notifySettled = false) } catch (_: Exception) {}
+            try { reconcileFills(ctx, base) } catch (_: Exception) {}
+        }
+        val before = com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)
+        if (before == null || !before.buyComplete() || (entryNow()?.filledPrice ?: 0.0) <= 0.0)
+            return BuyResult(false, sym, error = "Not added yet: Trading 212 has not reported what the " +
+                "first $sym buy filled at, so the two cannot be combined into one average. Try again in a " +
+                "few minutes — nothing was changed.")
+        val lock = "$base|$sym"
+        if (!topUpBusy.add(lock))
+            return BuyResult(false, sym, error = "Already adding to $sym — wait for that to finish.")
+        try {
+            val r = try {
+                PatientExecutor.buy(config, ticker, yahooSym, t212Space, cash, refPrice) { p -> onProgress?.invoke(p) }
+            } catch (ex: Exception) {
+                Log.e(TAG, "[$base] $sym top-up ladder threw", ex)
+                return BuyResult(false, sym, error = ex.message ?: "order failed")
+            }
+            if (!r.ok || r.filled <= 0.0)
+                return BuyResult(false, sym, error = r.error ?: r.note.ifBlank { "nothing filled" })
+
+            // Re-read both records: a pass may have touched them while the ladder ran.
+            com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)?.let { row ->
+                val gross = (if (row.liveQtyFilled > 0.0) row.liveQtyFilled else row.qty) + row.handSoldQty
+                com.signalscope.app.data.T212LiveStore.upsert(ctx, row.copy(
+                    settledBuyIds = row.allBuyIds(), settledQty = gross,
+                    settledPriceValue = row.liveEntryPrice * gross, settledCashValue = row.liveEntryValue,
+                    buyOrderIds = row.allBuyIds() + r.orderIds,
+                    qty = row.qty + r.filled, amount = row.amount + cash))
+            }
+            entryNow()?.let { e ->
+                val gross = e.filledQty + e.soldQty
+                ManualWatchStore.upsert(ctx, base, e.copy(
+                    settledIds = e.orderIds, settledQty = gross,
+                    settledPriceValue = e.filledPrice * gross,
+                    settledAskValue = if (e.askedPrice > 0.0) e.askedPrice * gross else 0.0,
+                    settledAskQty = if (e.askedPrice > 0.0) gross else 0.0,
+                    orderIds = e.orderIds + r.orderIds,
+                    filledQty = e.filledQty + r.filled,
+                    requestedCash = e.requestedCash + cash,
+                    topUps = e.topUps + 1))
+            }
+            try { T212LiveMirror.reconcileFills(ctx, notifySettled = false) } catch (_: Exception) {}
+            try { reconcileFills(ctx, base) } catch (_: Exception) {}
+            val after = entryNow()
+            Log.w(TAG, "[$base] $sym topped up by ${r.filled} — position now ${after?.filledQty}")
+            val q = after?.filledQty ?: (standing.filledQty + r.filled)
+            // The average is only quoted once the new shares' fill has been read back.
+            val priced = com.signalscope.app.data.T212LiveStore.get(ctx, id, ns)?.buyComplete() == true
+            val avg = if (priced) after?.filledPrice ?: 0.0 else 0.0
+            return BuyResult(true, sym, r.filled, avg, standing.signalPrice, toppedUp = true, immediate = true,
+                note = "Added ${"%.4f".format(r.filled)} to your $sym position — now " +
+                    "${"%.4f".format(q)} shares as one position" +
+                    (if (avg > 0.0) " at an average of ${"%.2f".format(avg)}"
+                     else " (the average price fills in once Trading 212 reports the new fill)") +
+                    ". The same stop and exit rules apply, and its target is resized to the new size " +
+                    "at the next check.")
+        } finally {
+            topUpBusy.remove(lock)
+        }
+    }
+
     /** The refusal a second buy on the same signal gets, saying what is already there. */
     private fun alreadyOnSignal(sym: String, standing: ManualWatchStore.Entry): BuyResult {
         val what = when {
@@ -1650,7 +1756,9 @@ object ManualEntryWatcher {
         }
         Log.w(TAG, "$sym: second buy on the same signal refused — $what")
         return BuyResult(false, sym, error = "Not bought again: on this signal for $sym, $what. " +
-            "Nothing was changed. To add more, wait for the next signal or use the broker's app.")
+            "Nothing was changed." + (if (standing.status == "PENDING")
+                " Once that buy has finished, tap again to add more — it joins the same position."
+                else " A new buy can follow on the next price bar."))
     }
 
     /**
@@ -2723,27 +2831,34 @@ object ManualEntryWatcher {
         if (fills.isEmpty()) return 0
         var fixed = 0
         for (e in pending) {
+            // A topped-up position reads only its newer orders and adds the frozen
+            // figures of the earlier ones — see [ManualWatchStore.Entry.settledIds].
+            val settled = e.settledIds.orEmpty().toHashSet()
             val ids = e.orderIds.toHashSet()
-            val mine = fills.filter { it.orderId in ids && it.side.equals("BUY", true) && it.fillPrice > 0.0 }
+            val mine = fills.filter { it.orderId in ids && it.orderId !in settled &&
+                it.side.equals("BUY", true) && it.fillPrice > 0.0 }
             if (mine.isEmpty()) continue
-            val qty = mine.sumOf { it.filledQuantity }
-            if (qty <= 0.0) continue
+            val bought = mine.sumOf { it.filledQuantity } + e.settledQty
+            if (bought <= 0.0) continue
+            // Less what you sold yourself — see [ManualWatchStore.Entry.soldQty].
+            val qty = (bought - e.soldQty).coerceAtLeast(0.0)
             // INSTRUMENT-currency only. filledValue is the cash that left the
             // ACCOUNT, so on a cross-currency trade (a euro account buying US
             // stocks) dividing it by a share count gives a per-share price in the
             // wrong currency — about 14% low, and it is this number the real stop
             // is measured from.
-            val value = mine.sumOf { it.fillPrice * it.filledQuantity }
-            val avg = if (value > 0.0) value / qty else mine.first().fillPrice
+            val value = mine.sumOf { it.fillPrice * it.filledQuantity } + e.settledPriceValue
+            // Over everything BOUGHT — a sale by you changes how many, not what they cost.
+            val avg = if (value > 0.0) value / bought else mine.first().fillPrice
             // What the ladder ASKED, weighted the same way, so asked-vs-got is a
             // like-for-like comparison. Rungs with no recorded limit are excluded
             // rather than counted as zero — a missing limit would otherwise drag
             // the average down and manufacture price improvement that never
             // happened.
             val withLimit = mine.filter { it.limitPrice > 0.0 }
-            val askQty = withLimit.sumOf { it.filledQuantity }
+            val askQty = withLimit.sumOf { it.filledQuantity } + e.settledAskQty
             val asked = if (askQty > 0.0)
-                withLimit.sumOf { it.limitPrice * it.filledQuantity } / askQty else 0.0
+                (withLimit.sumOf { it.limitPrice * it.filledQuantity } + e.settledAskValue) / askQty else 0.0
             // Only write when something actually changed, so a re-derivation that
             // agrees with what is stored does not churn the file every pass.
             val same = kotlin.math.abs(e.filledPrice - avg) < 1e-9 &&

@@ -69,8 +69,20 @@ object StrategyLabEngine {
         val entryBars: Int = 0,
         val warmBars: Int = 0,
         val firstTradableTs: Long = 0L,
-        val error: String? = null
+        val error: String? = null,
+        /** The 50-day hold only: the reading on the newest completed day. */
+        val holdLast: HoldReading? = null
     )
+
+    /**
+     * What the hold rule saw on one completed day. [sma] is NaN while fewer than
+     * [needed] closes exist ([closes] says how many there are).
+     */
+    data class HoldReading(val barTs: Long, val close: Double, val sma: Double,
+                           val closes: Int, val needed: Int) {
+        val warm: Boolean get() = !sma.isNaN()
+        val above: Boolean get() = warm && close > sma
+    }
 
     // ── EMA (recursive, adjust=false), seeded e[0]=x[0]; span>=2 ──
     private fun ema(x: DoubleArray, span: Int): DoubleArray {
@@ -596,6 +608,9 @@ object StrategyLabEngine {
         symbol: String, rawIn: List<CandleData>, cfg: StrategyLabConfig, completeThroughSec: Long?,
         entriesFromTs: Long = 0L
     ): RunResult {
+        // Before the split repair: coins have no corporate actions, and a real
+        // -35% crypto day (BTC, 12 Mar 2020) would be "repaired" into history.
+        if (cfg.isSmaHold) return runHold(symbol, rawIn, cfg, completeThroughSec, entriesFromTs)
         val raw = backAdjust(rawIn)
         val base = baseGranularitySec(raw)
         val entryTf = clampTf(timeframeSeconds(cfg.resample), base)
@@ -764,7 +779,7 @@ object StrategyLabEngine {
         entryPrice: Double,
         entryTs: Long,
         sourcePeriodSec: Long = 15 * 60L
-    ): AdoptedExit = try {
+    ): AdoptedExit = if (cfg.isSmaHold) adoptedHold(rawIn, cfg, entryPrice, entryTs, sourcePeriodSec) else try {
         // Same repair as the replay path — a hand-bought position spanning a split must not be
         // judged against a corrupted series either. NOTE the asymmetry this creates deliberately:
         // entryPrice is the REAL fill in unadjusted money, while bars before an action are
@@ -890,6 +905,184 @@ object StrategyLabEngine {
         }
         return AdoptedExit(true, false, "", fineTs[fine.size - 1], fineClose[fine.size - 1],
             fine.size - 1 - entryFineIdx, known, if (known) "" else "entry predates retained history")
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // THE 50-DAY HOLD (strategy "smaHold")
+    // ════════════════════════════════════════════════════════════════════════
+    // Hold while a day's close is above the simple average of the last N
+    // completed closes, that day's included; out on a close at or below it.
+    //
+    // A STATE, NOT AN EVENT: flat-and-above buys, held-and-at-or-below sells. That
+    // is also what makes a missed day self-correcting — the next completed close
+    // says where the position should be, whatever was missed before it.
+    //
+    // Only COMPLETED UTC days count; the still-forming day never does. Fills at the
+    // deciding close, as everywhere in this engine — crypto trades through
+    // midnight, so the next day's open is that same price.
+    //
+    // Deliberately absent, each because the desktop tests found it worse: an EMA,
+    // an intraday check of the live price, a 50-BAR average on intraday candles, a
+    // stop or a target, a buffer or confirmation delay around the line.
+    // ════════════════════════════════════════════════════════════════════════
+
+    private const val DAY_SEC = 86_400L
+
+    /** Complete UTC days from any source grain — 1d klines pass through unchanged. */
+    private fun holdDays(raw: List<CandleData>, completeThroughSec: Long?): List<CandleData> =
+        resample(raw, DAY_SEC, completeThroughSec, 0L)
+
+    /**
+     * Simple average of the [len] closes ending at each index; NaN before that.
+     * Summed afresh per window, oldest first, so no running-sum drift can move
+     * a close that sits right on the line to the other side of it.
+     */
+    internal fun holdSma(close: DoubleArray, len: Int): DoubleArray = DoubleArray(close.size) { i ->
+        if (i < len - 1) NaN else {
+            var s = 0.0
+            for (k in i - len + 1..i) s += close[k]
+            s / len
+        }
+    }
+
+    /** A price at a precision that suits it — DOGE needs more than BTC. Always a dot. */
+    internal fun holdPx(v: Double): String = String.format(java.util.Locale.US,
+        when { v >= 10.0 -> "%.2f"; v >= 0.1 -> "%.4f"; else -> "%.6f" }, v)
+
+    internal fun holdEntryReason(len: Int, close: Double, sma: Double) =
+        "close above SMA$len (${holdPx(close)} vs ${holdPx(sma)})"
+    internal fun holdExitReason(len: Int, close: Double, sma: Double) =
+        "close below SMA$len (${holdPx(close)} vs ${holdPx(sma)})"
+
+    private fun runHold(
+        symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
+        completeThroughSec: Long?, entriesFromTs: Long
+    ): RunResult {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val days = holdDays(raw, completeThroughSec)
+        val n = days.size
+        val close = DoubleArray(n) { days[it].close }
+        val ts = LongArray(n) { days[it].timestamp }
+        val sma = holdSma(close, len)
+        val trades = ArrayList<Trade>()
+        var signals = 0
+        var inTrade = false; var entryIdx = -1; var entryPrice = 0.0; var entryReason = ""
+        for (i in (len - 1) until n) {
+            val c = close[i]; val s = sma[i]
+            if (inTrade) {
+                if (c <= s) {
+                    val pct = pctReturn(entryPrice, c)
+                    trades.add(Trade(symbol, "LONG", "CLOSED", ts[entryIdx], entryPrice, entryReason,
+                        ts[i], c, holdExitReason(len, c, s), pct, cfg.notional * pct / 100.0, i - entryIdx))
+                    inTrade = false
+                }
+                continue
+            }
+            if (c <= s) continue
+            // FRESH-START BOUNDARY, as in the MACD loops. Being a state, the rule
+            // simply enters on the first eligible day that is above the line.
+            if (entriesFromTs > 0L && ts[i] < entriesFromTs) continue
+            signals++
+            inTrade = true; entryIdx = i; entryPrice = c; entryReason = holdEntryReason(len, c, s)
+        }
+        var openCount = 0
+        if (inTrade) {
+            val last = n - 1; val pct = pctReturn(entryPrice, close[last]); openCount = 1
+            trades.add(Trade(symbol, "LONG", "OPEN", ts[entryIdx], entryPrice, entryReason, null, null,
+                "mark-to-market", pct, cfg.notional * pct / 100.0, last - entryIdx))
+        }
+        return RunResult(symbol, trades, signals, emptyMap(), openCount, n,
+            lastBarTs = if (n > 0) ts[n - 1] else 0L,
+            baseSec = baseGranularitySec(raw), entryTfSec = DAY_SEC, exitTfSec = DAY_SEC,
+            entryBars = n, warmBars = len - 1,
+            firstTradableTs = if (n >= len) ts[len - 1] else 0L,
+            holdLast = if (n > 0) HoldReading(ts[n - 1], close[n - 1], sma[n - 1], n, len) else null)
+    }
+
+    /** [adoptedExit] for the hold: the first completed day after the entry that closes at or below the average. */
+    private fun adoptedHold(
+        raw: List<CandleData>, cfg: StrategyLabConfig, entryPrice: Double, entryTs: Long, sourcePeriodSec: Long
+    ): AdoptedExit = try {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val days = holdDays(raw, raw.maxOfOrNull { it.timestamp + sourcePeriodSec })
+        if (entryPrice <= 0.0 || days.size < len) AdoptedExit(false, note = "fewer than $len daily closes")
+        else {
+            val close = DoubleArray(days.size) { days[it].close }
+            val sma = holdSma(close, len)
+            var entryIdx = -1
+            for (k in days.indices) { if (days[k].timestamp <= entryTs) entryIdx = k else break }
+            // This rule reads nothing from the entry day, so an entry older than the
+            // retained days loses nothing — judged from the first day held.
+            val from = maxOf(entryIdx, 0)
+            var hit: AdoptedExit? = null
+            for (i in maxOf(entryIdx + 1, len - 1) until days.size) {
+                if (close[i] <= sma[i]) {
+                    hit = AdoptedExit(true, true, holdExitReason(len, close[i], sma[i]),
+                        days[i].timestamp, close[i], i - from)
+                    break
+                }
+            }
+            hit ?: AdoptedExit(true, false, "", days.last().timestamp, close.last(), days.size - 1 - from)
+        }
+    } catch (e: Exception) {
+        AdoptedExit(false, note = e.message ?: "adopted exit check failed")
+    }
+
+    /** [reviewPayload] for the hold: daily candles, the average drawn over them, one check per side. */
+    private fun holdReview(
+        symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
+        sourcePeriodSec: Long, maxBars: Int, entriesFromTs: Long
+    ): ReviewPayload = try {
+        val len = maxOf(2, cfg.holdSmaLength)
+        val complete = raw.maxOfOrNull { it.timestamp + sourcePeriodSec } ?: 0L
+        val days = holdDays(raw, complete)
+        if (days.size < 5) ReviewPayload(symbol, "not enough daily bars to review")
+        else {
+            val close = DoubleArray(days.size) { days[it].close }
+            val sma = holdSma(close, len)
+            // Replayed the way the live algo runs it — see the MACD review above.
+            fun replay(from: Long) = applySlippage(runHold(symbol, raw, cfg, complete, from), cfg).trades
+            val free = replay(0L)
+            val trades = if (entriesFromTs <= 0L) free
+                else free.filter { it.status == "CLOSED" && (it.exitTs ?: Long.MAX_VALUE) < entriesFromTs } +
+                    replay(entriesFromTs)
+            val entryAt = trades.associateBy { it.entryTs }
+            val exitAt = trades.filter { it.exitTs != null }.associateBy { it.exitTs!! }
+            val out = ArrayList<BarReview>()
+            for (i in maxOf(0, days.size - maxBars) until days.size) {
+                val d = days[i]; val c = close[i]; val s = sma[i]; val warm = !s.isNaN()
+                val above = warm && c > s
+                val pos = trades.firstOrNull { tr ->
+                    tr.entryTs <= d.timestamp && (tr.status == "OPEN" || (tr.exitTs ?: Long.MAX_VALUE) >= d.timestamp)
+                }
+                val vs = if (warm) " (${holdPx(c)} vs ${holdPx(s)})" else ""
+                val enVerdict = when {
+                    !warm -> "still warming up (${i + 1} of $len daily closes)"
+                    above -> "close above SMA$len — in the market (a flat book buys)"
+                    else -> "close at or below SMA$len — out of the market"
+                }
+                val exFires = pos != null && warm && !above
+                val exVerdict = when {
+                    pos == null -> "no open position at this bar"
+                    exFires -> "EXIT fires: close below SMA$len"
+                    else -> "no exit — position holds"
+                }
+                out.add(BarReview(d.timestamp, d.open, d.high, d.low, c, null, null, null, null,
+                    entryMarker = if (entryAt.containsKey(d.timestamp)) 1 else 0,
+                    exitMarker = exitAt[d.timestamp]?.let { if (it.pnlNotional > 0) 1 else 2 } ?: 0,
+                    entryCore = listOf(CheckRow(above, if (warm) "close above SMA$len$vs"
+                        else "SMA$len not formed yet (${i + 1} of $len daily closes)")),
+                    entryRescue = emptyList(), entryGates = emptyList(), entryModeAny = false,
+                    entryVerdict = enVerdict, entryFires = above,
+                    exitInd = listOf(CheckRow(warm && !above, "close at or below SMA$len$vs")),
+                    exitHard = emptyList(), exitDist = null,
+                    exitVerdict = exVerdict, exitFires = exFires, exitHasPos = pos != null,
+                    level = if (warm) s else null))
+            }
+            ReviewPayload(symbol, null, out, trades, "1D", "1D")
+        }
+    } catch (e: Exception) {
+        ReviewPayload(symbol, e.message ?: "review failed")
     }
 
     // ── single-timeframe (exitBars == "same") ──
@@ -1060,7 +1253,9 @@ object StrategyLabEngine {
         val entryCore: List<CheckRow>, val entryRescue: List<CheckRow>, val entryGates: List<CheckRow>,
         val entryModeAny: Boolean, val entryVerdict: String, val entryFires: Boolean,
         val exitInd: List<CheckRow>, val exitHard: List<CheckRow>, val exitDist: CheckRow?,
-        val exitVerdict: String, val exitFires: Boolean, val exitHasPos: Boolean
+        val exitVerdict: String, val exitFires: Boolean, val exitHasPos: Boolean,
+        /** A price-scale line drawn over the candles — the 50-day hold's average. */
+        val level: Double? = null
     )
 
     data class ReviewPayload(
@@ -1167,6 +1362,7 @@ object StrategyLabEngine {
     fun reviewPayload(symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
                       sourcePeriodSec: Long = 15 * 60L, maxBars: Int = 320,
                       entriesFromTs: Long = 0L): ReviewPayload {
+        if (cfg.isSmaHold) return holdReview(symbol, raw, cfg, sourcePeriodSec, maxBars, entriesFromTs)
         return try {
             // Same resample clamp as the engine's dispatch(), so the chart's bars
             // and the trades drawn on them are built the identical way.

@@ -60,11 +60,14 @@ object BinanceLiveMirror {
         //
         // Seats also govern how much is at risk AT ONCE: one seat means one order
         // may commit the whole budget, which is correct and worth knowing.
-        val seats = if (b != null)
-            com.signalscope.app.data.MacdGateStore.effectiveHoldN(
-                com.signalscope.app.data.MacdGateStore.load(ctx, ns),
-                b.symbols.size.coerceAtLeast(1))
-        else 1
+        //
+        // WITHOUT THE GATE, ONE SEAT PER COIN. A Manual algo has no gate, but its
+        // never-armed gate state still says "rank, hold 5" — so eight coins each
+        // ordered a fifth of the budget, 1.6 times the money allocated.
+        val gate = com.signalscope.app.data.MacdGateStore.load(ctx, ns)
+        val seats = if (b == null) 1
+            else if (!gate.enabled) b.symbols.size.coerceAtLeast(1)
+            else com.signalscope.app.data.MacdGateStore.effectiveHoldN(gate, b.symbols.size.coerceAtLeast(1))
         val per = if (b != null && b.liveBudget > 0.0)
             b.liveBudget / seats.coerceAtLeast(1) else 0.0
         return LiveCfg(

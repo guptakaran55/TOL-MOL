@@ -49,9 +49,21 @@ object WeekTarget {
      *  currency charge, so a smaller gain is still a real one. */
     const val MIN_GAP_PCT_FEE_FREE = 0.5
 
+    /**
+     * US shares on Trading 212 pay a currency conversion on the buy and on the
+     * sale. Tested on Nasdaq-100 2016–21 and 2022–26 (daily bars, 4% stop,
+     * 20-day limit, 0.36% round trip): a target under ~5% above the fill did
+     * worse than no target in both eras — the charges took most of what it
+     * booked. Closer than this, the stop and the algo's own exit do the selling.
+     */
+    const val MIN_GAP_PCT_US = 5.0
+
     /** The smallest worthwhile target for a market: "de", "us", "in"… */
-    fun minGapFor(base: String): Double =
-        if (base.equals("de", true)) MIN_GAP_PCT_FEE_FREE else MIN_GAP_PCT
+    fun minGapFor(base: String): Double = when (base.lowercase()) {
+        "de" -> MIN_GAP_PCT_FEE_FREE
+        "us" -> MIN_GAP_PCT_US
+        else -> MIN_GAP_PCT
+    }
 
     /** Trading days in the month window — the same month the watchlist's "1M" shows. */
     const val MONTH_DAYS = IntradayLevels.MONTH_DAYS
@@ -112,12 +124,16 @@ object WeekTarget {
 
     /** What to rest, or why nothing. [kind] is "week" or "month" — which rule
      *  picked the price — blank when there is none. */
-    data class Plan(val price: Double, val why: String = "", val kind: String = "") {
+    data class Plan(val price: Double, val why: String = "", val kind: String = "",
+                    /** Which level it came from, in words, for the log — "the 190.50 close of 2026-08-25". */
+                    val detail: String = "") {
         val ok: Boolean get() = price > 0.0
         /** The rule in words, for the card and the sale's reason. */
         val label: String get() = when (kind) {
             "week" -> "its 1-week high"
             "month" -> "near its 1-month high"
+            "monthpeak" -> "just under its last monthly peak"
+            "monthzone" -> "its projected monthly resistance zone"
             "manual" -> "your own price"
             else -> "its target"
         }
@@ -178,6 +194,122 @@ object WeekTarget {
             return Plan(0.0, "it was already above its target (" + "%.2f".format(px) +
                 ", " + Plan(px, kind = kind).label + ") when this rule was applied — left for you to decide")
         return Plan(px, kind = kind)
+    }
+
+    // ── US SHARES: NO SHORT TARGETS ─────────────────────────────────────────
+    // Every US round trip pays the currency conversion twice, so a target near
+    // the fill books little more than the charges. On the Nasdaq-100 test the
+    // week's high kept 0.24% a trade after costs in 2022–26 (the charges took
+    // 60% of what it made). With the 5% minimum, the last standing monthly peak
+    // kept 0.57% on week-low buys (2016–21: 1.24%) — level with the projected
+    // monthly zone (0.56% / 1.26%): the level is the one the chart shows, and it
+    // does no worse than the projection for it.
+
+    /** The rule version for US rows — decided by [usPlan], not [plan]. */
+    const val RULE_US = "us-monthpeak-v1"
+
+    /** The campaign algo's buffer: a tenth of the 14-day ATR, widened by √21 for a month. */
+    const val ZONE_ATR_FRAC = 0.1
+
+    /** How far back a peak still counts — the year the 1Y chart shows. */
+    const val PEAK_LOOKBACK_DAYS = 252
+
+    /** A month of sessions: a peak is the highest close of the month before it. */
+    const val PEAK_WINDOW_DAYS = 21
+
+    /** A close this recent is not a peak yet — it may be part of a rise still going. */
+    const val PEAK_MIN_AGE_DAYS = 5
+
+    /** A monthly peak: the day and its close. */
+    data class Peak(val date: java.time.LocalDate, val close: Double)
+
+    /**
+     * The monthly peaks the price has not closed above since, newest first —
+     * the resistance levels a 1Y chart shows above today's price.
+     *
+     * A peak is a close at least as high as every close of the month before it.
+     * "Not closed above since" keeps only levels still standing: a peak the price
+     * later rose through has turned into support, not resistance. Because each
+     * standing peak is above everything after it, the newest is the lowest — the
+     * first one a rise meets. Closes, not intraday highs, as the line chart draws.
+     */
+    fun standingPeaks(bars: List<com.signalscope.app.screener.DailyBar>): List<Peak> {
+        val c = bars.map { it.close }
+        val n = c.size
+        val out = ArrayList<Peak>()
+        var maxAfter = Double.NEGATIVE_INFINITY      // highest close after index i
+        for (i in n - 1 downTo maxOf(PEAK_WINDOW_DAYS, n - PEAK_LOOKBACK_DAYS)) {
+            if (i <= n - 1 - PEAK_MIN_AGE_DAYS && c[i] >= maxAfter &&
+                (i - PEAK_WINDOW_DAYS until i).all { c[it] <= c[i] })
+                out.add(Peak(bars[i].date, c[i]))
+            maxAfter = maxOf(maxAfter, c[i])
+        }
+        return out
+    }
+
+    /** A month's buffer under a level: the campaign algo's, a tenth of the ATR × √21. */
+    fun monthBuffer(bars: List<com.signalscope.app.screener.DailyBar>): Double? =
+        CampaignRules.atr14(bars)?.let { it * ZONE_ATR_FRAC * Math.sqrt(PEAK_WINDOW_DAYS.toDouble()) }
+
+    /**
+     * The bottom of the projected monthly resistance zone, from DAILY bars that
+     * closed before the buy — the campaign algo's own level ([CampaignRules.levels]):
+     * the 50-day average carried a month ahead on its slope, plus two standard
+     * deviations of the swings around it, less a month's ATR buffer. The bottom
+     * of the zone, because a sell parked at the top needs the stock to make it
+     * all the way. Falls back to the plain month's high when it cannot project.
+     */
+    fun monthZoneBottom(bars: List<com.signalscope.app.screener.DailyBar>): Double? {
+        val l = CampaignRules.levels(bars, ZONE_ATR_FRAC, "projected") ?: return null
+        val px = floorCent(l.monthRes - l.bufMonth)
+        return px.takeIf { it > 0.0 && it.isFinite() }
+    }
+
+    /**
+     * WHAT A US POSITION RESTS AS ITS TARGET.
+     *
+     *   An algo's buy   → none. The algos were tested selling on their own rules,
+     *                     with no take-profit; a target would cap the winners
+     *                     their results depend on.
+     *   Your watcher's  → just under the last monthly peak above the buy that the
+     *                     price has not closed above since — a month's buffer
+     *                     below that close, so it is booked on the way up rather
+     *                     than only at the very top. The nearest such peak that is
+     *                     at least [minGapPct] above the fill; one closer is a
+     *                     level a US sale would not be worth its charges at.
+     *                     Above every peak of the past year (a stock at new
+     *                     highs), the projected monthly zone stands in for one.
+     *
+     * [bars] are the daily bars that closed before the buy.
+     */
+    fun usPlan(watcher: Boolean, bars: List<com.signalscope.app.screener.DailyBar>?, paid: Double,
+               priceNow: Double?, preExisting: Boolean, minGapPct: Double = MIN_GAP_PCT_US): Plan {
+        if (!watcher) return Plan(0.0, "an algo's US buy rests no target — it sells on its own rules, as it was tested")
+        if (!(paid > 0.0)) return Plan(0.0, "the fill price is not known yet")
+        val buf = bars?.let { monthBuffer(it) }
+            ?: return Plan(0.0, "there is not enough daily history from before the buy to find its monthly levels")
+        fun clears(px: Double) = (px / paid - 1.0) * 100.0 >= minGapPct
+        val peaks = standingPeaks(bars).filter { it.close > paid }
+        val peak = peaks.sortedBy { it.close }.firstOrNull { clears(floorCent(it.close - buf)) }
+        val pick: Plan = when {
+            peak != null -> Plan(floorCent(peak.close - buf), kind = "monthpeak",
+                detail = "the " + "%.2f".format(peak.close) + " close of ${peak.date}, less a month's buffer of " + "%.2f".format(buf))
+            peaks.isEmpty() -> monthZoneBottom(bars)?.takeIf { clears(it) }?.let {
+                Plan(it, kind = "monthzone", detail = "above every monthly peak of the past year")
+            } ?: return Plan(0.0, "it is above every monthly peak of the past year, and its projected monthly zone " +
+                "is not " + "%.0f".format(minGapPct) + "% above what you paid — under what a US sale needs to be worth its charges")
+            else -> {
+                val p = peaks.maxByOrNull { it.close }!!
+                val px = floorCent(p.close - buf)
+                return Plan(0.0, "its highest monthly peak above the buy (" + "%.2f".format(p.close) + " on ${p.date}) puts the target at " +
+                    "%.2f".format(px) + ", only " + "%.1f".format((px / paid - 1.0) * 100.0) + "% above what you paid — under the " +
+                    "%.0f".format(minGapPct) + "% a US sale needs to be worth its charges")
+            }
+        }
+        if (preExisting && priceNow != null && priceNow >= pick.price)
+            return Plan(0.0, "it was already above its target (" + "%.2f".format(pick.price) + ", " + pick.label +
+                ") when this rule was applied — left for you to decide")
+        return pick
     }
 
     /** What to do with the resting order on this pass. */

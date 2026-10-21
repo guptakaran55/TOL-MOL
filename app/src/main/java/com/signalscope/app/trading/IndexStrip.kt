@@ -36,7 +36,9 @@ object IndexStrip {
     val INDICES = listOf(
         Index("dax", "DAX", "^GDAXI", "de"),
         Index("sensex", "Sensex", "^BSESN", "in"),
-        Index("ndx", "NDX", "^NDX", "us"))
+        // "NAS100", not the ticker "NDX": the Nasdaq-100 — the 100 largest Nasdaq
+        // companies, the list the US algos pick from — not the whole Nasdaq Composite.
+        Index("ndx", "NAS100", "^NDX", "us"))
 
     /**
      * The latest session of one index: its closes through the day, the close of

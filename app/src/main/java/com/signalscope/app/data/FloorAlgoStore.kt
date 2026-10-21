@@ -57,6 +57,26 @@ object FloorAlgoStore {
      *  down are followed on the side. See [com.signalscope.app.trading.ChainRules]. */
     const val KIND_CHAIN = "chain"
 
+    /**
+     * MACD turns on the MONTHLY-LOW LIST, AI-checked — the user's design (21 Oct
+     * 2026): the chain's stock picker, the MACD-turn entry and exits. Not a kind
+     * of its own: a MACD-turns algo whose [Settings.universeMode] is this. Each
+     * morning, every stock in the scan that touched its monthly low in the last
+     * [Settings.watchDays] trading days is asked the news outlook; BUY or STRONG
+     * BUY is watched for the turn as usual, anything else is watched ON THE SIDE —
+     * its turns are followed, never bought — so the record shows what the outlook
+     * was worth. Backtested without the outlook (desktop, Germany 2023-26, zero
+     * cost): +12.1%/yr against +10.2% for the same entry on the top-by-ROC list.
+     */
+    const val UNI_MONTHLY_LOW = "monthlylow"
+    /** What the "new algo" dialog sends for it; created as [KIND_MACD]. */
+    const val CREATE_LOW_MACD = "lowmacd"
+
+    /** [Member.pick] on a monthly-low list. */
+    const val PICK_OUT = "out"     // not at its monthly low lately, or no verdict yet: not watched today
+    const val PICK_YES = "yes"     // at its monthly low, outlook BUY / STRONG BUY: may take a seat
+    const val PICK_SIDE = "side"   // at its monthly low, outlook anything else: followed on the side
+
     /** Floor orders that expire at the close and are placed afresh each morning. */
     const val MODE_DAY = "day"
     /** Floor orders that wait, day after day, in the weekly support zone until
@@ -166,7 +186,15 @@ object FloorAlgoStore {
         val bothUp: Int = 0,
         val turnSec: Long = 0L,
         val turnPx: Double = 0.0,
-        val turnBlocked: Boolean = false
+        val turnBlocked: Boolean = false,
+        // Monthly-low lists only ([UNI_MONTHLY_LOW]). Nullable: lists saved before
+        // these existed read back without them (Gson leaves them null).
+        /** [PICK_OUT], [PICK_YES] or [PICK_SIDE]; null on any other list. */
+        val pick: String? = null,
+        /** The news outlook's verdict this morning. */
+        val verdict: String? = null,
+        /** Trading days since its last touch of the monthly low (0 = yesterday). */
+        val lowAgo: Int? = null
     )
 
     /** One half of the day's order on a stock. [filledSec] 0 = not filled. */
@@ -263,7 +291,18 @@ object FloorAlgoStore {
         val ret5: Double? = null,
         val dip: Double? = null,
         val done: Boolean = false,
-        val checkedMs: Long = 0L
+        val checkedMs: Long = 0L,
+        // Monthly-low lists only. Nullable for the same reason as on [Member].
+        /** The news outlook's verdict when the turn was seen. */
+        val verdict: String? = null,
+        /** Why a MISSED trade was only followed: "news outlook AVOID", "every seat taken". */
+        val followWhy: String? = null,
+        /** A followed trade, replayed through the same stop, target and time limit
+         *  as a bought one: what would have sold it, the result before charges, and
+         *  the day — so outlook-yes and outlook-no can be compared like for like. */
+        val sideExit: String? = null,
+        val sideExitPct: Double? = null,
+        val sideExitDay: String? = null
     ) {
         val entry: Double get() = if (qty > 0.0) cost / qty else 0.0
     }
@@ -485,13 +524,21 @@ object FloorAlgoStore {
     fun anyRunning(ctx: Context): Boolean = load(ctx).algos.any { hasWork(it) }
 
     fun create(ctx: Context, space: String, name: String, kind: String = KIND_FLOOR): Algo {
-        val k = if (kind == KIND_MACD || kind == KIND_CAMPAIGN || kind == KIND_CHAIN) kind else KIND_FLOOR
+        val lowMacd = kind == CREATE_LOW_MACD
+        val k = if (lowMacd) KIND_MACD
+                else if (kind == KIND_MACD || kind == KIND_CAMPAIGN || kind == KIND_CHAIN) kind else KIND_FLOOR
         // A campaign's stop starts as the watcher's own trailing stop for this
         // market — the same unit and size — or two ATRs where none is set.
         // A chain starts on the user's tested setup: seven seats, every stock past
         // the market's volume × price floor, the news outlook on.
+        // MACD turns on the monthly-low list start as the German MACD turns algo
+        // runs — 1000 in twenty seats, stop 4%, target 7%, ten days — so the two
+        // differ only in how the stocks are picked.
         val settings = if (k == KIND_CHAIN) Settings(seats = 7, capital = 1400.0, universeMode = "all",
             useNews = true, newsPerDay = 12, watchDays = 20, stopPct = 4.0, targetPct = 0.0)
+        else if (lowMacd) Settings(seats = 20, capital = 1000.0, universeMode = UNI_MONTHLY_LOW,
+            useNews = true, newsPerDay = 12, watchDays = 20, stopPct = 4.0, targetPct = 7.0, holdDays = 10,
+            trendFilter = false)
         else if (k != KIND_CAMPAIGN) Settings() else try {
             val w = ManualWatchStore.load(ctx, space)
             if (w.trailPct > 0.0) Settings(stopPct = w.trailPct, stopUnit = (w.trailUnit ?: ManualWatchStore.TrailUnit.PCT).name)
@@ -499,7 +546,7 @@ object FloorAlgoStore {
         } catch (e: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
         val a = Algo(
             id = "f" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36),
-            name = name.trim().ifBlank { when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"
+            name = name.trim().ifBlank { if (lowMacd) "AI low + MACD turns" else when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"
                 KIND_CHAIN -> "Monthly-low chain"; else -> "Floor orders" } }.take(40),
             kind = k, space = space, createdAt = System.currentTimeMillis(), settings = settings,
             log = listOf(stamp() + " · created"))

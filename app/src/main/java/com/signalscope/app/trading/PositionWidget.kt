@@ -35,8 +35,52 @@ class PositionWidget : AppWidgetProvider() {
         draw(ctx, mgr, intArrayOf(id), PositionRadar.latest(ctx))
     }
 
+    /** A tab was tapped: remember it for that copy of the widget and redraw it. */
+    override fun onReceive(ctx: Context, intent: Intent) {
+        if (intent.action != ACTION_TAB) { super.onReceive(ctx, intent); return }
+        val id = intent.getIntExtra(EXTRA_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
+        val dim = intent.getStringExtra(EXTRA_DIM) ?: return
+        val code = intent.getStringExtra(EXTRA_CODE) ?: return
+        if (id == AppWidgetManager.INVALID_APPWIDGET_ID) return
+        val p = prefs(ctx)
+        // Tapping the kind you are already on goes back to All.
+        val next = if (dim == "k" && p.getString("k_$id", WidgetTabs.ALL) == code) WidgetTabs.ALL else code
+        p.edit().putString("${dim}_$id", next).apply()
+        try { draw(ctx, AppWidgetManager.getInstance(ctx), intArrayOf(id), PositionRadar.latest(ctx)) }
+        catch (e: Exception) { Log.w(TAG, "tab redraw failed", e) }
+    }
+
     companion object {
         private const val TAG = "PositionWidget"
+        const val ACTION_TAB = "com.signalscope.WIDGET_TAB"
+        private const val EXTRA_ID = "id"
+        private const val EXTRA_DIM = "dim"
+        private const val EXTRA_CODE = "code"
+
+        private fun prefs(ctx: Context) = ctx.getSharedPreferences("position_widget", Context.MODE_PRIVATE)
+
+        private val M_CHIPS = intArrayOf(R.id.wp_m0, R.id.wp_m1, R.id.wp_m2, R.id.wp_m3, R.id.wp_m4)
+        private val K_CHIPS = intArrayOf(R.id.wp_k0, R.id.wp_k1, R.id.wp_k2, R.id.wp_k3, R.id.wp_k4, R.id.wp_k5)
+
+        /** One row of pills: each shows its count, the chosen one filled, and a tap filters on it. */
+        private fun drawChips(ctx: Context, v: RemoteViews, slots: IntArray, chips: List<WidgetTabs.Chip>,
+                              id: Int, dim: String) {
+            slots.forEachIndexed { i, slot ->
+                val c = chips.getOrNull(i)
+                if (c == null) { v.setViewVisibility(slot, View.GONE); return@forEachIndexed }
+                v.setViewVisibility(slot, View.VISIBLE)
+                v.setTextViewText(slot, c.text)
+                v.setInt(slot, "setBackgroundResource",
+                    if (c.selected) R.drawable.widget_chip_on else R.drawable.widget_chip_off)
+                v.setTextColor(slot, if (c.selected) 0xFFFFFFFF.toInt() else 0xCCFFFFFF.toInt())
+                val tap = Intent(ctx, PositionWidget::class.java).setAction(ACTION_TAB)
+                    .putExtra(EXTRA_ID, id).putExtra(EXTRA_DIM, dim).putExtra(EXTRA_CODE, c.code)
+                    // Distinct data per pill, or Android hands every pill the same intent.
+                    .setData(android.net.Uri.parse("signalscope://widget-tab/$id/$dim/${c.code}"))
+                v.setOnClickPendingIntent(slot, PendingIntent.getBroadcast(ctx, 0, tap,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+            }
+        }
 
         /** When a tap on ↻ started a refresh that has not finished (0 = none). The
          *  time line reads "refreshing…" meanwhile, so the tap visibly did something. */
@@ -71,7 +115,8 @@ class PositionWidget : AppWidgetProvider() {
             return IndexStrip.INDICES.take(3).map { ix ->
                 val r = st.readings.firstOrNull { it.key == ix.key }
                     ?: return@map ("${ix.label} —" as CharSequence) to null
-                val sb = android.text.SpannableStringBuilder(r.label).append(' ')
+                // The current name, not the one saved with an older reading.
+                val sb = android.text.SpannableStringBuilder(ix.label).append(' ')
                 val pct = String.format(java.util.Locale.US, "%+.2f%%", r.pct).replace('-', '−')
                 val from = sb.length
                 sb.append(pct)
@@ -138,6 +183,23 @@ class PositionWidget : AppWidgetProvider() {
                     "updated " + java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
                         .format(java.util.Date(it.atMs))
                 } ?: "")
+                // THE TABS, per copy of the widget: its own market and kind.
+                val allRows = (s?.rows as List<PositionRadar.Row>?).orEmpty()
+                val tabs = if (allRows.isEmpty()) null else WidgetTabs.view(allRows,
+                    prefs(ctx).getString("m_$id", WidgetTabs.ALL) ?: WidgetTabs.ALL,
+                    prefs(ctx).getString("k_$id", WidgetTabs.ALL) ?: WidgetTabs.ALL)
+                if (tabs == null) {
+                    v.setViewVisibility(R.id.wp_mtabs, View.GONE)
+                    v.setViewVisibility(R.id.wp_ktabs, View.GONE)
+                    v.setViewVisibility(R.id.wp_headline, View.VISIBLE)
+                } else {
+                    v.setViewVisibility(R.id.wp_mtabs, View.VISIBLE)
+                    v.setViewVisibility(R.id.wp_ktabs, View.VISIBLE)
+                    // The kinds' pills carry the headline's counts — it would only repeat them.
+                    v.setViewVisibility(R.id.wp_headline, View.GONE)
+                    drawChips(ctx, v, M_CHIPS, tabs.markets, id, "m")
+                    drawChips(ctx, v, K_CHIPS, tabs.kinds, id, "k")
+                }
                 if (s == null) {
                     v.setTextViewText(R.id.wp_headline, "Nothing held by the app right now")
                     v.setViewVisibility(R.id.wp_list, View.GONE)
@@ -159,7 +221,7 @@ class PositionWidget : AppWidgetProvider() {
                             .setHasStableIds(false).setViewTypeCount(1)
                         // The market's flag, the line, and — smaller, on a second line —
                         // what manages the exit. Older summaries have only the lines.
-                        val rows = (s.rows as List<PositionRadar.Row>?)
+                        val rows = tabs?.rows ?: (s.rows as List<PositionRadar.Row>?)
                         val texts: List<CharSequence> = rows?.map { r ->
                             val sb = android.text.SpannableStringBuilder()
                             if (r.flag.isNotBlank()) sb.append(r.flag).append(' ')
@@ -186,7 +248,8 @@ class PositionWidget : AppWidgetProvider() {
                         // Older phones: the same lines as plain text, top to bottom.
                         v.setViewVisibility(R.id.wp_list, View.GONE)
                         v.setViewVisibility(R.id.wp_empty, View.VISIBLE)
-                        v.setTextViewText(R.id.wp_empty, lines.joinToString(separator = System.lineSeparator()))
+                        v.setTextViewText(R.id.wp_empty, (tabs?.rows?.map { it.text } ?: lines)
+                            .joinToString(separator = System.lineSeparator()))
                     }
                 }
                 mgr.updateAppWidget(id, v)

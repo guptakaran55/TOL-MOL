@@ -168,12 +168,19 @@ object T212LiveMirror {
 
         for (t in (needsBuy + needsSell).distinctBy { it.ns to it.paperTradeId }) {
             var next = t
-            aggregate(t.allBuyIds())?.let { a ->
-                val qty = a[0]; val priceValue = a[1]; val cashValue = a[2]; val seen = a[3].toInt()
+            // A topped-up position reads only its NEWER buy orders and adds the
+            // frozen figures of the ones before — see LiveTrade.settledBuyIds.
+            val settled = t.settledBuyIds.orEmpty().toHashSet()
+            aggregate(t.allBuyIds().filterNot { it in settled })?.let { a ->
+                val qty = a[0] + t.settledQty
+                val priceValue = a[1] + t.settledPriceValue
+                val cashValue = a[2] + t.settledCashValue
+                val seen = a[3].toInt() + settled.size
                 next = next.copy(
                     // Per-share price from the INSTRUMENT-currency figures only.
                     liveEntryPrice = if (qty > 0.0) priceValue / qty else 0.0,
-                    liveQtyFilled = qty,
+                    // Less what you have sold yourself — see LiveTrade.handSoldQty.
+                    liveQtyFilled = (qty - t.handSoldQty).coerceAtLeast(0.0),
                     // Cash deployed stays in the ACCOUNT's currency — that is what
                     // actually left the account.
                     liveEntryValue = cashValue, buyRungsSeen = seen)

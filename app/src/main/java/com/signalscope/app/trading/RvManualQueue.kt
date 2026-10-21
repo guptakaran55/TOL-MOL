@@ -433,7 +433,8 @@ object RvManualQueue {
                     force = o.kind == Kind.DETAIL_BUY || o.force)
                 val fill = mapOf("qty" to r.filledQty, "price" to r.filledPrice.takeIf { it > 0.0 },
                     "signal" to r.signalPrice.takeIf { it > 0.0 })
-                (if (r.ok && r.filledQty > 0.0) "bought ${"%.4f".format(r.filledQty)} and handed to your watchlist"
+                (if (r.ok && r.toppedUp) "added ${"%.4f".format(r.filledQty)} to your watchlist position"
+                 else if (r.ok && r.filledQty > 0.0) "bought ${"%.4f".format(r.filledQty)} and handed to your watchlist"
                  else "nothing bought: ${r.error.ifBlank { r.note.ifBlank { "the ladder filled nothing" } }}") to fill
             }
             Kind.ALGO_TP -> {
