@@ -750,13 +750,18 @@ object LabNotifier {
                 "and none came, so the patient ${if (buy) "buy" else "sale"} has started now.",
             "rvt-$ns-$symbol-${System.currentTimeMillis() / 60000}", openNs = ns)
 
-    /** One of YOUR patient orders, held by the RV gate, has now run. */
+    /** One of YOUR patient orders, held by the RV gate, has now run. [ok] false =
+     *  it ran but did not go through: said in the title, and the reason comes
+     *  first, because the end of the text is what a lock screen cuts off. */
     fun rvManualDone(ctx: Context, space: String, symbol: String, buy: Boolean,
-                     timedOut: Boolean, why: String, result: String) =
+                     timedOut: Boolean, why: String, result: String, ok: Boolean = true) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
-            (if (timedOut) "⏱ " else "✅ ") + "$symbol — your patient ${if (buy) "buy" else "sale"} " +
+            if (!ok) "⚠️ $symbol — your patient ${if (buy) "buy" else "sale"} did not go through"
+            else (if (timedOut) "⏱ " else "✅ ") + "$symbol — your patient ${if (buy) "buy" else "sale"} " +
                 (if (timedOut) "started after 2 hours" else "started by the RV gate"),
-            (if (timedOut) "No better moment came in two hours of trading, so it ran anyway. "
+            if (!ok) result.replaceFirstChar { it.uppercase() } + ". " +
+                (if (timedOut) "It ran after two hours of waiting." else "The RV gate had released it: $why.")
+            else (if (timedOut) "No better moment came in two hours of trading, so it ran anyway. "
              else "The RV gate found its moment: $why. ") + "Result: $result.",
             "rvm-$space-$symbol-${System.currentTimeMillis() / 60000}",
             openSymbol = symbol, openSpace = space.lowercase())

@@ -1156,11 +1156,14 @@ object ManualEntryWatcher {
      *
      *   What you give up is the entry discipline, which is the half with measured
      *   evidence behind it. What you keep is every exit rule and the hard stop.
+     * @param signalTs the entry bar you pressed Buy on, for a buy the RV gate held
+     *   back: it still counts while the strategy is long from it. 0 = newest bar only.
      */
     fun buyAndHandOver(
         ctx: Context, space: String, symbol: String, cash: Double,
         onProgress: ((Map<String, Any?>) -> Unit)? = null,
-        force: Boolean = false
+        force: Boolean = false,
+        signalTs: Long = 0L
     ): BuyResult {
         val base = Spaces.baseOf(space.lowercase())
         val sym = symbol.trim().uppercase()
@@ -1202,7 +1205,8 @@ object ManualEntryWatcher {
         // ones — conviction trades in the book that the strategy had actually
         // chosen.
         val since = ManualWatchStore.load(ctx, base).watchingSince[sym] ?: 0L
-        val signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since)
+        val signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since,
+            stillOpenFromTs = signalTs)
         // A FORCED BUY BORROWS THE SHAPE OF A SIGNAL, NOT ITS AUTHORITY.
         //
         // Everything downstream — the ladder anchor, the book row, the live-order

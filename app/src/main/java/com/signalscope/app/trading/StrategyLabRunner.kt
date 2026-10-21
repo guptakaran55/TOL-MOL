@@ -1397,10 +1397,13 @@ object StrategyLabRunner {
      *   for weeks: the alert fires only on a position opened on the NEWEST bar, and
      *   a trade opened in August is never that. The algos already work this way —
      *   this is the same rule, applied to the same engine, for the same reason.
+     * @param stillOpenFromTs an entry bar that also counts while the strategy is
+     *   still long from it, though newer bars have closed since — for a buy you
+     *   asked for on that signal and the RV gate then held back. 0 = newest bar only.
      */
     fun freshEntrySignal(
         ctx: Context, ns: String, symbol: String, exchange: String = "",
-        entriesFromTs: Long = 0L
+        entriesFromTs: Long = 0L, stillOpenFromTs: Long = 0L
     ): FreshEntry? {
         lastPositionState = null
         lastHistoricalState = null
@@ -1468,7 +1471,12 @@ object StrategyLabRunner {
         // name is mid-position instead of leaving it looking inexplicably quiet.
         lastPositionState = PosState(sym, true, t.entryTs, t.entryPrice, t.pctReturn,
             fresh = (run.lastBarTs > 0L && t.entryTs == run.lastBarTs))
-        if (run.lastBarTs <= 0L || t.entryTs != run.lastBarTs) return null
+        // A HELD BUY'S OWN SIGNAL STILL COUNTS. The RV gate can hold a watchlist
+        // buy for up to two hours, and on intraday bars the signal is no longer on
+        // the newest bar by then — so every buy the gate held was refused as "the
+        // setup has passed" with the strategy still long from that same entry.
+        val held = stillOpenFromTs > 0L && t.entryTs == stillOpenFromTs
+        if (run.lastBarTs <= 0L || (t.entryTs != run.lastBarTs && !held)) return null
         return FreshEntry(
             symbol = sym, entryTs = t.entryTs, entryPrice = t.entryPrice,
             entryReason = t.entryReason, lastBarTs = run.lastBarTs,

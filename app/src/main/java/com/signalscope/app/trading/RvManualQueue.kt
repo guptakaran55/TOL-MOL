@@ -65,6 +65,9 @@ object RvManualQueue {
         val capLimit: Double = 0.0,
         /** When it stopped to ask you, because the price had run past [capLimit]. */
         val askedAt: Long = 0L,
+        /** A watchlist Buy's entry bar when you pressed it — see [watchSignalTs].
+         *  0 = none (any other kind, a forced buy, or queued before this existed). */
+        val signalTs: Long = 0L,
         /** WAITING, STARTED, DONE, CANCELLED. */
         val status: String = "WAITING",
         val why: String = "",
@@ -235,7 +238,21 @@ object RvManualQueue {
      * the order is queued here and the page says so.
      * @return (queued, why, startsBy) — startsBy is the latest it will start.
      */
-    fun submit(ctx: Context, o: Order): Triple<Boolean, String, Long> {
+    fun submit(ctx: Context, asked: Order): Triple<Boolean, String, Long> {
+        // A WATCHLIST BUY IS A BUY ON ONE SIGNAL, so the signal is pinned now. The
+        // buy re-checks it when it runs, and on intraday bars a signal is off the
+        // newest bar long before the gate's two hours are up: every held watchlist
+        // buy came back "the setup has passed" and nothing reached Trading 212
+        // (G24, VH2, 21 Oct). With no signal standing there is nothing to wait
+        // for — the button runs at once and gives its own answer.
+        val o = if (asked.kind == Kind.WATCH_BUY && !asked.force) {
+            val ts = watchSignalTs(ctx, asked)
+            if (ts == null) {
+                logAdd(ctx, logOf(asked, true, "not held", "no entry signal standing — the button answers at once"))
+                return Triple(false, "no entry signal standing to wait on", 0L)
+            }
+            asked.copy(signalTs = ts)
+        } else asked
         val config = ConfigManager(ctx)
         val now = System.currentTimeMillis()
         val open = MarketHours.isRegularSession(o.ns, now)
@@ -294,6 +311,20 @@ object RvManualQueue {
         return maxOf(o.createdAt, open) + RvGate.MAX_WAIT_MS
     }
 
+    /** The entry bar of a watchlist name's signal as it stands now, or null when
+     *  there is none — the same question the watchlist's Buy asks. Network. */
+    private fun watchSignalTs(ctx: Context, o: Order): Long? = try {
+        val base = Spaces.baseOf(o.ns)
+        val sym = o.symbol.trim().uppercase()
+        val since = com.signalscope.app.data.ManualWatchStore.load(ctx, base).watchingSince[sym] ?: 0L
+        StrategyLabRunner.freshEntrySignal(ctx, com.signalscope.app.data.ManualWatchStore.nsFor(base), sym,
+            Spaces.exchangeOf(base), since)?.entryTs
+    } catch (e: Exception) { Log.w(TAG, "${o.symbol} signal check failed: ${e.message}"); null }
+
+    /** Did the order do what it was for? Read off [run]'s sentence. */
+    private fun wentThrough(result: String) =
+        !listOf("nothing ", "not taken", "failed", "unknown").any { result.startsWith(it) }
+
     private fun resolve(config: ConfigManager, symbol: String, space: String): String = try {
         Trading212Client(config).resolveT212Ticker(symbol.uppercase().removeSuffix(".DE"), space) ?: ""
     } catch (e: Exception) { "" }
@@ -348,7 +379,8 @@ object RvManualQueue {
             logAdd(ctx, logOf(o, true,
                 if (gate.timedOut) "started at the 2-hour limit" else "started after ${heldMin.coerceAtLeast(0L)} min",
                 "${gate.why} — $result", RvGate.snapshot(rd, gate)))
-            try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, !o.isSell, gate.timedOut, gate.why, result) }
+            try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, !o.isSell, gate.timedOut, gate.why, result,
+                wentThrough(result)) }
             catch (_: Exception) {}
         }
     }
@@ -377,7 +409,8 @@ object RvManualQueue {
         update(ctx, o.id) { it.copy(status = "DONE", result = result) }
         jOutcome(ctx, jKey(o.id), result, fill)
         logAdd(ctx, logOf(o, true, "bought anyway, at your word", result))
-        try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, true, false, "you said buy anyway", result) }
+        try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, true, false, "you said buy anyway", result,
+            wentThrough(result)) }
         catch (_: Exception) {}
         return result
     }
@@ -430,7 +463,7 @@ object RvManualQueue {
             }
             Kind.DETAIL_BUY, Kind.WATCH_BUY -> {
                 val r = ManualEntryWatcher.buyAndHandOver(ctx, o.ns, o.symbol, o.cash, null,
-                    force = o.kind == Kind.DETAIL_BUY || o.force)
+                    force = o.kind == Kind.DETAIL_BUY || o.force, signalTs = o.signalTs)
                 val fill = mapOf("qty" to r.filledQty, "price" to r.filledPrice.takeIf { it > 0.0 },
                     "signal" to r.signalPrice.takeIf { it > 0.0 })
                 (if (r.ok && r.toppedUp) "added ${"%.4f".format(r.filledQty)} to your watchlist position"
