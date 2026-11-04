@@ -423,6 +423,70 @@ object ZerodhaLiveMirror {
      * routine now, because "how to buy at Zerodha" is one question with one
      * answer, and two copies of it is how those two paths silently diverged.
      */
+    /**
+     * BUY AT MY PRICE, IN INDIA: a buy trigger (GTT) resting at Zerodha at your
+     * level — free, and nothing held against it. Set below the price, Zerodha buys
+     * when it falls to the level; above, when it rises to it. The order it then
+     * sends is a limit a little over the level ([BUY_LIMIT_OVER]) so a fast market
+     * still fills. Nothing is bought until it triggers; the watcher notices the
+     * fill, hands the position to the strategy and protects it, as for any resting
+     * buy trigger (ManualEntryWatcher.settleWaitingBuys).
+     */
+    fun restBuyAt(ctx: Context, ns: String, symbol: String, cash: Double, level: Double,
+                  paperEntryPrice: Double, paperTradeId: String): ManualResult {
+        val sym = symbol.trim().uppercase()
+        val cfg = ConfigManager(ctx)
+        if (!cfg.isZerodhaConnected) return ManualResult(false, error = "Zerodha is not connected.")
+        if (ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId) != null)
+            return ManualResult(false, error = "This entry already has an order.")
+        val client = ZerodhaClient(cfg)
+        return try {
+            val ref = referencePrice(client, sym)
+            if (ref <= 0.0) return ManualResult(false,
+                error = "No current price for $sym — Zerodha needs it to set a trigger. Nothing was " +
+                        "placed; try again in a moment.")
+            val tick = cfg.learnedTickSize(sym) ?: 0.05
+            val trigger = onTick(level, tick)
+            if (Math.abs(trigger - ref) < tick) return ManualResult(false,
+                error = "₹${"%.2f".format(trigger)} is the price right now — use Buy to buy at once.")
+            val limit = onTick(trigger * (1.0 + BUY_LIMIT_OVER), tick)
+            val qty = Math.floor(cash / limit).toInt()
+            if (qty < 1) return ManualResult(false,
+                error = "₹${"%.0f".format(cash)} is under one share at ₹${"%.2f".format(limit)} — " +
+                        "NSE has no fractional shares.")
+            when (val res = createGttWithTick(cfg, client, sym, type = "single", triggers = listOf(trigger),
+                lastPrice = ref, orders = listOf(ZerodhaClient.GttOrderSpec(
+                    transactionType = "BUY", quantity = qty, price = limit,
+                    product = "CNC", orderType = "LIMIT")))
+            ) {
+                is ZerodhaClient.GttCreateResult.Success -> {
+                    // PENDING, as every resting buy trigger is: nothing has been bought.
+                    ZerodhaLiveStore.upsert(ctx, ZerodhaLiveStore.Row(
+                        ns = ns, paperTradeId = paperTradeId, symbol = sym,
+                        status = "PENDING", qty = qty, gttId = res.id,
+                        entryPrice = 0.0, paperEntryPrice = paperEntryPrice,
+                        buyAt = System.currentTimeMillis(),
+                        error = "your price: a buy trigger at ₹${"%.2f".format(trigger)}"))
+                    val rising = trigger > ref
+                    Log.w(TAG, "[$ns] BUY-AT-PRICE TRIGGER ${res.id} for $qty $sym at " +
+                        "${"%.2f".format(trigger)} (limit ${"%.2f".format(limit)}, live ${"%.2f".format(ref)})")
+                    ManualResult(true, qty = qty, price = trigger, gttId = res.id, immediate = false,
+                        note = "A buy trigger (GTT) is waiting at Zerodha: when $sym " +
+                               "${if (rising) "rises" else "falls"} to ₹${"%.2f".format(trigger)} " +
+                               "(it is ₹${"%.2f".format(ref)} now), it buys $qty, paying up to " +
+                               "₹${"%.2f".format(limit)}. Nothing is bought and no money is held until " +
+                               "then. Once filled it is handed to the watcher config for India and a " +
+                               "protective stop goes on.")
+                }
+                is ZerodhaClient.GttCreateResult.Failure ->
+                    ManualResult(false, error = "Zerodha refused the trigger: ${res.message}. Nothing was placed.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[$ns] buy-at-price trigger for $sym failed", e)
+            ManualResult(false, error = "The trigger could not be placed: ${e.message}")
+        }
+    }
+
     fun buyNowOrRest(ctx: Context, ns: String, symbol: String, cash: Double,
                      paperEntryPrice: Double, paperTradeId: String): ManualResult {
         val sym = symbol.trim().uppercase()

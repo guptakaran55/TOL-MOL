@@ -801,6 +801,12 @@ function pendingCondsFor(p){
     else if(lim>0)cs.push({ok:now>0?(buy?now<=lim:now>=lim):null,
       text:'Price '+(buy?'at or under ':'at or over ')+c+lim.toFixed(2)+nowTxt});
   }
+  // A BUY AT YOUR PRICE: the level, and where the price is now.
+  if(p.status==='PRICEENTRY'&&Number(p.level)>0){
+    var lv=Number(p.level), np=now>0?now:Number(p.lastPrice||0);
+    cs.push({ok:np>0?(p.rising?np>=lv:np<=lv):null,
+      text:'Price '+(p.rising?'rises':'falls')+' to '+c+lv.toFixed(2)+(np>0?(' · now '+c+np.toFixed(2)):'')});
+  }
   if(Number(p.ceiling||0)>0){
     var ce=Number(p.ceiling);
     cs.push({ok:now>0?now<=ce:null,text:'Under the price limit '+c+ce.toFixed(2)+nowTxt});
@@ -878,6 +884,7 @@ function openPendingOrders(keepTab){
       }
       if(p.dueAt>0)meta.push((rvHeld?'starts by ':'next look ')+new Date(p.dueAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+(rvHeld?' at the latest':''));
       if(p.tries)meta.push(p.tries+'/24 tried');
+      if(p.status==='PRICEENTRY'&&p.expiresAt>0)meta.push('armed until '+new Date(p.expiresAt).toLocaleDateString());
       var acts=[];
       if(p.rvSrc)acts.push(btn('openRvAnalysis(\''+escHtml(p.rvSrc)+'\',\''+escHtml(p.rvSrc==='you'?'':(p.ns||''))+'\',\''+escHtml(String(p.rvSrc==='you'?p.rvManualId:p.id))+'\')','📈 Analyse','var(--pu)','rgba(124,58,237,.45)'));
       if(p.cancellable){
@@ -899,6 +906,9 @@ function openPendingOrders(keepTab){
       }else if(p.status==='PENDING'&&p.stopTicker&&pendingSideOf(p)==='BUY'){
         // A BUY LADDER RUNNING NOW: stopped, and it pulls its own order.
         acts.push(btn('stopBuyLadderPrompt(\''+escHtml(p.stopTicker)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Stop this buy','var(--rd)',RED));
+      }else if(p.status==='PRICEENTRY'&&p.priceEntryId){
+        // Nothing at the broker: calling it off only stops the watching.
+        acts.push(btn('priceEntryCancelPrompt(\''+escHtml(p.priceEntryId)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Call it off','var(--rd)',RED));
       }else if(p.status==='RVMANUAL'&&p.rvManualId){
         acts.push(btn('rvManualCancelPrompt(\''+escHtml(p.rvManualId)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Call it off','var(--rd)',RED));
       }else if(p.status==='RVASK'&&p.rvManualId){
@@ -19109,6 +19119,7 @@ function detailTradeBlock(s){
 
   var h='<div style="margin-top:10px;padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--cd)">';
   h+='<div style="font-size:9px;font-weight:900;color:var(--t2);letter-spacing:.03em;margin-bottom:2px">ORDER '+escHtml(sym)+'</div>';
+  h+=priceEntryLines(sym,cur);
   h+='<div style="font-size:9px;color:var(--t3);line-height:1.5;margin-bottom:8px">'+
      (isIN
        ? 'Sends a real order priced to fill at once. If Zerodha refuses an ordinary order from this device it falls back to a resting trigger, and the reply says which one happened.'
@@ -19121,10 +19132,13 @@ function detailTradeBlock(s){
      (isIN?'Buy trigger':'Patient buy')+'</span>';
   // A LIMIT BUY that rests at the broker at a level you pick — for a stock you
   // want, but cheaper than now. Trading 212 only.
+  LB_STOCK[sym]=s;
   if(isT212){
-    LB_STOCK[sym]=s;
     h+='<span onclick="detailLimitBuy(\''+escHtml(sym)+'\')" style="cursor:pointer;padding:7px 14px;background:var(--bg2);border:1px solid rgba(34,197,94,.5);color:var(--gn);border-radius:6px;font-size:11px;font-weight:800">Limit buy</span>';
   }
+  // BUY AT MY PRICE — a GTT for every market. Trading 212: watched in the app,
+  // nothing held at the broker; India: a real buy trigger at Zerodha.
+  h+='<span onclick="detailPriceEntry(\''+escHtml(sym)+'\')" style="cursor:pointer;padding:7px 14px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.5);color:var(--pu);border-radius:6px;font-size:11px;font-weight:800">🎯 Buy at price</span>';
   if(held>0){
     h+='<span onclick="detailSell(\''+escHtml(sym)+'\','+held+','+px+')" style="cursor:pointer;padding:7px 14px;background:var(--bg2);border:1px solid var(--rd);color:var(--rd);border-radius:6px;font-size:11px;font-weight:800">'+
        (isIN?'Sell trigger':'Patient sell')+'</span>';
@@ -19174,6 +19188,16 @@ function lbLevels(){
   row('Weekly',w,w.length?'':'today is the lowest of the week');
   row('Monthly',m,m.length?'':'today is the lowest of the month');
   row('Average daily move ('+LB.ccy+LB.atr.toFixed(2)+')',a);
+  // BUY AT MY PRICE can also wait for a RISE: levels above today, for a breakout.
+  if(LB.mode==='entry'){
+    var up=[], above=function(v){v=Number(v||0);return v>LB.ltp};
+    if(above(lv.resistance))up.push(lbChip('Resistance',lv.resistance,'Where the price turned down before'));
+    else if(above(LB.resistance))up.push(lbChip('Resistance',LB.resistance,'Resistance on the daily chart'));
+    if(above(lv.weekHigh))up.push(lbChip('1-week high',lv.weekHigh,'Highest price of the last week'));
+    if(above(lv.monthHigh))up.push(lbChip('1-month high',lv.monthHigh,'Highest price of the last month'));
+    if(LB.atr>0)[0.5,1].forEach(function(k){up.push(lbChip('+'+k+'× ATR',LB.ltp+k*LB.atr,'Today’s price plus '+k+' average daily moves'))});
+    row('Above today (buys on a rise)',up);
+  }
   if(LB.lvError)rows.push('<div style="font-size:9px;color:var(--am)">Levels not available: '+escHtml(LB.lvError)+'</div>');
   return rows.join('');
 }
@@ -19209,6 +19233,7 @@ function lbCalc(){
   var a=document.getElementById('lb-pic');if(a)a.innerHTML=lbPicture();
   if(!out)return;
   if(!(LB.price>0)){out.innerHTML='Pick a level or type a price.';return}
+  if(LB.mode==='entry'){out.innerHTML=priceEntrySummary(LB.price,amt);return}
   var under=LB.ltp>0?((1-LB.price/LB.ltp)*100):0;
   if(LB.ltp>0&&LB.price>=LB.ltp){out.innerHTML='<span style="color:var(--am)">At or above today’s price — it would buy at once. Use <b>Patient buy</b> for that.</span>';return}
   out.innerHTML=(amt>0?('≈ <b>'+(amt/LB.price).toFixed(3)+'</b> shares · '):'')+'<b>'+under.toFixed(1)+'%</b> under today’s price';
@@ -19250,6 +19275,102 @@ function detailLimitBuy(sym){
     if(r&&r.ok)LB.lv=r.levels||{};else LB.lvError=(r&&r.error)||'levels unavailable';
     lbRedraw();
   });
+}
+// ── BUY AT MY PRICE ───────────────────────────────────────────────────────────
+// A GTT for every market. Trading 212 holds a limit buy's cash until it fills, so
+// there the trigger lives in the app: nothing is placed or held until the price
+// reaches your level, and then your Patient buy starts through the RV gate —
+// exactly as if you had pressed it at that moment. India keeps a real buy trigger
+// (GTT) at Zerodha, which is free and holds nothing.
+function priceEntrySummary(price,amt){
+  if(!(LB.ltp>0))return '';
+  var c=LB.ccy, d=(price/LB.ltp-1)*100, isIN=(SPACE==='IN');
+  if(Math.abs(d)<0.05)return '<span style="color:var(--am)">That is today’s price — use '+(isIN?'Buy':'Patient buy')+' to buy now.</span>';
+  var up=price>LB.ltp;
+  var shares=amt>0?(isIN?Math.floor(amt/(price*1.006)):(amt/price)):0;
+  return (amt>0?('≈ <b>'+(isIN?shares:shares.toFixed(3))+'</b> shares · '):'')+
+    'starts when the price <b>'+(up?'rises':'falls')+'</b> to '+c+price.toFixed(2)+' — <b>'+Math.abs(d).toFixed(1)+'%</b> '+(up?'above':'below')+' today’s';
+}
+function detailPriceEntry(sym){
+  if(typeof Android==='undefined'||!Android.callAsync||!Android.priceEntries){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  var s=LB_STOCK[sym]||{};
+  var amtEl=document.getElementById('dt-amt');
+  var amt=amtEl?Number(amtEl.value||0):0;
+  var ltp=Number(s.price||0);
+  if(!(ltp>0)){uiAlert('No price for '+sym,'Run a scan or wait for the live ticker so there is a price to work from.');return}
+  var isIN=(SPACE==='IN');
+  LB={mode:'entry',sym:sym,ccy:isIN?'₹':(SPACE==='DE'?'€':'$'),ltp:ltp,atr:Number(s.atr||0),support:Number(s.support||0),
+      resistance:Number(s.resistance||0),lv:null,loading:true,price:0};
+  var init=(LB.support>0&&LB.support<ltp)?LB.support:(LB.atr>0?ltp-LB.atr:ltp*0.98);
+  LB.price=Math.round(init*100)/100;
+  var managed=false;try{managed=!!JSON.parse(Android.watchPinnedList(SPACE)||'{}').configured}catch(e){}
+  var market=isIN?'India':(SPACE==='DE'?'German':'US');
+  var how=isIN
+    ?'Places a real <b>buy trigger (GTT) at Zerodha</b> at your price — free, and no money is held. Below today’s price it buys when the price falls to it; above, when it rises to it. Once filled it is handed to your India watcher config and a protective stop goes on.'
+    :'Nothing is placed at Trading 212 and <b>no cash is held</b>. The app checks the price every minute while the market is open; when it reaches your level, your <b>Patient buy starts through the RV gate</b> — exactly as if you had pressed it then.'+
+      (managed?' Once bought it is handed to your '+market+' watchlist.':' <span style="color:var(--am)">The '+market+' watchlist has no strategy attached, so nothing will manage the exit.</span>')+
+      ' Below today’s price it waits for a fall; above, for a rise. Armed until you call it off in Waiting orders — at most a year.'+
+      '<br/><span style="color:var(--t3)">Unlike an order at the broker it needs the app’s service running, and a dip that comes and goes inside one minute can be missed.</span>';
+  var inp='padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-family:monospace;width:100%';
+  var body='<div style="font-size:10px;color:var(--t3);line-height:1.5;margin-bottom:6px">'+how+'</div>'+
+    '<div id="lb-pic">'+lbPicture()+'</div>'+
+    '<div id="lb-levels">'+lbLevels()+'</div>'+
+    '<div style="display:flex;gap:8px;margin-top:6px">'+
+      '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Buy at ('+LB.ccy+')</div>'+
+      '<input id="lb-price" type="number" step="0.01" value="'+LB.price.toFixed(2)+'" oninput="lbCalc()" style="'+inp+';font-weight:700"/></div>'+
+      '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Amount ('+LB.ccy+')</div>'+
+      '<input id="lb-amt" type="number" step="1" min="1" value="'+(amt>0?amt:'')+'" placeholder="e.g. '+(isIN?'5000':'200')+'" oninput="lbCalc()" style="'+inp+'"/></div>'+
+    '</div>'+
+    '<div id="lb-sum" style="font-size:10px;color:var(--t2);margin-top:6px"></div>';
+  uiConfirm('🎯 Buy '+escHtml(sym)+' at my price',body,function(ok){
+    if(!ok)return;
+    var price=Number((document.getElementById('lb-price')||{}).value||0);
+    var cash=Number((document.getElementById('lb-amt')||{}).value||0);
+    if(!(cash>0)){uiAlert('No amount','Enter how much to invest.');return}
+    if(!(price>0)){uiAlert('No price','Pick a level or type a price.');return}
+    refBusy(true,isIN?'Placing the trigger at Zerodha…':'Arming your price…');
+    androidAsync('priceEntrySet',[SPACE,sym,cash,price],function(raw){
+      refBusy(false);
+      var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+      if(!r||!r.ok){uiAlert('Not set — '+escHtml(sym),'<span style="color:var(--rd)">'+escHtml((r&&r.error)||'no answer')+'</span>');return}
+      uiAlert('🎯 '+(r.india?'Trigger placed':'Armed')+' — '+escHtml(sym),'<div style="font-size:11px;line-height:1.6">'+escHtml(r.note||'')+'</div>');
+      var line=document.getElementById('pe-lines-'+sym);if(line)line.outerHTML=priceEntryLines(sym,LB.ccy);
+    });
+  });
+  setTimeout(lbCalc,0);
+  androidAsync('exitLevels',[sym,SPACE],function(raw){
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    LB.loading=false;
+    if(r&&r.ok)LB.lv=r.levels||{};else LB.lvError=(r&&r.error)||'levels unavailable';
+    lbRedraw();
+  });
+}
+// Your armed entries on this stock, on its order card. No network.
+function priceEntryLines(sym,cur){
+  var rows=[];try{rows=(JSON.parse(Android.priceEntries(SPACE)||'{}').rows)||[]}catch(e){}
+  rows=rows.filter(function(e){return String(e.symbol||'').toUpperCase()===String(sym).toUpperCase()});
+  var h='<div id="pe-lines-'+escHtml(sym)+'">';
+  rows.forEach(function(e){
+    var off=e.india
+      ?'cancelTriggerPrompt(\''+escHtml(e.symbol)+'\',\''+escHtml(String(e.signalBarTs||0))+'\')'
+      :'priceEntryCancelPrompt(\''+escHtml(e.id)+'\',\''+escHtml(e.symbol)+'\')';
+    h+='<div style="margin:2px 0 6px;font-size:10px;color:var(--pu);font-weight:700">🎯 Armed: buy '+cur+Number(e.cash||0).toFixed(0)+' when it '+
+      (e.india?'reaches':(e.rising?'rises to':'falls to'))+' '+cur+Number(e.level||0).toFixed(2)+(e.india?' — a trigger at Zerodha':'')+
+      ' · <span onclick="'+off+'" style="cursor:pointer;color:var(--rd)">✕ call off</span></div>';
+  });
+  return h+'</div>';
+}
+function priceEntryCancelPrompt(id,sym){
+  if(typeof Android==='undefined'||!Android.priceEntryCancel){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  uiConfirm('Call off your buy at price for '+escHtml(sym)+'?',
+    '<div style="font-size:11px;line-height:1.55">Nothing is at Trading 212 to cancel and no money was held — the app simply stops watching the price.</div>',
+    function(ok){
+      if(!ok)return;
+      var r={};try{r=JSON.parse(Android.priceEntryCancel(String(id))||'{}')}catch(e){r={ok:false}}
+      if(!r.ok)uiAlert('Not called off','It was no longer waiting — it may have just been reached. Check Waiting orders.');
+      var line=document.getElementById('pe-lines-'+sym);if(line)line.outerHTML=priceEntryLines(sym,SPACE==='DE'?'€':'$');
+      if(document.getElementById('pending-sheet')){closePendingOrders();openPendingOrders(true)}
+    });
 }
 function detailBuy(sym,px){
   var el=document.getElementById('dt-amt');

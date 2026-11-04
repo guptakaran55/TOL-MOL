@@ -300,6 +300,32 @@ object RvManualQueue {
         return Triple(true, q.why, 0L)
     }
 
+    /**
+     * A BUY THE APP STARTS ON YOUR BEHALF — a "buy at my price" whose price was
+     * reached ([PriceEntries]). Exactly what the button does with the RV gate box
+     * ticked: [submit] asks the gate; held, the order waits in this queue like any
+     * other (its price limit, the two-hour cap, the notification when it runs);
+     * let go at once, it runs here and now — where the page would have run the
+     * button's own order — and you are notified as for a released order, since
+     * nobody is looking at the page. Blocking: a ladder takes minutes.
+     * @return what happened, in a sentence.
+     */
+    fun submitAndRun(ctx: Context, o: Order): String {
+        val (queued, why, by) = submit(ctx, o)
+        if (queued) return "held by the RV gate — $why" +
+            (if (by > 0L) "; it starts by ${hhmm(by)} at the latest" else "")
+        if (why == NO_SIGNAL) return "not started — $why"
+        val (result, _) = try { run(ctx, ConfigManager(ctx), o) }
+                          catch (e: Exception) { Log.e(TAG, "${o.symbol} ${o.kind} failed", e); "failed: ${e.message}" to emptyMap() }
+        try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, !o.isSell, false, why, result, wentThrough(result)) }
+        catch (_: Exception) {}
+        return "started at once ($why) — $result"
+    }
+
+    private fun hhmm(ms: Long): String = try {
+        java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).toLocalTime().toString().take(5)
+    } catch (_: Exception) { "" }
+
     fun cancel(ctx: Context, id: String): Boolean {
         val o = all(ctx).firstOrNull { it.id == id && (it.status == "WAITING" || it.status == "ASK") } ?: return false
         update(ctx, o.id) { it.copy(status = "CANCELLED", result = "called off by you") }

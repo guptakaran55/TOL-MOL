@@ -297,9 +297,11 @@ object RvGate {
     const val ACTION_TICK = "com.signalscope.RV_GATE_TICK"
     private const val REQUEST_CODE = 0x52A6
 
-    /** Is any automatic order waiting on the gate in a market that is open now? */
+    /** Is any automatic order waiting on the gate in a market that is open now —
+     *  or a "buy at my price" armed there ([PriceEntries]), which the same minute
+     *  check watches? */
     fun anyWaiting(ctx: Context, now: Long = System.currentTimeMillis()): Boolean = try {
-        RvManualQueue.anyDue(ctx, now) || T212LiveStore.load(ctx).trades.any {
+        RvManualQueue.anyDue(ctx, now) || PriceEntries.anyDue(ctx, now) || T212LiveStore.load(ctx).trades.any {
             // An order waits two hours at most; a mark older than that plus an hour
             // is left over from an order that has since moved on, not a wait.
             it.rvSince > 0L && now - it.rvSince < MAX_WAIT_MS + 60 * 60_000L &&

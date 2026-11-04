@@ -903,6 +903,23 @@ object LabNotifier {
             "rvm-$space-$symbol-${System.currentTimeMillis() / 60000}",
             openSymbol = symbol, openSpace = space.lowercase())
 
+    /** A "buy at my price" reached its level: what the buy is doing now. */
+    fun priceEntryReached(ctx: Context, space: String, symbol: String, level: Double, price: Double,
+                          rising: Boolean, what: String) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
+            "🎯 $symbol ${if (rising) "rose" else "fell"} to your ${"%.2f".format(level)}",
+            "It is at ${"%.2f".format(price)}. Your Patient buy: ${what.replaceFirstChar { it.lowercase() }}.",
+            "pe-$space-$symbol-${System.currentTimeMillis() / 60000}",
+            openSymbol = symbol, openSpace = space.lowercase())
+
+    /** A "buy at my price" that was never reached lapsed after a year. */
+    fun priceEntryLapsed(ctx: Context, space: String, symbol: String, level: Double) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",
+            "⌛ $symbol — your buy at ${"%.2f".format(level)} lapsed",
+            "The price never reached it in a year, so it is no longer watched. Nothing was bought.",
+            "pel-$space-$symbol-${System.currentTimeMillis() / 60000}",
+            openSymbol = symbol, openSpace = space.lowercase())
+
     /**
      * A buy you asked to wait on the RV gate was ready to go, but the price had
      * run more than half a day's move above where you pressed the button. Nothing

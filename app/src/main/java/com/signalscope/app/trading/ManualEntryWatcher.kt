@@ -1517,6 +1517,59 @@ object ManualEntryWatcher {
     }
 
     /**
+     * BUY AT MY PRICE, IN INDIA — a real buy trigger (GTT) at Zerodha at [level],
+     * free and with nothing held against it. Recorded as a waiting buy of the
+     * watcher's, the same as a resting trigger its own buys fall back to, so when
+     * it fills [settleWaitingBuys] hands the position to the strategy and puts the
+     * protective stop on. Shaped as a forced entry (no signal stands behind it):
+     * the latest closed bar is its entry bar. Called from the stock page only.
+     */
+    fun buyIndiaAtPrice(ctx: Context, symbol: String, cash: Double, level: Double): BuyResult {
+        val base = "in"
+        val sym = symbol.trim().uppercase().removeSuffix(".NS")
+        val ns = ManualWatchStore.nsFor(base)
+        if (sym.isBlank()) return BuyResult(false, sym, error = "No symbol given.")
+        if (cash <= 0.0) return BuyResult(false, sym, error = "Enter an amount to invest.")
+        if (level <= 0.0) return BuyResult(false, sym, error = "Enter the price to buy at.")
+        if (!isConfigured(ctx, base))
+            return BuyResult(false, sym, error = "Attach a watcher config first — without one nothing would manage the exit.")
+        // NOT FOR A NAME YOU ALREADY HOLD. The fill is recognised by the stock
+        // appearing in your Zerodha holdings, and one you already hold is there
+        // already — it would be taken as filled the moment it was placed.
+        val held = (BrokerHoldings.zerodha(ctx) as? BrokerHoldings.Result.Ok)?.holdings
+            ?.any { it.symbol.equals(sym, true) && it.qty > 0.0 } ?: false
+        if (held) return BuyResult(false, sym, error = "You already hold $sym. Buy at price in India is for a " +
+            "stock you do not hold yet — its fill is recognised by the stock appearing in your holdings.")
+        var why = ""
+        val lb = StrategyLabRunner.latestClosedBar(ctx, ns, sym, Spaces.exchangeOf(base), tries = 3) { why = it }
+            ?: return BuyResult(false, sym, error = noPrices(sym, why))
+        val fresh = StrategyLabRunner.FreshEntry(sym, lb.ts, lb.close,
+            "your price — a buy trigger at Zerodha", lb.ts, lb.close, 0, 0)
+        val paperTradeId = "$sym-${fresh.entryTs}"
+        ManualWatchStore.claim(ctx, base, ManualWatchStore.Entry(
+            symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
+            requestedCash = cash, createdAt = System.currentTimeMillis(),
+            status = "PENDING", note = fresh.entryReason, forced = true))
+            ?.let { return alreadyOnSignal(sym, it) }
+        val r = ZerodhaLiveMirror.restBuyAt(ctx, ns, sym, cash, level, fresh.entryPrice, paperTradeId)
+        if (!r.ok) {
+            ManualWatchStore.upsert(ctx, base, ManualWatchStore.Entry(
+                symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
+                requestedCash = cash, createdAt = System.currentTimeMillis(),
+                status = "FAILED", note = r.error, forced = true))
+            return BuyResult(false, sym, error = r.error)
+        }
+        ManualWatchStore.upsert(ctx, base, ManualWatchStore.Entry(
+            symbol = sym, space = base, signalBarTs = fresh.entryTs, signalPrice = fresh.entryPrice,
+            requestedCash = cash, filledQty = 0.0, filledPrice = 0.0,
+            t212Ticker = sym, createdAt = System.currentTimeMillis(),
+            status = "PENDING", note = fresh.entryReason, forced = true,
+            gttId = r.gttId, triggerPrice = r.price))
+        Log.i(TAG, "[$base] $sym buy-at-price trigger ${r.gttId} resting at ${"%.2f".format(r.price)}")
+        return BuyResult(true, sym, 0.0, 0.0, fresh.entryPrice, 0.0, note = r.note, immediate = false)
+    }
+
+    /**
      * Hand a freshly opened Indian position to the strategy that will manage it.
      *
      * Shared by both ways a position can appear — bought outright, or noticed

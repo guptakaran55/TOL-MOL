@@ -615,6 +615,11 @@ class ScanService : Service() {
             try {
                 com.signalscope.app.trading.T212LiveMirror.retryPendingEntries(applicationContext)
                 com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext)
+                // Your "buy at my price" entries: one whose price is reached becomes
+                // your Patient buy through the RV gate — first, so the queue below
+                // takes its first look at a held one in this same minute.
+                try { com.signalscope.app.trading.PriceEntries.process(applicationContext) }
+                catch (e: Exception) { Log.e(TAG, "price entries check failed", e) }
                 // Your own patient orders that you asked to wait on the gate.
                 com.signalscope.app.trading.RvManualQueue.process(applicationContext)
             } catch (e: Exception) {

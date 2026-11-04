@@ -2020,6 +2020,9 @@ class MainActivity : AppCompatActivity() {
                         "dailyMacd" -> dailyMacdJson(a[0].asString, a[1].asString)
                         // WAITING ORDERS › RV GATE ANALYSIS: one held order laid open,
                         // and the gate's track record from its journal.
+                        // BUY AT MY PRICE: Trading 212 — watched in the app, nothing held at
+                        // the broker; India — a real buy trigger (GTT) at Zerodha. Network.
+                        "priceEntrySet" -> priceEntrySetJson(a[0].asString, a[1].asString, a[2].asDouble, a[3].asDouble)
                         "rvGateAnalysis" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
                             .forOrder(applicationContext, a[0].asString, a[1].asString, a[2].asString))
                         "rvGateRecord" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
@@ -6091,6 +6094,30 @@ class MainActivity : AppCompatActivity() {
                             "ceiling" to (if (!o.isSell && o.capLimit > 0.0) o.capLimit else 0.0),
                             "cancellable" to false, "sortKey" to 0))
                     }
+                    // YOUR "BUY AT MY PRICE" ENTRIES: nothing at Trading 212, no cash held —
+                    // the app watches the price and starts your Patient buy at your level.
+                    com.signalscope.app.trading.PriceEntries.waitingFor(applicationContext, base).forEach { e ->
+                        val cur = if (base == "de") "€" else "$"
+                        val managed = try { com.signalscope.app.trading.ManualEntryWatcher.isConfigured(applicationContext, base) }
+                                      catch (_: Exception) { false }
+                        out.add(mapOf(
+                            "id" to e.id, "ns" to "", "symbol" to e.symbol,
+                            "kind" to "buy at your price — watched in the app",
+                            "status" to "PRICEENTRY", "priceEntryId" to e.id, "side" to "BUY",
+                            "from" to "You · buy at price",
+                            "level" to e.level, "rising" to e.rising, "lastPrice" to e.lastPrice,
+                            "cur" to cur, "expiresAt" to e.expiresAt,
+                            "conds" to listOf(cond(com.signalscope.app.trading.MarketHours.isRegularSession(base, nowMs),
+                                "Market open (checked every minute)")),
+                            "why" to "Nothing is placed at Trading 212 and no cash is held. When the price " +
+                                "${if (e.rising) "rises" else "falls"} to $cur${px(e.level)} the app starts your " +
+                                "Patient buy of ${px(e.cash)} through the RV gate" +
+                                (if (managed) ", and hands the position to your watchlist." else ".") +
+                                " Checked once a minute while the market is open and the app's service runs; " +
+                                "armed until you call it off, at most a year.",
+                            "tries" to 0, "dueAt" to 0L, "since" to e.createdAt, "amount" to e.cash,
+                            "cancellable" to false, "sortKey" to 3))
+                    }
                     // …and those that ran past their price limit and are asking you.
                     com.signalscope.app.trading.RvManualQueue.askingFor(applicationContext, base).forEach { o ->
                         out.add(mapOf(
@@ -7198,6 +7225,46 @@ class MainActivity : AppCompatActivity() {
                 ticker = s("ticker"), yahooSymbol = s("yahooSymbol"), qty = d("qty"), cash = d("cash"),
                 refPrice = d("refPrice"), force = (a.get("force")?.asBoolean ?: false), algoNs = s("algoNs"))
         }
+
+        /** Arm a "buy at my price" — see [com.signalscope.app.trading.PriceEntries]
+         *  (Trading 212) and ManualEntryWatcher.buyIndiaAtPrice (India). */
+        fun priceEntrySetJson(space: String, symbol: String, cash: Double, level: Double): String = try {
+            if (space.equals("IN", true)) {
+                val r = com.signalscope.app.trading.ManualEntryWatcher.buyIndiaAtPrice(
+                    applicationContext, symbol, cash, level)
+                invalidateManualWatcherState()
+                gson.toJson(mapOf("ok" to r.ok, "error" to r.error, "note" to r.note, "india" to true,
+                    "symbol" to r.symbol))
+            } else {
+                val r = com.signalscope.app.trading.PriceEntries.set(applicationContext, space, symbol, cash, level)
+                gson.toJson(mapOf("ok" to r.ok, "error" to r.error, "note" to r.note, "id" to r.id,
+                    "rising" to r.rising, "price" to r.price, "symbol" to symbol.uppercase()))
+            }
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "could not set it")))
+        }
+
+        /** Call off a "buy at my price" (Trading 212). Nothing is at the broker to cancel. */
+        @JavascriptInterface
+        fun priceEntryCancel(id: String): String = gson.toJson(mapOf("ok" to
+            try { com.signalscope.app.trading.PriceEntries.cancel(applicationContext, id) } catch (_: Exception) { false }))
+
+        /** Your armed "buy at my price" entries in [space] — for the stock page. No network. */
+        @JavascriptInterface
+        fun priceEntries(space: String): String = try {
+            val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+            val rows: List<Map<String, Any?>> = if (base == "in")
+                com.signalscope.app.data.ManualWatchStore.load(applicationContext, base).entries
+                    .filter { it.status == "PENDING" && it.gttId > 0L && it.triggerPrice > 0.0 }
+                    .map { mapOf("symbol" to it.symbol, "level" to it.triggerPrice, "cash" to it.requestedCash,
+                        "india" to true, "signalBarTs" to it.signalBarTs, "since" to it.createdAt) }
+            else com.signalscope.app.trading.PriceEntries.waitingFor(applicationContext, base).map {
+                mapOf("id" to it.id, "symbol" to it.symbol, "level" to it.level, "cash" to it.cash,
+                    "rising" to it.rising, "lastPrice" to it.lastPrice, "since" to it.createdAt,
+                    "expiresAt" to it.expiresAt)
+            }
+            gson.toJson(mapOf("ok" to true, "rows" to rows))
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
 
         /**
          * Your patient orders on this stock and side still waiting or asking — so a
