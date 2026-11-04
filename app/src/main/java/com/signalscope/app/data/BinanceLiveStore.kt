@@ -66,7 +66,7 @@ object BinanceLiveStore {
     fun load(ctx: Context, ns: String = "binance"): State {
         return try {
             val f = file(ctx, ns)
-            if (!f.exists()) State() else gson.fromJson(f.readText(), State::class.java) ?: State()
+            StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes
         } catch (e: Exception) {
             Log.e(TAG, "load($ns) failed — returning empty", e)
             State()
@@ -77,10 +77,7 @@ object BinanceLiveStore {
     private fun save(ctx: Context, state: State, ns: String) {
         try {
             val f = file(ctx, ns)
-            val tmp = File(f.parentFile, f.name + ".tmp")
-            tmp.writeText(gson.toJson(state))
-            if (f.exists()) f.delete()
-            tmp.renameTo(f)
+            StoreCache.write(f, gson.toJson(state))   // in one step: never an empty file to read
         } catch (e: Exception) {
             Log.e(TAG, "save($ns) failed", e)
         }

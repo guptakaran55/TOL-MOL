@@ -109,13 +109,13 @@ object BucketStore {
         if (base !in BUCKETABLE_SPACES) return State()   // binance: never bucketized (Stage 1)
         return try {
             val f = file(ctx, base)
-            val s = if (!f.exists()) State() else gson.fromJson(f.readText(), State::class.java) ?: State()
+            val s = StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes
             migrateIfNeeded(ctx, base, s)
         } catch (e: Exception) { Log.e(TAG, "load($space) failed", e); State() }
     }
 
     private fun save(ctx: Context, space: String, s: State) {
-        try { file(ctx, Spaces.baseOf(space)).writeText(gson.toJson(s)) }
+        try { val f = file(ctx, Spaces.baseOf(space)); StoreCache.write(f, gson.toJson(s)) }
         catch (e: Exception) { Log.e(TAG, "save($space) failed", e) }
     }
 
@@ -282,7 +282,7 @@ object BucketStore {
         try { StrategyLabStore.resetPaperState(ctx, ns) } catch (_: Exception) {}
         for (name in listOf("strategy_lab_${ns}.json", "reinvest_${ns}.json",
                 "macd_gate_${ns}.json")) {
-            try { java.io.File(ctx.filesDir, name).delete() } catch (_: Exception) {}
+            try { java.io.File(ctx.filesDir, name).let { it.delete(); StoreCache.forget(it) } } catch (_: Exception) {}
         }
     }
 

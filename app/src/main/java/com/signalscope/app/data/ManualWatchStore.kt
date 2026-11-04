@@ -574,7 +574,7 @@ object ManualWatchStore {
     @Synchronized
     fun load(ctx: Context, space: String): State = try {
         val f = file(ctx, space)
-        val raw = if (!f.exists()) State() else gson.fromJson(f.readText(), State::class.java) ?: State()
+        val raw = StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes
         repairExitSeconds(ctx, space, renameRetiredSymbols(ctx, space, raw))
     } catch (e: Exception) { Log.e(TAG, "load($space) failed", e); State() }
 
@@ -677,7 +677,7 @@ object ManualWatchStore {
 
     @Synchronized
     fun save(ctx: Context, space: String, s: State) {
-        try { file(ctx, space).writeText(gson.toJson(s)) }
+        try { val f = file(ctx, space); StoreCache.write(f, gson.toJson(s)) }
         catch (e: Exception) { Log.e(TAG, "save($space) failed", e) }
     }
 

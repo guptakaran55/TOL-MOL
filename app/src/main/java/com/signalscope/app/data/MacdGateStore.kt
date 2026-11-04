@@ -107,15 +107,15 @@ object MacdGateStore {
     fun load(ctx: Context, ns: String): State {
         return try {
             val f = file(ctx, ns)
-            if (!f.exists()) defaultsFor(ns)
-            else gson.fromJson(f.readText(), State::class.java) ?: defaultsFor(ns)
+            // Parsed once, kept until the file changes — see [StoreCache].
+            StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: defaultsFor(ns)
         } catch (e: Exception) {
             Log.w(TAG, "load($ns) failed: ${e.message}"); defaultsFor(ns)
         }
     }
 
     fun save(ctx: Context, ns: String, state: State) {
-        try { file(ctx, ns).writeText(gson.toJson(state)) }
+        try { val f = file(ctx, ns); StoreCache.write(f, gson.toJson(state)) }
         catch (e: Exception) { Log.e(TAG, "save($ns) failed", e) }
     }
 

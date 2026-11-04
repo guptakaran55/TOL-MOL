@@ -307,17 +307,14 @@ object T212LiveStore {
 
     fun load(ctx: Context): State = try {
         val f = file(ctx)
-        if (!f.exists()) State() else gson.fromJson(f.readText(), State::class.java) ?: State()
+        StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes
     } catch (e: Exception) { Log.e(TAG, "load failed", e); State() }
 
     @Synchronized
     private fun save(ctx: Context, state: State) {
         try {
             val f = file(ctx)
-            val tmp = File(f.parentFile, f.name + ".tmp")
-            tmp.writeText(gson.toJson(state))
-            if (f.exists()) f.delete()
-            tmp.renameTo(f)
+            StoreCache.write(f, gson.toJson(state))   // in one step: never an empty file to read
         } catch (e: Exception) { Log.e(TAG, "save failed", e) }
     }
 
