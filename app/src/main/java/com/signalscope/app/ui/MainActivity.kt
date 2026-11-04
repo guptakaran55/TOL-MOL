@@ -2023,10 +2023,22 @@ class MainActivity : AppCompatActivity() {
                         // BUY AT MY PRICE: Trading 212 — watched in the app, nothing held at
                         // the broker; India — a real buy trigger (GTT) at Zerodha. Network.
                         "priceEntrySet" -> priceEntrySetJson(a[0].asString, a[1].asString, a[2].asDouble, a[3].asDouble)
+                        // WHAT IS REALLY YOURS TO SPEND: Trading 212's free cash less what the
+                        // app has promised (RV gate buys, buy-at-price entries, armed algos).
+                        "t212Spendable" -> gson.toJson(com.signalscope.app.trading.Spendable
+                            .compute(applicationContext, a.size() > 0 && a[0].asBoolean))
+                        // THE PRICE NOW, for setting a limit, a level or a stop.
+                        "livePrice" -> livePriceJson(a[0].asString, a[1].asString)
                         "rvGateAnalysis" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
                             .forOrder(applicationContext, a[0].asString, a[1].asString, a[2].asString))
                         "rvGateRecord" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
                             .recordFor(applicationContext, a[0].asString, a[1].asString, a[2].asInt))
+                        // The orders it finished with lately, one by one, and one of them
+                        // replayed on its day's chart (network: that day's prices).
+                        "rvGateFinished" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
+                            .finishedFor(applicationContext, a[0].asString, a[1].asInt))
+                        "rvGateEpisode" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
+                            .forEpisode(applicationContext, a[0].asString, a[1].asString, a[2].asLong))
                         "exitLevels" -> exitLevelsJson(a[0].asString, a[1].asString)
                         "pricePanels" -> pricePanelsJson(a[0].asString, a[1].asString)
                         // A first full history rebuild can take minutes at Trading
@@ -5521,6 +5533,12 @@ class MainActivity : AppCompatActivity() {
                     "configured" to configured,
                     "holdingsOk" to holdOk,
                     "brokerQty" to brokerQty,
+                    // What other algos own of each stock, and whose: the split line
+                    // offers to combine only what nobody manages.
+                    "algoShares" to try {
+                        com.signalscope.app.trading.ManualEntryWatcher.algoSharesFor(applicationContext, base)
+                            .mapValues { mapOf("qty" to it.value.qty, "by" to it.value.by) }
+                    } catch (_: Exception) { emptyMap<String, Any>() },
                     "managedQty" to managedQty,
                     "heldOnly" to heldOnly,
                     // India screens and alerts, but has no order path wired here —
@@ -7242,6 +7260,54 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "could not set it")))
+        }
+
+        /**
+         * THE PRICE NOW for [symbol] — for setting a limit, a trigger level, a stop
+         * or a target. The stock page's own price is the morning scan's close, which
+         * can be far from where the stock trades by the afternoon. Network.
+         *   DE: Tradegate's real-time mid (checked against the feed), else the feed.
+         *   US: the feed (real-time for US).
+         *   IN: Zerodha's last traded price when logged in, else the NSE feed.
+         */
+        fun livePriceJson(space: String, symbol: String): String = try {
+            val sp = space.uppercase()
+            val sym = symbol.trim().uppercase().removeSuffix(".DE").removeSuffix(".NS")
+            var price = 0.0; var source = ""; var bid = 0.0; var ask = 0.0
+            if (sp == "IN") {
+                val zc = com.signalscope.app.network.ZerodhaClient(config)
+                if (zc.isConnected) {
+                    val r = zc.fetchLtp("NSE", sym)
+                    if (r is com.signalscope.app.network.ZerodhaClient.LtpResult.Success && r.lastPrice > 0.0) {
+                        price = r.lastPrice; source = "Zerodha, last trade"
+                    }
+                }
+                if (price <= 0.0) com.signalscope.app.network.YahooFinanceClient.fetchLivePrice(
+                    com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(sym, "NSE"))
+                    ?.let { price = it; source = "NSE feed" }
+            } else {
+                val spc = if (sp == "DE") "DE" else "US"
+                val ys = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(sym, spc)
+                val feed = com.signalscope.app.network.YahooFinanceClient.fetchLivePrice(ys)
+                if (spc == "DE" && config.hasT212Credentials) try {
+                    val client = com.signalscope.app.network.Trading212Client(config)
+                    val ticker = client.resolveT212Ticker(sym, "DE")
+                    val isin = ticker?.let {
+                        (client.fetchInstrumentMetadata(setOf(it)) as?
+                            com.signalscope.app.network.Trading212Client.T212Result.Success)?.data?.get(it)?.isin
+                    }
+                    val stale = com.signalscope.app.network.FeedHealth.stoppedSince(ys) > 0L
+                    val q = isin?.let { com.signalscope.app.trading.GermanRealtime.checkedQuote(
+                        applicationContext, it, ys, ticker, feed ?: 0.0, stale) }
+                    if (q != null && q.mid > 0.0) { price = q.mid; bid = q.bid; ask = q.ask; source = "Tradegate, real-time" }
+                } catch (_: Exception) {}
+                if (price <= 0.0 && feed != null) { price = feed; source = if (spc == "DE") "Xetra feed" else "US feed" }
+            }
+            if (price > 0.0) gson.toJson(mapOf("ok" to true, "price" to price, "source" to source,
+                "bid" to bid, "ask" to ask, "at" to System.currentTimeMillis()))
+            else gson.toJson(mapOf("ok" to false, "error" to "No live price for $sym right now."))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "price read failed")))
         }
 
         /** Call off a "buy at my price" (Trading 212). Nothing is at the broker to cancel. */

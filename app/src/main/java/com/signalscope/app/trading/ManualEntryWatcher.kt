@@ -582,6 +582,41 @@ object ManualEntryWatcher {
         return out.mapValues { it.value.toList() }
     }
 
+    /** Shares of one stock that algos (not the watcher) own, and whose they are. */
+    data class AlgoShares(val qty: Double, val by: List<String>)
+
+    /**
+     * WHAT THE ALGOS OWN, per stock — every algo but the watcher: the live ledger's
+     * rows (Trading 212 or Zerodha) and, in Germany, the built-in algos' real shares.
+     * The one count "combine" and the watcher's split line both use, so the screen
+     * offers to combine exactly what combining would take: only what NOBODY manages.
+     */
+    fun algoSharesFor(ctx: Context, space: String): Map<String, AlgoShares> {
+        val base = Spaces.baseOf(space.lowercase())
+        val nsFor = ManualWatchStore.nsFor(base)
+        val qty = HashMap<String, Double>()
+        val by = HashMap<String, LinkedHashSet<String>>()
+        fun add(sym: String, q: Double, ns: String) {
+            val k = sym.uppercase()
+            qty[k] = (qty[k] ?: 0.0) + q
+            by.getOrPut(k) { LinkedHashSet() }.add(try { ShareOwners.nameOf(ctx, ns).trim() } catch (_: Exception) { "an algo" })
+        }
+        val live = setOf("OPEN", "PENDING", "EXITING")
+        try {
+            if (base == "in")
+                com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                    .filter { Spaces.baseOf(it.ns) == base && it.ns != nsFor && it.qty > 0 && it.status in live }
+                    .forEach { add(it.symbol, it.qty.toDouble(), it.ns) }
+            else
+                com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                    .filter { Spaces.baseOf(it.ns) == base && it.ns != nsFor && it.qty > 0.0 && it.status in live }
+                    .forEach { add(it.symbol, it.qty, it.ns) }
+        } catch (e: Exception) { Log.w(TAG, "[$base] algo quantities unreadable", e) }
+        try { ShareOwners.floorRows(ctx, base).forEach { add(it.symbol, it.qty, it.ns) } }
+        catch (e: Exception) { Log.w(TAG, "[$base] built-in algo quantities unreadable", e) }
+        return qty.mapValues { (k, q) -> AlgoShares(q, by[k]?.toList().orEmpty()) }
+    }
+
     fun managedQtyFor(ctx: Context, space: String): Map<String, Double> {
         val base = Spaces.baseOf(space.lowercase())
         val mirror = HashMap<String, Double>()
@@ -1641,16 +1676,7 @@ object ManualEntryWatcher {
         // partly held produced two records for one pile of shares — the ledger
         // claimed 22.792 DBK against 11.396 actually owned. The rule is one owner
         // per share: the algo keeps what it bought, this book takes the remainder.
-        val nsFor = ManualWatchStore.nsFor(base)
-        val byAlgos = try {
-            com.signalscope.app.data.T212LiveStore.load(ctx).trades
-                .filter {
-                    Spaces.baseOf(it.ns) == base && it.ns != nsFor &&
-                        it.symbol.equals(sym, true) && it.qty > 0.0 &&
-                        (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING")
-                }.sumOf { it.qty } +
-                (if (base == "de") com.signalscope.app.data.FloorLiveStore.heldQtyOf(ctx, sym) else 0.0)
-        } catch (_: Exception) { 0.0 }
+        val byAlgos = algoSharesFor(ctx, base)[sym.uppercase()]?.qty ?: 0.0
         val mineQty = (held.qty - byAlgos).coerceAtLeast(0.0)
         if (mineQty <= maxOf(1e-6, held.qty * 0.01)) return BuyResult(false, sym,
             error = "An algo already manages all ${"%.4f".format(held.qty)} of $sym. There is nothing " +

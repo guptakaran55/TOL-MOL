@@ -1097,8 +1097,10 @@ function openRvAnalysis(src,ns,id){
   }else{
     h+='<div style="margin:0 12px 8px;padding:14px;border:1px dashed var(--bd);border-radius:8px;text-align:center;color:var(--t3);font-size:11px">Nothing is held by the RV gate in this market right now.<br/>The track record below still shows how its waiting has worked out.</div>';
   }
+  h+='<div id="rva-done" style="padding:4px 12px 0"></div>';
   h+='<div id="rva-record" style="padding:4px 12px 24px"></div>';
   ov.innerHTML=h;document.body.appendChild(ov);
+  rvaLoadDone();
   if(rows.length)androidAsync('rvGateAnalysis',[RVA.src,RVA.ns,RVA.id],function(raw){
     var el=document.getElementById('rva-body');if(!el)return;
     var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
@@ -1149,11 +1151,7 @@ function rvaOrderHtml(r){
   h+=rvaWaitingForLine(r);
   // ── the chart
   var ch=rvaChart(r);
-  h+='<div style="margin-top:8px">'+ch.svg+'</div>';
-  h+='<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px 10px;font-size:9px;color:var(--t2)">'+ch.legend.map(function(l){
-      if(l.dot)return '<span style="white-space:nowrap"><span style="color:'+l.col+'">●</span> '+escHtml(l.text)+'</span>';
-      return '<span style="white-space:nowrap"><span style="display:inline-block;width:14px;height:0;border-top:2px '+(l.dash?'dashed':'solid')+' '+l.col+';vertical-align:middle;margin-right:3px'+(l.band?';height:7px;border:0;background:'+l.col:'')+'"></span>'+escHtml(l.text)+'</span>'}).join('')+'</div>';
-  if(ch.off.length)h+='<div style="font-size:9px;color:var(--t3);margin-top:3px">Off the chart: '+escHtml(ch.off.join(' · '))+'</div>';
+  h+='<div style="margin-top:8px">'+ch.svg+'</div>'+rvaLegendHtml(ch);
   if(Number(r.barLagMin)>0)h+='<div style="font-size:9px;color:var(--t3);margin-top:3px">15-minute bars from this feed run ~'+Number(r.barLagMin)+' min behind; the dotted line joins the last one to the live price.</div>';
   h+='</div>';
   // ── every way it can start
@@ -1187,6 +1185,13 @@ function rvaOrderHtml(r){
   return h;
 }
 // "Waiting for: ▲ over €28.95 (+0.04) · ▼ to €28.10 (−0.85) · ⏱ 19:49"
+function rvaLegendHtml(ch){
+  var h='<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px 10px;font-size:9px;color:var(--t2)">'+ch.legend.map(function(l){
+      if(l.dot)return '<span style="white-space:nowrap"><span style="color:'+l.col+'">'+(l.ring?'○':'●')+'</span> '+escHtml(l.text)+'</span>';
+      return '<span style="white-space:nowrap"><span style="display:inline-block;width:14px;height:0;border-top:2px '+(l.dash?'dashed':'solid')+' '+l.col+';vertical-align:middle;margin-right:3px'+(l.band?';height:7px;border:0;background:'+l.col:'')+'"></span>'+escHtml(l.text)+'</span>'}).join('')+'</div>';
+  if(ch.off.length)h+='<div style="font-size:9px;color:var(--t3);margin-top:3px">Off the chart: '+escHtml(ch.off.join(' · '))+'</div>';
+  return h;
+}
 function rvaWaitingForLine(r){
   if((r.decision||{}).go)return '';
   var c=r.cur||'', p=Number(r.price||0), parts=[];
@@ -1207,14 +1212,18 @@ function rvaChart(r){
   var W=340,H=220,L=4,R=46,T=8,B=20, pw=W-L-R, ph=H-T-B;
   var bars=r.bars||[], tr=r.trail||[], now=Number(r.now), price=Number(r.price||0);
   var x0=Number(r.openMs)||((bars[0]&&bars[0][0])||now-3600e3);
+  // A FINISHED ORDER (r.replay) is drawn over its whole session, with its first
+  // look, its fill and the best price the gate saw while it waited marked.
+  var rp=r.replay||null;
   // Today so far, through the 2-hour mark — not the empty rest of the session.
   var x1=Math.max(now,Number(r.startsBy||now))+20*60e3;
-  if(Number(r.closeMs)>x0)x1=Math.min(x1,Number(r.closeMs));
+  if(Number(r.closeMs)>x0)x1=rp?Math.max(Number(r.closeMs),now):Math.min(x1,Number(r.closeMs));
   if(now>x1)x1=now;
   var X=function(t){return L+(Math.max(x0,Math.min(x1,t))-x0)/(x1-x0)*pw};
   var hi=Number(r.high||0), lo=Number(r.low||0), unit=Number(lv.unit||0)||(price*0.02);
   var vals=[];bars.forEach(function(b){vals.push(b[2],b[3])});tr.forEach(function(t){vals.push(t[1])});
   if(price>0)vals.push(price);if(hi>0)vals.push(hi);if(lo>0)vals.push(lo);
+  if(rp)[rp.firstPrice,rp.fillPrice,rp.bestPrice].forEach(function(v){if(Number(v)>0)vals.push(Number(v))});
   var near=function(v){return v!=null&&isFinite(v)&&v>=lo-1.2*unit&&v<=hi+1.2*unit};
   var lines=[], off=[], legend=[];
   function line(v,col,dash,label,tag,from,to){
@@ -1257,7 +1266,7 @@ function rvaChart(r){
     }
   }
   // future and the waiting window
-  if(now<x1)s+='<rect x="'+X(now)+'" y="'+T+'" width="'+(X(x1)-X(now))+'" height="'+ph+'" style="fill:rgba(148,163,184,.10)"/>';
+  if(now<x1&&!rp)s+='<rect x="'+X(now)+'" y="'+T+'" width="'+(X(x1)-X(now))+'" height="'+ph+'" style="fill:rgba(148,163,184,.10)"/>';
   // hour grid + labels
   var d0=new Date(x0);d0.setMinutes(0,0,0);
   for(var t=d0.getTime()+3600e3;t<x1;t+=3600e3){
@@ -1283,7 +1292,7 @@ function rvaChart(r){
     var yt=Y(Math.max(b[1],b[4])), yb=Y(Math.min(b[1],b[4]));
     s+='<rect x="'+(xm-bw/2)+'" y="'+yt+'" width="'+bw+'" height="'+Math.max(1,yb-yt)+'" style="fill:'+col+';opacity:.85"/>';
   });
-  if(bars.length&&price>0){var lb=bars[bars.length-1];
+  if(!rp&&bars.length&&price>0){var lb=bars[bars.length-1];
     s+='<line x1="'+X(lb[0]+15*60e3)+'" x2="'+X(now)+'" y1="'+Y(lb[4])+'" y2="'+Y(price)+'" style="stroke:'+GR+';stroke-dasharray:2 2"/>';}
   // the rule's lines
   if(lv.velRef!=null&&near(Number(lv.velRef))&&lv.goLine!=null){
@@ -1297,6 +1306,13 @@ function rvaChart(r){
   });
   // the gate's looks
   tr.forEach(function(t){s+='<circle cx="'+X(t[0])+'" cy="'+Y(t[1])+'" r="1.4" style="fill:'+(t[2]?GN:AM)+';opacity:.85"/>'});
+  // a finished order: its first look, the best the gate saw while waiting, its fill
+  if(rp){
+    var dia=function(t,v,col){var cx=X(t),cy=Y(v);return '<path d="M'+cx+' '+(cy-4.5)+' L'+(cx+4.5)+' '+cy+' L'+cx+' '+(cy+4.5)+' L'+(cx-4.5)+' '+cy+' Z" style="fill:'+col+';stroke:var(--cd);stroke-width:1"/>'};
+    if(Number(rp.bestPrice)>0&&Number(rp.bestAt)>0)s+='<circle cx="'+X(rp.bestAt)+'" cy="'+Y(rp.bestPrice)+'" r="5" style="fill:none;stroke:'+GN+';stroke-width:1.5"/>';
+    if(Number(rp.firstPrice)>0)s+=dia(Number(r.since),Number(rp.firstPrice),PU);
+    if(Number(rp.fillPrice)>0&&Number(rp.fillAt)>0)s+=dia(Number(rp.fillAt),Number(rp.fillPrice),BL);
+  }
   // now
   if(price>0)s+='<circle cx="'+X(now)+'" cy="'+Y(price)+'" r="3.6" style="fill:var(--t1);stroke:var(--cd);stroke-width:1.5"/>';
   // right-hand price labels, pushed apart so none overlap
@@ -1312,8 +1328,155 @@ function rvaChart(r){
   s+='</svg>';
   if(tr.length){legend.push({col:AM,dot:true,text:'a look: not yet'});
     if(tr.some(function(t){return t[2]}))legend.push({col:GN,dot:true,text:'a look: go'});}
-  legend.push({col:'var(--t1)',dot:true,text:'live price now'});
+  if(rp){
+    if(Number(rp.firstPrice)>0)legend.push({col:PU,dot:true,text:'first look'});
+    if(price>0)legend.push({col:'var(--t1)',dot:true,text:'let go'});
+    if(Number(rp.fillPrice)>0)legend.push({col:BL,dot:true,text:'filled'});
+    if(Number(rp.bestPrice)>0)legend.push({col:GN,dot:true,ring:true,text:'best price it saw while waiting'});
+  }else legend.push({col:'var(--t1)',dot:true,text:'live price now'});
   return {svg:s,legend:legend,off:off};
+}
+// ── FINISHED — THE LAST THREE DAYS, ONE BY ONE ──────────────────────────────
+// The record below is averages. Here every order the gate finished with lately
+// is laid out on its own — where the price was at its first look, where and why
+// it let it go, what filled — and, on a tap, replayed on that day's chart with
+// the rule re-run on the very reading it let the order go on.
+var RVA_DONE=[], RVA_DONE_CUR='', RVA_DONE_OPEN=-1;
+function rvaLoadDone(){
+  var el=document.getElementById('rva-done');if(!el)return;
+  el.innerHTML='<div style="font-size:10px;color:var(--t3);padding:8px 2px">Reading the orders it finished with…</div>';
+  androidAsync('rvGateFinished',[SPACE,3],function(raw){
+    var el2=document.getElementById('rva-done');if(!el2)return;
+    var j=null;try{j=JSON.parse(raw||'{}')}catch(e){}
+    if(!j||!j.ok){el2.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((j&&j.error)||'The journal could not be read.')+'</div>';return}
+    RVA_DONE=(j.rows||[]).map(function(x){var f=x.f||{};f.from=x.from||'';return f});
+    RVA_DONE_CUR=j.cur||'';RVA_DONE_OPEN=-1;
+    el2.innerHTML=rvaDoneHtml();
+  });
+}
+function rvaDayLabel(ms){
+  var d=new Date(Number(ms)), t=new Date();t.setHours(0,0,0,0);
+  var k=Math.round((t.getTime()-new Date(d.getFullYear(),d.getMonth(),d.getDate()).getTime())/864e5);
+  return k<=0?'Today':k===1?'Yesterday':d.toLocaleDateString([], {weekday:'long',day:'numeric',month:'short'});
+}
+function rvaDoneHtml(){
+  var c=RVA_DONE_CUR, rows=RVA_DONE, f2=function(x){return Number(x).toFixed(2)};
+  var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:10px 2px 6px;letter-spacing:.03em">FINISHED — THE LAST 3 DAYS</div>';
+  if(!rows.length)return h+'<div style="font-size:10px;color:var(--t3);padding:2px 2px 8px">Nothing went through the gate in '+(SPACE==='DE'?'Germany':'the US')+' in the last three days.</div>';
+  var once=rows.filter(function(f){return f.atOnce}).length;
+  var held=rows.filter(function(f){return f.relAt>0&&!f.atOnce});
+  var hp=held.filter(function(f){return f.gatePct!=null});
+  var avg=hp.length?hp.reduce(function(a,f){return a+f.gatePct},0)/hp.length:null;
+  var better=hp.filter(function(f){return f.gatePct>0}).length;
+  var never=rows.filter(function(f){return !(f.relAt>0)}).length;
+  h+='<div style="font-size:10px;color:var(--t2);line-height:1.6;padding:0 2px 6px"><b>'+rows.length+'</b> order'+(rows.length===1?'':'s')+': <b>'+once+'</b> went at its first look'+
+    ' · <b>'+held.length+'</b> held, then let go'+(avg!=null?' — '+better+' of '+hp.length+' at a better price, <b style="color:'+(avg>0?'var(--gn)':'var(--rd)')+'">'+rvaPct(avg)+'</b> on average':'')+
+    (never?' · <b>'+never+'</b> never let go':'')+'. Tap one to see its day.</div>';
+  var day='';
+  rows.forEach(function(f,i){
+    var dl=rvaDayLabel(f.firstAt);
+    if(dl!==day){day=dl;h+='<div style="font-size:9px;font-weight:800;color:var(--t3);padding:6px 2px 3px">'+escHtml(dl)+'</div>'}
+    var buy=f.side!=='SELL', open=(i===RVA_DONE_OPEN);
+    var pc=f.gatePct, chip;
+    if(!(f.relAt>0))chip='<span style="font-size:9px;font-weight:800;color:var(--t3)">never let go</span>';
+    else if(f.atOnce)chip='<span style="font-size:9px;font-weight:800;color:var(--t3)">at once</span>';
+    else if(pc!=null)chip='<b style="font-family:monospace;font-size:11px;color:'+(pc>0?'var(--gn)':pc<0?'var(--rd)':'var(--t2)')+'">'+rvaPct(pc)+'</b>';
+    else chip='<span style="font-size:9px;color:var(--t3)">—</span>';
+    var path=(Number(f.firstPrice)>0?rvaT(f.firstAt)+' '+c+f2(f.firstPrice):rvaT(f.firstAt))+
+      (f.relAt>0&&!f.atOnce?' → '+rvaT(f.relAt)+(Number(f.relPrice)>0?' '+c+f2(f.relPrice):'')+' · waited '+Number(f.waitedMin||0)+' min':'')+
+      (f.relAt>0?' · '+escHtml(f.reason||''):'');
+    var end='';
+    if(f.status==='filled')end='filled '+c+f2(f.fillPrice)+(f.fillPct!=null?' ('+rvaPct(f.fillPct)+' against the first look)':'');
+    else if(f.status==='not filled')end='<span style="color:var(--am)">not filled — '+escHtml(f.endWhy)+'</span>';
+    else if(f.status==='never let go')end='<span style="color:var(--am)">'+escHtml(f.endWhy||'ended')+'</span>';
+    else if(f.status==='let go')end='<span style="color:var(--t3)">no fill on record yet</span>';
+    else end='<span style="color:var(--t3)">no outcome on record</span>';
+    if(f.askAt>0)end+=' · <span style="color:var(--am)">stopped at its limit to ask you</span>';
+    h+='<div onclick="rvaDoneToggle('+i+')" style="cursor:pointer;border:1px solid '+(open?'var(--pu)':'var(--bd)')+';border-radius:8px;background:var(--cd);padding:7px 9px;margin-bottom:4px">'+
+      '<div style="display:flex;align-items:center;gap:6px">'+
+        '<span style="font-size:12px;font-weight:900;color:var(--t1)">'+(buy?'▲ ':'▼ ')+escHtml(f.symbol)+'</span>'+
+        '<span style="font-size:8px;font-weight:900;color:'+(buy?'var(--gn)':'var(--rd)')+';border:1px solid currentColor;border-radius:3px;padding:0 4px">'+(buy?'BUY':'SALE')+'</span>'+
+        '<span style="font-size:9px;color:var(--t3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escHtml(f.from)+'</span><span style="flex:1"></span>'+chip+'</div>'+
+      '<div style="font-size:9px;color:var(--t2);margin-top:2px;line-height:1.5">'+path+'</div>'+
+      '<div style="font-size:9px;color:var(--t2);line-height:1.5">'+end+'</div></div>'+
+      '<div id="rva-ep-'+i+'">'+(open?'<div style="font-size:10px;color:var(--t3);padding:10px 2px">Replaying its day…</div>':'')+'</div>';
+  });
+  h+='<div style="font-size:9px;color:var(--t3);padding:4px 2px 2px;line-height:1.5">The % is the price it was let go at against the price at its first look — what buying or selling at once would have got. + means waiting got the better price. Orders placed with the box unticked are not here.</div>';
+  return h;
+}
+function rvaDoneToggle(i){
+  var el=document.getElementById('rva-done');if(!el)return;
+  RVA_DONE_OPEN=(RVA_DONE_OPEN===i)?-1:i;
+  el.innerHTML=rvaDoneHtml();
+  if(RVA_DONE_OPEN<0)return;
+  var f=RVA_DONE[i];
+  androidAsync('rvGateEpisode',[SPACE,f.key,f.firstAt],function(raw){
+    var box=document.getElementById('rva-ep-'+i);if(!box||RVA_DONE_OPEN!==i)return;
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    if(!r||!r.ok){box.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((r&&r.error)||'No answer.')+'</div>';return}
+    box.innerHTML=rvaEpisodeHtml(r);
+  });
+}
+// Where in the day's range, and which way, in words: "72% up today's range, rising".
+function rvaWhere(pos,vel,atr,buy){
+  var a=[];
+  if(pos!=null)a.push(Math.round(Number(pos)*100)+'% up today’s range');
+  else a.push('the range too narrow to count');
+  if(vel!=null&&Number(atr)>0){
+    var k=Number(vel)/Number(atr);
+    a.push(Math.abs(k)<=0.05?'flat':(k>0?'rising':'falling')+' ('+(k>0?'+':'−')+Math.abs(k).toFixed(2)+' ATR)');
+  }
+  return a.join(', ');
+}
+function rvaEpisodeHtml(r){
+  var f=r.episode||{}, c=r.cur||'', buy=r.side!=='SELL', f2=function(x){return Number(x).toFixed(2)};
+  r.replay={firstPrice:f.firstPrice,fillAt:f.fillAt,fillPrice:f.fillPrice,bestAt:r.bestAt,bestPrice:r.bestPrice};
+  var h='<div style="border:1px solid var(--pu);border-top:0;border-radius:0 0 8px 8px;background:var(--cd);padding:8px 9px;margin:-6px 0 8px">';
+  // the verdict
+  var pc=f.gatePct, tone, txt;
+  if(!(f.relAt>0)){tone='var(--t3)';txt='Never let go — '+(buy?'nothing was bought':'nothing was sold')+'.'}
+  else if(f.atOnce){tone='var(--t3)';txt='Went at its first look — here the gate changed nothing.'}
+  else if(pc==null){tone='var(--t3)';txt='Held '+f.waitedMin+' min; no price on record to compare.'}
+  else if(pc>=0){tone='var(--gn)';txt='Waiting got it <b>'+Math.abs(pc).toFixed(2)+'% '+(buy?'cheaper':'higher')+'</b> than '+(buy?'buying':'selling')+' at the first look.'}
+  else{tone='var(--rd)';txt='Waiting cost <b>'+Math.abs(pc).toFixed(2)+'%</b> against '+(buy?'buying':'selling')+' at the first look.'}
+  h+='<div style="padding:6px 8px;border-radius:6px;background:var(--bg2);font-size:11px;color:'+tone+';line-height:1.5">'+txt+'</div>';
+  if(!(r.bars||[]).length)h+='<div style="font-size:9px;color:var(--am);margin-top:6px">That day’s 15-minute prices did not come back — the chart shows only the gate’s own looks.</div>';
+  var ch=rvaChart(r);
+  h+='<div style="margin-top:6px">'+ch.svg+'</div>'+rvaLegendHtml(ch);
+  // what happened, step by step
+  var li=function(t){return '<div style="display:flex;gap:6px;padding:3px 0;border-bottom:1px solid var(--bg2)"><span style="color:var(--t3)">•</span><span style="flex:1">'+t+'</span></div>'};
+  var b='';
+  if(Number(f.firstPrice)>0)b+=li('<b>First look '+rvaT(f.firstAt)+'</b> at '+c+f2(f.firstPrice)+' — '+escHtml(rvaWhere(f.firstPos,f.firstVel,f.atr,buy))+'.');
+  if(f.askAt>0)b+=li('Stopped at its price limit '+(Number(f.askLimit)>0?c+f2(f.askLimit):'')+' at '+rvaT(f.askAt)+(Number(f.askPrice)>0?' (price '+c+f2(f.askPrice)+')':'')+' and asked you.');
+  if(f.relAt>0){
+    b+=li((f.atOnce?'<b>Let go at that same look</b>':'<b>Held '+f.waitedMin+' min, let go '+rvaT(f.relAt)+'</b>'+(Number(f.relPrice)>0?' at '+c+f2(f.relPrice):''))+
+      ': '+escHtml(f.relWhy||'')+(f.relHigh!=null&&!f.atOnce?' <span style="color:var(--t3)">(then '+escHtml(rvaWhere(f.relPos,f.relVel,f.atr,buy))+')</span>':'')+'.');
+    var rc=r.recheck;
+    if(rc)b+=li(rc.go
+      ?'<span style="color:var(--gn);font-weight:700">✓ The rule, re-run on what the gate saw at that moment, agrees:</span> '+escHtml(rc.why)+'.'
+      :'<span style="color:var(--rd);font-weight:700">⚠ Re-run on what the gate saw at that moment, the rule would NOT have let it go:</span> '+escHtml(rc.why)+'. The gate did not follow its own rule here.');
+    else b+=li('<span style="color:var(--t3)">Not the rule’s call ('+escHtml(f.reason||'')+') — nothing to re-check.</span>');
+  }else b+=li('<b>Never let go</b>'+(f.endAt>0?' — '+rvaT(f.endAt):'')+': '+escHtml(f.endWhy||'no outcome on record')+'.');
+  if(f.status==='filled'){
+    var rel=Number(f.relPrice||0), slip=rel>0?(buy?(f.fillPrice-rel):(rel-f.fillPrice))/rel*100:null;
+    b+=li('<b>Filled</b> '+c+f2(f.fillPrice)+(Number(f.fillQty)>0?' × '+Number(f.fillQty).toFixed(4).replace(/\.?0+$/,''):'')+(f.fillAt>0?' at '+rvaT(f.fillAt):'')+
+      (slip!=null?' — '+Math.abs(slip).toFixed(2)+'% '+(slip>0?(buy?'over':'under'):(buy?'under':'over'))+' the price it was let go at (the ladder’s steps)':'')+'.');
+  }else if(f.status==='not filled')b+=li('<span style="color:var(--am)"><b>Not filled</b> — '+escHtml(f.endWhy)+'.</span>');
+  else if(f.status==='let go')b+=li('<span style="color:var(--t3)">No fill on record yet — an algo’s fill is picked up on a later pass.</span>');
+  if(Number(r.bestPrice)>0&&!f.atOnce&&Number(f.firstPrice)>0&&Number(f.relPrice)>0){
+    var fp=Number(f.firstPrice), bp=Number(r.bestPrice), rp2=Number(f.relPrice);
+    var could=buy?fp-bp:bp-fp, got=buy?fp-rp2:rp2-fp;
+    b+=li('The best price the gate saw while it waited: '+c+f2(bp)+(r.bestAt?' at '+rvaT(r.bestAt):'')+'. '+
+      (could>0.000001?('Perfect timing inside the same wait would have '+(buy?'saved':'gained')+' '+c+f2(could)+' a share; it '+(got>=0?'got '+c+f2(got)+' ('+Math.round(Math.max(0,got)/could*100)+'%)':'ended '+c+f2(-got)+' the wrong side of its first look')+'.')
+        :('Nothing better came while it waited — '+(buy?'the price only rose':'the price only fell')+' from its first look.')));
+  }
+  if(Number(r.dayClose)>0){
+    var paid=Number(f.fillPrice||f.relPrice||0);
+    if(paid>0){var dc=(Number(r.dayClose)/paid-1)*100;
+      b+=li('The day closed at '+c+f2(r.dayClose)+' — '+Math.abs(dc).toFixed(2)+'% '+(dc>=0?'above':'below')+' what it '+(buy?'paid':'got')+'.');}
+  }
+  h+='<div style="margin-top:6px;font-size:10px;color:var(--t2);line-height:1.5">'+b+'</div></div>';
+  return h;
 }
 // ── THE TRACK RECORD ─────────────────────────────────────────────────────────
 function rvaRecSide(s){RVA_REC_SIDE=s;rvaLoadRecord()}
@@ -9773,18 +9936,20 @@ function ownerSplitLine(r){
     app+=Number(l.qty||0);
     if(Number(l.cost)>0)cost+=Number(l.cost);else known=false;
     var nm=String(l.name||'');if(nm.length>14)nm=nm.slice(0,13)+'…';
-    return '<b style="color:var(--t2)">'+q(l.qty)+'</b> '+escHtml(nm);
+    return '<span style="white-space:nowrap"><b style="color:var(--t2)">'+q(l.qty)+'</b> '+escHtml(nm)+'</span>';
   });
   var mine=tot-app, tol=Math.max(1e-4,tot*0.01), avg=Number(r.avgPrice||0);
   if(mine>tol){
     var my=(known&&avg>0)?(avg*tot-cost)/mine:0;
     var ok=my>avg*0.5&&my<avg*2;
-    parts.push('<b style="color:var(--t2)">'+q(mine)+'</b> you'+(ok?' ≈'+r.currency+fmt(my):''));
+    parts.push('<span style="white-space:nowrap"><b style="color:var(--t2)">'+q(mine)+'</b> you'+(ok?' ≈'+r.currency+fmt(my):'')+'</span>');
   }else if(mine<-tol){
-    parts.push('<span style="color:var(--am)">app counts '+q(-mine)+' more</span>');
+    parts.push('<span style="color:var(--am);white-space:nowrap">app counts '+q(-mine)+' more</span>');
   }
+  // WRAPS (the user, 5 Nov 2026): the cell does not, so one long line of owners
+  // used to stretch the whole Stock column and push the table off the screen.
   return '<div title="Who owns these shares. You = the rest. Your price ≈ broker average less what the app’s lots paid; drifts after another owner sells out." '+
-    'style="font-size:8px;color:var(--t3);margin-top:1px;line-height:1.4">'+parts.join(' · ')+'</div>';
+    'style="font-size:8px;color:var(--t3);margin-top:1px;line-height:1.4;white-space:normal;max-width:100px">'+parts.join(' · ')+'</div>';
 }
 // THE RED DOT (the user, 4 Nov 2026): a holding NOTHING looks after — no algo or
 // watchlist manages any of it, and no sell order (target or stop) rests at the
@@ -9837,75 +10002,95 @@ function renderUnifiedPortfolioTable(rows,opts){
   var h=renderPortfolioNewsPanel();
   h+=renderDummyGttPanel();
   h+='<div style="display:flex;justify-content:flex-end;margin:0 0 6px">'+sortPill('portfolio')+'</div>';
-  h+='<div class="tw"><table><thead><tr>';
-  h+='<th onclick="doPSort(\'symbol\')">Stock'+pSA('symbol')+'</th>';
-  h+='<th onclick="doPSort(\'macdPhase\')">MACD'+pSA('macdPhase')+'</th>';
-  h+='<th onclick="doPSort(\'totalReturnPct\')" title="Return% / P&L / Day%">P&L'+pSA('totalReturnPct')+'</th>';
-  h+='<th onclick="doPSort(\'zonePct\')" title="Price position: support=0% resistance=100%">Zone'+pSA('zonePct')+'</th>';
-  h+='<th title="Entry and exit scores"><span onclick="event.stopPropagation();doPSort(\'pullbackScore\')" style="cursor:pointer">Pb'+pSA('pullbackScore')+'</span>/<span onclick="event.stopPropagation();doPSort(\'momentumScore\')" style="cursor:pointer">Mo'+pSA('momentumScore')+'</span><br/><span style="font-size:7px;color:var(--t3)">Pr/Pt</span></th>';
-  h+='<th onclick="doPSort(\'ltp\')">LTP'+pSA('ltp')+'</th>';
-  h+='<th onclick="doPSort(\'invested\')">Inv/Qty'+pSA('invested')+'</th>';
-  // Germany and the US show their target or stop inside the Zone cell (one
-  // picture, one tap) — the GTT column is India's alone now.
-  h+=(isT212Space()?'':'<th>GTT</th>')+'</tr></thead><tbody>';
-  if(!rows.length){
-    h+='<tr><td colspan="8" style="text-align:center;color:var(--t3);padding:22px 8px;font-family:-apple-system,sans-serif;font-size:11px">No portfolio stocks match the current filter.</td></tr>';
-  }
-  rows.forEach(function(r){
-    var retCol=r.totalReturnPct>=0?'var(--gn)':'var(--rd)';
-    var pnlCol=r.pnl>=0?'var(--gn)':'var(--rd)';
-    var intent=r.verdict||'HOLD';
-    var liveBadge=r.live?'<span title="Yahoo live stream" style="margin-left:3px;color:var(--gn);font-size:8px;font-weight:900">LIVE</span>':'';
-    var primaryName=displayNameFor(r);
-    var subLine=stockSubLine(r);
-    h+='<tr data-search="'+escHtml(rowSearchText(r.symbol,r.sub,r.name))+'" onclick="'+r.detailCall+'" style="cursor:pointer">';
-    // A long company name gets a smaller size rather than being cut off; always bold.
-    var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
-    h+='<td><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+algoHeldDot(r)+untrackedDot(r);
-    var notes='';
-    notes+=portfolioWarningBadges(r);
-    if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
-    else if(r.softSniperFiredToday)notes+='<span class="snb snb-soft" title="Soft sniper fired today — auto-GTT placed on BOOK_PROFIT alert">SS</span>';
-    if(r.obvDivergence)notes+='<span class="snb snb-exit" title="OBV bearish divergence: price near 5-day high but volume not confirming.">BIG EXIT</span>';
-    else if(r.obvWeakness)notes+='<span class="snb snb-vol" title="OBV under 20-day average — volume support is weakening.">vol weak</span>';
-    notes+=divergenceChips(r);
-    notes+=volumePatternChip(r);
-    if(notes)h+='<div class="snnotes">'+notes+'</div>';
-    h+=ownerSplitLine(r);
-    if(!r.hasAnalysis&&r.analysisPending)h+='<div title="New holding — its scores are being worked out" style="font-size:6px;color:var(--t3);margin-top:1px">scoring…</div>';
-    else if(!r.hasAnalysis)h+='<div title="'+escHtml(r.analysisError||'Yahoo candle scan did not return usable data')+'" style="font-size:6px;color:var(--am);margin-top:1px">no scan</div>';
-    else h+='<div class="snn">'+escHtml(subLine)+(r.dayChangePct?' <span style="color:'+(r.dayChangePct>=0?'var(--gn)':'var(--rd)')+'">'+(r.dayChangePct>=0?'+':'')+fmt(r.dayChangePct,1)+'%</span>':'')+'</div>';
-    h+=liveIntradayPriceSvg(r,96,30);
-    h+='</div></td>';
-    h+='<td>'+portfolioMacdCell(r)+'</td>';
-    /* Legacy narrow MACD cell kept inert while the roomier portfolioMacdCell owns this column.
-    if(false&&r.hasAnalysis){
-      var spd=speedLabel(r.minBarsFilter);
-      h+='<td style="max-width:80px"><div style="display:flex;align-items:center;gap:2px"><div>'+macdSparkSvg(r.macdCurve,r.macdPhase,30,12)+'</div><span style="color:'+pc2+';font-size:7px;white-space:normal;max-width:50px;line-height:1.2">'+(r.macdPhase||'—')+'</span></div>';
-      if(spd.tag)h+='<div title="Adaptive MACD filter" style="margin-top:2px;display:inline-flex;align-items:center;gap:2px;background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.08);border-radius:3px;padding:1px 4px"><span style="font-size:7px;color:'+spd.col+';font-weight:800;font-family:monospace">⚡'+spd.d+'</span><span style="font-size:6px;color:var(--t3);font-weight:600">'+spd.tag+'</span></div>';
+  // ON AUTOPILOT, FOLDED (the user, 5 Nov 2026): holdings only a German built-in
+  // algo owns sell on its own stop, target and trend several times a week — no
+  // decision of yours in them. They go into their own fold under the table. The
+  // slower algos (champions and the rest) and anything partly yours stay in the
+  // main table: those may need you.
+  var auto=[], main=[], autoBy={};
+  rows.forEach(function(r){var who=autopilotOnly(r);if(who){auto.push(r);who.split(', ').forEach(function(n){autoBy[n]=1})}else main.push(r)});
+  if(!main.length&&auto.length&&!q){main=auto;auto=[]}   // nothing else to show: no fold
+  function tableOf(list){
+    var h='<div class="tw"><table><thead><tr>';
+    h+='<th onclick="doPSort(\'symbol\')">Stock'+pSA('symbol')+'</th>';
+    h+='<th onclick="doPSort(\'macdPhase\')">MACD'+pSA('macdPhase')+'</th>';
+    h+='<th onclick="doPSort(\'totalReturnPct\')" title="Return% / P&L / Day%">P&L'+pSA('totalReturnPct')+'</th>';
+    h+='<th onclick="doPSort(\'zonePct\')" title="Price position: support=0% resistance=100%">Zone'+pSA('zonePct')+'</th>';
+    h+='<th title="Entry and exit scores"><span onclick="event.stopPropagation();doPSort(\'pullbackScore\')" style="cursor:pointer">Pb'+pSA('pullbackScore')+'</span>/<span onclick="event.stopPropagation();doPSort(\'momentumScore\')" style="cursor:pointer">Mo'+pSA('momentumScore')+'</span><br/><span style="font-size:7px;color:var(--t3)">Pr/Pt</span></th>';
+    h+='<th onclick="doPSort(\'ltp\')">LTP'+pSA('ltp')+'</th>';
+    h+='<th onclick="doPSort(\'invested\')">Inv/Qty'+pSA('invested')+'</th>';
+    // Germany and the US show their target or stop inside the Zone cell (one
+    // picture, one tap) — the GTT column is India's alone now.
+    h+=(isT212Space()?'':'<th>GTT</th>')+'</tr></thead><tbody>';
+    if(!list.length){
+      h+='<tr><td colspan="8" style="text-align:center;color:var(--t3);padding:22px 8px;font-family:-apple-system,sans-serif;font-size:11px">No portfolio stocks match the current filter.</td></tr>';
+    }
+    list.forEach(function(r){
+      var retCol=r.totalReturnPct>=0?'var(--gn)':'var(--rd)';
+      var pnlCol=r.pnl>=0?'var(--gn)':'var(--rd)';
+      var intent=r.verdict||'HOLD';
+      var liveBadge=r.live?'<span title="Yahoo live stream" style="margin-left:3px;color:var(--gn);font-size:8px;font-weight:900">LIVE</span>':'';
+      var primaryName=displayNameFor(r);
+      var subLine=stockSubLine(r);
+      h+='<tr data-search="'+escHtml(rowSearchText(r.symbol,r.sub,r.name))+'" onclick="'+r.detailCall+'" style="cursor:pointer">';
+      // A long company name gets a smaller size rather than being cut off; always bold.
+      var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
+      h+='<td><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+algoHeldDot(r)+untrackedDot(r);
+      var notes='';
+      notes+=portfolioWarningBadges(r);
+      if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
+      else if(r.softSniperFiredToday)notes+='<span class="snb snb-soft" title="Soft sniper fired today — auto-GTT placed on BOOK_PROFIT alert">SS</span>';
+      if(r.obvDivergence)notes+='<span class="snb snb-exit" title="OBV bearish divergence: price near 5-day high but volume not confirming.">BIG EXIT</span>';
+      else if(r.obvWeakness)notes+='<span class="snb snb-vol" title="OBV under 20-day average — volume support is weakening.">vol weak</span>';
+      notes+=divergenceChips(r);
+      notes+=volumePatternChip(r);
+      if(notes)h+='<div class="snnotes">'+notes+'</div>';
+      h+=ownerSplitLine(r);
+      if(!r.hasAnalysis&&r.analysisPending)h+='<div title="New holding — its scores are being worked out" style="font-size:6px;color:var(--t3);margin-top:1px">scoring…</div>';
+      else if(!r.hasAnalysis)h+='<div title="'+escHtml(r.analysisError||'Yahoo candle scan did not return usable data')+'" style="font-size:6px;color:var(--am);margin-top:1px">no scan</div>';
+      else h+='<div class="snn">'+escHtml(subLine)+(r.dayChangePct?' <span style="color:'+(r.dayChangePct>=0?'var(--gn)':'var(--rd)')+'">'+(r.dayChangePct>=0?'+':'')+fmt(r.dayChangePct,1)+'%</span>':'')+'</div>';
+      h+=liveIntradayPriceSvg(r,96,30);
+      h+='</div></td>';
+      h+='<td>'+portfolioMacdCell(r)+'</td>';
+      /* Legacy narrow MACD cell kept inert while the roomier portfolioMacdCell owns this column.
+      if(false&&r.hasAnalysis){
+        var spd=speedLabel(r.minBarsFilter);
+        h+='<td style="max-width:80px"><div style="display:flex;align-items:center;gap:2px"><div>'+macdSparkSvg(r.macdCurve,r.macdPhase,30,12)+'</div><span style="color:'+pc2+';font-size:7px;white-space:normal;max-width:50px;line-height:1.2">'+(r.macdPhase||'—')+'</span></div>';
+        if(spd.tag)h+='<div title="Adaptive MACD filter" style="margin-top:2px;display:inline-flex;align-items:center;gap:2px;background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.08);border-radius:3px;padding:1px 4px"><span style="font-size:7px;color:'+spd.col+';font-weight:800;font-family:monospace">⚡'+spd.d+'</span><span style="font-size:6px;color:var(--t3);font-weight:600">'+spd.tag+'</span></div>';
+        h+='</td>';
+      }else h+='<td style="color:var(--t3)">—</td>';
+      */
+      h+='<td><span style="color:'+retCol+';font-weight:800;font-size:11px">'+(r.totalReturnPct>=0?'+':'')+fmt(r.totalReturnPct,1)+'%</span><br/><span style="color:'+pnlCol+';font-size:9px">'+(r.pnl>=0?'+':'-')+r.currency+fmtV(Math.abs(r.pnl))+'</span></td>';
+      h+='<td>'+(r.broker==='t212'?renderT212ZoneCell(r)
+                :renderZone(r.support,r.resistance,r.ltp,r.hasAnalysis,{atr:r.atr,sl:r.sl,tgt:r.tgt,ccy:r.currency,buy:r.avgPrice}))+'</td>';
+      h+='<td>'+portfolioScoresCell(r)+'</td>';
+      /* Legacy vertical score stack kept inert; portfolioScoresCell lays scores horizontally.
+      h+='<td>';
+      if(r.hasAnalysis)h+='<div style="display:flex;flex-direction:column;gap:1px;align-items:flex-start"><span class="sc scb">B:'+r.buyScore+'</span><span class="scp scp-profit'+(r.profitScore>=35?' s':'')+'">Pr:'+r.profitScore+'</span><span class="scp scp-protect'+(r.protectScore>=35?' s':'')+'">Pt:'+r.protectScore+'</span>'+styleMini(r)+'</div>';
+      else h+='—';
       h+='</td>';
-    }else h+='<td style="color:var(--t3)">—</td>';
-    */
-    h+='<td><span style="color:'+retCol+';font-weight:800;font-size:11px">'+(r.totalReturnPct>=0?'+':'')+fmt(r.totalReturnPct,1)+'%</span><br/><span style="color:'+pnlCol+';font-size:9px">'+(r.pnl>=0?'+':'-')+r.currency+fmtV(Math.abs(r.pnl))+'</span></td>';
-    h+='<td>'+(r.broker==='t212'?renderT212ZoneCell(r)
-              :renderZone(r.support,r.resistance,r.ltp,r.hasAnalysis,{atr:r.atr,sl:r.sl,tgt:r.tgt,ccy:r.currency,buy:r.avgPrice}))+'</td>';
-    h+='<td>'+portfolioScoresCell(r)+'</td>';
-    /* Legacy vertical score stack kept inert; portfolioScoresCell lays scores horizontally.
-    h+='<td>';
-    if(r.hasAnalysis)h+='<div style="display:flex;flex-direction:column;gap:1px;align-items:flex-start"><span class="sc scb">B:'+r.buyScore+'</span><span class="scp scp-profit'+(r.profitScore>=35?' s':'')+'">Pr:'+r.profitScore+'</span><span class="scp scp-protect'+(r.protectScore>=35?' s':'')+'">Pt:'+r.protectScore+'</span>'+styleMini(r)+'</div>';
-    else h+='—';
-    h+='</td>';
-    */
-    h+='<td style="font-weight:700;font-size:11px">'+r.currency+fmt(r.ltp)+liveBadge+'</td>';
-    h+='<td><span style="font-size:10px">'+r.currency+fmtV(r.invested)+'</span><br/><span style="font-size:9px;color:var(--t3)">'+(r.qty%1?r.qty.toFixed(2):r.qty)+' @'+r.currency+fmt(r.avgPrice)+'</span></td>';
-    /* Intent now lives inside portfolioScoresCell, so it no longer needs its own column.
-    var vrdShort=intent==='STRONG EXIT'?'EXIT':intent==='BOOK PROFIT'?'PROFIT':intent==='PROTECT CAPITAL'?'PROTECT':intent;
-    h+='<td style="max-width:56px;padding-left:2px;padding-right:2px"><span class="vrd '+vrdCls+'" title="'+intent+'">'+vrdShort+'</span></td>';
-    */
-    if(r.broker!=='t212')h+='<td onclick="event.stopPropagation()">'+r.orderHtml()+'</td>';
-    h+='</tr>';
-  });
-  h+='</tbody></table></div>';
+      */
+      h+='<td style="font-weight:700;font-size:11px">'+r.currency+fmt(r.ltp)+liveBadge+'</td>';
+      h+='<td><span style="font-size:10px">'+r.currency+fmtV(r.invested)+'</span><br/><span style="font-size:9px;color:var(--t3)">'+(r.qty%1?r.qty.toFixed(2):r.qty)+' @'+r.currency+fmt(r.avgPrice)+'</span></td>';
+      /* Intent now lives inside portfolioScoresCell, so it no longer needs its own column.
+      var vrdShort=intent==='STRONG EXIT'?'EXIT':intent==='BOOK PROFIT'?'PROFIT':intent==='PROTECT CAPITAL'?'PROTECT':intent;
+      h+='<td style="max-width:56px;padding-left:2px;padding-right:2px"><span class="vrd '+vrdCls+'" title="'+intent+'">'+vrdShort+'</span></td>';
+      */
+      if(r.broker!=='t212')h+='<td onclick="event.stopPropagation()">'+r.orderHtml()+'</td>';
+      h+='</tr>';
+    });
+    h+='</tbody></table></div>';
+    return h;
+  }
+  h+=tableOf(main);
+  if(auto.length){
+    var autoVal=auto.reduce(function(t,r){return t+Number(r.qty||0)*Number(r.ltp||0)},0), ccy=auto[0].currency||'';
+    h+='<details data-dk="pf-autopilot" style="margin:8px 0 4px;border:1px solid var(--bd);border-radius:8px;background:var(--cd)">'+
+      '<summary style="cursor:pointer;padding:8px 10px;font-size:11px;font-weight:800;color:var(--t2)">🤖 On autopilot · '+auto.length+
+      ' <span style="font-weight:600;color:var(--t3)">— '+escHtml(Object.keys(autoBy).join(', '))+(autoVal>0?' · '+ccy+fmtV(autoVal):'')+'</span>'+
+      '<div style="font-size:9px;font-weight:400;color:var(--t3);margin-top:2px">They sell on their own stop, target and trend — nothing here needs you.</div></summary>'+
+      tableOf(auto)+'</details>';
+  }
   return h;
 }
 
@@ -11399,19 +11584,32 @@ function splitLine(w,e){
   var sym=String(e.symbol||'').toUpperCase();
   var bq=Number((w.brokerQty||{})[sym]||0);
   var mine=Number(e.filledQty||0);
-  var rest=bq-mine;
-  if(!(bq>0)||rest<=bq*0.01)return '';
+  // WHAT OTHER ALGOS OWN IS NOT YOURS (the user, 5 Nov 2026): Macd swing's shares
+  // of the same stock were shown as "yours" with an offer to combine them. Only
+  // what NOBODY manages is yours — and only that is offered (it is all combining
+  // takes: ManualEntryWatcher.algoSharesFor).
+  var al=(w.algoShares||{})[sym]||{}, algo=Number(al.qty||0);
+  var others=bq-mine;
+  if(!(bq>0)||others<=bq*0.01)return '';
   var px=Number(e.livePrice||e.filledPrice||0);
-  if(px>0&&rest*px<5)return '';
+  if(px>0&&others*px<5)return '';
+  var rest=Math.max(0,others-algo);
+  var free=rest>bq*0.01&&!(px>0&&rest*px<5);
   var q=function(v){return String(Number(v).toFixed(4)).replace(/0+$/,'').replace(/\.$/,'')};
+  var who=(al.by||[]).join(', ')||'an algo';
+  var parts='watcher '+q(mine)+(algo>0?' &middot; '+escHtml(who)+' '+q(algo):'')+(free?' &middot; yours '+q(rest):'')+' &middot; total '+q(bq);
+  if(!free)   // the rest is an algo's: said, not offered
+    return '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:5px 0 0;padding:4px 7px;'+
+      'background:var(--bg2);border:1px solid var(--bd);border-radius:6px">'+
+      '<span style="font-size:8px;font-weight:900;color:var(--t3)">THE REST IS AN ALGO’S</span>'+
+      '<span style="font-size:9px;font-family:monospace;color:var(--t3)" title="Those shares are managed by the algo that bought them; nothing here to combine.">'+parts+'</span></div>';
   return '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:5px 0 0;padding:5px 7px;'+
     'background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.3);border-radius:6px">'+
-    '<span style="font-size:8px;font-weight:900;color:var(--am)">PART OF THIS IS NOT MANAGED HERE</span>'+
-    '<span style="font-size:9px;font-family:monospace;color:var(--t2)" title="An exit here sells only what the watcher bought. The rest is judged by your config too, but it prompts you rather than selling.">'+
-      'watcher '+q(mine)+' &middot; yours '+q(rest)+' &middot; total '+q(bq)+'</span>'+
+    '<span style="font-size:8px;font-weight:900;color:var(--am)">PART OF THIS IS NOT MANAGED</span>'+
+    '<span style="font-size:9px;font-family:monospace;color:var(--t2)" title="An exit here sells only what the watcher bought; what an algo owns, that algo sells. Yours is judged by your config too, but it prompts you rather than selling.">'+parts+'</span>'+
     '<span style="flex:1"></span>'+
-    '<span onclick="adoptHoldingPrompt(\''+escHtml(sym)+'\')" title="Hand the rest of this holding to the watcher so its exits cover the whole position" '+
-      'style="cursor:pointer;font-size:9px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.4);border-radius:5px;padding:2px 7px">+ combine</span>'+
+    '<span onclick="adoptHoldingPrompt(\''+escHtml(sym)+'\')" title="Hand your '+q(rest)+' to the watcher so its exits cover it — the algos keep theirs" '+
+      'style="cursor:pointer;font-size:9px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.4);border-radius:5px;padding:2px 7px">+ combine '+q(rest)+'</span>'+
     '</div>';
 }
 // ── HOLDINGS THE APP NEVER BOUGHT ───────────────────────────────────────────
@@ -11838,6 +12036,7 @@ function manualBuyShares(){
   var out=document.getElementById('manual-buy-est');
   if(!el||!out)return;
   var px=Number(out.getAttribute('data-px')||0), amt=Number(el.value||0);
+  if(document.getElementById('spend-mb'))spendPaint();
   if(!(px>0)||!(amt>0)){out.innerHTML='&nbsp;';return}
   var sh=amt/px;
   out.innerHTML='about <b>'+sh.toFixed(sh<1?4:3)+'</b> shares at this price';
@@ -11892,7 +12091,8 @@ function manualBuyPrompt(sym,rank,px,pxLive,pxAt){
     priceBlock+
     '<div style="margin-top:10px"><div style="font-size:10px;color:var(--t3);margin-bottom:3px">Amount to invest</div>'+
     '<input id="manual-buy-amt" type="number" step="1" min="1" placeholder="e.g. 200" oninput="manualBuyShares()" style="width:100%;padding:8px;font-size:13px;font-family:monospace;background:var(--bgC,var(--bg2));color:var(--t1);border:1px solid var(--bd);border-radius:6px"/>'+
-    '<div id="manual-buy-est" data-px="'+px+'" style="margin-top:4px;font-size:10px;color:var(--t3);min-height:13px">&nbsp;</div></div>'+
+    '<div id="manual-buy-est" data-px="'+px+'" style="margin-top:4px;font-size:10px;color:var(--t3);min-height:13px">&nbsp;</div>'+
+    (isIN?'':spendLine('spend-mb','manual-buy-amt'))+'</div>'+
     // THE OVERRIDE. Off unless deliberately ticked, and it states what it costs
     // rather than what it allows — the tempting half is obvious, the price is not.
     '<div style="margin-top:10px;padding:8px;border:1px solid rgba(124,58,237,.4);border-radius:6px;background:rgba(124,58,237,.06)">'+
@@ -12003,9 +12203,9 @@ window.onCancelTrigger=function(json){
 // standing right, and the difference is worth a sentence.
 function adoptHoldingPrompt(sym){
   if(typeof Android==='undefined'||!Android.manualAdoptHolding){uiAlert('Unavailable','Rebuild the APK for this.');return}
-  uiConfirm('Let the watcher manage all of '+escHtml(sym)+'?',
+  uiConfirm('Let the watcher manage your '+escHtml(sym)+'?',
     '<div style="line-height:1.55;font-size:11px">Right now your config <b>judges</b> these shares and prompts you. After this it will <b>sell them itself</b> when an exit rule fires, exactly as it does for stock the app bought.<br/><br/>'+
-    'The whole holding moves, including anything you bought in the broker\'s own app, so one exit closes the position instead of a part of it.<br/><br/>'+
+    'Your shares move — including anything you bought in the broker\'s own app. <b>Shares an algo owns stay that algo\'s</b>: it keeps selling them on its own rules.<br/><br/>'+
     '<span style="color:var(--t3)">Rules are measured from what you actually paid. The broker does not report a purchase date, so anything that counts time starts from when the app first saw the holding — not from your real buy. That is weaker, and it is why the app has been asking rather than acting.</span><br/><br/>'+
     '<span style="color:var(--am)">Nothing is bought or sold right now.</span></div>',
     function(ok){ if(!ok)return; try{Android.manualAdoptHolding(SPACE,sym)}catch(e){uiAlert('Error',e.message)} });
@@ -19123,6 +19323,91 @@ function detailHeldQty(s){
 function ScanServiceResultHolderPortfolio(){
   try{ return (PORTFOLIO && PORTFOLIO.holdings) || [] }catch(e){ return [] }
 }
+// ── WHAT IS REALLY YOURS TO SPEND (Trading 212) ──────────────────────────────
+// Trading 212's free cash already leaves out what its own resting orders hold.
+// It cannot know what THIS APP has promised and not yet placed: buys waiting on
+// the RV gate, "buy at price" entries, and what armed algos will still spend on
+// their seats. Shown under every buy amount: free cash, less those promises.
+// One answer shared by every box on screen; Trading 212's cash is re-read when
+// the figure is over two minutes old, or on ↻.
+var SPEND={d:null,busy:false,open:false,autoAt:0};
+// [inAcct]: the box's amount is already in the account's currency (the limit buy
+// takes euros); otherwise a US box is in dollars.
+function spendLine(id,amtId,inAcct){
+  if(SPACE!=='DE'&&SPACE!=='US')return '';
+  if(typeof Android==='undefined'||!Android.callAsync)return '';
+  setTimeout(function(){spendLoad(false)},0);
+  return '<div id="'+id+'" class="spend-line" data-amt="'+escHtml(amtId||'')+'" data-acct="'+(inAcct?1:0)+'" style="margin-top:7px;font-size:10px;line-height:1.5;color:var(--t2)">'+
+    spendHtml(amtId,inAcct)+'</div>';
+}
+function spendLoad(refresh){
+  if(SPEND.busy)return;
+  var d=SPEND.d, now=Date.now();
+  // Trading 212's cash read is cheap but rate-limited: automatically at most once
+  // a minute, and only when the figure is over two minutes old.
+  var stale=!d||!d.ok||!(d.checkedAt>0)||(now-d.checkedAt>120000);
+  var auto=!refresh&&stale&&(now-SPEND.autoAt>60000);
+  if(auto)SPEND.autoAt=now;
+  if(!refresh&&!auto&&d){spendPaint();return}
+  SPEND.busy=true;spendPaint();
+  androidAsync('t212Spendable',[!!(refresh||auto)],function(raw){
+    SPEND.busy=false;
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    if(r)SPEND.d=r;
+    spendPaint();
+  });
+}
+function spendPaint(){
+  var els=document.querySelectorAll('.spend-line');
+  for(var i=0;i<els.length;i++)els[i].innerHTML=spendHtml(els[i].getAttribute('data-amt'),els[i].getAttribute('data-acct')==='1');
+}
+function spendCcy(code){return code==='EUR'?'€':code==='USD'?'$':code==='GBP'?'£':(code+' ')}
+function spendMoney(c,v){
+  v=Number(v||0);
+  return (v<0?'−':'')+c+Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:Math.abs(v)<100?2:0,maximumFractionDigits:Math.abs(v)<100?2:0});
+}
+function spendHtml(amtId,inAcct){
+  var d=SPEND.d;
+  if(!d)return '<span style="color:var(--t3)">Working out what is yours to spend…</span>';
+  if(!d.ok)return '<span style="color:var(--t3)">'+escHtml(d.error||'Cash not available')+'</span>';
+  var c=spendCcy(d.currency), usd=Number(d.usdPerAcct||0);
+  var ref='<span onclick="event.stopPropagation();spendLoad(true)" style="cursor:pointer;color:var(--ac);font-weight:700">'+(SPEND.busy?'reading…':'↻')+'</span>';
+  var when=d.checkedAt>0?('checked '+agoText(d.checkedAt)+' ago'):'never checked';
+  if(d.checkedAt>0&&Date.now()-d.checkedAt<60000)when='checked just now';
+  var err=d.refreshError?' <span style="color:var(--am)">(fresh read failed: '+escHtml(d.refreshError)+')</span>':'';
+  if(!d.known)return '<span style="color:var(--t3)">Trading 212’s free cash not read yet</span> '+ref+err;
+  var yours=Number(d.yours||0), free=Number(d.free||0), com=Number(d.committed||0);
+  var inUsd=(SPACE==='US'&&d.currency!=='USD'&&usd>0);
+  var h='<div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">'+
+    '<span style="font-size:9px;font-weight:900;color:var(--t3);letter-spacing:.03em">YOURS TO SPEND</span>'+
+    '<b style="font-family:monospace;font-size:12px;color:'+(yours<0?'var(--rd)':'var(--gn)')+'">'+spendMoney(c,yours)+'</b>'+
+    (inUsd?'<span style="font-family:monospace;color:var(--t3)">≈ '+spendMoney('$',yours*usd)+'</span>':'')+
+    '<span style="color:var(--t3)">· '+when+'</span> '+ref+err+'</div>';
+  // The amount being typed, against what is yours.
+  var ae=amtId?document.getElementById(amtId):null, amt=ae?Number(ae.value||0):0;
+  if(amt>0){
+    var amtAcct=(inUsd&&!inAcct)?amt/usd:amt;
+    if(yours<=0)h+='<div style="color:var(--rd);font-weight:700">Nothing of the free cash is yours — the app has already promised all of it.</div>';
+    else if(amtAcct>yours+0.005)h+='<div style="color:var(--am);font-weight:700">'+spendMoney(c,amtAcct-yours)+' more than is yours — spend it and one of the app’s waiting buys finds no cash when its moment comes.</div>';
+  }else if(yours<0){
+    h+='<div style="color:var(--rd);font-weight:700">The app has promised '+spendMoney(c,-yours)+' more than Trading 212 has free.</div>';
+  }
+  // The breakdown, folded.
+  var rows='<div style="display:flex;justify-content:space-between;gap:8px"><span>Free cash at Trading 212</span><b style="font-family:monospace">'+spendMoney(c,free)+'</b></div>';
+  (d.parts||[]).forEach(function(p){
+    rows+='<div style="display:flex;justify-content:space-between;gap:8px"><span>− '+escHtml(p.label)+
+      (p.detail?' <span style="color:var(--t3)">('+escHtml(p.detail)+')</span>':'')+'</span>'+
+      '<b style="font-family:monospace;color:var(--am);white-space:nowrap">'+spendMoney(c,-Number(p.amount||0))+'</b></div>';
+  });
+  if(!(d.parts||[]).length)rows+='<div style="color:var(--t3)">The app has promised nothing that is not already placed.</div>';
+  rows+='<div style="display:flex;justify-content:space-between;gap:8px;border-top:1px solid var(--bd);margin-top:2px;padding-top:2px"><b>Yours to spend</b><b style="font-family:monospace">'+spendMoney(c,yours)+'</b></div>';
+  if(Number(d.heldAtBroker||0)>0)rows+='<div style="color:var(--t3);margin-top:3px">Your limit buys resting at Trading 212 hold '+spendMoney(c,d.heldAtBroker)+' — already left out of the free cash, so not taken off again.</div>';
+  rows+='<div style="color:var(--t3);margin-top:3px">Trading 212 cannot see these promises: nothing is placed there until their moment comes, so it still shows that money as free.</div>';
+  h+='<details ontoggle="SPEND.open=this.open"'+(SPEND.open?' open':'')+' style="margin-top:2px">'+
+    '<summary style="cursor:pointer;color:var(--t3)">'+spendMoney(c,free)+' free at Trading 212 − '+spendMoney(c,com)+' promised by the app</summary>'+
+    '<div style="margin-top:4px;padding:6px 8px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px">'+rows+'</div></details>';
+  return h;
+}
 function detailTradeBlock(s){
   var sym=String(stockSymbolFor(s)||s.symbol||'').toUpperCase().replace('.NS','');
   if(!sym)return '';
@@ -19142,7 +19427,7 @@ function detailTradeBlock(s){
      '</div>';
   h+='<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">';
   h+='<div><div style="font-size:8px;color:var(--t3);margin-bottom:2px">Amount to invest ('+cur+')</div>'+
-     '<input id="dt-amt" type="number" step="1" min="1" placeholder="e.g. '+(isIN?'5000':'200')+'" style="width:100px;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-family:monospace"/></div>';
+     '<input id="dt-amt" type="number" step="1" min="1" placeholder="e.g. '+(isIN?'5000':'200')+'" oninput="spendPaint()" style="width:100px;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-family:monospace"/></div>';
   h+='<span onclick="detailBuy(\''+escHtml(sym)+'\','+px+')" style="cursor:pointer;padding:7px 14px;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.5);color:var(--gn);border-radius:6px;font-size:11px;font-weight:800">'+
      (isIN?'Buy trigger':'Patient buy')+'</span>';
   // A LIMIT BUY that rests at the broker at a level you pick — for a stock you
@@ -19172,7 +19457,9 @@ function detailTradeBlock(s){
       ? '<span style="font-size:9px;color:var(--t3)">Not held — nothing to sell</span>'
       : '<span style="font-size:9px;color:var(--am)">Holdings not loaded — open the Portfolio tab once and the sell button appears if you own this.</span>';
   }
-  h+='</div></div>';
+  h+='</div>';
+  if(isT212)h+=spendLine('spend-dt','dt-amt');
+  h+='</div>';
   return h;
 }
 // ── LIMIT BUY FROM THE STOCK PAGE ────────────────────────────────────────
@@ -19240,12 +19527,41 @@ function lbRedraw(){
   var b=document.getElementById('lb-levels');if(b)b.innerHTML=lbLevels();
   lbCalc();
 }
-function lbSet(v){var el=document.getElementById('lb-price');if(el){el.value=Number(v).toFixed(2);lbCalc()}}
+function lbSet(v){var el=document.getElementById('lb-price');if(el){LB.touched=true;el.value=Number(v).toFixed(2);lbCalc()}}
+// The level a dialog opens on: the support under today's price, else one average
+// daily move under it, else 2% under it.
+function lbInit(){var l=Number(LB.ltp||0);return Math.round(((LB.support>0&&LB.support<l)?LB.support:(LB.atr>0?l-LB.atr:l*0.98))*100)/100}
+// "Now" in the level dialogs: the live price when it has come, else the scan's —
+// and a live one is asked for as the dialog opens.
+function lbNowHtml(){
+  var c=LB.ccy, q=LB.live, p=c+Number(LB.ltp||0).toFixed(2);
+  var again=function(t){return ' <span onclick="lbLiveFetch()" style="cursor:pointer;color:var(--ac);font-weight:700">'+t+'</span>'};
+  if(LB.liveBusy&&!q)return '<span style="color:var(--t3)">Now '+p+' from the scan — getting the live price…</span>';
+  if(q)return '<b style="color:var(--gn)">● Now '+p+'</b> <span style="color:var(--t3)">live at '+clockOf(q.at)+' · '+escHtml(q.source)+'</span>'+again(LB.liveBusy?'…':'↻');
+  if(LB.liveErr)return '<span style="color:var(--am)">Now '+p+' is the scan’s price — no live price: '+escHtml(LB.liveErr)+'.</span>'+again('↻ try again');
+  return '<span style="color:var(--t3)">Now '+p+' from the scan</span>'+again('↻ live price');
+}
+function lbNowPaint(){var e=document.getElementById('lb-now');if(e)e.innerHTML=lbNowHtml()}
+function lbLiveFetch(){
+  var sym=LB.sym;if(!sym||LB.liveBusy)return;
+  LB.liveBusy=true;LB.liveErr='';lbNowPaint();
+  livePxFetch(sym,function(q,err){
+    if(LB.sym!==sym)return;
+    LB.liveBusy=false;
+    if(!q){LB.liveErr=err||'no answer';lbNowPaint();return}
+    LB.live=q;LB.ltp=q.price;
+    var st=LB_STOCK[sym];if(st){takeLivePx(st,q);if(DETAIL_STOCK===st)detailPxPaint()}
+    // A level you have not touched follows the price; one you picked stays.
+    if(!LB.touched){LB.price=lbInit();var pe=document.getElementById('lb-price');if(pe)pe.value=LB.price.toFixed(2)}
+    lbNowPaint();lbRedraw();
+  });
+}
 function lbCalc(){
   var pe=document.getElementById('lb-price'), ae=document.getElementById('lb-amt'), out=document.getElementById('lb-sum');
   LB.price=pe?Number(pe.value||0):0;
   var amt=ae?Number(ae.value||0):0;
   var a=document.getElementById('lb-pic');if(a)a.innerHTML=lbPicture();
+  if(document.getElementById('spend-lb'))spendPaint();
   if(!out)return;
   if(!(LB.price>0)){out.innerHTML='Pick a level or type a price.';return}
   if(LB.mode==='entry'){out.innerHTML=priceEntrySummary(LB.price,amt);return}
@@ -19255,40 +19571,54 @@ function lbCalc(){
 }
 function detailLimitBuy(sym){
   if(typeof Android==='undefined'||!Android.t212LimitBuyCash){uiAlert('Unavailable','Rebuild the APK for this.');return}
-  var s=LB_STOCK[sym]||{};
+  var s=LB_STOCK[sym]||(LB_STOCK[sym]={});
   var amtEl=document.getElementById('dt-amt');
   var amt=amtEl?Number(amtEl.value||0):0;
+  var live=livePxFresh(sym);if(live)takeLivePx(s,live);
   var ltp=Number(s.price||0);
-  if(!(ltp>0)){uiAlert('No price for '+sym,'Run a scan or wait for the live ticker so there is a price to work from.');return}
+  if(!(ltp>0)){lbNoPrice(sym,detailLimitBuy);return}
   LB={sym:sym,ccy:SPACE==='DE'?'€':'$',ltp:ltp,atr:Number(s.atr||0),support:Number(s.support||0),
-      resistance:Number(s.resistance||0),lv:null,loading:true,price:0};
-  var init=(LB.support>0&&LB.support<ltp)?LB.support:(LB.atr>0?ltp-LB.atr:ltp*0.98);
-  LB.price=Math.round(init*100)/100;
+      resistance:Number(s.resistance||0),lv:null,loading:true,price:0,live:live,touched:false};
+  LB.price=lbInit();
   var body='<div style="font-size:10px;color:var(--t3);line-height:1.5;margin-bottom:6px">Waits at Trading 212 until the price comes down to your level. The cash is held back meanwhile; cancel it any time in Waiting orders.</div>'+
+    '<div id="lb-now" style="font-size:10px;margin-bottom:4px">'+lbNowHtml()+'</div>'+
     '<div id="lb-pic">'+lbPicture()+'</div>'+
     '<div id="lb-levels">'+lbLevels()+'</div>'+
     '<div style="display:flex;gap:8px;margin-top:6px">'+
       '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Buy at ('+LB.ccy+')</div>'+
-      '<input id="lb-price" type="number" step="0.01" value="'+LB.price.toFixed(2)+'" oninput="lbCalc()" style="width:100%;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-weight:700;font-family:monospace"/></div>'+
+      '<input id="lb-price" type="number" step="0.01" value="'+LB.price.toFixed(2)+'" oninput="LB.touched=true;lbCalc()" style="width:100%;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-weight:700;font-family:monospace"/></div>'+
       '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Amount (€)</div>'+
       '<input id="lb-amt" type="number" step="1" min="1" value="'+(amt>0?amt:'')+'" placeholder="e.g. 200" oninput="lbCalc()" style="width:100%;padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-family:monospace"/></div>'+
     '</div>'+
-    '<div id="lb-sum" style="font-size:10px;color:var(--t2);margin-top:6px"></div>';
+    '<div id="lb-sum" style="font-size:10px;color:var(--t2);margin-top:6px"></div>'+
+    spendLine('spend-lb','lb-amt',true);
   uiConfirm('Limit buy '+escHtml(sym),body,function(ok){
     if(!ok)return;
     var price=Number((document.getElementById('lb-price')||{}).value||0);
     var cash=Number((document.getElementById('lb-amt')||{}).value||0);
     if(!(cash>0)){uiAlert('No amount','Enter how much to invest.');return}
     if(!(price>0)){uiAlert('No price','Pick a level or type a price.');return}
-    if(price>=ltp){uiAlert('Above today’s price','A limit buy at or above today’s price fills at once. Use Patient buy for that.');return}
+    if(price>=LB.ltp){uiAlert('Above today’s price','A limit buy at or above today’s price fills at once. Use Patient buy for that.');return}
     try{Android.t212LimitBuyCash(sym,SPACE,cash,price)}catch(e){uiAlert('Error',e.message)}
   });
   setTimeout(lbCalc,0);
+  if(!LB.live)lbLiveFetch();
   androidAsync('exitLevels',[sym,SPACE],function(raw){
     var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
     LB.loading=false;
     if(r&&r.ok)LB.lv=r.levels||{};else LB.lvError=(r&&r.error)||'levels unavailable';
     lbRedraw();
+  });
+}
+// No price on the page at all (a name the scan never saw): ask for the live one,
+// then open the dialog on it.
+function lbNoPrice(sym,reopen){
+  refBusy(true,'Getting a live price for '+sym+'…');
+  livePxFetch(sym,function(q,err){
+    refBusy(false);
+    if(!q){uiAlert('No price for '+escHtml(sym),'No live price came back ('+escHtml(err||'no answer')+'). Run a scan or try again in a minute.');return}
+    takeLivePx(LB_STOCK[sym]||(LB_STOCK[sym]={}),q);
+    reopen(sym);
   });
 }
 // ── BUY AT MY PRICE ───────────────────────────────────────────────────────────
@@ -19308,16 +19638,16 @@ function priceEntrySummary(price,amt){
 }
 function detailPriceEntry(sym){
   if(typeof Android==='undefined'||!Android.callAsync||!Android.priceEntries){uiAlert('Unavailable','Rebuild the APK for this.');return}
-  var s=LB_STOCK[sym]||{};
+  var s=LB_STOCK[sym]||(LB_STOCK[sym]={});
   var amtEl=document.getElementById('dt-amt');
   var amt=amtEl?Number(amtEl.value||0):0;
+  var live=livePxFresh(sym);if(live)takeLivePx(s,live);
   var ltp=Number(s.price||0);
-  if(!(ltp>0)){uiAlert('No price for '+sym,'Run a scan or wait for the live ticker so there is a price to work from.');return}
+  if(!(ltp>0)){lbNoPrice(sym,detailPriceEntry);return}
   var isIN=(SPACE==='IN');
   LB={mode:'entry',sym:sym,ccy:isIN?'₹':(SPACE==='DE'?'€':'$'),ltp:ltp,atr:Number(s.atr||0),support:Number(s.support||0),
-      resistance:Number(s.resistance||0),lv:null,loading:true,price:0};
-  var init=(LB.support>0&&LB.support<ltp)?LB.support:(LB.atr>0?ltp-LB.atr:ltp*0.98);
-  LB.price=Math.round(init*100)/100;
+      resistance:Number(s.resistance||0),lv:null,loading:true,price:0,live:live,touched:false};
+  LB.price=lbInit();
   var managed=false;try{managed=!!JSON.parse(Android.watchPinnedList(SPACE)||'{}').configured}catch(e){}
   var market=isIN?'India':(SPACE==='DE'?'German':'US');
   var how=isIN
@@ -19328,15 +19658,17 @@ function detailPriceEntry(sym){
       '<br/><span style="color:var(--t3)">Unlike an order at the broker it needs the app’s service running, and a dip that comes and goes inside one minute can be missed.</span>';
   var inp='padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1);font-size:12px;font-family:monospace;width:100%';
   var body='<div style="font-size:10px;color:var(--t3);line-height:1.5;margin-bottom:6px">'+how+'</div>'+
+    '<div id="lb-now" style="font-size:10px;margin-bottom:4px">'+lbNowHtml()+'</div>'+
     '<div id="lb-pic">'+lbPicture()+'</div>'+
     '<div id="lb-levels">'+lbLevels()+'</div>'+
     '<div style="display:flex;gap:8px;margin-top:6px">'+
       '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Buy at ('+LB.ccy+')</div>'+
-      '<input id="lb-price" type="number" step="0.01" value="'+LB.price.toFixed(2)+'" oninput="lbCalc()" style="'+inp+';font-weight:700"/></div>'+
+      '<input id="lb-price" type="number" step="0.01" value="'+LB.price.toFixed(2)+'" oninput="LB.touched=true;lbCalc()" style="'+inp+';font-weight:700"/></div>'+
       '<div style="flex:1"><div style="font-size:8px;color:var(--t3)">Amount ('+LB.ccy+')</div>'+
       '<input id="lb-amt" type="number" step="1" min="1" value="'+(amt>0?amt:'')+'" placeholder="e.g. '+(isIN?'5000':'200')+'" oninput="lbCalc()" style="'+inp+'"/></div>'+
     '</div>'+
-    '<div id="lb-sum" style="font-size:10px;color:var(--t2);margin-top:6px"></div>';
+    '<div id="lb-sum" style="font-size:10px;color:var(--t2);margin-top:6px"></div>'+
+    spendLine('spend-lb','lb-amt');
   uiConfirm('🎯 Buy '+escHtml(sym)+' at my price',body,function(ok){
     if(!ok)return;
     var price=Number((document.getElementById('lb-price')||{}).value||0);
@@ -19353,6 +19685,7 @@ function detailPriceEntry(sym){
     });
   });
   setTimeout(lbCalc,0);
+  if(!LB.live)lbLiveFetch();
   androidAsync('exitLevels',[sym,SPACE],function(raw){
     var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
     LB.loading=false;
@@ -19659,6 +19992,69 @@ function dailyMacdSvg(d){
   svg+='</svg>';
   return svg;
 }
+// ── THE PRICE NOW ─────────────────────────────────────────────────────────────
+// The stock page's price is whatever the morning's Discovery scan saw, and by the
+// afternoon it can be well away from the market — a poor base for a limit, a
+// trigger level, a stop or a target. One tap asks for the price now: Germany from
+// Tradegate (real-time), the US from its real-time feed, India from Zerodha. The
+// limit and buy-at-price dialogs ask for it on their own when they open.
+var LIVE_PX={}, DETAIL_PX_BUSY=false;
+function livePxKey(sym){return SPACE+'|'+String(sym||'').toUpperCase().replace(/\.(DE|NS)$/,'')}
+function livePxFresh(sym){var q=LIVE_PX[livePxKey(sym)];return (q&&Date.now()-q.at<180000)?q:null}
+function livePxFetch(sym,cb){
+  if(typeof Android==='undefined'||!Android.callAsync){cb(null,'rebuild the APK for this');return}
+  var k=livePxKey(sym);
+  androidAsync('livePrice',[SPACE,k.split('|')[1]],function(raw){
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    if(r&&r.ok&&Number(r.price)>0){
+      LIVE_PX[k]={price:Number(r.price),at:Number(r.at)||Date.now(),source:String(r.source||''),bid:Number(r.bid||0),ask:Number(r.ask||0)};
+      cb(LIVE_PX[k]);
+    }else cb(null,(r&&r.error)||'no answer');
+  });
+}
+function clockOf(ms){var d=new Date(Number(ms));return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)}
+// Takes a live price into the stock object, keeping what the scan said.
+function takeLivePx(s,q){
+  if(!s||!q)return;
+  if(!(s._scanPrice>0))s._scanPrice=Number(s.price||0);
+  s.price=q.price;s._livePx=q;
+}
+function detailPxHtml(s,cur,err){
+  var q=s._livePx;
+  var h='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+    '<span style="font-size:20px;font-weight:800;font-family:monospace">'+cur+fmt(s.price)+'</span>'+
+    '<span onclick="detailLivePrice()" style="cursor:pointer;padding:3px 9px;font-size:10px;font-weight:800;border:1px solid var(--ac);color:var(--ac);border-radius:5px;white-space:nowrap">'+
+      (DETAIL_PX_BUSY?'getting the price…':(q?'↻ again':'↻ live price'))+'</span></div>';
+  if(q){
+    var was=Number(s._scanPrice||0), d=was>0?(q.price/was-1)*100:0;
+    h+='<div style="font-size:9px;font-weight:700;color:var(--gn)">● live at '+clockOf(q.at)+' · '+escHtml(q.source)+
+      (q.bid>0&&q.ask>0?' · bid '+cur+q.bid.toFixed(2)+' / ask '+cur+q.ask.toFixed(2):'')+
+      (was>0&&Math.abs(d)>=0.01?' <span style="color:var(--t3);font-weight:400">· the scan said '+cur+fmt(was)+' ('+(d>=0?'+':'')+d.toFixed(1)+'% since)</span>':'')+'</div>';
+    // A HOLDING'S STOP AND TARGET below were worked out from the older price.
+    if(s._t212&&s._pxUsed>0&&Math.abs(s._pxUsed-q.price)>1e-9)
+      h+='<div style="font-size:9px;color:var(--am)">The stop and target below were worked out at '+cur+fmt(s._pxUsed)+'. '+
+        '<span onclick="showDetail(DETAIL_STOCK)" style="cursor:pointer;color:var(--ac);font-weight:800;text-decoration:underline">Redo them at the live price</span></div>';
+  }
+  if(err)h+='<div style="font-size:9px;color:var(--am)">No live price: '+escHtml(err)+'</div>';
+  return h;
+}
+function detailPxPaint(err){
+  var s=DETAIL_STOCK, el=document.getElementById('dt-px');if(!el||!s)return;
+  el.innerHTML=detailPxHtml(s,el.getAttribute('data-cur')||'',err);
+  var st=document.getElementById('dt-stale');
+  if(st&&s._livePx)st.innerHTML=st.innerHTML.replace('⚠ Price and figures','⚠ The price is live; the other figures are');
+}
+function detailLivePrice(){
+  var s=DETAIL_STOCK;if(!s||DETAIL_PX_BUSY)return;
+  var sym=String(stockSymbolFor(s)||s.symbol||'').toUpperCase();
+  DETAIL_PX_BUSY=true;detailPxPaint();
+  livePxFetch(sym,function(q,err){
+    DETAIL_PX_BUSY=false;
+    if(DETAIL_STOCK!==s)return;
+    if(q)takeLivePx(s,q);
+    detailPxPaint(q?null:err);
+  });
+}
 function showDetail(idx,focus){
   // Accepts either an index into FILTERED (normal scan-row click) OR a full
   // stock object (manual-search result, watchlist-row click). The object form
@@ -19666,6 +20062,9 @@ function showDetail(idx,focus){
   var s = (typeof idx==='number') ? FILTERED[idx] : idx;
   if(!s)return;
   DETAIL_STOCK=s;  // Store for AI outlook callback
+  // The price a holding's stop and target are about to be worked out from — so a
+  // live price fetched afterwards can say they are older than it.
+  if(s._t212)s._pxUsed=Number(s.price||s.currentPrice||0);
   var cur=s._t212?(s.currency==='EUR'?'\u20ac':s.currency==='GBP'?'\u00a3':'$'):STATE.currency;var pc=PH[s.macdPhase]||'var(--t3)';
 
   var detailName=displayDetailNameFor(s);
@@ -19674,12 +20073,12 @@ function showDetail(idx,focus){
   hh+='<span style="font-size:16px;font-weight:800">'+escHtml(detailName)+'</span>';
   if(detailSub)hh+='<span style="font-size:10px;color:var(--t3);font-family:monospace">'+escHtml(detailSub)+'</span>';
   hh+='</div>';
-  hh+='<div style="font-size:20px;font-weight:800;font-family:monospace;margin-top:4px">'+cur+fmt(s.price)+'</div>';
+  hh+='<div id="dt-px" data-cur="'+escHtml(cur)+'" style="margin-top:4px">'+detailPxHtml(s,cur)+'</div>';
   // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a
   // two-month-old price shown bare reads as today's.
   var fromScan=(typeof idx==='number')||(STATE.data&&STATE.data.indexOf(s)>=0);
   var stale=fromScan?scanAge():null;
-  if(stale)hh+='<div style="font-size:9px;font-weight:700;color:#b45309">⚠ Price and figures from the Discovery scan of '+stale.date+' — '+stale.days+' day'+(stale.days===1?'':'s')+' old. Run a scan for today’s. The daily MACD chart below is fetched fresh.</div>';
+  if(stale)hh+='<div id="dt-stale" style="font-size:9px;font-weight:700;color:#b45309">⚠ '+(s._livePx?'The price is live; the other figures are':'Price and figures')+' from the Discovery scan of '+stale.date+' — '+stale.days+' day'+(stale.days===1?'':'s')+' old. Run a scan for today’s. The daily MACD chart below is fetched fresh.</div>';
   if(s.avgVol20)hh+='<div style="font-size:9px;color:var(--t3);font-family:monospace">Vol: '+fmtV(s.avgVol20)+'/day</div>';
   hh+='</div><button class="mox" onclick="closeDetail()">\u2715</button>';
   document.getElementById('modal-header').innerHTML=hh;

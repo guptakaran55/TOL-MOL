@@ -475,6 +475,229 @@ object RvGateAnalysis {
             fx.size, if (fx.isEmpty()) null else fx.average())
     }
 
+    // ── FINISHED — THE LAST FEW DAYS, ONE BY ONE ────────────────────────────
+    //
+    // The track record above is averages. To judge whether the gate does what it
+    // says, each order it finished with is laid out on its own: where the price
+    // was at the first look, where and why it let it go, what filled — and the
+    // rule re-run on the very reading it let it go on, so a release the rule does
+    // not support stands out.
+
+    /** One order the gate looked at and is done with. Prices in the market's currency. */
+    data class Finished(
+        val key: String, val symbol: String, val side: String, val src: String, val ns: String,
+        val kind: String, val amount: Double?, val qty: Double?,
+        val firstAt: Long, val firstPrice: Double?, val firstHigh: Double?, val firstLow: Double?,
+        val firstPos: Double?, val firstVel: Double?, val atr: Double?,
+        val relAt: Long, val relPrice: Double?, val relWhy: String, val reason: String,
+        val waitedMin: Long, val timedOut: Boolean,
+        val relHigh: Double?, val relLow: Double?, val relPos: Double?, val relVel: Double?,
+        val relMinsOpen: Long?, val peak: Double?, val trough: Double?,
+        val askAt: Long, val askPrice: Double?, val askLimit: Double?,
+        val fillAt: Long, val fillPrice: Double?, val fillQty: Double?,
+        val endAt: Long, val endWhy: String,
+        /** "filled", "let go" (no fill on record yet), "not filled", "never let go", "no outcome". */
+        val status: String,
+        /** Let go at the first look — the gate changed nothing. */
+        val atOnce: Boolean,
+        /** Release price against the first look: + = waiting got the better price. */
+        val gatePct: Double?,
+        /** Fill against the first look: + = better (the ladder's steps included). */
+        val fillPct: Double?
+    )
+
+    private class Ep(val o: JsonObject, val key: String) {
+        var rel: JsonObject? = null
+        var ask: JsonObject? = null
+        var fill: JsonObject? = null
+        var end: JsonObject? = null
+    }
+
+    /** + when [px] is the better price than [first] for this side, in %. Pure. */
+    internal fun better(buy: Boolean, first: Double?, px: Double?): Double? {
+        if (first == null || !(first > 0.0) || px == null || !(px > 0.0)) return null
+        return (if (buy) first - px else px - first) / first * 100.0
+    }
+
+    /**
+     * Every order the gate finished with in [space] ("DE"/"US"), newest first, from
+     * journal [lines]. Pure. Left out: orders placed with the box unticked (the gate
+     * did not hold them), those in [live] (still waiting — keys), and any first
+     * looked at under 2 h 10 min before [nowMs] with no outcome yet (likely still
+     * waiting). An algo order released more than once counts from its first release.
+     */
+    fun finished(lines: List<String>, space: String, nowMs: Long, live: Set<String> = emptySet()): List<Finished> {
+        val latest = HashMap<String, Ep>()
+        val eps = ArrayList<Ep>()
+        for (l in lines) {
+            val o = try { JsonParser.parseString(l).asJsonObject } catch (_: Exception) { continue }
+            val key = o.str("key") ?: continue
+            when (o.str("ev")) {
+                "first" -> {
+                    if (!(o.str("space") ?: "").equals(space, true) || o.bool("asked") == false) {
+                        latest.remove(key); continue
+                    }
+                    val e = Ep(o, key); latest[key] = e; eps += e
+                }
+                "release" -> latest[key]?.takeIf { it.rel == null }?.let { it.rel = o }
+                "ask" -> latest[key]?.takeIf { it.ask == null }?.let { it.ask = o }
+                "fill" -> latest[key]?.takeIf { it.rel != null && it.fill == null }?.let { it.fill = o }
+                "end" -> latest[key]?.takeIf { it.fill == null && it.end == null }?.let { it.end = o }
+            }
+        }
+        val out = ArrayList<Finished>()
+        for (e in eps) {
+            val f = e.o
+            val firstAt = f.long("at") ?: 0L
+            val r = e.rel; val fl = e.fill; val en = e.end
+            if (r == null && en == null && (e.key in live || nowMs - firstAt < 130L * 60_000L)) continue
+            val side = (f.str("side") ?: "BUY").uppercase()
+            val buy = side == "BUY"
+            val relAt = r?.long("at") ?: 0L
+            val why = r?.str("why") ?: ""
+            val waited = r?.long("waitedMin") ?: 0L
+            val firstPx = f.num("price")
+            val relPx = r?.num("price")
+            val fillPx = fl?.num("price")
+            out += Finished(
+                key = e.key, symbol = f.str("symbol") ?: "", side = side, src = f.str("src") ?: "",
+                ns = f.str("ns") ?: "", kind = f.str("kind") ?: "", amount = f.num("amount"), qty = f.num("qty"),
+                firstAt = firstAt, firstPrice = firstPx, firstHigh = f.num("high"), firstLow = f.num("low"),
+                firstPos = f.num("pos"), firstVel = f.num("vel"), atr = f.num("atr") ?: r?.num("atr"),
+                relAt = relAt, relPrice = relPx, relWhy = why,
+                reason = if (r == null) "" else reasonOf(why, buy).let {
+                    if (why.startsWith("you said")) "you said buy anyway" else it },
+                waitedMin = waited, timedOut = r?.bool("timedOut") == true,
+                relHigh = r?.num("high"), relLow = r?.num("low"), relPos = r?.num("pos"), relVel = r?.num("vel"),
+                relMinsOpen = r?.long("minsOpen"), peak = r?.num("peak"), trough = r?.num("trough"),
+                askAt = e.ask?.long("at") ?: 0L, askPrice = e.ask?.num("price"), askLimit = e.ask?.num("limit"),
+                fillAt = fl?.let { it.long("filledAt") ?: it.long("at") } ?: 0L, fillPrice = fillPx, fillQty = fl?.num("qty"),
+                endAt = en?.long("at") ?: 0L, endWhy = en?.str("why") ?: "",
+                status = when {
+                    fl != null -> "filled"
+                    r != null && en != null -> "not filled"
+                    r != null -> "let go"
+                    en != null -> "never let go"
+                    else -> "no outcome"
+                },
+                atOnce = r != null && waited == 0L && relAt - firstAt < 90_000L,
+                gatePct = better(buy, firstPx, relPx), fillPct = better(buy, firstPx, fillPx))
+        }
+        return out.sortedByDescending { it.firstAt }
+    }
+
+    /** Who placed it, in words, for [f]. */
+    private fun fromOf(ctx: Context, f: Finished): String = when {
+        f.src == "you" -> when (f.kind) {
+            RvManualQueue.Kind.WATCH_BUY -> "You · watchlist Buy"
+            RvManualQueue.Kind.ALGO_TP -> "You · take profit"
+            RvManualQueue.Kind.DETAIL_BUY -> "You · stock page → watchlist"
+            else -> "You · stock page"
+        }
+        f.src == "watch" || Spaces.bucketIdOf(f.ns) == com.signalscope.app.data.ManualWatchStore.ID -> "Your watchlist"
+        else -> "Algo · " + (try { com.signalscope.app.data.BucketStore.get(ctx, f.ns)?.name } catch (_: Exception) { null } ?: f.ns)
+    }
+
+    /** Orders the gate is holding now in [space] — left out of the finished list. */
+    private fun liveKeys(ctx: Context, space: String): Set<String> {
+        val out = HashSet<String>()
+        try { RvManualQueue.all(ctx).filter { it.status == "WAITING" || it.status == "ASK" }.forEach { out += "you|${it.id}" } } catch (_: Exception) {}
+        try {
+            T212LiveStore.load(ctx).trades.filter { it.rvSince > 0L && Spaces.baseOf(it.ns).equals(space, true) }.forEach {
+                val sell = it.status == "OPEN" || it.status == "EXITING"
+                out += RvJournal.algoKey(it.ns, it.paperTradeId, if (sell) RvGate.Side.SELL else RvGate.Side.BUY)
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    /** The finished list for the screen: the last [days] days of [space]. No network. */
+    fun finishedFor(ctx: Context, space: String, days: Int = 3): Map<String, Any?> = try {
+        val now = System.currentTimeMillis()
+        val sp = space.uppercase()
+        val rows = finished(RvJournal.lines(ctx, now - days * 24L * 3_600_000L), sp, now, liveKeys(ctx, sp))
+        mapOf("ok" to true, "days" to days, "cur" to (if (sp == "DE") "€" else "$"),
+            "rows" to rows.map { mapOf("f" to it, "from" to fromOf(ctx, it)) })
+    } catch (e: Exception) { mapOf("ok" to false, "error" to (e.message ?: "record unreadable")) }
+
+    /**
+     * One finished order, replayed on its day's chart: the 15-minute prices of
+     * that session, the gate's looks, the first look, the release and the fill,
+     * the rule's lines as they stood at the release — and the rule re-run on the
+     * reading it let the order go on. Network: that day's 15-minute prices.
+     */
+    fun forEpisode(ctx: Context, space: String, key: String, firstAt: Long): Map<String, Any?> {
+        val sp = space.uppercase()
+        val f = finished(RvJournal.lines(ctx, firstAt - 60_000L), sp, Long.MAX_VALUE)
+            .firstOrNull { it.key == key && it.firstAt == firstAt }
+            ?: return mapOf("ok" to false, "error" to "That order is no longer in the gate's record.")
+        val base = if (sp == "DE") "de" else "us"
+        val cur = if (base == "de") "€" else "$"
+        val side = if (f.side == "SELL") RvGate.Side.SELL else RvGate.Side.BUY
+        val buy = side == RvGate.Side.BUY
+        val openMs = RvGate.todayOpenMs(base, firstAt)
+        val closeMs = try {
+            val zone = MarketHours.zoneOf(base); val close = MarketHours.closeOf(base)
+            if (zone == null || close == null) 0L
+            else Instant.ofEpochMilli(firstAt).atZone(zone).toLocalDate().atTime(close).atZone(zone).toInstant().toEpochMilli()
+        } catch (_: Exception) { 0L }
+        val bars = try {
+            val res = com.signalscope.app.network.YahooFinanceClient.fetchCandles15mRange(
+                f.symbol.trim(), if (base == "de") "DE" else "NASDAQ", "5d")
+            (res as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles.orEmpty()
+        } catch (e: Exception) { Log.w(TAG, "${f.symbol}: day's prices failed: ${e.message}"); emptyList() }
+        val day = bars.filter { it.close > 0.0 && it.timestamp * 1000L >= openMs && (closeMs <= 0L || it.timestamp * 1000L < closeMs) }
+            .sortedBy { it.timestamp }
+        val endAt = listOf(f.relAt, f.endAt).filter { it > 0L }.minOrNull() ?: (firstAt + RvGate.MAX_WAIT_MS)
+        val trail = RvJournal.trail(ctx, key).filter { it.at >= firstAt - 60_000L && it.at <= endAt + 60_000L }
+        // The reading at the release, and the rule's lines on it.
+        val atPx = f.relPrice ?: f.firstPrice ?: 0.0
+        val hi = f.relHigh ?: f.firstHigh ?: 0.0
+        val lo = f.relLow ?: f.firstLow ?: 0.0
+        val atr = f.atr ?: 0.0
+        val vel = if (f.relAt > 0L) f.relVel else f.firstVel
+        val mem = if (buy && f.peak != null && f.peak > 0.0) RvGate.Memory(f.peak, f.trough ?: 0.0) else null
+        val lv = levels(side, atPx, hi, lo, atr, vel, mem)
+        // RE-RUN: the rule on the very reading it let the order go on. Not for a
+        // release that was not the rule's to make.
+        val judged = f.relAt > 0L && f.relPrice != null && f.relPrice > 0.0 && f.relHigh != null &&
+            f.reason !in setOf("you said buy anyway", "gate failed", "under its stop") &&
+            !f.relWhy.startsWith("box not ticked")
+        val recheck = if (!judged) null else RvGate.decide(side, f.relPrice, f.relHigh ?: 0.0, f.relLow ?: 0.0, atr,
+            f.relVel, f.waitedMin * 60_000L, f.relMinsOpen ?: Long.MAX_VALUE, memory = mem)
+        // The best price the gate itself saw while it waited — what perfect timing
+        // inside the same wait would have got.
+        val inWait = trail.filter { it.at in firstAt..(if (f.relAt > 0L) f.relAt else endAt) }.map { it.at to it.price }
+        val best = if (inWait.isEmpty()) null else if (buy) inWait.minByOrNull { it.second } else inWait.maxByOrNull { it.second }
+        val lag = if (base == "de") FeedDelay.XETRA_SEC else 0L
+        val relSec = (if (f.relAt > 0L) f.relAt else endAt) / 1000L
+        val refBar = day.lastOrNull { FeedDelay.isComplete(it.timestamp, 15 * 60L, relSec, 0L, lag) }
+        val sessionOver = closeMs > 0L && System.currentTimeMillis() >= closeMs
+        return mapOf(
+            "ok" to true, "episode" to f, "from" to fromOf(ctx, f), "symbol" to f.symbol, "side" to side.name,
+            "space" to sp, "cur" to cur,
+            "now" to (if (f.relAt > 0L) f.relAt else endAt), "price" to (f.relPrice ?: 0.0),
+            "openMs" to openMs, "closeMs" to closeMs, "since" to firstAt,
+            "startsBy" to maxOf(firstAt, openMs) + RvGate.MAX_WAIT_MS,
+            "high" to lv.hi, "low" to lv.lo, "atr" to atr, "velocity" to vel,
+            "prevClose" to bars.filter { it.timestamp * 1000L < openMs && it.close > 0.0 }.maxByOrNull { it.timestamp }?.close,
+            "bars" to day.map { listOf(it.timestamp * 1000L, it.open, it.high, it.low, it.close) },
+            "barLagMin" to lag / 60L,
+            "decision" to mapOf("go" to (f.relAt > 0L), "why" to f.relWhy, "timedOut" to f.timedOut),
+            "levels" to mapOf(
+                "rangeMeans" to lv.rangeMeans, "minRange" to lv.minRange, "range" to lv.range, "pos" to lv.pos,
+                "zoneEdge" to lv.zoneEdge, "chaseFloor" to lv.chaseFloor, "widenAt" to lv.widenAt,
+                "velRef" to lv.velRef, "velRefAt" to refBar?.let { (it.timestamp + 15 * 60L) * 1000L },
+                "dead" to lv.dead, "goLine" to lv.goLine, "peak" to lv.peak.takeIf { it > 0.0 },
+                "trough" to lv.trough.takeIf { it > 0.0 }, "dipAt" to lv.dipAt, "turnAt" to lv.turnAt,
+                "limit" to (if (buy) f.askLimit else null), "limitIsAlgo" to false, "unit" to lv.unit),
+            "trail" to trail.map { listOf(it.at, it.price, if (it.go) 1 else 0, it.why) },
+            "recheck" to recheck?.let { mapOf("go" to it.go, "why" to it.why) },
+            "bestAt" to best?.first, "bestPrice" to best?.second,
+            "dayClose" to (if (sessionOver) day.lastOrNull()?.close else null),
+            "dayHigh" to day.maxOfOrNull { it.high }, "dayLow" to day.minOfOrNull { it.low })
+    }
+
     /** The record for the screen: the last [days] days of [space]'s [side]. */
     fun recordFor(ctx: Context, space: String, side: String, days: Int = 30): Map<String, Any?> = try {
         val r = record(RvJournal.lines(ctx, System.currentTimeMillis() - days * 24L * 3_600_000L),

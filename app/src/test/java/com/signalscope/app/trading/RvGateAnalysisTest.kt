@@ -159,4 +159,61 @@ class RvGateAnalysisTest {
         assertNotNull(r.all)
         assertEquals((1.0 + (98.0 - 99.0) / 98.0 * 100.0) / 2.0, r.all!!.avgPct, 1e-9)
     }
+
+    // ── finished, one by one ────────────────────────────────────────────────
+
+    @Test fun `each finished order is laid out start to end, newest first`() {
+        val m = 60_000L; val day = 24 * 60 * m
+        val lines = listOf(
+            // held 30 min, let go rising, filled
+            l(0, "first", "you|a", "space" to "DE", "side" to "BUY", "price" to 100.0, "asked" to true,
+                "symbol" to "SAP", "src" to "you", "kind" to "t212Buy", "pos" to 0.7, "vel" to 0.3, "atr" to 2.0),
+            l(30 * m, "release", "you|a", "price" to 99.0, "why" to "rising on the 15-minute prices", "waitedMin" to 30L,
+                "high" to 101.0, "low" to 98.0, "pos" to 0.33, "vel" to 0.2),
+            l(31 * m, "fill", "you|a", "price" to 99.2, "qty" to 1.5, "filledAt" to 31 * m),
+            // went at once
+            l(2 * day, "first", "you|b", "space" to "DE", "side" to "BUY", "price" to 10.0, "asked" to true, "symbol" to "BAS"),
+            l(2 * day + 1000, "release", "you|b", "price" to 10.0, "why" to "in the bottom 40% of today's range", "waitedMin" to 0L),
+            // called off before it was let go
+            l(day, "first", "you|c", "space" to "DE", "side" to "BUY", "price" to 10.0, "asked" to true, "symbol" to "SIE"),
+            l(day + 20 * m, "end", "you|c", "why" to "called off by you"),
+            // asked at its limit, then you said buy anyway
+            l(day + m, "first", "you|d", "space" to "DE", "side" to "BUY", "price" to 20.0, "asked" to true, "symbol" to "ALV"),
+            l(day + 40 * m, "ask", "you|d", "price" to 21.2, "limit" to 21.0),
+            l(day + 45 * m, "release", "you|d", "why" to "you said buy anyway", "waitedMin" to 44L),
+            l(day + 46 * m, "end", "you|d", "why" to "nothing filled"),
+            // unticked, another market, and one still waiting — all left out
+            l(0, "first", "you|x", "space" to "DE", "side" to "BUY", "price" to 10.0, "asked" to false),
+            l(0, "first", "you|y", "space" to "US", "side" to "BUY", "price" to 10.0, "asked" to true),
+            l(3 * day - 10 * m, "first", "you|w", "space" to "DE", "side" to "BUY", "price" to 10.0, "asked" to true),
+            l(day, "first", "you|live", "space" to "DE", "side" to "BUY", "price" to 10.0, "asked" to true))
+        val rows = RvGateAnalysis.finished(lines, "DE", 3 * day, setOf("you|live"))
+        assertEquals(listOf("you|b", "you|d", "you|c", "you|a"), rows.map { it.key })
+        val a = rows.single { it.key == "you|a" }
+        assertEquals("filled", a.status); assertFalse(a.atOnce)
+        assertEquals("SAP", a.symbol); assertEquals("rising", a.reason); assertEquals(30L, a.waitedMin)
+        assertEquals(1.0, a.gatePct!!, 1e-9); assertEquals(0.8, a.fillPct!!, 1e-9)
+        assertEquals(0.7, a.firstPos!!, 1e-9); assertEquals(0.33, a.relPos!!, 1e-9)
+        assertEquals(101.0, a.relHigh!!, 1e-9); assertEquals(31 * m, a.fillAt)
+        val b = rows.single { it.key == "you|b" }
+        assertTrue(b.atOnce); assertEquals("let go", b.status); assertEquals(0.0, b.gatePct!!, 1e-9)
+        val c = rows.single { it.key == "you|c" }
+        assertEquals("never let go", c.status); assertEquals("called off by you", c.endWhy); assertNull(c.gatePct)
+        val d = rows.single { it.key == "you|d" }
+        assertEquals("not filled", d.status); assertEquals("you said buy anyway", d.reason)
+        assertEquals(21.0, d.askLimit!!, 1e-9); assertEquals(day + 40 * m, d.askAt)
+    }
+
+    @Test fun `an old order with no outcome is shown as such, not dropped`() {
+        val lines = listOf(l(0, "first", "you|z", "space" to "US", "side" to "SELL", "price" to 10.0, "asked" to true))
+        assertEquals("no outcome", RvGateAnalysis.finished(lines, "US", 3 * 3_600_000L).single().status)
+        assertTrue(RvGateAnalysis.finished(lines, "US", 60 * 60_000L).isEmpty())
+    }
+
+    @Test fun `better is from the side's point of view`() {
+        assertEquals(1.0, RvGateAnalysis.better(true, 100.0, 99.0)!!, 1e-9)
+        assertEquals(-1.0, RvGateAnalysis.better(false, 100.0, 99.0)!!, 1e-9)
+        assertNull(RvGateAnalysis.better(true, null, 99.0))
+        assertNull(RvGateAnalysis.better(true, 100.0, 0.0))
+    }
 }

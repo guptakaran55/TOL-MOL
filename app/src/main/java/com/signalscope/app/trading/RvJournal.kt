@@ -124,13 +124,14 @@ object RvJournal {
         } catch (e: Exception) { Log.w(TAG, "prune failed: ${e.message}") }
     }
 
-    // ── EVERY LOOK OF THE LAST DAY AND A HALF, for the analysis chart ──────
+    // ── EVERY LOOK OF THE LAST FOUR DAYS, for the analysis chart ───────────
     // The record above keeps only the first look and the release; the chart in
     // Waiting orders › RV gate analysis also shows each minute's verdict between
-    // them — where the price was every time the gate said "not yet".
+    // them — where the price was every time the gate said "not yet". Four days so
+    // the finished orders of the last three can be replayed over a weekend too.
 
     private const val TRAIL_FILE = "rv_gate_trail.json"
-    private const val TRAIL_KEEP_MS = 36L * 3_600_000L
+    private const val TRAIL_KEEP_MS = 4L * 24 * 3_600_000L
     private const val TRAIL_MAX = 480
 
     /** One look: when, the live price, and what the gate said. */
@@ -138,10 +139,13 @@ object RvJournal {
 
     private val trailType = object : TypeToken<Map<String, List<Look>>>() {}.type
 
+    // Parsed once and kept until the file changes (StoreCache): four days of looks
+    // are read on every look the gate takes, so they are not re-parsed each time.
     @Synchronized
     private fun trailLoad(ctx: Context): Map<String, List<Look>> = try {
         val f = File(ctx.filesDir, TRAIL_FILE)
-        if (!f.exists()) emptyMap() else gson.fromJson<Map<String, List<Look>>>(f.readText(), trailType) ?: emptyMap()
+        if (!f.exists()) emptyMap()
+        else com.signalscope.app.data.StoreCache.read(f) { gson.fromJson<Map<String, List<Look>>>(it, trailType) } ?: emptyMap()
     } catch (e: Exception) { emptyMap() }
 
     @Synchronized
@@ -154,11 +158,11 @@ object RvJournal {
                 if (keep.isNotEmpty()) m[k] = keep
             }
             m[key] = (m[key].orEmpty() + look).takeLast(TRAIL_MAX)
-            File(ctx.filesDir, TRAIL_FILE).writeText(gson.toJson(m))
+            com.signalscope.app.data.StoreCache.write(File(ctx.filesDir, TRAIL_FILE), gson.toJson(m))
         } catch (e: Exception) { Log.w(TAG, "trail not recorded: ${e.message}") }
     }
 
-    /** The gate's looks at the order behind [key], oldest first — the last 36 hours. */
+    /** The gate's looks at the order behind [key], oldest first — the last four days. */
     fun trail(ctx: Context, key: String): List<Look> = trailLoad(ctx)[key].orEmpty()
 
     /** The record's lines from [sinceMs] on — for the analysis's track record. */
