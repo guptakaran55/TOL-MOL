@@ -118,7 +118,12 @@ object PositionRadar {
                        val rows: List<Row>? = null,
                        /** "AIR €387" for each holding of yours with nothing protecting it,
                         *  largest first — the widget's warning line. Null on older summaries. */
-                       val unprotected: List<String>? = null)
+                       val unprotected: List<String>? = null,
+                       /** Holdings left out because they sell on their own rules (the
+                        *  German built-in algos — see ShareOwners.onAutopilot), and
+                        *  whose they are. 0 / null on older summaries. */
+                       val autopilot: Int = 0,
+                       val autopilotBy: List<String>? = null)
 
     /** One widget row: the market's flag, the line, and who manages the exit —
      *  plus its market ("DE"/"US"/"IN"/"BN") and [Kind] name, which the widget's
@@ -279,7 +284,9 @@ object PositionRadar {
         val raw = try { gather(ctx, now, priceMaxAgeMs) } catch (e: Exception) {
             Log.w(TAG, "gather failed", e); return latest(ctx)
         }
-        val s = if (raw.isEmpty()) null else summarize(raw, now)
+        val s = if (raw.ps.isEmpty() && raw.autopilot == 0) null
+                else summarize(raw.ps, now).copy(autopilot = raw.autopilot,
+                    autopilotBy = raw.autopilotBy.takeIf { it.isNotEmpty() })
         keep(ctx, s)
         publish(ctx, s)
         if (s != null) Log.i(TAG, "${s.held} held — ${s.headline}")
@@ -343,7 +350,22 @@ object PositionRadar {
                        /** Shares — known for a holding bought by hand. */
                        val qty: Double = 0.0)
 
-    private fun gather(ctx: Context, now: Long, priceMaxAgeMs: Long = 20 * 60_000L): List<Pos> {
+    /**
+     * Pure: of [held] shares at [price], how many are yours when the autopilot owns
+     * [auto] of them — all of them when it owns none, and 0 when what is left is a
+     * sliver not worth a line (1% of the holding, or under 5 in money).
+     */
+    internal fun yoursBeside(held: Double, auto: Double, price: Double): Double {
+        if (!(auto > 0.0)) return held
+        val mine = held - auto
+        return if (mine <= held * 0.01 || mine * price < 5.0) 0.0 else mine
+    }
+
+    /** What [gather] found: the positions to show, and how many it left out as
+     *  on autopilot, and whose. */
+    private class Gathered(val ps: List<Pos>, val autopilot: Int, val autopilotBy: List<String>)
+
+    private fun gather(ctx: Context, now: Long, priceMaxAgeMs: Long = 20 * 60_000L): Gathered {
         val held = ArrayList<Held>()
         // ── Trading 212: Germany and the US ──────────────────────────────────
         T212LiveStore.load(ctx).trades.filter {
@@ -355,14 +377,23 @@ object PositionRadar {
                 if (it.buyAt > 0L) it.buyAt / 1000L else it.entryTs, it.paperTradeId,
                 ticker = it.t212Ticker))
         }
-        // ── The German built-in algos' real positions (their own record) ──────
-        // Missing here, each read as a holding of yours with nothing protecting it.
+        // ── The German built-in algos' real positions: ON AUTOPILOT, NOT LISTED ──
+        // (the user, 5 Nov 2026). Their own stop, target, time limit and trend sell
+        // them, and nothing in them is yours to decide, so they crowded out what
+        // needs your eye. Counted, so the widget can say they exist; and their
+        // shares are kept out of "yours" below — before they were listed here,
+        // each read as a holding of yours with nothing protecting it.
+        val autopilotQty = HashMap<String, Double>()          // "de|SAP" → shares the autopilot owns
+        val autopilotBy = LinkedHashSet<String>()
+        var autopilotN = 0
         try {
             com.signalscope.app.data.FloorLiveStore.load(ctx).rows
                 .filter { it.status == com.signalscope.app.data.FloorLiveStore.OPEN && it.qty > 0.0 && it.entryPrice > 0.0 }
                 .forEach {
-                    held.add(Held("floor|${it.ns}|${it.tradeId}", it.ns, it.symbol.uppercase(),
-                        it.entryPrice, it.paperPrice, it.buyAt / 1000L, it.tradeId, ticker = it.ticker))
+                    val k = Spaces.baseOf(it.ns) + "|" + it.symbol.uppercase()
+                    autopilotQty[k] = (autopilotQty[k] ?: 0.0) + it.qty
+                    autopilotN++
+                    autopilotBy.add(ShareOwners.nameOf(ctx, it.ns).trim())
                 }
         } catch (e: Exception) { Log.w(TAG, "built-in algos unreadable", e) }
         // ── Zerodha: India ───────────────────────────────────────────────────
@@ -406,12 +437,16 @@ object PositionRadar {
             hs.holdings.filter { it.qty > 0.0 && it.symbol.isNotBlank() && it.symbol.uppercase() !in covered }
                 .distinctBy { it.symbol.uppercase() }
                 .forEach { h ->
+                    // THE AUTOPILOT'S SHARES ARE NOT YOURS: only what is left over is
+                    // listed, so shares of your own in the same stock still show.
+                    val mine = yoursBeside(h.qty, autopilotQty["$space|${h.symbol.uppercase()}"] ?: 0.0, h.price)
+                    if (mine <= 0.0) return@forEach
                     held.add(Held("hand|$space|${h.symbol.uppercase()}", space, h.symbol.uppercase(),
                         h.avgCost, 0.0, 0L, "", byHand = true, brokerPrice = h.price, ticker = h.ticker,
-                        qty = h.qty))
+                        qty = mine))
                 }
         }
-        if (held.isEmpty()) { PositionPeakStore.save(ctx, emptyMap()); return emptyList() }
+        if (held.isEmpty()) { PositionPeakStore.save(ctx, emptyMap()); return Gathered(emptyList(), autopilotN, autopilotBy.toList()) }
 
         // ── Prices: refreshed only where the market is open ─────────────────
         // Out of hours the last price is the price, and asking again every pass
@@ -515,7 +550,7 @@ object PositionRadar {
                 unprotected = if (bare && price > 0.0) h.qty * price else 0.0))
         }
         PositionPeakStore.save(ctx, nextPeaks)
-        return withShortHighs(out)
+        return Gathered(withShortHighs(out), autopilotN, autopilotBy.toList())
     }
 
     /**

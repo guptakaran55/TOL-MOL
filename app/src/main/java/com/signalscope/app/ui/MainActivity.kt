@@ -7880,11 +7880,18 @@ class MainActivity : AppCompatActivity() {
                     return gson.toJson(mapOf("ok" to true, "held" to emptyMap<String, Any>()))
                 val lots = com.signalscope.app.trading.ShareOwners.lots(applicationContext, base)
                 val held = HashMap<String, Map<String, Any>>()
+                val autopilot = HashMap<String, Boolean>()
+                fun onAutopilot(ns: String) = autopilot.getOrPut(ns) {
+                    com.signalscope.app.trading.ShareOwners.onAutopilot(applicationContext, ns) }
                 for ((_, group) in lots.groupBy { com.signalscope.app.trading.MacdLadder.bare(it.symbol).uppercase() }) {
                     val algos = group.filter { it.kind == com.signalscope.app.trading.ShareOwners.ALGO }
+                    val auto = group.filter { onAutopilot(it.ns) }
                     val entry = mapOf(
                         "by" to algos.map { it.name }.distinct(),
                         "qty" to algos.sumOf { it.qty },
+                        // Shares that sell on their own rules — see ShareOwners.onAutopilot.
+                        "autopilotQty" to auto.sumOf { it.qty },
+                        "autopilotBy" to auto.map { it.name }.distinct(),
                         "lots" to group.groupBy { it.ns }.map { (_, l) ->
                             mapOf("name" to l.first().name, "kind" to l.first().kind,
                                 "qty" to l.sumOf { it.qty },

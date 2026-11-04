@@ -7199,18 +7199,33 @@ function renderPortfolioNewsPanel(){
     });
     h+='</div>';
   }else if(!PORTFOLIO_NEWS.running){
-    h+='<div style="padding:0 10px 9px;font-size:9px;color:var(--t3)">Scan your holdings’ latest headlines for criticalities and standout positives. Uses your AI key (one batched call).</div>';
+    h+='<div style="padding:0 10px 9px;font-size:9px;color:var(--t3)">Scan your holdings’ latest headlines for criticalities and standout positives. Uses your AI key (one batched call). Holdings an autopilot algo sells on its own rules are left out.</div>';
   }
+  if(PORTFOLIO_NEWS.skipped&&!collapsed)
+    h+='<div style="padding:0 10px 9px;font-size:9px;color:var(--t3)">Left out: '+PORTFOLIO_NEWS.skipped.n+' on autopilot ('+escHtml(PORTFOLIO_NEWS.skipped.by)+') — they sell on their own rules.</div>';
   }
   h+='</div>';
   return h;
 }
+// ON AUTOPILOT: shares a German built-in algo owns — they sell on its own stop,
+// target, time limit and trend, with no decision of yours in it. Their news is
+// left out of the scan (the user, 5 Nov 2026); a holding is kept when any of its
+// shares are yours or a slower algo's. Returns the algos' names, or null.
+function autopilotOnly(r){
+  var a=algoHeldFor(r), qty=Number(r.qty||0), auto=Number((a&&a.autopilotQty)||0);
+  if(!(auto>0)||!(qty>0))return null;
+  var mine=qty-auto;
+  if(mine>qty*0.01&&mine*Number(r.ltp||0)>=5)return null;
+  return (a.autopilotBy||[]).join(', ')||'an algo';
+}
 function scanPortfolioNewsNow(){
-  var rows=LAST_PORTFOLIO_ROWS||[];
+  var all=LAST_PORTFOLIO_ROWS||[], skipped=[], by={};
+  var rows=all.filter(function(r){var who=autopilotOnly(r);if(!who)return true;skipped.push(r.symbol||r.ticker);by[who]=1;return false});
+  PORTFOLIO_NEWS.skipped=skipped.length?{n:skipped.length,by:Object.keys(by).join(', ')}:null;
   // The company's own name — the same one the stock page's outlook searches with
   // (the row's display name joins several forms of it for the search box).
   var payload=rows.map(function(r){return {symbol:(r.symbol||r.ticker||''),name:(r.newsName||r.name||r.symbol||'')}}).filter(function(x){return x.symbol});
-  if(!payload.length){uiAlert('Nothing to scan','No holdings found in this portfolio.');return}
+  if(!payload.length){uiAlert('Nothing to scan',skipped.length?('All '+skipped.length+' holdings here are on autopilot ('+escHtml(Object.keys(by).join(', '))+') — they sell on their own rules, so their news is not scanned.'):'No holdings found in this portfolio.');return}
   if(typeof Android==='undefined'||!Android.scanPortfolioNews){uiAlert('Unavailable','News scan bridge not available.');return}
   if(typeof Android.hasAiEnabled==='function'){try{if(!Android.hasAiEnabled()){uiAlert('AI key needed','Add an AI key in Settings → AI Stock Analysis to scan news.');return}}catch(e){}}
   PORTFOLIO_NEWS.running=true;

@@ -26,6 +26,18 @@ object ShareOwners {
     data class Lot(val ns: String, val name: String, val kind: String, val symbol: String,
                    val qty: Double, val cost: Double, val keys: List<String>)
 
+    /**
+     * ON AUTOPILOT: an owner whose shares sell entirely on their own rules — the
+     * German built-in algos (only their MACD-turns kind may trade real money, see
+     * FloorLive.eligible): the algo's own stop, target, time limit and trend sell
+     * the real shares too, with no decision of yours in it. Left out of the
+     * Positions widget and the portfolio news scan (the user, 5 Nov 2026); the
+     * slower algos and the watchlist stay, as they may need your eye.
+     */
+    fun onAutopilot(ctx: Context, ns: String): Boolean = try {
+        FloorAlgoStore.load(ctx).algos.any { it.ns == ns }
+    } catch (_: Exception) { false }
+
     /** The name an owner goes by on its card. */
     fun nameOf(ctx: Context, ns: String): String = try {
         when {

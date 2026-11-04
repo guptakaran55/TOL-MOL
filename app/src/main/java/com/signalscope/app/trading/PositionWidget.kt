@@ -189,7 +189,9 @@ class PositionWidget : AppWidgetProvider() {
                 v.setOnClickPendingIntent(R.id.wp_refresh, refresh)
                 v.setTextViewText(R.id.wp_time, if (busy) "refreshing…" else s?.let {
                     "updated " + java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
-                        .format(java.util.Date(it.atMs))
+                        .format(java.util.Date(it.atMs)) +
+                        // Left out of the list: they sell on their own rules.
+                        (if (it.autopilot > 0) " · ${it.autopilot} on autopilot" else "")
                 } ?: "")
                 // THE TABS, per copy of the widget: its own market and kind.
                 val allRows = (s?.rows as List<PositionRadar.Row>?).orEmpty()
