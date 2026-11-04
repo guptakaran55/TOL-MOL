@@ -268,7 +268,10 @@ class EngineParityTest {
             println("PARITY SNAPSHOT CREATED (${now.lines().size} lines) — rerun to gate against it")
             return
         }
-        val golden = goldenFile.readText()
+        // LINE ENDINGS ARE NOT BEHAVIOUR. A Windows checkout can hand this file back
+        // with CR LF, and a fresh copy of the repo then failed here on every line
+        // while the trades were identical (21 Oct). See also .gitattributes.
+        val golden = goldenFile.readText().replace("\r\n", "\n")
         if (golden != now) {
             val g = golden.lines(); val c = now.lines()
             val firstDiff = (0 until maxOf(g.size, c.size)).firstOrNull {

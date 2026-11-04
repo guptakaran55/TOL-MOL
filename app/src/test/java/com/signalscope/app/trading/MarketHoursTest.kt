@@ -50,4 +50,23 @@ class MarketHoursTest {
         val start = at("Europe/Berlin", 2026, 9, 29, 16, 0) / 1000
         assertFalse(MarketHours.barIsCurrent(start, 3600, at("Europe/Berlin", 2026, 9, 30, 11, 0) / 1000, FeedDelay.XETRA_SEC))
     }
+
+    @Test fun `a market's background work sleeps from the bars after the close until just before the open`() {
+        val de = "Europe/Berlin"
+        // Wednesday 30 Sep 2026: awake 08:30 to 18:15 — the 4-hour candle after the 17:30 close is in by 18:00.
+        assertFalse(MarketHours.awake("de", at(de, 2026, 9, 30, 8, 29)))
+        assertTrue(MarketHours.awake("de", at(de, 2026, 9, 30, 8, 30)))
+        assertTrue(MarketHours.awake("de", at(de, 2026, 9, 30, 18, 0)))
+        assertTrue(MarketHours.awake("de", at(de, 2026, 9, 30, 18, 15)))
+        assertFalse(MarketHours.awake("de", at(de, 2026, 9, 30, 18, 16)))
+        // Saturday 3 Oct: asleep all day; crypto never sleeps.
+        assertFalse(MarketHours.awake("de", at(de, 2026, 10, 3, 12, 0)))
+        assertFalse(MarketHours.anyStockAwake(at(de, 2026, 10, 3, 12, 0)))
+        assertTrue(MarketHours.awake("binance", at(de, 2026, 10, 3, 12, 0)))
+        // Each market on its own clock: New York until 16:45 there, India from 08:45 there.
+        assertTrue(MarketHours.awake("us", at("America/New_York", 2026, 9, 30, 16, 45)))
+        assertFalse(MarketHours.awake("us", at("America/New_York", 2026, 9, 30, 16, 46)))
+        assertTrue(MarketHours.awake("in", at("Asia/Kolkata", 2026, 9, 30, 8, 45)))
+        assertFalse(MarketHours.awake("in", at("Asia/Kolkata", 2026, 9, 30, 16, 16)))
+    }
 }

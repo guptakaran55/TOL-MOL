@@ -566,6 +566,13 @@ object ManualEntryWatcher {
                         .map { it.symbol.uppercase() to it.ns }
             for ((sym, ns) in rows) out.getOrPut(sym) { LinkedHashSet() }.add(ns)
         } catch (e: Exception) { Log.w(TAG, "[$base] managing algos unreadable", e) }
+        // THE GERMAN BUILT-IN ALGOS' REAL SHARES live in their own record. Missing
+        // here, their stocks read as yours: listed as held outside, judged by the
+        // watchlist's config and open to a "sell?" alert on shares an algo owns.
+        try {
+            ShareOwners.floorRows(ctx, base)
+                .forEach { out.getOrPut(it.symbol.uppercase()) { LinkedHashSet() }.add(it.ns) }
+        } catch (e: Exception) { Log.w(TAG, "[$base] built-in algos unreadable", e) }
         try {
             ManualWatchStore.load(ctx, base).entries
                 .filter { it.status == "OPEN" && it.filledQty > 0.0 }
@@ -597,6 +604,13 @@ object ManualEntryWatcher {
                     }
             }
         } catch (e: Exception) { Log.w(TAG, "[$base] mirror quantities unreadable", e) }
+        // The German built-in algos' real shares — see managedOwnersFor.
+        try {
+            ShareOwners.floorRows(ctx, base).forEach { r ->
+                val k = r.symbol.uppercase()
+                mirror[k] = (mirror[k] ?: 0.0) + r.qty
+            }
+        } catch (e: Exception) { Log.w(TAG, "[$base] built-in algo quantities unreadable", e) }
 
         val book = HashMap<String, Double>()
         try {
@@ -797,6 +811,7 @@ object ManualEntryWatcher {
         // REPAIR FIRST: a manual position with no live-order row is invisible to
         // BOTH stops, so nothing can ever sell it.
         try { backfillLiveRows(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] live-row backfill failed", e) }
+        repairS92Once(ctx, base)
         // ONE OWNER PER SHARE, re-established every pass. Must run BEFORE anything
         // that reads a quantity or decides an exit: a book still claiming shares an
         // algo owns would size its sell off a number the account cannot honour.
@@ -820,6 +835,9 @@ object ManualEntryWatcher {
         // filled is a real position whether or not a strategy is attached.
         try { restoreLostTriggers(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] trigger restore failed", e) }
         try { settleWaitingBuys(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] buy settle failed", e) }
+        if (base == "de") ManualWatchStore.ensureGermanTakeProfitOffOnce(ctx)
+        ManualWatchStore.ensureBarCloseTrailOnce(ctx, base)
+        try { retireInterruptedBuys(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] interrupted-buy sweep failed", e) }
         // YOUR OWN FLOOR AND CEILING DO NOT DEPEND ON A STRATEGY. They sit ABOVE
         // the config check on purpose: both are rules the user set by hand, and
         // neither has anything to do with which JSON happens to be attached. Below
@@ -828,6 +846,12 @@ object ManualEntryWatcher {
         try { runManualStopsAndTargets(ctx, base) }
         catch (e: Exception) { Log.w(TAG, "[$base] hand-set exit sweep failed", e) }
         if (!isConfigured(ctx, base)) return Outcome(0, emptyList(), "no watcher config attached")
+        // Stocks you bought by hand, handed over by themselves — see [autoAdopt].
+        // Before the sweep below, so one taken over is managed in the same pass.
+        try {
+            autoAdopt(ctx, base).takeIf { it.isNotEmpty() }
+                ?.let { Log.w(TAG, "[$base] handed over by themselves: ${it.joinToString()}") }
+        } catch (e: Exception) { Log.w(TAG, "[$base] auto hand-over failed", e) }
         // Positions the replay never opened — forced buys, and anything whose
         // hand-over did not take. Needs the config, so it sits below the check.
         try { manageAdoptedPositions(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] adopted exit sweep failed", e) }
@@ -995,7 +1019,7 @@ object ManualEntryWatcher {
                 sigPx = px
                 sigAtFloor = IntradayLevels.inSupportZone(pos)
                 sigFresh = marketLive
-                // THE 3-DAY, WEEK AND MONTH LOWS, each by the same rule. One alert per
+                // THE 3-DAY, WEEK, MONTH AND YEAR LOWS, each by the same rule. One alert per
                 // pass names the deepest one it is sitting at; each horizon alerts
                 // at most once a day, so reaching the month's low later in a day that
                 // already flagged the 3-day one still gets through.
@@ -1546,7 +1570,8 @@ object ManualEntryWatcher {
                     Spaces.baseOf(it.ns) == base && it.ns != nsFor &&
                         it.symbol.equals(sym, true) && it.qty > 0.0 &&
                         (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING")
-                }.sumOf { it.qty }
+                }.sumOf { it.qty } +
+                (if (base == "de") com.signalscope.app.data.FloorLiveStore.heldQtyOf(ctx, sym) else 0.0)
         } catch (e: Exception) { 0.0 }
         val mineQty = (held.qty - byAlgos).coerceAtLeast(0.0)
         if (mineQty <= maxOf(1e-6, held.qty * 0.01)) return BuyResult(false, sym,
@@ -1609,6 +1634,165 @@ object ManualEntryWatcher {
             Log.e(TAG, "[$base] adoptHolding $sym failed", e)
             BuyResult(false, sym, error = e.message ?: "could not move this holding")
         }
+    }
+
+    // ── S92'S RECORDS, REPAIRED ONCE (4 Nov 2026) ───────────────────────────────
+    // What Trading 212's fills say, against what the records said:
+    //  • the 19 Oct buy of 3.544 was SOLD on 20 Oct at 51.40 — its live row closed,
+    //    its book entry never did;
+    //  • the 20 Oct 09:49 buy never filled — its live row (0 filled) is the "sale"
+    //    the RV gate let go 45 times on 22-23 Oct;
+    //  • the 5.957 handed over on 21 Oct sat on a live row never resized from 1.956,
+    //    so its target covered 1.956;
+    //  • and at 10:51 today a phantom algo claim on all 11.958 shares made the
+    //    part-sale check close the watchlist's 5.957 as "sold by you" — no order,
+    //    records only. Restored here.
+    // Applied only if every record is exactly as found, then never again.
+    private fun repairS92Once(ctx: Context, base: String) {
+        if (base != "de") return
+        val marker = java.io.File(ctx.filesDir, "s92_repair_v2_2026_11_04.done")
+        if (marker.exists()) return
+        try {
+            val st = ManualWatchStore.load(ctx, base)
+            val s92 = st.entries.filter { it.symbol == "S92" }
+            val kept = s92.firstOrNull { it.signalBarTs == 1792486800L && kotlin.math.abs(it.filledQty - 5.957) < 0.001 &&
+                (it.status == "OPEN" || (it.status == "CLOSED" && (it.exitReason ?: "").startsWith("sold by you at Trading 212"))) }
+            val sold = s92.firstOrNull { it.signalBarTs == 1792407600L && it.status == "OPEN" }
+            val noFill = s92.firstOrNull { it.signalBarTs == 1792422000L && it.filledPrice <= 0.0 && it.status in setOf("OPEN", "CLOSED") }
+            val rows = com.signalscope.app.data.T212LiveStore.load(ctx).trades.filter { it.ns == "de__manual" && it.symbol == "S92" }
+            val soldRow = rows.firstOrNull { it.paperTradeId == "S92-1792407600" && it.status == "CLOSED" }
+            val keepRow = rows.firstOrNull { it.paperTradeId == "S92-1792486800" && it.status in setOf("OPEN", "MANUAL_CLOSED") }
+            val zombie = rows.firstOrNull { it.paperTradeId == "S92-1792422000" && it.liveQtyFilled <= 0.0 && it.status in setOf("OPEN", "MANUAL_CLOSED") }
+            if (kept == null || sold == null || noFill == null || soldRow == null || keepRow == null || zombie == null) {
+                Log.i(TAG, "[de] S92 repair: records not as found on 4 Nov — left as they are")
+                marker.writeText("skipped ${System.currentTimeMillis()}"); return
+            }
+            val soldAt = if (soldRow.sellAt > 0L) soldRow.sellAt else System.currentTimeMillis()
+            ManualWatchStore.mutate(ctx, base) { s ->
+                s.copy(entries = s.entries.map { e ->
+                    if (e.symbol != "S92") e else when (e.signalBarTs) {
+                        1792407600L -> if (e.status != "OPEN") e else
+                            e.copy(status = "CLOSED", closedAt = soldAt, exitTs = soldAt / 1000L, exitQty = e.filledQty,
+                                exitPrice = 51.40, exitReason = "sold 20 Oct (record repaired 4 Nov)")
+                        1792422000L -> e.copy(status = "FAILED", filledQty = 0.0, exitTs = 0L, closedAt = 0L,
+                            exitQty = 0.0, exitPrice = 0.0, exitReason = null, note = "never filled (record repaired 4 Nov)")
+                        1792486800L -> e.copy(status = "OPEN", exitTs = 0L, closedAt = 0L, exitQty = 0.0,
+                            exitPrice = 0.0, exitReason = null)
+                        else -> e
+                    }
+                })
+            }
+            com.signalscope.app.data.T212LiveStore.upsert(ctx, zombie.copy(status = "ERROR", qty = 0.0,
+                manualClosedAt = 0L, manualExitPrice = 0.0, manualExitQty = 0.0,
+                error = "never filled (record repaired 4 Nov)"))
+            com.signalscope.app.data.T212LiveStore.upsert(ctx, keepRow.copy(status = "OPEN", qty = kept.filledQty,
+                liveQtyFilled = kept.filledQty, liveEntryPrice = kept.filledPrice,
+                manualClosedAt = 0L, manualExitPrice = 0.0, manualExitQty = 0.0, error = ""))
+            // Its target, put back to be placed afresh for the whole position.
+            com.signalscope.app.data.T212TargetStore.load(ctx).targets
+                .firstOrNull { it.ns == "de__manual" && it.paperTradeId == "S92-1792486800" }?.let { t ->
+                    com.signalscope.app.data.T212TargetStore.update(ctx, t.ns, t.paperTradeId, { t }) {
+                        it.copy(done = false, doneAt = 0L, orderId = 0L, orderQty = 0.0, goneSince = 0L,
+                            prevIds = null, retryAfter = 0L, note = null)
+                    }
+                }
+            marker.writeText(System.currentTimeMillis().toString())
+            Log.w(TAG, "[de] S92 records repaired: one watchlist position of ${kept.filledQty} at ${kept.filledPrice}")
+        } catch (e: Exception) { Log.w(TAG, "[de] S92 repair failed", e) }
+    }
+
+    // ── AUTO HAND-OVER (the user, 3 Nov 2026) ──────────────────────────────────
+    // A stock you bought by hand was alerts-only until you tapped "+": AIR, €387 —
+    // the largest German holding — sat with no target and no stop for days. Now
+    // one you buy, worth at least the minimum, joins this watchlist by itself
+    // after half an hour and gets its target and exits like any other.
+    //
+    // NOT WHAT YOU ALREADY HELD when this began: some of those are past the hard
+    // stop already, and taking them over would sell them at the next check. They
+    // keep their "+". Nor one with a sell of your own resting at the broker: you
+    // are managing that one, and only one sell can wait per share.
+
+    const val AUTO_ADOPT_WAIT_MS = 30 * 60_000L
+
+    fun autoAdoptMinFor(base: String, st: ManualWatchStore.State): Double =
+        st.autoAdoptMin ?: if (base == "in") 10_000.0 else 100.0
+
+    /**
+     * Which holdings are due, and the first-seen times to keep. Pure.
+     * [held]: SYMBOL -> (shares, price). A stock drops out of [seen] once it is
+     * managed, too small or gone, so a later buy starts its wait afresh.
+     */
+    internal fun autoAdoptDue(held: Map<String, Pair<Double, Double>>, baseline: Set<String>,
+                              managed: Map<String, Double>, seen: Map<String, Long>,
+                              min: Double, now: Long): Pair<List<String>, Map<String, Long>> {
+        val keep = HashMap<String, Long>()
+        val due = ArrayList<String>()
+        for ((sym, qp) in held) {
+            val (qty, price) = qp
+            if (qty <= 0.0 || sym in baseline) continue
+            val mine = qty - (managed[sym] ?: 0.0)
+            if (mine <= qty * 0.01 || mine * price < min) continue
+            val first = seen[sym] ?: now
+            keep[sym] = first
+            if (now - first >= AUTO_ADOPT_WAIT_MS) due += sym
+        }
+        return due to keep
+    }
+
+    /** Stocks with a sell of yours resting at the broker; null when unknown. */
+    private fun yourRestingSells(ctx: Context, base: String): Set<String>? = try {
+        if (base == "in") {
+            val cfg = ConfigManager(ctx)
+            if (!cfg.isZerodhaConnected) null
+            else (com.signalscope.app.network.ZerodhaClient(cfg).fetchGttTriggers()
+                as? com.signalscope.app.network.ZerodhaClient.GttListResult.Success)?.triggers
+                ?.filter { it.status == "active" && it.transactionType.equals("SELL", true) }
+                ?.map { it.tradingsymbol.uppercase() }?.toSet()
+        } else {
+            val snap = T212WaitingOrders.last(ctx)
+            // Read each pass; older than an hour is not an answer.
+            if (snap.at <= 0L || System.currentTimeMillis() - snap.at > 60 * 60_000L) null
+            else snap.orders.filter { !it.isBuy && it.space.equals(base, true) }
+                .map { MacdLadder.bare(it.symbol).uppercase() }.toSet()
+        }
+    } catch (e: Exception) { null }
+
+    private fun autoAdopt(ctx: Context, base: String): List<String> {
+        val st = ManualWatchStore.load(ctx, base)
+        if (st.autoAdoptOn == false) return emptyList()
+        val hs = (BrokerHoldings.forSpace(ctx, base) as? BrokerHoldings.Result.Ok)?.holdings ?: return emptyList()
+        val held = HashMap<String, Pair<Double, Double>>()
+        for (h in hs) if (h.qty > 0.0 && h.symbol.isNotBlank()) {
+            val k = h.symbol.uppercase()
+            held[k] = ((held[k]?.first ?: 0.0) + h.qty) to h.price
+        }
+        // The first pass records what you hold, and takes nothing over.
+        val baseline = st.autoAdoptBaseline ?: run {
+            ManualWatchStore.mutate(ctx, base) { it.copy(autoAdoptBaseline = held.keys.sorted()) }
+            Log.i(TAG, "[$base] auto hand-over begins — ${held.size} holding(s) already held stay yours")
+            return emptyList()
+        }
+        // A stock you sold leaves it: buy it again and it is a new buy.
+        val keptBase = baseline.filter { it in held }.toSet()
+        val (due, seen) = autoAdoptDue(held, keptBase, managedQtyFor(ctx, base), st.autoAdoptSeen,
+            autoAdoptMinFor(base, st), System.currentTimeMillis())
+        val taken = ArrayList<String>()
+        if (due.isNotEmpty()) {
+            val yours = yourRestingSells(ctx, base)
+            for (sym in due) {
+                if (yours == null) break                       // unknown: wait for the next pass
+                if (sym in yours) continue                     // you are managing this one
+                val r = adoptHolding(ctx, base, sym)
+                if (r.ok) {
+                    taken += sym
+                    try { LabNotifier.autoAdopted(ctx, base, sym, r.filledQty, r.filledPrice) } catch (_: Exception) {}
+                } else Log.w(TAG, "[$base] auto hand-over of $sym refused: ${r.error}")
+            }
+        }
+        ManualWatchStore.mutate(ctx, base) {
+            it.copy(autoAdoptBaseline = keptBase.sorted(), autoAdoptSeen = seen - taken.toSet())
+        }
+        return taken
     }
 
     /**
@@ -1747,6 +1931,151 @@ object ManualEntryWatcher {
         } finally {
             topUpBusy.remove(lock)
         }
+    }
+
+    // ── A WATCHLIST BUY CUT OFF BEFORE ITS RESULT WAS RECORDED ─────────────────
+    //
+    // The book writes a PENDING row before the ladder runs and replaces it when the
+    // ladder returns. If the app is stopped in between — killed, an update
+    // installed, the phone restarted — the row stays PENDING for good, and Waiting
+    // orders went on calling it "ladder running" with nothing behind it: REGN, from
+    // 19 to 23 Oct 2026, the 0.063 shares it had bought sold by hand on 20 Oct.
+
+    /** A buy ladder takes about five minutes; past this with none running, it ended. */
+    const val INTERRUPTED_AFTER_MS = 15 * 60_000L
+
+    const val INTERRUPTED_NOTE = "interrupted — the app was stopped while this buy was being placed, so " +
+        "its result was never recorded. Nothing is waiting at Trading 212. Any shares it did buy are in " +
+        "your Portfolio, not managed by the watchlist."
+
+    /** Trading 212 rows only (a resting Zerodha trigger is a real wait). Pure — tested. */
+    fun isInterrupted(e: ManualWatchStore.Entry, now: Long, running: Boolean): Boolean =
+        e.status == "PENDING" && e.gttId <= 0L && e.buyOrderId.isNullOrBlank() && !running &&
+            now - e.createdAt > INTERRUPTED_AFTER_MS
+
+    private fun runningFor(e: ManualWatchStore.Entry) =
+        PatientExecutor.isBuyRunning(e.t212Ticker.ifBlank { e.symbol }, e.symbol)
+
+    /** A buy's ladder runs a few minutes; its fills are looked for this long after it began. */
+    const val INTERRUPTED_FILL_WINDOW_MS = 30 * 60_000L
+    /** Rows retired as interrupted before fills were looked for are re-checked this far back. */
+    private const val RECOVER_RETIRED_MS = 7L * 24 * 3600_000L
+
+    /**
+     * The BUY fills of [ticker] made while an interrupted buy was running — from
+     * just before it began to [INTERRUPTED_FILL_WINDOW_MS] after — by orders no
+     * other record owns ([claimed]). Pure — tested.
+     */
+    fun fillsOfInterrupted(fills: List<com.signalscope.app.network.Trading212Client.HistoricalFill>,
+                           ticker: String, createdAt: Long, claimed: Set<Long>)
+            : List<com.signalscope.app.network.Trading212Client.HistoricalFill> =
+        fills.filter {
+            it.ticker.equals(ticker, true) && it.side.equals("BUY", true) &&
+                it.filledQuantity > 0.0 && it.fillPrice > 0.0 && it.orderId !in claimed &&
+                isoMs(it.dateExecuted) in (createdAt - 120_000L)..(createdAt + INTERRUPTED_FILL_WINDOW_MS)
+        }.distinctBy { it.orderId }
+
+    private fun isoMs(iso: String): Long = try { java.time.Instant.parse(iso).toEpochMilli() }
+        catch (_: Exception) {
+            try { java.time.OffsetDateTime.parse(iso).toInstant().toEpochMilli() } catch (_: Exception) { 0L }
+        }
+
+    /**
+     * Each pass: settle the interrupted rows, so the book and Waiting orders stop
+     * waiting on them.
+     *
+     * A BUY CUT OFF IS NOT A BUY THAT FAILED. The app stopped mid-ladder does not
+     * mean nothing was bought — AIR, 29 Oct 2026: killed for memory at 14:32 while
+     * its ladder ran, 0.254 shares bought at 196.98, and the row retired as
+     * "nothing waiting", leaving the shares with no stop and no exit. So Trading
+     * 212's history is read first: a fill made while the buy ran is recorded as the
+     * position it became, the way a buy that finished is, and only a buy with no
+     * fill is retired. Rows already retired that way in the last week are looked
+     * at again.
+     */
+    private fun retireInterruptedBuys(ctx: Context, base: String) {
+        if (base != "de" && base != "us") return
+        val now = System.currentTimeMillis()
+        val entries = ManualWatchStore.load(ctx, base).entries
+        val pending = entries.filter { isInterrupted(it, now, runningFor(it)) }
+        val retired = entries.filter {
+            it.status == "FAILED" && it.note == INTERRUPTED_NOTE && !(it.t212Ticker as String?).isNullOrBlank() &&
+                now - it.closedAt < RECOVER_RETIRED_MS &&
+                // Already in the book by another route — moved in by hand, say: leave it.
+                entries.none { o -> o.symbol.equals(it.symbol, true) && o.status == "OPEN" }
+        }
+        if (pending.isEmpty() && retired.isEmpty()) return
+        // Fills: the saved history, plus the latest orders when a buy has just been cut
+        // off (the saved history may not have reached it). Unreadable = decide nothing.
+        val saved = try { T212ClosedTrades.loadArchive(ctx).fills } catch (e: Exception) { emptyList() }
+        val recent = if (pending.isEmpty()) emptyList() else
+            (com.signalscope.app.network.Trading212Client(ConfigManager(ctx)).fetchOrderHistory(limit = 50)
+                as? com.signalscope.app.network.Trading212Client.T212Result.Success)?.data
+        val fills = (saved + recent.orEmpty()).filter { it.filledQuantity > 0.0 }
+        val claimed = HashSet<Long>()
+        try { com.signalscope.app.data.T212LiveStore.load(ctx).trades.forEach { claimed.addAll(it.allBuyIds()) } }
+        catch (e: Exception) { return }
+        // Gson leaves a list missing from an older row null, whatever its type says.
+        entries.forEach { claimed.addAll((it.orderIds as List<Long>?).orEmpty()) }
+        for (e in pending + retired) {
+            try {
+                val got = fillsOfInterrupted(fills, e.t212Ticker, e.createdAt, claimed)
+                if (got.isNotEmpty()) {
+                    claimed.addAll(got.map { it.orderId })
+                    recoverInterrupted(ctx, base, e, got)
+                    continue
+                }
+                if (e.status != "PENDING") continue
+                if (recent == null) continue                       // could not look: next pass
+                ManualWatchStore.upsert(ctx, base, e.copy(status = "FAILED", closedAt = now, note = INTERRUPTED_NOTE))
+                Log.w(TAG, "[$base] ${e.symbol}: buy started ${java.util.Date(e.createdAt)} was interrupted, nothing filled — row retired")
+            } catch (ex: Exception) { Log.w(TAG, "[$base] ${e.symbol}: interrupted buy not settled", ex) }
+        }
+    }
+
+    /** An interrupted buy that did fill, recorded as the buy that finished would have been. */
+    private fun recoverInterrupted(ctx: Context, base: String, e: ManualWatchStore.Entry,
+                                   fills: List<com.signalscope.app.network.Trading212Client.HistoricalFill>) {
+        val ns = ManualWatchStore.nsFor(base)
+        val sym = e.symbol.uppercase()
+        val qty = fills.sumOf { it.filledQuantity }
+        val px = fills.sumOf { it.fillPrice * it.filledQuantity } / qty
+        val ids = fills.map { it.orderId }
+        val at = fills.maxOf { isoMs(it.dateExecuted) }.takeIf { it > 0L } ?: e.createdAt
+        ManualWatchStore.upsert(ctx, base, e.copy(status = "OPEN", filledQty = qty, filledPrice = px,
+            orderIds = ((e.orderIds as List<Long>?).orEmpty() + ids).distinct(), closedAt = 0L,
+            note = "the app was stopped while this buy ran; Trading 212 shows it bought " +
+                "${"%.4f".format(qty)} at ${"%.2f".format(px)} — managed here from now on"))
+        com.signalscope.app.data.T212LiveStore.upsert(ctx,
+            com.signalscope.app.data.T212LiveStore.LiveTrade(
+                paperTradeId = "$sym-${e.signalBarTs}", ns = ns, symbol = sym,
+                t212Ticker = e.t212Ticker, status = "OPEN", entryTs = e.signalBarTs,
+                paperEntryPrice = e.signalPrice, amount = e.requestedCash,
+                qty = qty, buyOrderIds = ids, buyOrderId = ids.first(), buyAt = at,
+                liveEntryPrice = px, liveQtyFilled = qty))
+        adoptIntoStrategy(ctx, ns, sym, base, e.signalBarTs)
+        Log.w(TAG, "[$base] $sym: interrupted buy had FILLED — ${"%.4f".format(qty)} at ${"%.2f".format(px)}, now managed")
+        try { LabNotifier.interruptedBuyRecovered(ctx, ns, sym, qty, px, if (base == "de") "€" else "$") } catch (_: Exception) {}
+    }
+
+    /**
+     * The "Clear" button: the same retirement, at once. Refused while a buy is
+     * running on the name, or in its first minute (a ladder may be about to start).
+     * @return a sentence for the page, or null when it was cleared.
+     */
+    fun clearInterrupted(ctx: Context, space: String, symbol: String, signalBarTs: Long): String? {
+        val base = Spaces.baseOf(space.lowercase())
+        if (base != "de" && base != "us") return "Only Trading 212 buys can be cleared here."
+        val e = ManualWatchStore.load(ctx, base).entries.firstOrNull {
+            it.symbol.equals(symbol, true) && it.signalBarTs == signalBarTs && it.status == "PENDING"
+        } ?: return "That buy is no longer pending."
+        if (e.gttId > 0L || !e.buyOrderId.isNullOrBlank()) return "That one is waiting at the broker — cancel it there."
+        if (runningFor(e)) return "A buy is running on ${e.symbol} right now — use Stop this buy instead."
+        if (System.currentTimeMillis() - e.createdAt < 60_000L) return "It only just started — give it a minute."
+        ManualWatchStore.upsert(ctx, base, e.copy(status = "FAILED", closedAt = System.currentTimeMillis(),
+            note = INTERRUPTED_NOTE))
+        Log.w(TAG, "[$base] ${e.symbol}: interrupted buy cleared by the user")
+        return null
     }
 
     /** The refusal a second buy on the same signal gets, saying what is already there. */
@@ -2438,6 +2767,7 @@ object ManualEntryWatcher {
      */
     private fun manageAdoptedPositions(ctx: Context, base: String) {
         val ns = ManualWatchStore.nsFor(base)
+        if (!ManualWatchStore.strategyExitsOn(ctx, ns)) return      // switched off in the exits panel
         val st = ManualWatchStore.load(ctx, base)
         val open = st.entries.filter { it.status == "OPEN" && it.filledQty > 0.0 && it.filledPrice > 0.0 }
         if (open.isEmpty()) return
@@ -2512,7 +2842,8 @@ object ManualEntryWatcher {
                         Log.i(TAG, "[$base] $sym strategy exit held by the RV gate: ${gate.why}")
                         continue
                     }
-                    if (gate.timedOut) try { LabNotifier.rvGateTimedOut(ctx, ns, sym, buy = false) } catch (_: Exception) {}
+                    if (gate.timedOut) T212LiveMirror.rvSaleTimedOutOnce(ctx, lr, since, v.reason,
+                        "exit minder for stock you bought yourself")
                 }
             }
 

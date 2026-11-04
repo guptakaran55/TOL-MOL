@@ -179,6 +179,7 @@ class MainActivity : AppCompatActivity() {
                             "slippagePct" to pr.config.slippagePct,
                             "entryTf" to pr.config.resample,
                             "exitTf" to (if (pr.config.multiTimeframe) pr.config.exitBars else pr.config.resample),
+                            "fastExit" to (pr.config.multiTimeframe && pr.config.exit.fastMacdExitEnabled),
                             "warmupBars" to pr.config.warmupBars))
                     }
                     is com.signalscope.app.trading.StrategyLabConfig.Companion.ParseResult.Rejected ->
@@ -548,6 +549,11 @@ class MainActivity : AppCompatActivity() {
         // always gives the user the Settings-tab defaults (per product spec).
         com.signalscope.app.data.SessionWeights.override = null
 
+        // TEST BUILDS ONLY: the page can be inspected over the USB cable — how
+        // its memory, which reached 2.4 GB before Android killed it, is measured.
+        if ((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0)
+            WebView.setWebContentsDebuggingEnabled(true)
+
         setupWebView()
         setupButtons()
         requestNotificationPermission()
@@ -708,6 +714,12 @@ class MainActivity : AppCompatActivity() {
         // Left on the intent instead, it is picked up the moment the page is
         // ready (see onPageFinished).
         if (!pageReady) return
+        // A tap already acted on, handed back by Android when it restarted the
+        // app, is not acted on again — see TapGuard.
+        if (src != null && TapGuard.replayed(applicationContext, src)) {
+            Log.i(TAG, "notification tap already used — not opened again")
+            return
+        }
         consumeChartDeepLink(src)
         consumeWatcherDeepLink(src)
         consumeTabDeepLink(src)
@@ -1096,6 +1108,27 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 val url = request?.url?.toString().orEmpty()
                 return !url.startsWith("file:///android_asset/")
+            }
+
+            /**
+             * THE PAGE'S OWN PROCESS WAS KILLED — for memory, on this phone several
+             * times a day (30 Oct 2026, at up to 2.4 GB). Not handling this tells
+             * Android to kill the whole app with it, a fifth of a second later,
+             * which is the freeze-then-restart the user kept seeing. Handled, only
+             * the screen is rebuilt: the dead page is taken down and the screen
+             * recreated, and everything running in the background carries on.
+             */
+            override fun onRenderProcessGone(view: WebView?,
+                                             detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                Log.e(TAG, "page process gone (crashed=${detail?.didCrash()}, " +
+                    "priority=${detail?.rendererPriorityAtExit()}) — rebuilding the screen")
+                pageReady = false
+                try {
+                    (view?.parent as? android.view.ViewGroup)?.removeView(view)
+                    view?.destroy()
+                } catch (e: Exception) { Log.w(TAG, "dead page tear-down failed", e) }
+                if (!isFinishing && !isDestroyed) recreate()
+                return true
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -1958,6 +1991,8 @@ class MainActivity : AppCompatActivity() {
                         "t212Fills" -> t212Fills(a[0].asInt)
                         "macdLadder" -> macdLadderJson(a[0].asString, a[1].asString)
                         "floorRunNow" -> floorRunNow(a[0].asString)
+                        "qualityCheapCheckNow" -> qualityCheapCheckNow(a[0].asString)
+                        "qualityCheapAccept" -> qualityCheapAccept(a[0].asString)
                         "algoTakeProfit" -> gson.toJson(com.signalscope.app.trading.AlgoTakeProfit
                             .takeNow(applicationContext, a[0].asString, a[1].asString))
                         "weekTargetRemove" -> gson.toJson(mapOf("msg" to com.signalscope.app.trading.T212WeekTargets
@@ -4100,6 +4135,9 @@ class MainActivity : AppCompatActivity() {
                 // The crypto 50-day hold arrives ready to switch on, once.
                 if (base == "binance")
                     com.signalscope.app.data.BucketStore.ensureSmaHoldSeeded(applicationContext)
+                ensureQualityCheapSeeded(base)
+                // Every algo's 💡 replay, once, on the first visit after this install.
+                com.signalscope.app.trading.WhatIfBatch.startOnce(applicationContext)
                 val rows = com.signalscope.app.data.BucketStore.list(applicationContext, base).map { b ->
                     val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, b.ns)
                     val guards: Map<String, Map<String, Any?>> =
@@ -4189,6 +4227,7 @@ class MainActivity : AppCompatActivity() {
                         "extraFeeCash" to (b.flatFeeOverride ?: config.flatFeeFor(b.ns)),
                         "entryTf" to acfg.resample,
                         "exitTf" to (if (acfg.multiTimeframe) acfg.exitBars else acfg.resample),
+                        "fastExit" to (acfg.multiTimeframe && acfg.exit.fastMacdExitEnabled),
                         // "smaHold" cards get the rule check and the on/off switch.
                         "strategy" to acfg.strategy, "holdSmaLength" to acfg.holdSmaLength,
                         "warmupBars" to acfg.warmupBars,
@@ -4270,7 +4309,10 @@ class MainActivity : AppCompatActivity() {
                         "flatFeeOverride" to b.flatFeeOverride,
                         "flatFeeEffective" to (b.flatFeeOverride
                             ?: config.flatFeeFor(b.ns)),
-                        "currency" to com.signalscope.app.trading.Spaces.currencyOf(b.ns))
+                        "currency" to com.signalscope.app.trading.Spaces.currencyOf(b.ns),
+                        // The quarter's list and the news veto, on the quality algos only.
+                        "quality" to try { com.signalscope.app.trading.QualityCheap.cardInfo(applicationContext, b.ns) }
+                            catch (e: Exception) { null })
                 }
                 gson.toJson(mapOf("ok" to true, "bucketable" to bucketable, "space" to base, "buckets" to rows))
             } catch (e: Exception) {
@@ -4290,6 +4332,100 @@ class MainActivity : AppCompatActivity() {
                 "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
             }
         }
+
+        /**
+         * THE "QUALITY · CHEAP · UPTREND" PAPER ALGO, added once to each stock
+         * market on its first visit after this install (the user's ask, 26 Oct
+         * 2026). A copy of the market's live conservative algo — its strategy
+         * file, costs, seats, smoothing, ranking and capital — with only the
+         * company list changed, and never armed: any difference from the live one
+         * comes from the list. Set up through the same Save & run as the card.
+         * A failed copy is removed and tried again next visit; deleting a good
+         * one is respected.
+         */
+        @Synchronized
+        private fun ensureQualityCheapSeeded(base: String) {
+            val BS = com.signalscope.app.data.BucketStore
+            val list = BS.QUALITY_CHEAP_LISTS[base] ?: return
+            val marker = java.io.File(applicationContext.filesDir, "seeded_quality_cheap_$base.done")
+            if (marker.exists()) {
+                // One made by the first build (26 Oct 2026, before the news veto and
+                // the quarterly list existed) is registered here; already-registered
+                // ones are left as they are.
+                try {
+                    BS.list(applicationContext, base).filter { it.name == BS.QUALITY_CHEAP_NAME }.forEach {
+                        com.signalscope.app.data.QualityCheapStore.register(applicationContext, it.ns,
+                            com.signalscope.app.trading.QualityCheap.lastQuarter(java.time.LocalDate.now()))
+                    }
+                } catch (e: Exception) { Log.w(TAG, "[$base] quality algo registration failed", e) }
+                return
+            }
+            val src = BS.qualityCheapSource(applicationContext, base) ?: return
+            var made: String? = null
+            try {
+                val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, src.ns)
+                val gate = com.signalscope.app.data.MacdGateStore.load(applicationContext, src.ns)
+                val b = BS.create(applicationContext, base, BS.QUALITY_CHEAP_NAME)
+                made = b.ns
+                com.signalscope.app.data.StrategyLabStore.setConfig(applicationContext, lab.configJson, lab.configSource, b.ns)
+                val patch = org.json.JSONObject()
+                    .put("symbols", org.json.JSONArray(list))
+                    .put("mode", src.mode.name)
+                    .put("capital", src.capital).put("holdN", src.holdN).put("smoothing", src.smoothing)
+                    .put("live", false).put("liveBudget", 0.0)
+                    .put("useScreenerSelection", gate.useScreenerSelection)
+                    .put("slippagePctOverride", src.slippagePctOverride ?: org.json.JSONObject.NULL)
+                    .put("flatFeeOverride", src.flatFeeOverride ?: org.json.JSONObject.NULL)
+                // Registered before the first run, so its news veto is on from the start.
+                com.signalscope.app.data.QualityCheapStore.register(applicationContext, b.ns,
+                    com.signalscope.app.trading.QualityCheap.lastQuarter(java.time.LocalDate.now()))
+                val r = org.json.JSONObject(bucketConfigure(b.ns, patch.toString()))
+                if (!r.optBoolean("ok")) throw IllegalStateException(r.optString("error"))
+                marker.writeText(System.currentTimeMillis().toString())
+                Log.i(TAG, "[${b.ns}] quality-cheap paper algo copied from ${src.name}: ${list.size} companies")
+            } catch (e: Exception) {
+                Log.w(TAG, "[$base] quality-cheap paper algo not set up — retried next visit", e)
+                made?.let { try { BS.delete(applicationContext, it) } catch (_: Exception) {} }
+            }
+        }
+
+        /** Work out the quality algo's list from the latest scan now, and leave
+         *  it on the card for approval if it differs. Slow: reads the scan. */
+        fun qualityCheapCheckNow(ns: String): String = try {
+            gson.toJson(mapOf("ok" to true,
+                "msg" to com.signalscope.app.trading.QualityCheap.propose(applicationContext, ns, manual = true)))
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown"))) }
+
+        /** The waiting list accepted: the algo is saved with it, through the same
+         *  Save & run as the card. Stocks dropped are not sold — the algo stops
+         *  seating them and lets any it holds close on their own exit. */
+        fun qualityCheapAccept(ns: String): String = try {
+            val p = com.signalscope.app.data.QualityCheapStore.get(applicationContext, ns)?.proposal
+            if (p == null || p.list.isEmpty()) gson.toJson(mapOf("ok" to false, "error" to "No list is waiting."))
+            else {
+                val r = org.json.JSONObject(bucketConfigure(ns,
+                    org.json.JSONObject().put("symbols", org.json.JSONArray(p.list)).toString()))
+                if (r.optBoolean("ok")) {
+                    com.signalscope.app.trading.QualityCheap.accepted(applicationContext, ns)
+                    Log.i(TAG, "[$ns] ${p.quarter} quality list accepted: ${p.list.size} companies")
+                }
+                r.toString()
+            }
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown"))) }
+
+        @JavascriptInterface
+        fun qualityCheapDismiss(ns: String): String = try {
+            com.signalscope.app.trading.QualityCheap.dismissed(applicationContext, ns)
+            "{\"ok\":true}"
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown"))) }
+
+        @JavascriptInterface
+        fun qualityCheapSetVeto(ns: String, on: Boolean): String = try {
+            com.signalscope.app.data.QualityCheapStore.update(applicationContext, ns) { it.copy(veto = on) }
+                ?: throw IllegalStateException("not a quality algo")
+            Log.i(TAG, "[$ns] news veto ${if (on) "on" else "off"}")
+            "{\"ok\":true}"
+        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown"))) }
 
         /**
          * Switch an algo on or off without touching its settings. Off stops new
@@ -4330,11 +4466,15 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun floorList(space: String): String = try {
             val base = bucketBaseNs(space)
+            if (base == "de") com.signalscope.app.data.FloorAlgoStore.ensureMonthTrendSeeded(applicationContext)
+            if (base == "de") com.signalscope.app.data.FloorAlgoStore.ensurePortfolioSeeded(applicationContext)
+            if (base == "in") com.signalscope.app.data.FloorAlgoStore.ensureIndiaCapitalRaised(applicationContext)
             gson.toJson(mapOf("ok" to true,
                 "cur" to com.signalscope.app.trading.FloorAlgoEngine.currencyMark(base),
                 "algos" to com.signalscope.app.data.FloorAlgoStore.list(applicationContext, base)
                     .map { it.copy(log = it.log.takeLast(30).reversed()) }
-                    .map { a -> mapOf("a" to a, "ns" to a.ns) }))
+                    .map { a -> mapOf("a" to a, "ns" to a.ns,
+                        "live" to com.signalscope.app.data.FloorLiveStore.rowsFor(applicationContext, a.ns).takeLast(40)) }))
         } catch (e: Exception) { floorErr(e) }
 
         @JavascriptInterface
@@ -4394,7 +4534,7 @@ class MainActivity : AppCompatActivity() {
                           orderMode: String, zonePct: Double, spreadPct: Double): String = try {
             fun bad(what: String): Nothing = throw IllegalArgumentException(what)
             if (!(capital >= 10.0 && capital <= 10_000_000.0)) bad("capital must be between 10 and 10,000,000")
-            if (seats !in 1..30) bad("seats must be 1 to 30")
+            if (seats !in 1..com.signalscope.app.data.FloorAlgoStore.PORTFOLIO_SEATS) bad("seats must be 1 to ${com.signalscope.app.data.FloorAlgoStore.PORTFOLIO_SEATS}")
             if (universeSize !in 5..100) bad("universe must be 5 to 100 stocks")
             if (lowDays !in 1..10) bad("the low must look back 1 to 10 days")
             if (!(secondPct >= 0.0 && secondPct <= 10.0)) bad("the second order must be 0 to 10% below")
@@ -4413,11 +4553,16 @@ class MainActivity : AppCompatActivity() {
                 // order first. See FloorOrders.walk.
                 if (a.kind == com.signalscope.app.data.FloorAlgoStore.KIND_FLOOR && stopPct > 0.0 && secondPct >= stopPct)
                     bad("the second order must sit above the stop — keep it less than ${"%.1f".format(stopPct)}% below")
-                val s = com.signalscope.app.data.FloorAlgoStore.Settings(capital, seats, universeSize, lowDays,
-                    secondPct, holdDays, stopPct, targetPct, trendFilter, mode, zonePct,
+                // A COPY, not a fresh Settings: this form edits only these numbers, and
+                // everything else the algo carries — its list mode (top / all / the
+                // monthly-low list), news checks, watch days, campaign stop unit — must
+                // survive a save rather than fall back to the defaults.
+                val s = a.settings.copy(capital = capital, seats = seats, universeSize = universeSize,
+                    lowDays = lowDays, secondPct = secondPct, holdDays = holdDays, stopPct = stopPct,
+                    targetPct = targetPct, trendFilter = trendFilter, orderMode = mode, zonePct = zonePct,
                     // The market's default is kept as "default" (null) while it is the
                     // value saved, so a later change of default reaches it.
-                    spreadPct.takeIf { Math.abs(it - com.signalscope.app.data.FloorAlgoStore.defaultSpreadPct(a.space)) > 1e-9 })
+                    spreadPct = spreadPct.takeIf { Math.abs(it - com.signalscope.app.data.FloorAlgoStore.defaultSpreadPct(a.space)) > 1e-9 })
                 // The spread is re-read for sales already booked: put right on the next pass.
                 val spreadChanged = s.spreadPct != a.settings.spreadPct
                 val weekly = a.kind == com.signalscope.app.data.FloorAlgoStore.KIND_FLOOR &&
@@ -4510,8 +4655,73 @@ class MainActivity : AppCompatActivity() {
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
 
+        /**
+         * REAL MONEY for a German MACD-turns algo — [budget] euros over its seats.
+         * Only paper buys from the moment it goes on are copied. Off stops new real
+         * buys; whatever it holds for real still sells with its paper trade.
+         */
+        @JavascriptInterface
+        fun floorLive(id: String, on: Boolean, budget: Double): String = try {
+            fun bad(what: String): Nothing = throw IllegalArgumentException(what)
+            val lo = com.signalscope.app.trading.FloorLive.MIN_BUDGET
+            val hi = com.signalscope.app.trading.FloorLive.MAX_BUDGET
+            if (on && !(budget >= lo && budget <= hi)) bad("the budget must be €${lo.toInt()} to €${hi.toInt()}")
+            if (on && !ConfigManager(applicationContext).hasT212Credentials) bad("Trading 212 is not connected")
+            val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
+                if (!com.signalscope.app.trading.FloorLive.eligible(a)) bad("real money is for Germany's MACD-turns algos only")
+                val s = a.settings
+                val per = com.signalscope.app.trading.FloorLive.perSeat(budget, s.seats)
+                if (on && per < com.signalscope.app.trading.FloorLive.MIN_PER_BUY)
+                    bad("€${"%.0f".format(budget)} over ${s.seats} seats is €${"%.2f".format(per)} a buy — " +
+                        "at least €${"%.0f".format(com.signalscope.app.trading.FloorLive.MIN_PER_BUY * s.seats)} is needed for €" +
+                        "${"%.0f".format(com.signalscope.app.trading.FloorLive.MIN_PER_BUY)} a buy")
+                val n = s.copy(liveOn = on, liveBudget = if (on) budget else s.liveBudget,
+                    liveSince = if (on && !s.liveOn) System.currentTimeMillis() else s.liveSince)
+                if (n == s) a
+                else a.copy(settings = n, log = a.log + ("$stamp · " + if (on)
+                    "real money on: €${"%.0f".format(budget)} over ${s.seats} seats, " +
+                        "€${"%.2f".format(com.signalscope.app.trading.FloorLive.perSeat(budget, s.seats))} a buy — paper buys from now on are bought at Trading 212"
+                    else "real money off — nothing new is bought for real; what is held still sells with its paper trade"))
+            } ?: bad("algo not found")
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** Set the paper record aside as a ledger and empty every seat — see
+         *  FloorLive.startAfresh. Waits for a running check off the page's thread;
+         *  the card shows the result on its next refresh. */
+        @JavascriptInterface
+        fun floorStartAfresh(id: String): String = try {
+            Thread({
+                try {
+                    val msg = com.signalscope.app.trading.FloorLive.startAfresh(applicationContext, id,
+                        "real money switched on")
+                    Log.i(TAG, "start afresh $id: $msg")
+                } catch (e: Exception) { Log.w(TAG, "start afresh failed", e) }
+            }, "floor-afresh").start()
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** Buy or Skip from the card's "Waiting for you" list — the same path as the
+         *  notification's buttons, settled off the page's thread. */
+        @JavascriptInterface
+        fun floorAnswer(id: String, askId: String, buy: Boolean): String = try {
+            val tap = System.currentTimeMillis()
+            com.signalscope.app.trading.FloorAsks.queue(applicationContext, id, askId, buy, tap)
+            com.signalscope.app.trading.LabNotifier.floorAskDone(applicationContext, id, askId)
+            Thread({
+                try { com.signalscope.app.trading.FloorAlgoEngine.answer(applicationContext, id, askId, buy, tap) }
+                catch (e: Exception) { Log.w(TAG, "floorAnswer failed — the next pass settles it", e) }
+            }, "floor-ask").start()
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
         @JavascriptInterface
         fun floorDelete(id: String): String = try {
+            com.signalscope.app.data.FloorAlgoStore.get(applicationContext, id)?.let { a ->
+                if (com.signalscope.app.data.FloorLiveStore.rowsFor(applicationContext, a.ns).any { it.holds })
+                    throw IllegalStateException("it still holds real shares — switch real money off and wait for them to sell first")
+            }
             com.signalscope.app.data.FloorAlgoStore.delete(applicationContext, id)
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
@@ -4946,6 +5156,7 @@ class MainActivity : AppCompatActivity() {
                 val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, ns)
                 val configured = lab.configJson != null
                 val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
+                if (base == "de") com.signalscope.app.data.ManualWatchStore.ensureGermanTakeProfitOffOnce(applicationContext)
                 val st = com.signalscope.app.data.ManualWatchStore.load(applicationContext, base)
                 // ONE exposure walk, ONE state read, shared by the candidate list and
                 // the ranking below. This method is called on every repaint of the
@@ -4979,6 +5190,8 @@ class MainActivity : AppCompatActivity() {
                               "swingLow" to it.swingLow, "swingHigh" to it.swingHigh,
                               "weekLow" to it.weekLow, "weekHigh" to it.weekHigh, "weekDays" to it.weekDays,
                               "monthLow" to it.monthLow, "monthHigh" to it.monthHigh, "monthDays" to it.monthDays,
+                              // The year's too — the 1Y figure and its sort read these.
+                              "yearLow" to it.yearLow, "yearHigh" to it.yearHigh, "yearDays" to it.yearDays,
                               "swingPos" to it.swingPos,
                               "swingVisits" to it.swingVisits,
                               "swingDays" to it.swingDays,
@@ -5103,6 +5316,10 @@ class MainActivity : AppCompatActivity() {
                         "driftPct" to e.driftPct, "requestedCash" to e.requestedCash,
                         "createdAt" to e.createdAt, "note" to e.note,
                         "ticker" to e.t212Ticker,
+                        // Cut off before its result was recorded — see ManualEntryWatcher.isInterrupted.
+                        "interrupted" to (e.status == "PENDING" && e.gttId <= 0L && e.buyOrderId.isNullOrBlank() &&
+                            System.currentTimeMillis() - e.createdAt > 60_000L &&
+                            !com.signalscope.app.trading.PatientExecutor.isBuyRunning(e.t212Ticker.ifBlank { e.symbol }, e.symbol)),
                         // Whether the ENGINE actually holds it — the one check that
                         // proves the hand-over worked. An entry marked OPEN here with
                         // no engine position behind it is a managed exit that isn't.
@@ -5252,7 +5469,7 @@ class MainActivity : AppCompatActivity() {
                             try {
                                 if (com.signalscope.app.trading.Spaces.bucketIdOf(n) ==
                                     com.signalscope.app.data.ManualWatchStore.ID) "the watchlist"
-                                else com.signalscope.app.data.BucketStore.get(applicationContext, n)?.name ?: n
+                                else com.signalscope.app.trading.ShareOwners.nameOf(applicationContext, n)
                             } catch (e: Exception) { n }
                         },
                         "reason" to (trackState?.tracks?.get(sym)?.lastReason ?: ""),
@@ -5285,6 +5502,9 @@ class MainActivity : AppCompatActivity() {
                     // different real stops, because each is measured from what that
                     // position actually cost.
                     "stopPct" to (if (cfg.exit.stopLossEnabled) cfg.exit.stopLossPct else 0.0),
+                    // The exits panel: every switch resolved to what is in force, and
+                    // per held position the prices that sell it.
+                    "exits" to exitsPanelFor(base, ns, st, cfg.exit.stopLossEnabled, cfg.exit.stopLossPct),
                     // The hand-set trail, and where it takes its high from.
                     "trailPct" to st.trailPct, "trailSource" to st.trailSource.name,
                     "trailUnit" to (st.trailUnit ?: com.signalscope.app.data.ManualWatchStore.TrailUnit.PCT).name,
@@ -5316,6 +5536,7 @@ class MainActivity : AppCompatActivity() {
                     "flatFeeCash" to config.flatFeeFor(base),
                     "entryTf" to cfg.resample,
                     "exitTf" to (if (cfg.multiTimeframe) cfg.exitBars else cfg.resample),
+                    "fastExit" to (cfg.multiTimeframe && cfg.exit.fastMacdExitEnabled),
                     "slippagePct" to cfg.slippagePct,
                     "warmupBars" to cfg.warmupBars,
                     "currency" to com.signalscope.app.trading.Spaces.currencyOf(base),
@@ -5464,6 +5685,59 @@ class MainActivity : AppCompatActivity() {
          * decisions, and a single call that carries both would overwrite a trail
          * with whatever the target field happened to contain at the time.
          */
+        /** The exits panel's state for one market's watchlist. */
+        private fun exitsPanelFor(base: String, ns: String, st: com.signalscope.app.data.ManualWatchStore.State,
+                                  cfgStopOn: Boolean, cfgStopPct: Double): Map<String, Any?> {
+            val W = com.signalscope.app.trading.WeekTarget
+            val shown = W.levelRuleFor(base, st.copy(targetOn = null))!!
+            val level = when (shown.kind) { "high1w" -> "week"; "high1m" -> "month"; "high1y" -> "year"
+                "resist" -> "resistance"; else -> "3month" }
+            val shade = if (shown.tenthOfRange) "tenth" else when (shown.underPct) { 1.0 -> "1pct"; 2.0 -> "2pct"; else -> "none" }
+            val india = base == "in"
+            val stopOn = if (india) true else (st.hardStopOn ?: cfgStopOn)
+            val stopPct = st.hardStopPct ?: if (india) (1.0 - ConfigManager(applicationContext).newPositionHardStopFraction) * 100.0 else cfgStopPct
+            val rows = st.entries.filter { it.status == "OPEN" && it.filledQty > 0.0 && it.filledPrice > 0.0 }.map { e ->
+                val key = "${e.symbol.uppercase()}-${e.signalBarTs}"
+                val tgt = if (india) null else try { com.signalscope.app.data.T212TargetStore.get(applicationContext, ns, key) } catch (x: Exception) { null }
+                mapOf("symbol" to e.symbol, "fill" to e.filledPrice,
+                    "target" to (tgt?.takeIf { !it.done && !it.removed }?.price ?: 0.0),
+                    "trail" to e.trailLevel,
+                    "stop" to (if (stopOn) e.filledPrice * (1.0 - stopPct / 100.0) else 0.0))
+            }
+            return mapOf("autoAdoptOn" to (st.autoAdoptOn != false),
+                "autoAdoptMin" to com.signalscope.app.trading.ManualEntryWatcher.autoAdoptMinFor(base, st),
+                "targetOn" to (st.targetOn != false), "level" to level, "shade" to shade,
+                "minGap" to shown.minGapPct, "fallbackPct" to shown.fallbackPct,
+                "hardStopOn" to stopOn, "hardStopPct" to stopPct, "hardStopAtBroker" to india,
+                "strategyOn" to (st.strategyExitsOn != false), "rows" to rows)
+        }
+
+        /** The exits panel's switches, saved together. A field left out keeps its value. */
+        @JavascriptInterface
+        fun manualSetExits(space: String, json: String): String = try {
+            val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+            val o = com.google.gson.JsonParser.parseString(json).asJsonObject
+            fun b(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asBoolean
+            fun d(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asDouble
+            fun t(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asString
+            val level = t("level")?.takeIf { it in setOf("week", "month", "3month", "year", "resistance") }
+            val shade = t("shade")?.takeIf { it in setOf("tenth", "1pct", "2pct", "none") }
+            val gap = d("minGap")?.coerceIn(0.0, 100.0)
+            val stop = d("hardStopPct")?.coerceIn(0.5, 50.0)
+            val aaMin = d("autoAdoptMin")?.coerceIn(0.0, 10_000_000.0)
+            com.signalscope.app.data.ManualWatchStore.mutate(applicationContext, base) { st ->
+                st.copy(autoAdoptOn = b("autoAdoptOn") ?: st.autoAdoptOn, autoAdoptMin = aaMin ?: st.autoAdoptMin,
+                    targetOn = b("targetOn") ?: st.targetOn, targetLevel = level ?: st.targetLevel,
+                    targetShade = shade ?: st.targetShade, targetMinGapPct = gap ?: st.targetMinGapPct,
+                    hardStopOn = b("hardStopOn") ?: st.hardStopOn, hardStopPct = stop ?: st.hardStopPct,
+                    strategyExitsOn = b("strategyOn") ?: st.strategyExitsOn)
+            }
+            Log.w(TAG, "[$base] exits panel saved: $json")
+            "{\"ok\":true}"
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "could not save")))
+        }
+
         @JavascriptInterface
         fun manualSetTakeProfit(space: String, pct: Double): String {
             return try {
@@ -5621,6 +5895,9 @@ class MainActivity : AppCompatActivity() {
                                 // broker, and pretending otherwise would leave them
                                 // there while the app claimed they were gone.
                                 "cancellable" to (r.status == "RETRY"),
+                                // A buy ladder mid-flight is stopped rather than
+                                // cancelled: the ladder pulls its own order.
+                                "stopTicker" to (if (r.status == "PENDING") r.t212Ticker else ""),
                                 // So the sheet can offer "wait for the open" only
                                 // where it would change something — on a row that
                                 // is already holding for one, the button would be
@@ -5660,6 +5937,27 @@ class MainActivity : AppCompatActivity() {
                     com.signalscope.app.data.ManualWatchStore.load(applicationContext, base).entries
                         .filter { it.status == "PENDING" }
                         .forEach { e ->
+                            // NOT RUNNING ANY MORE — cut off before its result was
+                            // recorded. Said so, with a way to clear it, instead of
+                            // "ladder running" for days (REGN, 19–23 Oct).
+                            val running = com.signalscope.app.trading.PatientExecutor
+                                .isBuyRunning(e.t212Ticker.ifBlank { e.symbol }, e.symbol)
+                            if (!running && nowMs - e.createdAt > 60_000L) {
+                                out.add(mapOf(
+                                    "id" to e.symbol, "ns" to "", "symbol" to e.symbol,
+                                    "kind" to "your buy — interrupted",
+                                    "status" to "STALEBUY", "side" to "BUY", "from" to "You · watchlist Buy",
+                                    "conds" to listOf(cond(false, "No buy running — nothing at Trading 212")),
+                                    "why" to "This buy was cut off before its result was recorded — usually " +
+                                        "the app being stopped while it ran. Nothing is waiting at Trading 212. " +
+                                        "Any shares it did buy are in your Portfolio. It clears itself within " +
+                                        "a quarter of an hour, or clear it now.",
+                                    "tries" to 0, "dueAt" to 0L, "since" to e.createdAt,
+                                    "signalPrice" to e.signalPrice, "amount" to e.requestedCash,
+                                    "signalBarTs" to e.signalBarTs,
+                                    "cancellable" to false, "sortKey" to 0))
+                                return@forEach
+                            }
                             out.add(mapOf(
                                 "id" to e.symbol, "ns" to "", "symbol" to e.symbol,
                                 "kind" to "your buy — ladder running",
@@ -5670,6 +5968,7 @@ class MainActivity : AppCompatActivity() {
                                 "tries" to 0, "dueAt" to 0L, "since" to e.createdAt,
                                 "signalPrice" to e.signalPrice, "amount" to e.requestedCash,
                                 "cancellable" to false,
+                                "stopTicker" to e.t212Ticker.ifBlank { e.symbol },
                                 "sortKey" to 0))
                         }
                 }
@@ -5977,6 +6276,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * Stop a buy ladder that is running now, from Waiting orders. The ladder
+         * itself pulls its resting order and confirms it gone, as it does when it
+         * runs out of rungs; whatever it had bought stays as the position.
+         */
+        /** Clear a watchlist buy that was cut off before its result was recorded. */
+        @JavascriptInterface
+        fun watchClearInterrupted(space: String, symbol: String, signalBarTs: Long): String = try {
+            val err = com.signalscope.app.trading.ManualEntryWatcher.clearInterrupted(
+                applicationContext, space, symbol, signalBarTs)
+            if (err == null) {
+                invalidateManualWatcherState()
+                gson.toJson(mapOf("ok" to true))
+            } else gson.toJson(mapOf("ok" to false, "error" to err))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "could not clear it")))
+        }
+
+        @JavascriptInterface
+        fun stopBuyLadder(ticker: String, symbol: String): String = try {
+            if (com.signalscope.app.trading.PatientExecutor.stopBuy(ticker, symbol)) {
+                Log.w(TAG, "buy ladder stop asked by user: $symbol ($ticker)")
+                gson.toJson(mapOf("ok" to true, "note" to "$symbol's buy stops within a second. Its order " +
+                    "at Trading 212 is cancelled, and anything it had already bought is kept as the position."))
+            } else gson.toJson(mapOf("ok" to false, "error" to "No buy is running on $symbol at this moment — " +
+                "it may be about to start or have just finished. Reopen Waiting orders in a few seconds."))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "could not stop it")))
+        }
+
         @JavascriptInterface
         fun cancelQueuedEntry(ns: String, paperTradeId: String) {
             thread(isDaemon = true, name = "cancel-queued") {
@@ -5992,9 +6321,16 @@ class MainActivity : AppCompatActivity() {
                             com.signalscope.app.data.T212LiveStore.upsert(applicationContext,
                                 row.copy(status = "ERROR", parkedForOpen = false,
                                     error = "cancelled by you before it reached the broker"))
-                            Log.w(TAG, "queued entry cancelled by user: ${row.symbol} (${row.ns})")
+                            // A queued entry's attempt can be mid-ladder: stop it too,
+                            // or it buys after the cancel.
+                            val running = com.signalscope.app.trading.PatientExecutor.stopBuy(row.t212Ticker, row.symbol)
+                            Log.w(TAG, "queued entry cancelled by user: ${row.symbol} (${row.ns})" +
+                                if (running) " — its running ladder was stopped" else "")
                             gson.toJson(mapOf("ok" to true, "symbol" to row.symbol,
-                                "note" to "${row.symbol} will not be bought. Nothing was placed, so nothing is cancelled at the broker."))
+                                "note" to if (running) "${row.symbol}'s attempt was running — it stops within a " +
+                                    "second and its order at Trading 212 is cancelled. Anything it had already " +
+                                    "bought is kept as the position."
+                                    else "${row.symbol} will not be bought. Nothing was placed, so nothing is cancelled at the broker."))
                         }
                     }
                 } catch (e: Exception) {
@@ -6442,32 +6778,8 @@ class MainActivity : AppCompatActivity() {
         fun bucketHypothetical(ns: String) {
             thread(isDaemon = true) {
                 val out = try {
-                    val b = com.signalscope.app.data.BucketStore.get(applicationContext, ns)
-                    val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
-                    val cap = b?.capital ?: cfg.notional
-                    val r = com.signalscope.app.trading.StrategyLabRunner
-                        .hypothetical(applicationContext, ns, cap)
-                    // Keep the result so the algos comparison table can show it
-                    // without re-running a multi-minute fetch per algo. Slippage and
-                    // frames are stored WITH it — a return is not interpretable
-                    // without the assumptions that produced it.
-                    if (r.ok) try {
-                        com.signalscope.app.data.WhatIfStore.put(applicationContext,
-                            com.signalscope.app.data.WhatIfStore.Summary(
-                                ns = ns, name = b?.name ?: ns,
-                                computedAt = System.currentTimeMillis(),
-                                layer = r.layer,
-                                configSource = com.signalscope.app.data.StrategyLabStore
-                                    .load(applicationContext, ns).configSource,
-                                slippagePct = cfg.slippagePct,
-                                entryTf = r.entryTf, exitTf = r.exitTf, interval = r.interval,
-                                compoundedPct = r.compoundedPct, cagrPct = r.cagrPct,
-                                maxDrawdownPct = r.maxDrawdownPct, spanDays = r.spanDays,
-                                fromTs = r.fromTs, toTs = r.toTs,
-                                closed = r.closed, symbols = r.symbols, seats = r.holdN,
-                                note = r.note))
-                    } catch (e: Exception) { Log.w(TAG, "what-if summary save failed", e) }
-                    gson.toJson(r)
+                    // Kept for the algos comparison table, as every replay is — see WhatIfBatch.
+                    gson.toJson(com.signalscope.app.trading.WhatIfBatch.replayAndSave(applicationContext, ns))
                 } catch (e: Exception) {
                     gson.toJson(mapOf("ok" to false, "note" to (e.message ?: "what-if failed")))
                 }
@@ -6556,7 +6868,11 @@ class MainActivity : AppCompatActivity() {
                 if (!t.buyComplete()) return@mapNotNull null
                 val pe = t.paperEntryPrice
                 if (pe <= 0.0 || t.liveEntryPrice <= 0.0) return@mapNotNull null
-                val closedRow = t.status == "CLOSED" || t.status == "MANUAL_CLOSED"
+                // A SALE STILL BEING RECORDED counts too. The broker's history shows
+                // the fill before the ladder reports back, so the closed-trades row
+                // appeared with no mark until it did (TEAM, 23 Oct 2026: filled
+                // 18:34, recorded 18:35). Its buy leg is already measurable.
+                val closedRow = t.status == "CLOSED" || t.status == "MANUAL_CLOSED" || t.status == "EXITING"
                 if (!closedRow) return@mapNotNull null
                 val px = (t.paperExitPrice?.takeIf { it > 0.0 }
                     ?: paperExitOf(t.ns, t.paperTradeId)
@@ -6823,7 +7139,10 @@ class MainActivity : AppCompatActivity() {
         fun rvGateOrderJson(kind: String, argsJson: String): String = try {
             val o = rvOrderOf(kind, argsJson)
             val (queued, why, by) = com.signalscope.app.trading.RvManualQueue.submit(applicationContext, o)
-            gson.toJson(mapOf("ok" to true, "queued" to queued, "why" to why, "startsBy" to by))
+            gson.toJson(mapOf("ok" to true, "queued" to queued, "why" to why, "startsBy" to by,
+                // Not held because there is no signal to wait on — the button's own
+                // answer follows, so the page must not say "patient buy started".
+                "noSignal" to (why == com.signalscope.app.trading.RvManualQueue.NO_SIGNAL)))
         } catch (e: Exception) {
             gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "the RV gate could not be asked")))
         }
@@ -7072,9 +7391,8 @@ class MainActivity : AppCompatActivity() {
                                         "your " + when (com.signalscope.app.trading.Spaces.baseOf(n)) {
                                             "de" -> "German"; "us" -> "US"; "in" -> "Indian"; else -> "crypto"
                                         } + " watchlist"
-                                    else -> com.signalscope.app.data.BucketStore
-                                        .get(applicationContext, n)?.name
-                                        ?: "a deleted algo"
+                                    else -> com.signalscope.app.trading.ShareOwners
+                                        .nameOf(applicationContext, n)
                                 }
                             },
                             // Lets the page route the fix: bench rows are cleared from
@@ -7201,6 +7519,36 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /**
+         * "↻ ORDERS" (the user, 2 Nov 2026: the quarter-hourly read sometimes lags a
+         * fill — CEG bought at 19:02 still showed its ladder resting). Reads Trading
+         * 212's filled orders now: the algos' and the watchlist's fills, and the
+         * prices of sales closed without one. Off the UI thread; the answer comes
+         * back to the page. Read-only at the broker — places and cancels nothing.
+         */
+        @JavascriptInterface
+        fun t212SyncOrdersNow(space: String) {
+            val base = bucketBaseNs(space)
+            thread(isDaemon = true, name = "orders-now") {
+                val out: Map<String, Any?> = try {
+                    if (base != "de" && base != "us") mapOf("ok" to false, "error" to "Trading 212 only")
+                    else if (!config.hasT212Credentials) mapOf("ok" to false, "error" to "no Trading 212 key")
+                    else {
+                        val ctx = applicationContext
+                        val algo = com.signalscope.app.trading.T212LiveMirror.reconcileFills(ctx)
+                        val sales = try { com.signalscope.app.trading.T212LiveMirror.backfillExitPrices(ctx) } catch (_: Exception) { 0 }
+                        val watch = listOf("de", "us").sumOf { b ->
+                            try { com.signalscope.app.trading.ManualEntryWatcher.reconcileFills(ctx, b) } catch (_: Exception) { 0 }
+                        }
+                        Log.i(TAG, "orders read on request: $algo algo, $watch watchlist fill(s), $sales sale price(s)")
+                        mapOf("ok" to true, "fills" to algo + watch, "sales" to sales,
+                            "laddersBusy" to com.signalscope.app.trading.PatientExecutor.anyBuyRunning())
+                    }
+                } catch (e: Exception) { mapOf("ok" to false, "error" to (e.message ?: "failed")) }
+                deliverAiCallback("window.onT212OrdersSynced", gson.toJson(out))
+            }
+        }
+
         /** Read fills for bench rows on demand — the bench is used interactively
          *  and should not wait for the hourly tick to learn what it paid. */
         @JavascriptInterface
@@ -7248,10 +7596,13 @@ class MainActivity : AppCompatActivity() {
                     armed++
                     val spent = rows.filter { it.ns == n && it.status in setOf("OPEN", "PENDING", "EXITING") }
                         .sumOf { it.liveEntryValue }
-                    commitment += b.liveBudget
+                    // What the algo can spend now: its seats as they have grown (LiveSeats).
+                    val seats = b.holdN.coerceAtLeast(1)
+                    val grown = com.signalscope.app.trading.LiveSeats.perSeatFor(applicationContext, n, b.liveBudget, seats) * seats
+                    commitment += grown
                     deployed += spent
-                    perAlgo.add(mapOf("name" to b.name, "budget" to b.liveBudget,
-                        "deployed" to spent, "remaining" to (b.liveBudget - spent).coerceAtLeast(0.0)))
+                    perAlgo.add(mapOf("name" to b.name, "budget" to grown,
+                        "deployed" to spent, "remaining" to (grown - spent).coerceAtLeast(0.0)))
                 }
                 val stillToSpend = (commitment - deployed).coerceAtLeast(0.0)
                 val free = config.t212FreeFundsCached
@@ -7268,6 +7619,177 @@ class MainActivity : AppCompatActivity() {
                     "currency" to (if (com.signalscope.app.trading.Spaces.baseOf(
                             bucketBaseNs("DE")) == "de") "EUR" else "EUR"),
                     "algos" to perAlgo))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * THE SEATS OF EVERY ALGO in [space], drawn as buckets on its card: which
+         * company sits in each seat and what is in it — real money on an armed
+         * algo (its seats grow with its real result, LiveSeats), paper positions
+         * on the rest. Each seat's money is worked out here. Local reads only —
+         * prices are the last ones seen.
+         */
+        @JavascriptInterface
+        fun liveSeats(space: String): String {
+            return try {
+                val ctx = applicationContext
+                val base = bucketBaseNs(space)
+                val LS = com.signalscope.app.trading.LiveSeats
+                // Trading 212's own last prices, by instrument, for a stock the feed has not priced.
+                val t212Px = HashMap<String, Double>()
+                if (base == "de" || base == "us") try {
+                    val a = org.json.JSONObject(com.signalscope.app.data.T212PortfolioStore.load(ctx) ?: "{}")
+                        .optJSONArray("positions")
+                    if (a != null) for (i in 0 until a.length()) a.optJSONObject(i)?.let { p ->
+                        val px = p.optDouble("currentPrice", 0.0)
+                        if (px > 0.0) t212Px[p.optString("ticker")] = px
+                    }
+                } catch (e: Exception) { }
+                fun markOf(sym: String) = com.signalscope.app.trading.MarkToMarket.get(sym)?.price?.takeIf { it > 0.0 }
+                val cur = when (base) { "in" -> "INR"; "binance" -> "USDC"; else -> config.accountCurrency }
+                val algos = com.signalscope.app.data.BucketStore.allNamespaces(ctx)
+                    .filter { com.signalscope.app.trading.Spaces.baseOf(it) == base }
+                    .mapNotNull { n ->
+                        val b = com.signalscope.app.data.BucketStore.get(ctx, n) ?: return@mapNotNull null
+                        val armed = b.live && b.liveBudget > 0.0
+                        val gate = com.signalscope.app.data.MacdGateStore.load(ctx, n)
+                        val universe = (b.symbols ?: emptyList()).size.coerceAtLeast(1)
+                        // The seat count real orders are sized by; on paper, the gate's.
+                        // No gate and more companies than seats: only what it holds.
+                        val seats = when {
+                            armed && base != "binance" -> b.holdN.coerceAtLeast(1)
+                            gate.enabled -> com.signalscope.app.data.MacdGateStore.effectiveHoldN(gate, universe)
+                            armed || universe <= b.holdN -> universe
+                            else -> 0
+                        }
+                        val held = HashMap<String, com.signalscope.app.trading.LiveSeats.Holding>()
+                        fun add(sym: String, h: com.signalscope.app.trading.LiveSeats.Holding) {
+                            val k = sym.uppercase(); held[k] = held[k]?.plus(h) ?: h
+                        }
+                        when (base) {
+                            "de", "us" -> com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                                .filter { it.ns == n && it.status in setOf("OPEN", "EXITING") }
+                                .forEach { t ->
+                                    val cost = if (t.liveEntryValue > 0.0) t.liveEntryValue else t.amount
+                                    val px = markOf(t.symbol) ?: t212Px[t.t212Ticker]
+                                    // In the account's currency: what it cost, moved by the price since.
+                                    add(t.symbol, com.signalscope.app.trading.LiveSeats.Holding(cost,
+                                        if (px != null && t.liveEntryPrice > 0.0) cost * px / t.liveEntryPrice else null,
+                                        t.liveQtyFilled))
+                                }
+                            // Shares in hand only. A buy still waiting at Zerodha holds
+                            // nothing, and counting those drew ten seats on a five-seat algo.
+                            "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                                .filter { it.ns == n && (it.status == "OPEN" || it.status == "EXITING") && it.qty > 0 }
+                                .forEach { t ->
+                                    val paid = if (t.entryPrice > 0.0) t.entryPrice else t.paperEntryPrice
+                                    add(t.symbol, com.signalscope.app.trading.LiveSeats.Holding(paid * t.qty, markOf(t.symbol)?.let { it * t.qty }, t.qty.toDouble()))
+                                }
+                            "binance" -> com.signalscope.app.data.BinanceLiveStore.load(ctx, n).trades
+                                .filter { it.status == "OPEN" }
+                                .forEach { t ->
+                                    val q = t.executedQty.toDoubleOrNull() ?: 0.0
+                                    add(t.symbol, com.signalscope.app.trading.LiveSeats.Holding(t.buyQuoteQty.toDoubleOrNull() ?: t.quoteOrderQty,
+                                        markOf(t.symbol)?.let { it * q }, q))
+                                }
+                        }
+                        // Paper positions open now: company -> the price paper paid.
+                        val paperEntry = try {
+                            com.signalscope.app.data.StrategyLabStore.load(ctx, n).trades
+                                .filter { it.status == "OPEN" }.associate { it.symbol.uppercase() to it.entryPrice }
+                        } catch (e: Exception) { emptyMap<String, Double>() }
+                        // Who sits in each seat: the gate's own seats; with no gate, the
+                        // companies themselves when there are no more of them than seats,
+                        // otherwise only what is held.
+                        val slots: List<String?> = when {
+                            gate.enabled -> gate.slots.map { it.symbol }
+                            seats > 0 && universe <= seats -> b.symbols ?: emptyList()
+                            armed -> held.keys.sorted()
+                            else -> (held.keys + paperEntry.keys).sorted()
+                        }
+                        val flagged = if (gate.enabled) gate.slots.filter { it.flagged }.mapNotNull { it.symbol?.uppercase() }.toSet()
+                            else emptySet()
+                        val tiles = LS.tiles(slots, seats, held.keys, flagged, paperEntry.keys, paperCounts = !armed)
+                        // A paper seat's money is the gate's own compounding seat; with no
+                        // gate, an even share of the algo's paper capital.
+                        val paperStart = if (gate.enabled && gate.injected > 0.0)
+                                gate.injected / (gate.slots.size.takeIf { it > 0 } ?: seats.coerceAtLeast(1))
+                            else b.capital / (if (seats > 0) seats else b.holdN.coerceAtLeast(1))
+                        fun paperCap(i: Int) = (if (gate.enabled && i >= 0) gate.slots.getOrNull(i)?.capital else null)
+                            ?.takeIf { it > 0.0 } ?: paperStart
+                        val real = if (armed) LS.realisedFor(ctx, n) else null
+                        val start = if (armed) b.liveBudget / seats.coerceAtLeast(1) else paperStart
+                        val now = if (armed) LS.perSeat(b.liveBudget, seats.coerceAtLeast(1), real!!.pnl) else paperStart
+                        mapOf("ns" to n, "name" to b.name, "currency" to cur, "armed" to armed,
+                            "budget" to (if (armed) b.liveBudget else paperStart * seats), "seats" to seats,
+                            "startSeat" to start, "seatNow" to now,
+                            "ceiling" to (if (armed) start * LS.CEILING_X else null),
+                            "realised" to real?.pnl, "sales" to real?.trades, "unread" to real?.unread,
+                            "since" to (if (armed) LS.startOf(ctx, n) else null),
+                            "tiles" to tiles.map { t ->
+                                val h = held[t.symbol]
+                                val e = paperEntry[t.symbol]
+                                val m = markOf(t.symbol)
+                                val paperGain = if (e != null && e > 0.0 && m != null) m / e - 1.0 else null
+                                // What is in the seat now; an empty or waiting one, what its next buy uses.
+                                val money = when (t.state) {
+                                    LS.LIVE -> h?.value ?: h?.cost ?: 0.0
+                                    LS.PAPER -> paperCap(t.seat) * (1.0 + (paperGain ?: 0.0))
+                                    else -> if (armed) now else paperCap(t.seat)
+                                }
+                                val gain = when (t.state) {
+                                    LS.LIVE -> h?.let { hh -> hh.value?.let { v -> if (hh.cost > 0.0) v / hh.cost - 1.0 else null } }
+                                    LS.PAPER -> paperGain
+                                    else -> null
+                                }
+                                mapOf("seat" to t.seat, "symbol" to t.symbol, "state" to t.state,
+                                    "flagged" to t.flagged, "paperHeld" to t.paperHeld,
+                                    "money" to money, "gainPct" to gain?.let { it * 100.0 },
+                                    "cost" to h?.cost, "value" to h?.value, "qty" to h?.qty)
+                            })
+                    }
+                gson.toJson(mapOf("ok" to true, "algos" to algos))
+            } catch (e: Exception) {
+                gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+            }
+        }
+
+        /**
+         * WHO OWNS WHICH SHARES of each holding (the user, 2 Nov 2026), for the
+         * holdings table: per company, every lot the app holds — each algo's, the
+         * German built-in algos', the watchlist's — with its shares and what it
+         * paid. The rest of the holding is yours. [by] and [qty] count algos
+         * only: they draw the blue dot. Keyed by the company and, on Trading
+         * 212, by its instrument too. Local reads only.
+         */
+        @JavascriptInterface
+        fun algoHoldings(space: String): String {
+            return try {
+                val base = bucketBaseNs(space)
+                if (base != "de" && base != "us" && base != "in")
+                    return gson.toJson(mapOf("ok" to true, "held" to emptyMap<String, Any>()))
+                val lots = com.signalscope.app.trading.ShareOwners.lots(applicationContext, base)
+                val held = HashMap<String, Map<String, Any>>()
+                for ((_, group) in lots.groupBy { com.signalscope.app.trading.MacdLadder.bare(it.symbol).uppercase() }) {
+                    val algos = group.filter { it.kind == com.signalscope.app.trading.ShareOwners.ALGO }
+                    val entry = mapOf(
+                        "by" to algos.map { it.name }.distinct(),
+                        "qty" to algos.sumOf { it.qty },
+                        "lots" to group.groupBy { it.ns }.map { (_, l) ->
+                            mapOf("name" to l.first().name, "kind" to l.first().kind,
+                                "qty" to l.sumOf { it.qty },
+                                // Unknown for the whole owner if any lot's price is.
+                                "cost" to (if (l.all { it.cost > 0.0 }) l.sumOf { it.cost } else 0.0))
+                        })
+                    (listOf(group.first().symbol) + group.flatMap { it.keys })
+                        .map { com.signalscope.app.trading.MacdLadder.bare(it).uppercase() to it.uppercase() }
+                        .flatMap { listOf(it.first, it.second) }
+                        .filter { it.isNotBlank() }.distinct()
+                        .forEach { held[it] = entry }
+                }
+                gson.toJson(mapOf("ok" to true, "held" to held))
             } catch (e: Exception) {
                 gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
             }
@@ -7682,6 +8204,40 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** One built-in algo's 💡 replay (FloorReplay); the result arrives at
+         *  window.onFloorHypothetical and is kept for the compare table. */
+        @JavascriptInterface
+        fun floorHypothetical(id: String) {
+            thread(isDaemon = true) {
+                val out = try {
+                    val a = com.signalscope.app.data.FloorAlgoStore.get(applicationContext, id)
+                    if (a == null) gson.toJson(mapOf("ok" to false, "id" to id, "note" to "algo not found"))
+                    else com.signalscope.app.trading.FloorReplay.replayAndSave(applicationContext, a).let { r ->
+                        gson.toJson(mapOf("ok" to r.ok, "id" to id, "note" to r.note,
+                            "compoundedPct" to r.compoundedPct, "trades" to r.trips.size))
+                    }
+                } catch (e: Exception) {
+                    gson.toJson(mapOf("ok" to false, "id" to id, "note" to (e.message ?: "replay failed")))
+                }
+                deliverAiCallback("window.onFloorHypothetical", out)
+            }
+        }
+
+        /** EVERY ALGO'S 💡 REPLAY, EVERY MARKET — see WhatIfBatch. [action]:
+         *  "status", "start" or "cancel"; the status comes back either way. */
+        @JavascriptInterface
+        fun whatIfBatch(action: String): String = try {
+            val err = when (action) {
+                "start" -> com.signalscope.app.trading.WhatIfBatch.start(applicationContext)
+                "cancel" -> { com.signalscope.app.trading.WhatIfBatch.cancel(); null }
+                else -> null
+            }
+            gson.toJson(mapOf("ok" to (err == null), "error" to err,
+                "status" to com.signalscope.app.trading.WhatIfBatch.status(applicationContext)))
+        } catch (e: Exception) {
+            gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
+        }
+
         /** Stop the in-flight replay at the next symbol boundary. */
         @JavascriptInterface
         fun bucketCancelWhatIf(): String {
@@ -7752,7 +8308,25 @@ class MainActivity : AppCompatActivity() {
                         "closed" to (s?.closed ?: 0), "symbols" to (s?.symbols ?: 0),
                         "seats" to (s?.seats ?: 0))
                 }
-                gson.toJson(mapOf("ok" to true, "rows" to rows))
+                // The built-in algos that have a 💡 replay too — see FloorReplay.
+                val builtIn = com.signalscope.app.data.FloorAlgoStore.list(applicationContext, base)
+                    .filter { com.signalscope.app.trading.FloorReplay.unsupported(it) == null }.map { a ->
+                        val s = saved[a.ns]
+                        val spread = a.settings.spreadPct ?: com.signalscope.app.data.FloorAlgoStore.defaultSpreadPct(a.space)
+                        mapOf(
+                            "ns" to a.ns, "name" to a.name, "mode" to a.kind, "builtIn" to true,
+                            "configSource" to "built-in rules", "slippageNow" to spread,
+                            "has" to (s != null), "computedAt" to (s?.computedAt ?: 0L),
+                            "layer" to (s?.layer ?: ""), "slippagePct" to (s?.slippagePct ?: spread),
+                            "entryTf" to (s?.entryTf ?: ""), "exitTf" to (s?.exitTf ?: ""),
+                            "interval" to (s?.interval ?: ""),
+                            "compoundedPct" to (s?.compoundedPct ?: 0.0), "cagrPct" to (s?.cagrPct ?: 0.0),
+                            "maxDrawdownPct" to (s?.maxDrawdownPct ?: 0.0), "spanDays" to (s?.spanDays ?: 0.0),
+                            "fromTs" to (s?.fromTs ?: 0L), "toTs" to (s?.toTs ?: 0L),
+                            "closed" to (s?.closed ?: 0), "symbols" to (s?.symbols ?: 0),
+                            "seats" to (s?.seats ?: 0), "note" to (s?.note ?: ""))
+                    }
+                gson.toJson(mapOf("ok" to true, "rows" to rows + builtIn))
             } catch (e: Exception) {
                 "{\"ok\":false,\"error\":\"${(e.message ?: "unknown").replace("\"","")}\"}"
             }
@@ -8112,16 +8686,21 @@ class MainActivity : AppCompatActivity() {
                 // say plainly whether real shares will be sold, in every market.
                 val liveRows = try {
                     when (com.signalscope.app.trading.Spaces.baseOf(ns)) {
+                        // realEntry / realExit: what the broker actually filled, shown
+                        // beside the strategy's own prices on the ledger (the user's
+                        // ask, 30 Oct 2026). 0 = not filled, or not known yet.
                         "in" -> com.signalscope.app.data.ZerodhaLiveStore.load(applicationContext).trades
                             .filter { it.ns == ns }
                             .associate { r ->
                                 r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
-                                    "qty" to r.qty.toDouble())
+                                    "qty" to r.qty.toDouble(),
+                                    "realEntry" to r.entryPrice, "realExit" to r.exitPrice)
                             }
                         "binance" -> com.signalscope.app.data.BinanceLiveStore.load(applicationContext, ns).trades
                             .associate { r ->
                                 r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
-                                    "qty" to (r.executedQty.toDoubleOrNull() ?: 0.0))
+                                    "qty" to (r.executedQty.toDoubleOrNull() ?: 0.0),
+                                    "realEntry" to r.liveAvgBuyPrice, "realExit" to r.liveAvgSellPrice)
                             }
                         else -> {
                             // The 1-week-high target waiting at the broker, when there is one.
@@ -8133,6 +8712,10 @@ class MainActivity : AppCompatActivity() {
                                     r.paperTradeId to mapOf("status" to r.status, "error" to (r.error ?: ""),
                                         "qty" to r.qty, "retryAfter" to r.retryAfter,
                                         "parked" to r.parkedForOpen,
+                                        "realEntry" to r.liveEntryPrice, "realExit" to r.liveExitPrice,
+                                        // When the real sale went through — a day after the
+                                        // strategy's, for CDW — and a sale someone else made.
+                                        "realSellAt" to r.sellAt, "exitNote" to r.exitReasonNote,
                                         "target" to tg[com.signalscope.app.data.T212TargetStore.key(ns, r.paperTradeId)])
                                 }
                         }
@@ -9153,6 +9736,34 @@ class MainActivity : AppCompatActivity() {
                     "⚠ AI analysis crashed: ${e.message ?: e.javaClass.simpleName}"
                 }
                 deliverAiCallback("window.onOutlookResult", text)
+            }
+        }
+
+        /** The same news outlook, for one row of the watcher's candidate list. The
+         *  page asks for several in turn, so the answer names its stock — an error
+         *  included — and lands on window.onMwAiResult instead of the detail card's
+         *  callback. Technicals are not sent: the outlook ignores them anyway. */
+        @JavascriptInterface
+        fun analyzeOutlookForRow(symbol: String, price: Double, name: String, space: String) {
+            thread(isDaemon = true) {
+                val out = org.json.JSONObject().put("symbol", symbol)
+                try {
+                    when (val r = StockAiClient.analyzeOutlook(
+                        config, symbol, price, 0, 0, 0, "", "", 0.0, null, null, 0.0, 0.0, 0.0, false,
+                        ctx = StockAiClient.MarketContext.fromSpace(space),
+                        name = name.ifBlank { null })) {
+                        is StockAiClient.AiResult.Success -> {
+                            // Kept for today's alerts too — see AiVerdicts.
+                            com.signalscope.app.trading.AiVerdicts.remember(applicationContext, space, symbol, r.text)
+                            out.put("outlook", r.text)
+                        }
+                        is StockAiClient.AiResult.Error -> out.put("error", r.message)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Row outlook crashed for $symbol", e)
+                    out.put("error", "AI analysis crashed: ${e.message ?: e.javaClass.simpleName}")
+                }
+                deliverAiCallback("window.onMwAiResult", out.toString())
             }
         }
 
@@ -10714,18 +11325,65 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var sectorFetchInProgress = false
 
+    // ── THE SECTORS TAB'S LINES ─────────────────────────────────────────────
+    // THREE THINGS IT DID NOT DO (23 Oct 2026, "no sector graphs, no commodities"
+    // — the lines themselves all download fine). It sent nothing until every one
+    // of 43 downloads had finished, a minute or more on the phone, so the tab sat
+    // empty meanwhile; it kept nothing, so every start of the app began empty
+    // again; and it said nothing, so throttling by Yahoo — the app asks it for a
+    // great deal else — looked exactly like a broken tab. Now the lines go to the
+    // page as they arrive, the last good set is kept on disk and shown at once,
+    // and the page is told how the fetch is going.
+    private val sectorCacheFile get() = java.io.File(filesDir, "sector_lines.json")
+
+    private fun loadSectorCache(): List<Map<String, Any?>> = try {
+        val f = sectorCacheFile
+        if (!f.exists()) emptyList() else {
+            val type = object : com.google.gson.reflect.TypeToken<List<Map<String, Any?>>>() {}.type
+            gson.fromJson<List<Map<String, Any?>>>(f.readText(), type) ?: emptyList()
+        }
+    } catch (e: Exception) { Log.w(TAG, "sector cache unreadable", e); emptyList() }
+
+    /** The lines in the order the tab lists them, and how the fetch stands. */
+    private fun pushSectors(byKey: Map<String, Map<String, Any?>>, status: Map<String, Any?>) {
+        val lines = sectorSpecs.mapNotNull { byKey["${it.space}|${it.name}"] }
+        val json = gson.toJson(lines).replace("\\", "\\\\").replace("'", "\\'")
+        val st = gson.toJson(status).replace("\\", "\\\\").replace("'", "\\'")
+        runOnUiThread {
+            try { webView.evaluateJavascript("window.updateSectorData('$json','$st')", null) }
+            catch (e: Exception) { Log.w(TAG, "sector push failed", e) }
+        }
+    }
+
     private fun fetchSectorData() {
         if (sectorFetchInProgress) return
         sectorFetchInProgress = true
 
         thread(isDaemon = true) {
+            val total = sectorSpecs.size
+            var fresh = 0
+            var done = 0
+            var limited = false
+            val byKey = LinkedHashMap<String, Map<String, Any?>>()
+            fun status(state: String) = mapOf("state" to state, "fresh" to fresh, "done" to done,
+                "total" to total, "at" to System.currentTimeMillis())
             try {
-                val sectors = mutableListOf<Map<String, Any?>>()
+                // What the tab showed last time, straight away.
+                loadSectorCache().forEach { byKey["${it["space"]}|${it["name"]}"] = it }
+                pushSectors(byKey, status("loading"))
 
                 for (spec in sectorSpecs) {
+                    if (limited) break
                     for ((i, symbol) in spec.symbols.withIndex()) {
                         try {
-                            val result = YahooFinanceClient.fetchCandles(symbol, spec.exchange)
+                            var result = YahooFinanceClient.fetchCandles(symbol, spec.exchange)
+                            // Turned away: one patient retry, then stop asking — every
+                            // further request would only extend the block.
+                            if (result is YahooFinanceClient.CandleResult.RateLimited) {
+                                Thread.sleep(5000)
+                                result = YahooFinanceClient.fetchCandles(symbol, spec.exchange)
+                                if (result is YahooFinanceClient.CandleResult.RateLimited) { limited = true; break }
+                            }
                             Thread.sleep(400) // pace requests
                             if (result !is YahooFinanceClient.CandleResult.Success || result.candles.size < 2) continue
                             val candles = result.candles
@@ -10745,11 +11403,11 @@ class MainActivity : AppCompatActivity() {
                             // An ETF standing in for an index (or an ETF being the
                             // sector line itself, outside India) says which one.
                             val viaEtf = !symbol.startsWith("^")
-                            sectors.add(mapOf(
+                            byKey["${spec.space}|${spec.name}"] = mapOf(
                                 "space" to spec.space,
                                 "name" to spec.name,
                                 "index" to if (viaEtf && spec.kind == "sector") "${spec.index} · ${symbol.substringBefore('.')} ETF" else spec.index,
-                            "kind" to spec.kind,
+                                "kind" to spec.kind,
                                 "symbol" to symbol,
                                 "proxy" to (viaEtf && i > 0),
                                 "price" to latest.close,
@@ -10757,25 +11415,27 @@ class MainActivity : AppCompatActivity() {
                                 "periodChange" to periodChange,
                                 "high" to high,
                                 "low" to low,
-                                "closes" to closesForChart
-                            ))
+                                "closes" to closesForChart,
+                                "at" to System.currentTimeMillis()
+                            )
+                            fresh++
                             break
                         } catch (e: Exception) {
                             Log.w(TAG, "Sector fetch error for ${spec.name} ($symbol)", e)
                         }
                     }
+                    done++
+                    // A handful at a time: the tab fills as it goes.
+                    if (done % 4 == 0) pushSectors(byKey, status("loading"))
                 }
-                Log.i(TAG, "sectors: ${sectors.size} of ${sectorSpecs.size} lines fetched")
-
-                if (sectors.isNotEmpty()) {
-                    val json = gson.toJson(sectors)
-                    val escaped = json.replace("\\", "\\\\").replace("'", "\\'")
-                    runOnUiThread {
-                        webView.evaluateJavascript("window.updateSectorData('$escaped')", null)
-                    }
-                }
+                Log.i(TAG, "sectors: $fresh of $total lines fetched" + (if (limited) " — Yahoo is rate-limiting, stopped early" else ""))
+                if (byKey.isNotEmpty()) try {
+                    sectorCacheFile.writeText(gson.toJson(sectorSpecs.mapNotNull { byKey["${it.space}|${it.name}"] }))
+                } catch (e: Exception) { Log.w(TAG, "sector cache write failed", e) }
+                pushSectors(byKey, status(if (limited) "limited" else "done"))
             } catch (e: Exception) {
                 Log.e(TAG, "Sector data fetch failed", e)
+                pushSectors(byKey, status("failed"))
             } finally {
                 sectorFetchInProgress = false
             }

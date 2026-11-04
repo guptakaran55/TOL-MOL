@@ -74,6 +74,9 @@ object LiveSkipStore {
         } catch (e: Exception) { Log.w(TAG, "clear failed: ${e.message}") }
     }
 
+    /** One algo's skips in full — reason and time — for the Unfulfilled sweep. */
+    fun skipsFor(ctx: Context, ns: String): List<Skip> = load(ctx).skips.filter { it.ns == ns }
+
     /** Reasons for one algo, keyed by paper trade id, for the card to render. */
     fun forNs(ctx: Context, ns: String): Map<String, String> =
         load(ctx).skips.filter { it.ns == ns }.associate { it.paperTradeId to it.reason }

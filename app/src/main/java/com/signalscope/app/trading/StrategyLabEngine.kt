@@ -250,6 +250,8 @@ object StrategyLabEngine {
         lateinit var macdSignal: DoubleArray
         lateinit var entrySlope: DoubleArray
         lateinit var exitSlope: DoubleArray
+        /** The MACD's change per candle, before any averaging — what both slopes average. */
+        lateinit var rawSlope: DoubleArray
         lateinit var entryAccel: DoubleArray
         lateinit var exitAccel: DoubleArray
         lateinit var accelSigma: DoubleArray
@@ -273,6 +275,7 @@ object StrategyLabEngine {
         val rawSlope = diff(macd)
         f.entrySlope = ema(rawSlope, cfg.entry.slopeFlipUpSmoothing)
         f.exitSlope = ema(rawSlope, cfg.exit.slopeFlipDownSmoothing)
+        f.rawSlope = rawSlope
         f.entryAccel = diff(f.entrySlope)
         f.exitAccel = diff(f.exitSlope)
         f.accelSigma = rollingStdSample(f.entryAccel, 200, 50)
@@ -1028,6 +1031,11 @@ object StrategyLabEngine {
         AdoptedExit(false, note = e.message ?: "adopted exit check failed")
     }
 
+    /** The free replay's trade still open at [entriesFromTs] — see ReviewPayload.heldAtStart. Pure — tested. */
+    internal fun heldAtStart(free: List<Trade>, entriesFromTs: Long): List<Trade> =
+        if (entriesFromTs <= 0L) emptyList()
+        else free.filter { it.entryTs < entriesFromTs && (it.status == "OPEN" || (it.exitTs ?: Long.MAX_VALUE) >= entriesFromTs) }
+
     /** [reviewPayload] for the hold: daily candles, the average drawn over them, one check per side. */
     private fun holdReview(
         symbol: String, raw: List<CandleData>, cfg: StrategyLabConfig,
@@ -1046,6 +1054,7 @@ object StrategyLabEngine {
             val trades = if (entriesFromTs <= 0L) free
                 else free.filter { it.status == "CLOSED" && (it.exitTs ?: Long.MAX_VALUE) < entriesFromTs } +
                     replay(entriesFromTs)
+            val held = heldAtStart(free, entriesFromTs)
             val entryAt = trades.associateBy { it.entryTs }
             val exitAt = trades.filter { it.exitTs != null }.associateBy { it.exitTs!! }
             val out = ArrayList<BarReview>()
@@ -1055,6 +1064,8 @@ object StrategyLabEngine {
                 val pos = trades.firstOrNull { tr ->
                     tr.entryTs <= d.timestamp && (tr.status == "OPEN" || (tr.exitTs ?: Long.MAX_VALUE) >= d.timestamp)
                 }
+                // Held by the strategy before the algo was switched on — never booked.
+                val before = pos == null && held.any { it.entryTs <= d.timestamp && d.timestamp < entriesFromTs }
                 val vs = if (warm) " (${holdPx(c)} vs ${holdPx(s)})" else ""
                 val enVerdict = when {
                     !warm -> "still warming up (${i + 1} of $len daily closes)"
@@ -1063,6 +1074,7 @@ object StrategyLabEngine {
                 }
                 val exFires = pos != null && warm && !above
                 val exVerdict = when {
+                    before -> "the strategy holds here — but before this algo was switched on, so it never had this trade"
                     pos == null -> "no open position at this bar"
                     exFires -> "EXIT fires: close below SMA$len"
                     else -> "no exit — position holds"
@@ -1079,7 +1091,7 @@ object StrategyLabEngine {
                     exitVerdict = exVerdict, exitFires = exFires, exitHasPos = pos != null,
                     level = if (warm) s else null))
             }
-            ReviewPayload(symbol, null, out, trades, "1D", "1D")
+            ReviewPayload(symbol, null, out, trades, "1D", "1D", heldAtStart = held)
         }
     } catch (e: Exception) {
         ReviewPayload(symbol, e.message ?: "review failed")
@@ -1255,7 +1267,18 @@ object StrategyLabEngine {
         val exitInd: List<CheckRow>, val exitHard: List<CheckRow>, val exitDist: CheckRow?,
         val exitVerdict: String, val exitFires: Boolean, val exitHasPos: Boolean,
         /** A price-scale line drawn over the candles — the 50-day hold's average. */
-        val level: Double? = null
+        val level: Double? = null,
+        /** The momentum exit is switched off: its one-bar down-turn was blocked by the
+         *  MACD-distance rule and the slope has not turned up since. Null otherwise. */
+        val exitWarn: String? = null,
+        /** When the slope row and the stop are actually checked. */
+        val exitCheckNote: String? = null,
+        /** This entry-frame candle's raw MACD slope, the exit slope one entry candle
+         *  earlier, and — on a fine bar where no entry candle closed — when the next
+         *  one closes (epoch seconds), the moment the averaged lines can move again. */
+        val rawSlope: Double? = null,
+        val exitSlopePrev: Double? = null,
+        val nextEntryCloseSec: Long? = null
     )
 
     data class ReviewPayload(
@@ -1282,6 +1305,19 @@ object StrategyLabEngine {
          * Entries right of it are replay, exactly like those left of the start.
          */
         val trackingEndTs: Long = 0L,
+        /**
+         * THE REPLAY'S TRADE STILL OPEN WHEN TRACKING BEGAN — kept out of [trades]
+         * (the live algo starts flat and never had it) but no longer dropped: the
+         * chart showed a clean entry signal with no trade after it, as if the rule
+         * had failed to act (BTC, 17 Aug–22 Oct 2026, +26%, while the algo was
+         * switched on 20 Oct). Drawn up to the start line, labelled never booked.
+         */
+        val heldAtStart: List<Trade> = emptyList(),
+        /** How many entry candles each slope averages, and whether the exit reads its own
+         *  finer candles — the chart's legend states them instead of a fixed sentence. */
+        val entrySmoothing: Int = 0,
+        val exitSmoothing: Int = 0,
+        val fastExit: Boolean = false,
         /**
          * THE DAILY GATE'S VERDICT, as a series the chart can shade.
          *
@@ -1406,7 +1442,7 @@ object StrategyLabEngine {
             // The free replay is kept only for trades that FINISHED before tracking
             // began: what the strategy would have done had it been watching. One still
             // open at the boundary is precisely the trade the live algo never had, so
-            // it is dropped rather than drawn across the line.
+            // it is kept apart (heldAtStart) and drawn only up to the line.
             fun replay(from: Long) = applySlippage(
                 if (mtf) runMtf(symbol, raw, cfg, entryTf, exitTf, complete, from)
                 else runSingle(symbol, raw, cfg, entryTf, complete, from),
@@ -1447,8 +1483,12 @@ object StrategyLabEngine {
                 }
 
                 val entFineMacd = pos?.let { p -> fineIdxOfTs[p.entryTs]?.let { fi -> fe?.macd?.get(fi) } } ?: NaN
-                val (exInd, exHard, exDist, exVerdict, exFires) =
-                    exitRows(f, i, ei, cfg, fineClose, exitVelFine, pos, entMacd, fe, entFineMacd)
+                // Where the open trade began, on each frame — for the card's "momentum exit
+                // switched off" scan. -1 when there is no open trade.
+                val entEi = pos?.let { p -> coarseIdxAt(p.entryTs + exitTf) } ?: -1
+                val entFi = pos?.let { p -> fineIdxOfTs[p.entryTs] } ?: -1
+                val exr = exitRows(f, i, ei, cfg, fineClose, exitVelFine, pos, entMacd, fe, entFineMacd, entEi, entFi)
+                val (exInd, exHard, exDist, exVerdict, exFires) = exr
 
                 fun nn(v: Double): Double? = if (v.isNaN()) null else v
                 out.add(BarReview(
@@ -1456,9 +1496,19 @@ object StrategyLabEngine {
                     if (ei in 0 until f.n) nn(f.macd[ei]) else null, if (ei in 0 until f.n) nn(f.macdSignal[ei]) else null,
                     if (ei in 0 until f.n) nn(f.entrySlope[ei]) else null, if (ei in 0 until f.n) nn(f.exitSlope[ei]) else null,
                     entryMarker, exitMarker, core, rescue, gateRows, modeAny, enVerdict, enFires,
-                    exInd, exHard, exDist, exVerdict, exFires, pos != null))
+                    exInd, exHard, exDist, exVerdict, exFires, pos != null,
+                    exitWarn = exr.warn, exitCheckNote = exr.checkNote,
+                    rawSlope = if (ei in 0 until f.n) nn(f.rawSlope[ei]) else null,
+                    exitSlopePrev = if (ei in 1 until f.n) nn(f.exitSlope[ei - 1]) else null,
+                    // No entry candle closed on this fine bar: the averaged lines stand still
+                    // until the next one does.
+                    nextEntryCloseSec = if (mtf && i > 0 && ei >= 0 && coarseIdxAt(fine[i - 1].timestamp + exitTf) == ei)
+                        (if (ei + 1 < f.n) eEnd[ei + 1] else eEnd[ei] + entryTf) else null))
             }
-            ReviewPayload(symbol, null, out, trades, cfg.resample, if (mtf) cfg.exitBars else cfg.resample)
+            ReviewPayload(symbol, null, out, trades, cfg.resample, if (mtf) cfg.exitBars else cfg.resample,
+                heldAtStart = heldAtStart(free, entriesFromTs),
+                entrySmoothing = cfg.entry.slopeFlipUpSmoothing, exitSmoothing = cfg.exit.slopeFlipDownSmoothing,
+                fastExit = fastOn)
         } catch (e: Exception) {
             ReviewPayload(symbol, e.message ?: "review failed")
         }
@@ -1505,11 +1555,26 @@ object StrategyLabEngine {
         return EntryRows(core, rescue, gates, e.mode.equals("ANY", true))
     }
 
-    private data class ExitRowsResult(val ind: List<CheckRow>, val hard: List<CheckRow>, val dist: CheckRow?, val verdict: String, val fires: Boolean)
+    private data class ExitRowsResult(val ind: List<CheckRow>, val hard: List<CheckRow>, val dist: CheckRow?, val verdict: String, val fires: Boolean,
+                                      val warn: String? = null, val checkNote: String? = null)
 
+    private fun fmtTs(sec: Long): String = try {
+        java.time.format.DateTimeFormatter.ofPattern("d MMM HH:mm", java.util.Locale.US)
+            .format(Instant.ofEpochSecond(sec).atZone(ZoneId.systemDefault()))
+    } catch (e: Exception) { sec.toString() }
+
+    /**
+     * THE EXIT CARD — DISPLAY ONLY. Every `ok` here is the same test the engine runs;
+     * what changed on 3 Nov 2026 is wording and extra information: the slope's values
+     * and smoothing, the MACD-distance qualifier shown while a trade is open (not only
+     * once the flip has fired), the stop's trigger price, when each check happens, and
+     * a warning when a blocked one-bar down-turn has left only the stop on guard.
+     * [entryEi] / [entryFi]: the open trade's entry bar on the coarse / fine frame.
+     */
     private fun exitRows(f: Frame, i: Int, ei: Int, cfg: StrategyLabConfig, fineClose: DoubleArray,
                          exitVelFine: DoubleArray, pos: Trade?, entryMacd: Double,
-                         fe: FastExit? = null, entryFineMacd: Double = NaN): ExitRowsResult {
+                         fe: FastExit? = null, entryFineMacd: Double = NaN,
+                         entryEi: Int = -1, entryFi: Int = -1): ExitRowsResult {
         val x = cfg.exit; val ind = ArrayList<CheckRow>(); val hard = ArrayList<CheckRow>()
         val all = x.mode.equals("ALL", true); val persist = x.slopeFlipDownPersistent
         val armed = all || persist
@@ -1519,15 +1584,18 @@ object StrategyLabEngine {
         var fastFlip = false
         if (fastOn && i >= 1) {
             fastFlip = if (armed) fe!!.slope[i] <= 0.0 else fe!!.slope[i - 1] > 0.0 && fe.slope[i] <= 0.0
-            ind.add(CheckRow(fastFlip, if (armed) "${cfg.exitBars} MACD slope < 0 (armed, fast exit, ${g3(fe.slope[i])})"
-                                       else "${cfg.exitBars} MACD slope flips + → − (fast exit)"))
+            val sm = x.slopeFlipDownSmoothing
+            ind.add(CheckRow(fastFlip, if (armed) "${cfg.exitBars} MACD slope < 0 (armed, fast exit, smoothed $sm: ${g3(fe.slope[i])})"
+                                       else "${cfg.exitBars} MACD slope flips + → − (fast exit, smoothed $sm: ${g3(fe.slope[i - 1])}→${g3(fe.slope[i])})"))
         }
         // rows combined by exit.mode, read off the coarse frame
         val byMode = ArrayList<CheckRow>()
         if (ei in 1 until f.n) {
             if (!fastOn && x.slopeFlipDownEnabled) {
-                if (armed) byMode.add(CheckRow(f.exitSlope[ei] <= 0.0, "MACD slope < 0 (armed, ${g3(f.exitSlope[ei])})"))
-                else byMode.add(CheckRow(f.exitSlope[ei - 1] > 0.0 && f.exitSlope[ei] <= 0.0, "MACD slope flips + → −"))
+                val sm = x.slopeFlipDownSmoothing
+                if (armed) byMode.add(CheckRow(f.exitSlope[ei] <= 0.0, "${cfg.resample} MACD slope < 0 (armed, smoothed $sm: ${g3(f.exitSlope[ei])})"))
+                else byMode.add(CheckRow(f.exitSlope[ei - 1] > 0.0 && f.exitSlope[ei] <= 0.0,
+                    "${cfg.resample} MACD slope flips + → − (smoothed $sm: ${g3(f.exitSlope[ei - 1])}→${g3(f.exitSlope[ei])})"))
             }
             if (x.macdCrossDownEnabled) byMode.add(if (all) CheckRow(f.macd[ei] < f.macdSignal[ei], "MACD below signal")
                                                  else CheckRow(f.macd[ei - 1] >= f.macdSignal[ei - 1] && f.macd[ei] < f.macdSignal[ei], "MACD crosses below signal"))
@@ -1547,30 +1615,76 @@ object StrategyLabEngine {
 
         var indFired = if (byMode.isEmpty()) false else if (all) byMode.all { it.ok } else byMode.any { it.ok }
         var dist: CheckRow? = null
-        if (indFired && x.macdDistanceEnabled) {
+        val hasPos = pos != null
+        // THE DISTANCE QUALIFIER, SHOWN WHILE A TRADE IS OPEN — not only once the flip
+        // has fired — so the card says beforehand whether a down-turn would be taken.
+        // It still only ever suppresses an exit that had fired, exactly as before.
+        // (With the fast exit on, the coarse rows other than the slope keep the old
+        // behaviour; the fast branch below owns the row.)
+        val coarseDistShown = x.macdDistanceEnabled && (indFired || (hasPos && !fastOn))
+        if (coarseDistShown) {
             if (!entryMacd.isNaN() && ei in 0 until f.n && abs(entryMacd) > 1e-12) {
                 val moved = abs(f.macd[ei] - entryMacd) / abs(entryMacd) * 100.0
                 val ok = moved >= x.macdDistancePct
-                dist = CheckRow(ok, "MACD moved ≥ ${g(x.macdDistancePct)}% from entry (${"%.0f".format(moved)}%)")
-                if (!ok) indFired = false
+                dist = CheckRow(ok, if (indFired) "MACD moved ≥ ${g(x.macdDistancePct)}% from entry (${"%.0f".format(moved)}%)"
+                    else "MACD moved ${"%.0f".format(moved)}% of ${g(x.macdDistancePct)}% · next down-turn: ${if (ok) "taken" else "blocked"}")
+                if (indFired && !ok) indFired = false
             } else dist = CheckRow(false, "MACD distance ≥ ${g(x.macdDistancePct)}% (needs open trade)")
         }
         // the fast exit's distance qualifier measures the FINE MACD vs the fine MACD at entry
         var fastFires = fastFlip
-        if (fastFlip && x.macdDistanceEnabled) {
+        if (fastOn && x.macdDistanceEnabled && (fastFlip || (hasPos && dist == null))) {
             if (!entryFineMacd.isNaN() && abs(entryFineMacd) > 1e-12) {
                 val moved = abs(fe!!.macd[i] - entryFineMacd) / abs(entryFineMacd) * 100.0
                 val ok = moved >= x.macdDistancePct
-                dist = CheckRow(ok, "${cfg.exitBars} MACD moved ≥ ${g(x.macdDistancePct)}% from entry (${"%.0f".format(moved)}%)")
-                if (!ok) fastFires = false
-            } else { dist = CheckRow(false, "MACD distance ≥ ${g(x.macdDistancePct)}% (needs open trade)"); fastFires = false }
+                dist = CheckRow(ok, if (fastFlip) "${cfg.exitBars} MACD moved ≥ ${g(x.macdDistancePct)}% from entry (${"%.0f".format(moved)}%)"
+                    else "${cfg.exitBars} MACD moved ${"%.0f".format(moved)}% of ${g(x.macdDistancePct)}% · next down-turn: ${if (ok) "taken" else "blocked"}")
+                if (fastFlip && !ok) fastFires = false
+            } else if (fastFlip) { dist = CheckRow(false, "MACD distance ≥ ${g(x.macdDistancePct)}% (needs open trade)"); fastFires = false }
         }
         indFired = indFired || fastFires
 
-        val hasPos = pos != null
+        // MOMENTUM EXIT SWITCHED OFF. In one-bar mode the down-turn is a single event:
+        // blocked by the distance rule on that bar, it does not come back until the
+        // slope turns up and crosses down again — and meanwhile only the stop guards
+        // the trade. Found by scanning from the entry to this bar.
+        var warn: String? = null
+        if (hasPos && x.slopeFlipDownEnabled && x.macdDistanceEnabled && !armed) {
+            if (!fastOn && entryEi >= 0 && !entryMacd.isNaN() && abs(entryMacd) > 1e-12 && ei in 1 until f.n) {
+                var kb = -1
+                for (k in maxOf(1, entryEi + 1)..ei) {
+                    val flip = f.exitSlope[k - 1] > 0.0 && f.exitSlope[k] <= 0.0
+                    if (flip && abs(f.macd[k] - entryMacd) / abs(entryMacd) * 100.0 < x.macdDistancePct) kb = k
+                }
+                if (kb > 0 && (kb..ei).all { f.exitSlope[it] <= 0.0 })
+                    warn = "⚠ down-turn ${fmtTs(f.ts[kb])} blocked by the ${g(x.macdDistancePct)}% rule — " +
+                        "momentum exit off until the slope turns up and down again; only the stop guards"
+            } else if (fastOn && entryFi >= 0 && !entryFineMacd.isNaN() && abs(entryFineMacd) > 1e-12 && i >= 1) {
+                var kb = -1
+                for (k in maxOf(1, entryFi + 1)..i) {
+                    val flip = fe!!.slope[k - 1] > 0.0 && fe.slope[k] <= 0.0
+                    if (flip && abs(fe.macd[k] - entryFineMacd) / abs(entryFineMacd) * 100.0 < x.macdDistancePct) kb = k
+                }
+                if (kb > 0 && (kb..i).all { fe!!.slope[it] <= 0.0 })
+                    warn = "⚠ ${cfg.exitBars} down-turn ${kb - entryFi} bars after entry blocked by the ${g(x.macdDistancePct)}% rule — " +
+                        "momentum exit off until the slope turns up and down again; only the stop guards"
+            }
+        }
+        val single = cfg.exitBars.isBlank() || cfg.exitBars.equals("same", true) || cfg.exitBars.equals(cfg.resample, true)
+        val checkNote = when {
+            single -> "checked: slope + stop each ${cfg.resample} close"
+            fastOn -> "checked: slope + stop each ${cfg.exitBars} close (fast exit)"
+            else -> "checked: slope each ${cfg.resample} close · stop each ${cfg.exitBars} close"
+        }
+
         if (hasPos) {
             val cl = fineClose[i]; val ep = pos!!.entryPrice
-            if (x.stopLossEnabled) hard.add(CheckRow(cl <= ep * (1 - x.stopLossPct / 100.0), "stop loss −${g(x.stopLossPct)}% (px ${"%.2f".format(cl)} vs entry ${"%.2f".format(ep)})"))
+            if (x.stopLossEnabled) {
+                val trig = ep * (1 - x.stopLossPct / 100.0)
+                hard.add(CheckRow(cl <= ep * (1 - x.stopLossPct / 100.0),
+                    "stop −${g(x.stopLossPct)}%: fires ≤ ${"%.2f".format(trig)}, ${"%.1f".format((cl / trig - 1) * 100)}% away " +
+                        "(px ${"%.2f".format(cl)}, entry ${"%.2f".format(ep)})"))
+            }
             if (x.takeProfitEnabled) hard.add(CheckRow(cl >= ep * (1 + x.takeProfitPct / 100.0), "take profit +${g(x.takeProfitPct)}% (px ${"%.2f".format(cl)})"))
         }
 
@@ -1581,9 +1695,14 @@ object StrategyLabEngine {
             when {
                 hardFired != null -> { verdict = "EXIT fires: ${hardFired.label}"; fires = true }
                 indFired -> { verdict = "EXIT fires (indicator)"; fires = true }
-                else -> { verdict = "no exit — position holds"; fires = false }
+                else -> {
+                    verdict = if (warn != null) "no exit — position holds (momentum exit off; " +
+                        (if (x.stopLossEnabled) "stop ${"%.2f".format(pos!!.entryPrice * (1 - x.stopLossPct / 100.0))})" else "no stop)")
+                    else "no exit — position holds"
+                    fires = false
+                }
             }
         }
-        return ExitRowsResult(ind, hard, dist, verdict, fires)
+        return ExitRowsResult(ind, hard, dist, verdict, fires, warn, checkNote)
     }
 }

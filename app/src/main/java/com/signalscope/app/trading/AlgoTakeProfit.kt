@@ -114,7 +114,7 @@ object AlgoTakeProfit {
                         return Result(false, "The German market is shut, so the real shares cannot be sold now. Nothing was changed.", sym)
                     real = true; broker = "Trading 212"
                     val so = T212LiveMirror.stopOutNow(ctx, ns, sym, REASON,
-                        origin = "your take-profit tap", paperTradeId = open.id)
+                        origin = "your take-profit tap", paperTradeId = open.id, alertOnFail = false)
                     if (!so.ok)
                         return Result(false, "Not sold at Trading 212: ${so.error}. Nothing was changed — the position is still open.", sym)
                     exitPx = so.exitPrice

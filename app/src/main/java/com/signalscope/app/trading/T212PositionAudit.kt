@@ -233,12 +233,24 @@ object T212PositionAudit {
             .groupBy { it.t212Ticker }
         val actualByTicker = positions.associateBy { it.ticker }
         val drifts = ArrayList<Drift>()
+        // THE GERMAN BUILT-IN ALGOS' REAL SHARES, kept in their own record. Left
+        // out, every one of their positions read as a holding no algo claims, and
+        // a stock they share with another algo as more than the app manages. A buy
+        // still in progress has no settled quantity, so it is claimed but not compared.
+        val floorRows = try {
+            com.signalscope.app.data.FloorLiveStore.load(ctx).rows.filter { it.holds && it.ticker.isNotBlank() }
+        } catch (e: Exception) { emptyList() }
+        val floorByTicker = floorRows.filter { it.status != com.signalscope.app.data.FloorLiveStore.BUYING && it.qty > 0.0 }
+            .groupBy { it.ticker }
 
-        for ((ticker, rows) in expectedByTicker) {
+        for (ticker in expectedByTicker.keys + floorByTicker.keys) {
             if (ticker.isBlank()) continue
+            val rows = expectedByTicker[ticker].orEmpty()
+            val floor = floorByTicker[ticker].orEmpty()
             // Prefer the qty actually filled; fall back to the qty ordered for rows
             // whose fills have not been read back yet.
-            val expected = rows.sumOf { if (it.liveQtyFilled > 0.0) it.liveQtyFilled else it.qty }
+            val expected = rows.sumOf { if (it.liveQtyFilled > 0.0) it.liveQtyFilled else it.qty } +
+                floor.sumOf { it.qty }
             val pos = actualByTicker[ticker]
             val actual = pos?.quantity ?: 0.0
             val short = shortfall(expected, actual)
@@ -247,8 +259,8 @@ object T212PositionAudit {
             drifts.add(Drift(
                 kind = if (short) (if (actual <= 0.0) "MISSING" else "MISMATCH") else "OVERLAP",
                 ticker = ticker,
-                symbol = rows.first().symbol,
-                algos = rows.map { it.ns }.distinct(),
+                symbol = rows.firstOrNull()?.symbol ?: floor.first().symbol,
+                algos = (rows.map { it.ns } + floor.map { it.ns }).distinct(),
                 expectedQty = expected, actualQty = actual,
                 deltaQty = actual - expected,
                 actualValue = (pos?.quantity ?: 0.0) * (pos?.currentPrice ?: 0.0)))
@@ -264,7 +276,7 @@ object T212PositionAudit {
         }
         // "No algo claims this" must account for stuck rows too, or a stuck leg's
         // holding is reported twice — once as STUCK and again as EXTRA.
-        val claimedTickers = open.map { it.t212Ticker }.toSet()
+        val claimedTickers = open.map { it.t212Ticker }.toSet() + floorRows.map { it.ticker }
         for (p in positions) {
             if (p.ticker in claimedTickers) continue
             if (p.quantity <= 0.0) continue

@@ -240,6 +240,33 @@ object BucketStore {
         } catch (e: Exception) { Log.w(TAG, "50-day hold seed failed", e) }
     }
 
+    // ── QUALITY · CHEAP · UPTREND, A PAPER EXPERIMENT ──────────────────────────
+
+    /**
+     * The companies for the "quality, cheap, uptrend" paper algos (the user's
+     * note of 26 Oct 2026), cheapest first. The filter: Value Score quality part
+     * 20 of 30 or more, no value-trap penalty, free cash flow not negative, a
+     * positive P/E, the price above its 200-day average. Germany is the phone's
+     * scan of 23 Oct and the US the desktop backtest's September quarter, both as
+     * the note gives them; India is the phone's scan of 26 Oct through the same
+     * filter. Bare tickers, as the algos store them.
+     */
+    val QUALITY_CHEAP_LISTS = mapOf(
+        "de" to listOf("TMV", "MUV2", "DWS", "VH2", "ALV", "G24", "BEI", "EVD",
+                       "ADS", "SHL", "G1A", "AIR", "QIA", "SAP", "NEM"),
+        "us" to listOf("GOOGL", "WDC", "REGN", "AMZN", "ADP", "SNDK", "MU", "AMGN", "ROST"),
+        "in" to listOf("MASTEK", "CASTROLIND", "TCS", "SAGILITY", "HCLTECH", "OFSS",
+                       "MPHASIS", "IGIL", "TECHM", "LTTS", "CRISIL", "COFORGE",
+                       "INDHOTEL", "BHEL", "STLTECH", "TDPOWERSYS", "CGPOWER"))
+    const val QUALITY_CHEAP_NAME = "Quality · cheap · uptrend"
+    private val QUALITY_CHEAP_SOURCE = mapOf("de" to "buyx6g", "us" to "b148ki0", "in" to "bexj6w")
+
+    /** The live algo each copies: the conservative one the note names, or
+     *  failing that the market's first armed algo. */
+    fun qualityCheapSource(ctx: Context, base: String): Bucket? = list(ctx, base).let { l ->
+        l.firstOrNull { it.id == QUALITY_CHEAP_SOURCE[base] } ?: l.firstOrNull { it.live }
+    }
+
     fun update(ctx: Context, bucket: Bucket) {
         val s = load(ctx, bucket.space)
         save(ctx, bucket.space, s.copy(buckets = s.buckets.map { if (it.id == bucket.id) bucket else it }))

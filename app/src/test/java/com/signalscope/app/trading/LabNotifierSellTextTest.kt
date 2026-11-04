@@ -47,7 +47,7 @@ class LabNotifierSellTextTest {
             reason = "reached its target of 145.00 (its 1-week high) · its target at Trading 212",
             paid = 143.25, realExit = 145.00, broker = "Trading 212", flag = "🇩🇪")
         assertEquals("🇩🇪 HEI sold +1.22%", title)
-        assertEquals("Watcher buy · 1-week-high target reached", body)
+        assertEquals("Watcher buy · week target reached", body)
         assertFalse(body.contains("145")); assertFalse(body.contains("0.348")); assertFalse(body.contains("%"))
     }
 

@@ -65,14 +65,48 @@ object PatientExecutor {
          *  had to clear to be legal. Reported so the caller can keep them out of the
          *  strategy's P&L: they were never bought, so counting their proceeds as
          *  return would credit the algo with money it did not earn. */
-        val sweptQty: Double = 0.0
+        val sweptQty: Double = 0.0,
+        /** You stopped this buy from Waiting orders. Its resting order was pulled;
+         *  [filled] is what it had bought before that, and the caller must not
+         *  queue it again. */
+        val stopped: Boolean = false
     )
+
+    // ── STOPPING A BUY LADDER THAT IS RUNNING ───────────────────────────────
+    // Keyed by the Trading 212 ticker and by the symbol the caller passed, so the
+    // Waiting orders list can ask with whichever its row carries. One ladder per
+    // name at a time is already the rule everywhere that starts one.
+    private val buysRunning = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val buyStopAsked = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Ask the buy ladder running on any of [keys] to stop. It stops within about
+     *  a second, pulls its resting order and reports what it had bought.
+     *  @return false when no buy ladder is running on them right now. */
+    fun stopBuy(vararg keys: String): Boolean {
+        val ks = keys.map { it.trim().uppercase() }.filter { it.isNotEmpty() }
+        val hit = ks.filter { it in buysRunning }
+        if (hit.isEmpty()) return false
+        buyStopAsked.addAll(hit)
+        return true
+    }
+
+    fun isBuyRunning(vararg keys: String): Boolean =
+        keys.any { it.trim().uppercase() in buysRunning }
+
+    /** Is any buy ladder working right now. */
+    fun anyBuyRunning(): Boolean = buysRunning.isNotEmpty()
 
     /** Progress payload keys match the original window.onT212PatientProgress
      *  contract exactly, so the dashboard's renderer needs no change. */
     private fun prog(cb: ((Map<String, Any?>) -> Unit)?, m: Map<String, Any?>) {
         try { cb?.invoke(m) } catch (_: Exception) {}
     }
+
+    /** The ladder has ended, filled or not — the page's progress strip clears.
+     *  Without it the strip sat on its last rung for hours (CEG, 2 Nov 2026). */
+    private fun done(cb: ((Map<String, Any?>) -> Unit)?, side: String, ticker: String, r: Result) =
+        prog(cb, mapOf("side" to side, "ticker" to ticker, "note" to "done", "ok" to r.ok,
+            "filled" to r.filled, "result" to (r.error ?: r.note)))
 
     // ── shared helpers (verbatim) ───────────────────────────────────────────
 
@@ -337,7 +371,7 @@ object PatientExecutor {
         SellGuard.selling(ticker) {
             sellLadder(config, ticker, yahooSymbol, space, quantity, refPrice,
                 onProgress, targetQty, claimedByOthers)
-        }
+        }.also { done(onProgress, "SELL", ticker, it) }
 
     private fun sellLadder(
         config: ConfigManager, ticker: String, yahooSymbol: String, space: String,
@@ -574,7 +608,10 @@ object PatientExecutor {
     ): Result {
         val spc = if (space.uppercase() == "DE") "DE" else "US"
         var tickerForMsg = symbol.trim()
-        return try {
+        val keys = HashSet<String>().apply { add(symbol.trim().uppercase()) }
+        // A request left over from an earlier ladder must not stop this one.
+        buyStopAsked.removeAll(keys); buysRunning.addAll(keys)
+        return (try {
             if (cashAmount <= 0.0) throw IllegalArgumentException("Enter an amount greater than 0")
             if (refPrice <= 0.0) throw IllegalArgumentException("No reference price — run a scan or wait for the live quote")
             val client = Trading212Client(config)
@@ -587,6 +624,8 @@ object PatientExecutor {
                     ?: throw IllegalArgumentException("Couldn't resolve \"$sym\": ${client.resolveFailureReason(sym, spc)}")
             }
             tickerForMsg = ticker
+            ticker.uppercase().let { k -> buyStopAsked.remove(k); keys.add(k); buysRunning.add(k) }
+            fun stopAsked() = keys.any { it in buyStopAsked }
             val ref = freshRef(config, client, ticker, yahooSymbol, space, refPrice)
             // REFUSE BEFORE PLACING ANYTHING. The market is already above the limit
             // the caller set, so no rung of this ladder could fill under it — and a
@@ -623,15 +662,29 @@ object PatientExecutor {
             fun ownedQty(): Double =
                 (client.fetchPortfolio() as? Trading212Client.T212Result.Success)
                     ?.data?.firstOrNull { it.ticker.equals(ticker, true) }?.quantity ?: -1.0
-            val baseline = ownedQty().let { if (it < 0) 0.0 else it }
+            // THE STARTING HOLDING MUST BE KNOWN (4 Nov 2026). An unreadable first
+            // look used to count as 0, so the next good look took every share already
+            // held as just bought: S92, 11.958 shares "bought" with no order placed,
+            // claimed by an algo that would later have sold them all. Read again; if
+            // it still cannot be read, buy nothing.
+            var firstLook = ownedQty()
+            for (wait in longArrayOf(5_000L, 10_000L, 20_000L)) {
+                if (firstLook >= 0) break
+                Thread.sleep(wait); firstLook = ownedQty()
+            }
+            if (firstLook < 0)
+                throw IllegalStateException("could not read your current holding from Trading 212 — nothing placed")
+            var baseline = firstLook
             val dustShares = maxOf(1e-6, targetShares * DUST_FRAC)
             val placedIds = ArrayList<Long>()
             var lastId: Long? = null
             var filledAny = false
             var lastKnownOwned = baseline
             var lastMarket = ref
+            var stopped = false
 
             rung@ for (i in offsets.indices) {
+                if (stopAsked()) { stopped = true; break@rung }
                 var suspectFill = false
                 lastId?.let { id ->
                     val outcome = cancelAndConfirmGone(client, id)
@@ -640,6 +693,8 @@ object PatientExecutor {
                     Thread.sleep(ORDER_SPACING_MS)
                 }
                 val ownedNow = if (suspectFill) awaitQtyChange({ ownedQty() }, lastKnownOwned) else ownedQty()
+                // Before this ladder has placed anything, nothing it sees is its own.
+                if (placedIds.isEmpty() && ownedNow >= 0) baseline = ownedNow
                 val boughtSoFar = if (ownedNow < 0) (lastKnownOwned - baseline).coerceAtLeast(0.0)
                                   else (ownedNow - baseline).coerceAtLeast(0.0)
                 if (ownedNow >= 0) lastKnownOwned = ownedNow
@@ -688,27 +743,51 @@ object PatientExecutor {
                     }
                 }
                 if (!placed) break@rung
-                Thread.sleep(DWELL_MS)
+                // The rung's rest, looked through once a second for a stop.
+                val until = System.currentTimeMillis() + DWELL_MS
+                while (System.currentTimeMillis() < until) {
+                    if (stopAsked()) { stopped = true; break@rung }
+                    Thread.sleep(1000L)
+                }
             }
 
+            // A STOP PULLS THE ORDER FIRST AND COUNTS AFTER, so shares that fill
+            // while it is being cancelled are still counted as bought.
+            var staleOrderWarning = false
+            var pulled = false
+            if (stopped) lastId?.let { id ->
+                pulled = true
+                val outcome = cancelAndConfirmGone(client, id)
+                if (!outcome.gone) staleOrderWarning = true
+                if (outcome.likelyFilled) awaitQtyChange({ ownedQty() }, lastKnownOwned)
+            }
             var ownedEnd = ownedQty()
             if (ownedEnd < 0) { Thread.sleep(6000L); ownedEnd = ownedQty() }
             val bought = if (ownedEnd < 0) (lastKnownOwned - baseline).coerceAtLeast(0.0)
                          else (ownedEnd - baseline).coerceAtLeast(0.0)
             if (targetShares - bought <= dustShares ||
                 (targetShares - bought) * ref < MIN_ORDER_VALUE) filledAny = true
-            var staleOrderWarning = false
-            if (!filledAny) lastId?.let { id -> if (!cancelAndConfirmGone(client, id).gone) staleOrderWarning = true }
+            if (!filledAny && !pulled) lastId?.let { id -> if (!cancelAndConfirmGone(client, id).gone) staleOrderWarning = true }
+            if (stopped) Log.w(TAG, "patient buy $ticker stopped by you — bought $bought of $targetShares")
 
-            Result(ok = filledAny, ticker = ticker, filled = bought,
+            // A stopped ladder that bought some keeps them: ok, so every caller
+            // records the shares as the position they now are.
+            Result(ok = filledAny || (stopped && bought > dustShares), ticker = ticker, filled = bought,
                 remaining = (targetShares - bought).coerceAtLeast(0.0),
-                note = if (filledAny) "filled"
-                       else "unfilled" + (lastFailure?.let { " — the broker said: $it" } ?: ""),
+                note = when {
+                    stopped -> "stopped by you" + (if (bought > dustShares)
+                        " after buying ${"%.4f".format(bought)}" else " — nothing bought") +
+                        (if (staleOrderWarning) "; the last order could not be confirmed cancelled — check Trading 212" else "")
+                    filledAny -> "filled"
+                    else -> "unfilled" + (lastFailure?.let { " — the broker said: $it" } ?: "")
+                },
                 staleOrder = staleOrderWarning,
-                orderIds = placedIds, refPrice = ref, atr = atr)
+                orderIds = placedIds, refPrice = ref, atr = atr, stopped = stopped)
         } catch (e: Exception) {
             Log.e(TAG, "patient buy failed", e)
             Result(ok = false, ticker = tickerForMsg, error = e.message ?: "patient buy failed")
-        }
+        } finally {
+            buysRunning.removeAll(keys); buyStopAsked.removeAll(keys)
+        }).also { done(onProgress, "BUY", tickerForMsg, it) }
     }
 }

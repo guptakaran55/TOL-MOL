@@ -55,6 +55,20 @@
             android:contentDescription="Refresh now" />
     </LinearLayout>
 
+    <!-- NO PROTECTION: your holdings with nothing resting at the broker and no
+         one in the app managing them (3 Nov 2026). Hidden when there are none. -->
+    <TextView
+        android:id="@+id/wp_unprot"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textColor="#FFFBBF24"
+        android:textSize="11sp"
+        android:textStyle="bold"
+        android:maxLines="2"
+        android:ellipsize="end"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/wp_headline"
         android:layout_width="match_parent"

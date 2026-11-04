@@ -325,6 +325,12 @@ object ManualWatchStore {
         val monthHigh: Double = 0.0,
         val monthVisits: Int = 0,
         val monthDays: Int = 0,
+        /** And over the last YEAR (252 trading days) — the 52-week low, the rarest
+         *  of the four. 0 = less than most of a year of bars. */
+        val yearLow: Double = 0.0,
+        val yearHigh: Double = 0.0,
+        val yearVisits: Int = 0,
+        val yearDays: Int = 0,
         /** The close these were measured against. */
         val price: Double = 0.0,
         /** Minutes per bar they were read off — 1440 when the watcher's feed is
@@ -409,6 +415,30 @@ object ManualWatchStore {
          * different pictures of the same bar.
          */
         val takeProfitPct: Double = 0.0,
+        // ── the exits panel's switches (2 Nov 2026); null = the market's default ──
+        /** The target at the broker: on unless switched off. */
+        val targetOn: Boolean? = null,
+        /** week | month | 3month | year | resistance — see WeekTarget.levelRuleFor. */
+        val targetLevel: String? = null,
+        /** How far under the level: tenth (of its range) | 1pct | 2pct | none. */
+        val targetShade: String? = null,
+        val targetMinGapPct: Double? = null,
+        /** The fixed stop under what you paid: on unless switched off; its size, else the config's. */
+        val hardStopOn: Boolean? = null,
+        val hardStopPct: Double? = null,
+        /** The attached config's own sales (MACD and its stop): on unless switched off. */
+        val strategyExitsOn: Boolean? = null,
+        // ── AUTO HAND-OVER (3 Nov 2026): a stock you buy by hand joins by itself ──
+        /** On unless switched off. */
+        val autoAdoptOn: Boolean? = null,
+        /** Smallest holding taken over, in the market's money; null = the default. */
+        val autoAdoptMin: Double? = null,
+        /** What you held when it began — never taken over by itself, only by a "+".
+         *  Null until the first pass records it. */
+        val autoAdoptBaseline: List<String>? = null,
+        /** SYMBOL -> when first seen held with no one managing it: it waits half an
+         *  hour, so a buy still settling is not caught mid-way. */
+        val autoAdoptSeen: Map<String, Long> = emptyMap(),
         val trailSource: TrailSource = TrailSource.BAR_CLOSE,
         /** What [trailPct] counts in. Null on files saved before the choice
          *  existed, which were all percentages. */
@@ -656,6 +686,30 @@ object ManualWatchStore {
         val next = block(load(ctx, space)); save(ctx, space, next); return next
     }
 
+    /**
+     * THE TRAILING STOP JUDGED ON BAR CLOSES, once (the user's decision, 30 Oct
+     * 2026). It was on live prices, so a one-second wick under the level sold
+     * the position. Replayed on the 48 watchlist trailing-stop sales since 9 Sep,
+     * judging on the hourly close (the bar close for this watchlist's
+     * 240/120-minute strategy) averaged −1.02% a position, against −1.25% on
+     * 15-minute closes and −1.07% as it happened. Germany and the US; India's
+     * trail moves a resting trigger and is untouched. Changing it back in
+     * Settings afterwards is respected.
+     */
+    fun ensureBarCloseTrailOnce(ctx: Context, space: String) {
+        val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
+        if (base != "de" && base != "us") return
+        val marker = java.io.File(ctx.filesDir, "trail_bar_close_$base.done")
+        if (marker.exists()) return
+        try {
+            mutate(ctx, base) { s ->
+                if (s.trailSource == TrailSource.TICK) s.copy(trailSource = TrailSource.BAR_CLOSE) else s
+            }
+            marker.writeText(System.currentTimeMillis().toString())
+            Log.i(TAG, "[$base] trailing stop now judged on bar closes")
+        } catch (e: Exception) { Log.w(TAG, "[$base] trailing-stop switch failed", e) }
+    }
+
     /** True when [symbol] has already been alerted on [day] — the once-a-day cap. */
     fun alreadyAlerted(s: State, symbol: String, day: String): Boolean =
         s.alerted[symbol.uppercase()] == day
@@ -672,7 +726,7 @@ object ManualWatchStore {
             it.copy(supportAlerted = it.supportAlerted + (symbol.uppercase() to day))
         }
 
-    /** Has this stock's [scale] low ("3d", "1w", "1m") already been flagged [day]? */
+    /** Has this stock's [scale] low ("3d", "1w", "1m", "1y") already been flagged [day]? */
     fun floorAlerted(s: State, symbol: String, scale: String, day: String): Boolean =
         if (scale == "3d") alreadySupportAlerted(s, symbol, day)
         else s.supportAlertedScales?.get("${symbol.uppercase()}|$scale") == day
@@ -838,5 +892,23 @@ object ManualWatchStore {
                 else it
             })
         }
+    }
+
+    /** Do the attached config's own sales act on this watchlist? True for anything not a watchlist. */
+    fun strategyExitsOn(ctx: Context, ns: String): Boolean {
+        if (Spaces.bucketIdOf(ns) != ID) return true
+        return try { load(ctx, Spaces.baseOf(ns)).strategyExitsOn != false } catch (e: Exception) { true }
+    }
+
+    /** The German watchlist's +4% take-profit off, once — the user's call, 2 Nov 2026,
+     *  so the 3-month targets can be reached. */
+    fun ensureGermanTakeProfitOffOnce(ctx: Context) {
+        val marker = File(ctx.filesDir, "tp_off_de_2026_11_02.done")
+        if (marker.exists()) return
+        try {
+            mutate(ctx, "de") { it.copy(takeProfitPct = 0.0) }
+            marker.writeText(System.currentTimeMillis().toString())
+            Log.w(TAG, "[de] take profit switched off (one-time, 2 Nov 2026)")
+        } catch (e: Exception) { Log.w(TAG, "take-profit switch-off failed", e) }
     }
 }

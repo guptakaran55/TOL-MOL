@@ -3,6 +3,7 @@ package com.signalscope.app.trading
 import android.content.Context
 import android.util.Log
 import com.signalscope.app.data.ConfigManager
+import com.signalscope.app.data.FloorLiveStore
 import com.signalscope.app.data.ManualWatchStore
 import com.signalscope.app.data.StrategyLabStore
 import com.signalscope.app.data.T212LiveStore
@@ -82,7 +83,8 @@ object T212HandSales {
             T212WeekTargets.applies(it.ns) && it.t212Ticker.equals(ticker, true) &&
                 it.status == "OPEN" && it.qty > 0.0
         }
-        if (rows.isEmpty()) return ""
+        val floor = floorOpen(ctx, ticker)
+        if (rows.isEmpty() && floor.isEmpty()) return ""
         val client = Trading212Client(ConfigManager(ctx))
         // What is left in the account now. Unreadable = do nothing here; a full
         // exit is still caught by [sweep] later, from the broker's own word.
@@ -96,7 +98,8 @@ object T212HandSales {
             Thread.sleep(3000L)
         }
         val left = remaining ?: return ""
-        val managed = rows.sumOf { ownQty(it) }
+        val t212Managed = rows.sumOf { ownQty(it) }
+        val managed = t212Managed + floor.sumOf { it.qty }
         val tol = maxOf(1e-4, managed * 0.005)
         var excess = managed - left
         if (excess <= tol) return ""                     // you sold shares the app does not manage
@@ -107,10 +110,13 @@ object T212HandSales {
         // In [saleOrder]: your watchlist's positions first, oldest first, then an
         // algo's. (This took the newest first until 20 Oct; one order for every
         // sale of yours, whichever button made it.)
-        for (cut in allocate(rows, excess)) {
+        for (cut in allocate(rows, minOf(excess, t212Managed))) {
             notes += if (cut.whole) closeOne(ctx, cut.row, orderIds, exitPx, now)
                      else trim(ctx, cut.row, cut.qty, "your sale from the stock's page")
         }
+        // The German built-in algos' real shares come last — see [floorAllocate].
+        notes += takeFromFloor(ctx, floorAllocate(floor, excess - t212Managed), exitPx, now,
+            "your sale from the stock's page")
         try { T212LiveMirror.reconcileFills(ctx) }
         catch (e: Exception) { Log.w(TAG, "fill read after your sale failed", e) }
         return notes.filter { it.isNotBlank() }.joinToString(" ")
@@ -268,8 +274,14 @@ object T212HandSales {
         val ledger = T212LiveStore.load(ctx).trades.filter { T212WeekTargets.applies(it.ns) }
         val byTicker = ledger.filter { it.status == "OPEN" && ownQty(it) > 0.0 && it.t212Ticker.isNotBlank() }
             .groupBy { it.t212Ticker.uppercase() }
-        p.all.keys.filter { it.removePrefix("part|") !in byTicker.keys }.forEach { p.edit().remove(it).apply() }
-        if (byTicker.isEmpty()) return ""
+        // The German built-in algos' real positions share the account; theirs are
+        // in their own record. Any row of theirs, even one mid-buy or mid-sale.
+        val floorBy = try {
+            FloorLiveStore.load(ctx).rows.filter { it.holds && it.ticker.isNotBlank() }.groupBy { it.ticker.uppercase() }
+        } catch (e: Exception) { emptyMap() }
+        val tickers = byTicker.keys + floorBy.keys
+        p.all.keys.filter { it.removePrefix("part|") !in tickers }.forEach { p.edit().remove(it).apply() }
+        if (tickers.isEmpty()) return ""
         // Unreadable holdings = do nothing. Never act on a list that may be short.
         val holdings = (BrokerHoldings.t212(ctx) as? BrokerHoldings.Result.Ok)?.holdings ?: return ""
         val heldQty = holdings.groupBy { it.ticker.uppercase() }.mapValues { (_, v) -> v.sumOf { it.qty } }
@@ -279,6 +291,7 @@ object T212HandSales {
         val ownIds: Set<Long> by lazy {
             val s = HashSet<Long>()
             try { T212LiveStore.load(ctx).trades.forEach { s.addAll(it.allBuyIds()); s.addAll(it.allSellIds()) } } catch (_: Exception) {}
+            try { FloorLiveStore.load(ctx).rows.forEach { s.addAll(it.buyIds); s.addAll(it.sellIds) } } catch (_: Exception) {}
             try { com.signalscope.app.data.T212TargetStore.load(ctx).targets.forEach {
                 if (it.orderId > 0L) s.add(it.orderId); it.prevIds?.let { ids -> s.addAll(ids) } } } catch (_: Exception) {}
             try { com.signalscope.app.data.T212ExitGuardStore.load(ctx).guards.forEach {
@@ -290,20 +303,39 @@ object T212HandSales {
                 as? Trading212Client.T212Result.Success)?.data
         }
         var absorbed = 0
-        for ((tk, rows) in byTicker) {
+        for (tk in tickers) {
             val key = "part|$tk"
-            val managed = rows.sumOf { ownQty(it) }
+            val rows = byTicker[tk].orEmpty()
+            val floorAll = floorBy[tk].orEmpty()
+            val floor = floorAll.filter { it.status == FloorLiveStore.OPEN && it.qty > 0.0 }
+            val t212Managed = rows.sumOf { ownQty(it) }
+            val managed = t212Managed + floor.sumOf { it.qty }
             val held = heldQty[tk] ?: 0.0
             val short = managed - held
             val tol = maxOf(1e-4, managed * 0.005)
             if (short <= tol) { p.edit().remove(key).apply(); continue }
-            // GONE ENTIRELY is the full-sale checks' business (two reads half an hour
-            // apart). Marked all the same, so the ledger check stays quiet while they work.
-            if (held <= 0.0) { if (p.getLong(key, 0L) == 0L) p.edit().putLong(key, now).apply(); continue }
             // HANDS OFF while anything could still be moving these shares, or a buy
             // may simply not be in the holdings list yet.
-            if (tk in moving || rows.any { "${it.ns}|${it.paperTradeId}" in selling } ||
-                rows.any { it.buyAt > 0L && now - it.buyAt < SETTLE_MS }) continue
+            val busy = tk in moving || rows.any { "${it.ns}|${it.paperTradeId}" in selling } ||
+                floorAll.any { it.status != FloorLiveStore.OPEN } ||
+                rows.any { it.buyAt > 0L && now - it.buyAt < SETTLE_MS } ||
+                floor.any { it.buyAt > 0L && now - it.buyAt < SETTLE_MS }
+            // GONE ENTIRELY is the full-sale checks' business (two reads half an hour
+            // apart). Marked all the same, so the ledger check stays quiet while they work.
+            // Those checks never see the built-in algos' rows, so theirs close here,
+            // on the same evidence: gone on reads at least half an hour apart.
+            if (held <= 0.0) {
+                val first = p.getLong(key, 0L)
+                if (first == 0L) p.edit().putLong(key, now).apply()
+                else if (floor.isNotEmpty() && !busy && now - first >= ABSENT_CONFIRM_MS) {
+                    val gone = SellGuard.ifIdle(floor.first().ticker) {
+                        takeFromFloor(ctx, floorAllocate(floor, floor.sumOf { it.qty }), 0.0, now, "gone from the account")
+                    }
+                    if (gone != null) Log.w(TAG, "$tk: gone from the account — the built-in algos' positions closed as sold by you")
+                }
+                continue
+            }
+            if (busy) continue
             val first = p.getLong(key, 0L)
             if (first == 0L) {
                 p.edit().putLong(key, now).apply()
@@ -313,31 +345,79 @@ object T212HandSales {
             }
             if (now - first < PART_CONFIRM_MS) continue
             // WHAT IT SOLD FOR, when the broker's record shows sales the app did not make.
-            val since = rows.minOf { it.buyAt }
+            val since = (rows.map { it.buyAt } + floor.map { it.buyAt }).minOrNull() ?: 0L
+            val tkr = rows.firstOrNull()?.t212Ticker ?: floor.first().ticker
             val yours = history?.filter {
-                it.ticker.equals(rows.first().t212Ticker, true) && it.side.equals("SELL", true) &&
+                it.ticker.equals(tkr, true) && it.side.equals("SELL", true) &&
                     it.filledQuantity > 0.0 && it.fillPrice > 0.0 && it.orderId !in ownIds &&
                     executedAfter(it.dateExecuted, since)
             }.orEmpty()
             val px = if (yours.isEmpty()) 0.0
                      else yours.sumOf { it.fillPrice * it.filledQuantity } / yours.sumOf { it.filledQuantity }
-            val notes = SellGuard.ifIdle(rows.first().t212Ticker) {
-                allocate(rows, short).map { cut ->
+            val notes = SellGuard.ifIdle(tkr) {
+                allocate(rows, minOf(short, t212Managed)).map { cut ->
                     if (cut.whole) closeYours(ctx, cut.row, yours.map { it.orderId }, px, now)
                     else trim(ctx, cut.row, cut.qty, "a sale at Trading 212")
-                }
+                } + takeFromFloor(ctx, floorAllocate(floor, short - t212Managed), px, now, "a sale at Trading 212")
             } ?: continue                                   // a sale holds this stock right now
             p.edit().remove(key).apply()
             absorbed++
             Log.w(TAG, "$tk: ${"%.4f".format(short)} sold by you at Trading 212 — taken off the app's " +
                 "positions" + (if (px > 0.0) " at $px" else ""))
             try {
-                LabNotifier.partSoldOutsideApp(ctx, rows.first().ns, rows.first().symbol, short, px,
+                val ns0 = rows.firstOrNull()?.ns ?: floor.first().ns
+                LabNotifier.partSoldOutsideApp(ctx, ns0, rows.firstOrNull()?.symbol ?: floor.first().symbol, short, px,
                     notes.filter { it.isNotBlank() }.joinToString(" "),
-                    if (Spaces.baseOf(rows.first().ns) == "de") "EUR" else "USD")
+                    if (Spaces.baseOf(ns0) == "de") "EUR" else "USD")
             } catch (_: Exception) {}
         }
         return if (absorbed > 0) "✋ $absorbed part-sold outside the app, taken off" else ""
+    }
+
+    // ── THE GERMAN BUILT-IN ALGOS' REAL SHARES ──────────────────────────────────
+    // Kept in their own record, so a sale of yours that reached them was never
+    // taken off: the app went on counting shares that were gone (2 Nov 2026).
+    // They come LAST in [saleOrder]'s terms — after your watchlist and the other
+    // algos — and oldest first among themselves.
+
+    /** This stock's built-in algo rows holding shares and not mid-buy or mid-sale. */
+    private fun floorOpen(ctx: Context, ticker: String): List<FloorLiveStore.Row> = try {
+        FloorLiveStore.load(ctx).rows.filter {
+            it.status == FloorLiveStore.OPEN && it.qty > 0.0 && it.ticker.equals(ticker, true)
+        }
+    } catch (e: Exception) { emptyList() }
+
+    /** How [sold] shares fall across built-in algo rows, oldest first. Pure. */
+    internal fun floorAllocate(rows: List<FloorLiveStore.Row>, sold: Double): List<Pair<FloorLiveStore.Row, Double>> {
+        if (sold <= 0.0) return emptyList()
+        val tol = maxOf(1e-4, rows.sumOf { it.qty } * 0.005)
+        val out = ArrayList<Pair<FloorLiveStore.Row, Double>>()
+        var left = sold
+        for (r in rows.sortedBy { it.buyAt }) {
+            if (left <= tol) break
+            if (r.qty <= 0.0) continue
+            val q = if (left >= r.qty - tol) r.qty else left
+            out += r to q
+            left -= q
+        }
+        return out
+    }
+
+    /** Takes each cut off its row: a row used up closes as sold by you, the rest
+     *  keep their remainder. Its paper trade carries on; the row will not re-buy. */
+    private fun takeFromFloor(ctx: Context, cuts: List<Pair<FloorLiveStore.Row, Double>>,
+                              px: Double, now: Long, how: String): List<String> = cuts.map { (r, q) ->
+        val whole = q >= r.qty - maxOf(1e-4, r.qty * 0.005)
+        val who = ShareOwners.nameOf(ctx, r.ns)
+        FloorLiveStore.update(ctx, r.ns, r.tradeId) {
+            if (whole) it.copy(status = FloorLiveStore.CLOSED, qty = 0.0, soldQty = it.soldQty + it.qty,
+                exitPrice = if (px > 0.0) px else it.exitPrice, sellAt = now, exitReason = REASON,
+                note = "sold by you ($how)")
+            else it.copy(qty = it.qty - q, soldQty = it.soldQty + q,
+                note = "${"%.4f".format(q)} sold by you ($how)")
+        }
+        Log.w(TAG, "[${r.ns}] ${r.symbol} ${"%.4f".format(q)} sold by you ($how)" + (if (whole) " — position closed" else ""))
+        if (whole) "$who's ${r.symbol} position is closed." else "$who keeps ${"%.4f".format(r.qty - q)} ${r.symbol}."
     }
 
     /** One position used up entirely by a sale of yours at Trading 212. */
@@ -406,6 +486,7 @@ object T212HandSales {
         val ownIds: Set<Long> by lazy {
             val s = HashSet<Long>()
             try { T212LiveStore.load(ctx).trades.forEach { s.addAll(it.allBuyIds()); s.addAll(it.allSellIds()) } } catch (_: Exception) {}
+            try { FloorLiveStore.load(ctx).rows.forEach { s.addAll(it.buyIds); s.addAll(it.sellIds) } } catch (_: Exception) {}
             try { com.signalscope.app.data.T212TargetStore.load(ctx).targets.forEach {
                 if (it.orderId > 0L) s.add(it.orderId); it.prevIds?.let { ids -> s.addAll(ids) } } } catch (_: Exception) {}
             try { com.signalscope.app.data.T212ExitGuardStore.load(ctx).guards.forEach {

@@ -47,6 +47,23 @@ object FloorOrders {
         (week != null && week != 1) || (day != null && day != 1)
 
     /**
+     * Monthly closes, oldest first, finished months only: the month [today] falls
+     * in is left out — a half month is not a month. Pure — tested.
+     */
+    fun completedMonths(bars: List<com.signalscope.app.data.CandleData>, today: LocalDate): DoubleArray {
+        val now = java.time.YearMonth.from(today)
+        val out = TreeMap<java.time.YearMonth, Double>()
+        for (b in bars.sortedBy { it.timestamp }) {
+            if (!(b.close > 0.0) || !b.close.isFinite()) continue
+            // A monthly bar is stamped at its month's first day; a few hours of
+            // time zone either side must not move it into the month before.
+            val ym = java.time.YearMonth.from(Instant.ofEpochSecond(b.timestamp + 12 * 3600L).atZone(java.time.ZoneOffset.UTC))
+            if (ym < now) out[ym] = b.close
+        }
+        return out.values.toDoubleArray()
+    }
+
+    /**
      * Weekly closes from daily bars, oldest first: each finished week's last
      * close. Only days before [today] count, and the week [today] falls in is
      * left out — on a Wednesday, Monday and Tuesday are half a week.

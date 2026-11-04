@@ -209,7 +209,18 @@ object T212LiveStore {
          * Boolean, so a row written before this existed deserializes to false and
          * simply announces itself once on its next park — the harmless direction.
          */
-        val parkedForOpen: Boolean = false
+        val parkedForOpen: Boolean = false,
+        /**
+         * The RV gate's two-hour alert was sent for the hold that began at this
+         * time — the [rvSince] it was told for; 0 = not yet. A held sale that then
+         * fails to sell comes back every pass with the same hold still timed out,
+         * and without this said "started after 2 hours" each time (S92, 23 Oct).
+         */
+        val rvTimeoutToldFor: Long = 0L,
+        /** When this position's "sale did not go through" alert was sent; 0 = never.
+         *  Once per position: later failures only update [error], which the
+         *  waiting-orders list shows. */
+        val sellFailToldAt: Long = 0L
     ) {
         /** Every buy rung, tolerating rows written before [buyOrderIds] existed. */
         fun allBuyIds(): List<Long> =
@@ -430,7 +441,9 @@ object T212LiveStore {
             .filter { it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING" }
             .filter { it.t212Ticker.equals(t212Ticker, true) }
             .filterNot { it.ns == selfNs && it.paperTradeId == selfId }
-            .sumOf { if (it.liveQtyFilled > 0.0) it.liveQtyFilled else it.qty }
+            .sumOf { if (it.liveQtyFilled > 0.0) it.liveQtyFilled else it.qty } +
+            // The built-in algos' real positions share the account — see FloorLiveStore.
+            FloorLiveStore.claimsQty(ctx, t212Ticker, selfNs, selfId)
 
     fun reset(ctx: Context): State { val s = State(); save(ctx, s); return s }
 }

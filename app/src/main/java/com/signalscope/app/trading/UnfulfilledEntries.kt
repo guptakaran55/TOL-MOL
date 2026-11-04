@@ -27,6 +27,14 @@ import java.io.File
  * it, the strategy's exits — so the record shows what the miss cost (or saved):
  * "+2.8% so far, still open", or "+5.4%, closed 22 Oct · MACD slope flipped".
  *
+ * NEVER SENT COUNTS TOO (23 Oct). A buy the app declined to send while the algo
+ * WAS armed for the name — the price feed stale on that pass, the signal found on
+ * an older bar, or first seen after its bar had been checked — left the paper
+ * position holding a seat with nothing at the broker, exactly like a failed one:
+ * GFT sat in B_Conservative from 21 Oct "not mirrored". Those are taken out too,
+ * with the decline as the reason. Declines that mean the name was never meant to
+ * be real — the algo not armed, the name not on its real-money list — are not.
+ *
  * Only algos with seats lose the paper position: in one without, a paper trade
  * blocks nothing, so it stays in the book and is listed here all the same.
  * The watchlist's own buys are left out — no seat is involved.
@@ -98,6 +106,30 @@ object UnfulfilledEntries {
 
     private fun isWatcher(ns: String) = Spaces.bucketIdOf(ns) == ManualWatchStore.ID
 
+    /** A paper entry the real account never got — what [record] writes down. */
+    internal data class Miss(
+        val ns: String, val paperTradeId: String, val symbol: String, val ticker: String,
+        val signalPrice: Double, val amount: Double, val decidedAt: Long, val reason: String)
+
+    private fun missOf(r: T212LiveStore.LiveTrade) = Miss(r.ns, r.paperTradeId, r.symbol, r.t212Ticker,
+        r.paperEntryPrice, r.amount, r.buyAt, r.error.ifBlank { "the real buy did not fill" })
+
+    private val MISSED_WHILE_ARMED = listOf(
+        "the price feed was stale", "signal came from an older bar", "this signal was first seen after")
+
+    /**
+     * A decline that is a MISS: the app chose not to send an order the armed algo
+     * would otherwise have placed. Not one that means the name was never meant to
+     * be real (algo unarmed, name not on its list, no credentials). Pure — tested.
+     */
+    internal fun missedWhileArmed(reason: String): Boolean =
+        MISSED_WHILE_ARMED.any { reason.trim().startsWith(it, ignoreCase = true) }
+
+    /** The decline's first sentence — the rest promised a "next fresh signal"
+     *  that can no longer happen once the trade has left the book. Pure. */
+    internal fun shortReason(reason: String): String =
+        reason.trim().substringBefore(". ").removeSuffix(".")
+
     /**
      * Algo buys whose real order failed for good and that are not listed yet: a
      * finished failure (not still being retried), no share ever bought, attempted
@@ -136,10 +168,35 @@ object UnfulfilledEntries {
                     Log.w(TAG, "[${r.ns}] ${r.symbol}: the buy is marked failed but the account holds shares — left alone")
                     continue
                 }
-                val row = record(ctx, r, now) ?: continue
+                val row = record(ctx, missOf(r), now) ?: continue
                 upsert(ctx, row)
                 moved++
                 Log.w(TAG, "[${r.ns}] ${r.symbol} unfulfilled (${r.error.take(80)}) — ${row.paperWas}" +
+                    (row.seatTo?.let { ", seat → $it" } ?: ""))
+            }
+        }
+        // ── BUYS NEVER SENT, though the algo was armed for the name ──────────
+        // Only while it still is (a name taken off the list since is left alone),
+        // and only with no live row at all — a sent order is the path above.
+        val armed = listOf("de", "us").flatMap { sp ->
+            try { com.signalscope.app.data.BucketStore.list(ctx, sp).filter { it.live }.map { it.ns } }
+            catch (e: Exception) { emptyList() }
+        }
+        for (ns in armed) {
+            val skips = try { com.signalscope.app.data.LiveSkipStore.skipsFor(ctx, ns) } catch (e: Exception) { emptyList() }
+            for (sk in skips) {
+                if (!missedWhileArmed(sk.reason)) continue
+                if (sk.at <= 0L || now - sk.at < SETTLE_MS || now - sk.at > WINDOW_MS) continue
+                if ("$ns|${sk.paperTradeId}" in have) continue
+                if (T212LiveStore.get(ctx, sk.paperTradeId, ns) != null) continue
+                if (!T212LiveMirror.realOrdersExpected(ctx, ns, sk.symbol)) continue
+                val paper = StrategyLabStore.load(ctx, ns).trades.firstOrNull { it.id == sk.paperTradeId }
+                val row = record(ctx, Miss(ns, sk.paperTradeId, sk.symbol.uppercase(), "",
+                    paper?.entryPrice ?: 0.0, T212LiveMirror.perTradeFor(ctx, ns), sk.at,
+                    "no real order was placed: " + shortReason(sk.reason)), now) ?: continue
+                upsert(ctx, row)
+                moved++
+                Log.w(TAG, "[$ns] ${sk.symbol} unfulfilled — never sent (${sk.reason.take(60)}) — ${row.paperWas}" +
                     (row.seatTo?.let { ", seat → $it" } ?: ""))
             }
         }
@@ -152,8 +209,8 @@ object UnfulfilledEntries {
             if (followed > 0) "$followed followed up" else null).joinToString(", ")
     }
 
-    /** Write one failed buy down — and, in a seat algo, free its seat. Null to try again next pass. */
-    private fun record(ctx: Context, r: T212LiveStore.LiveTrade, now: Long): Row? {
+    /** Write one missed buy down — and, in a seat algo, free its seat. Null to try again next pass. */
+    private fun record(ctx: Context, r: Miss, now: Long): Row? {
         val lab = StrategyLabStore.load(ctx, r.ns)
         val paper = lab.trades.firstOrNull { it.id == r.paperTradeId }
         val seats = try { MacdGateStore.load(ctx, r.ns).enabled } catch (e: Exception) { false }
@@ -165,7 +222,9 @@ object UnfulfilledEntries {
                 val ok = StrategyLabRunner.withAlgoHeld(r.ns, 60_000L) {
                     StrategyLabStore.unenroll(ctx, r.symbol, r.ns)
                     seatTo = try {
-                        MacdGateEngine.handOn(ctx, r.ns, r.symbol, "real buy failed — moved to Unfulfilled")
+                        MacdGateEngine.handOn(ctx, r.ns, r.symbol,
+                            (if (r.reason.startsWith("no real order")) "real buy never placed"
+                             else "real buy failed") + " — moved to Unfulfilled")
                     } catch (e: Exception) { null }
                     true
                 } ?: return null   // the algo is mid-pass; next time
@@ -176,10 +235,10 @@ object UnfulfilledEntries {
             else -> "already out of the book"
         }
         val base = Row(
-            key = "${r.ns}|${r.paperTradeId}", ns = r.ns, symbol = r.symbol, ticker = r.t212Ticker,
+            key = "${r.ns}|${r.paperTradeId}", ns = r.ns, symbol = r.symbol, ticker = r.ticker,
             paperTradeId = r.paperTradeId, entryTs = entryTsOf(r.paperTradeId),
-            signalPrice = r.paperEntryPrice, amount = r.amount, decidedAt = r.buyAt,
-            reason = r.error.ifBlank { "the real buy did not fill" }, recordedAt = now,
+            signalPrice = r.signalPrice, amount = r.amount, decidedAt = r.decidedAt,
+            reason = r.reason, recordedAt = now,
             paperWas = paperWas, seatTo = seatTo)
         // A paper trade still in the book already says what it made.
         return if (paper != null && paperWas != "taken out of the book") fromPaper(base, paper, now) else base

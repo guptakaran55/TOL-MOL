@@ -79,5 +79,38 @@ class WideLowsTest {
         assertEquals(5, lv.weekDays)
         assertEquals(85.0, lv.monthLow, 1e-9)
         assertEquals(21, lv.monthDays)
+        // 25 days is nowhere near a year: no 1-year low is claimed.
+        assertEquals(0.0, lv.yearLow, 1e-9)
+    }
+
+    // ── THE 1-YEAR LOW (asked for 21 Oct 2026) ──
+
+    @Test fun `at its 52-week low it is the deepest of the four`() {
+        val lv = levels(s = 70.0 to 74.0, w = 70.0 to 80.0, m = 70.0 to 95.0)
+            .copy(yearLow = 70.0, yearHigh = 140.0, yearDays = 252, yearVisits = 1)
+        val hits = IntradayLevels.floorsHit(lv, 70.2)
+        assertEquals(listOf("3d", "1w", "1m", "1y"), hits.map { it.scale })
+        assertEquals("1-year", hits.last().label)
+    }
+
+    @Test fun `low for the month but nowhere near the year's low`() {
+        val lv = levels(s = 90.0 to 94.0, w = 90.0 to 100.0, m = 90.0 to 110.0)
+            .copy(yearLow = 60.0, yearHigh = 140.0, yearDays = 252, yearVisits = 1)
+        assertEquals(listOf("3d", "1w", "1m"), IntradayLevels.floorsHit(lv, 90.2).map { it.scale })
+    }
+
+    @Test fun `a year is read from the same bars when they reach back that far`() {
+        // 300 trading days of daily bars; the lowest point 200 days ago, an older
+        // and lower one 290 days ago that lies outside the year.
+        val bars = ArrayList<CandleData>()
+        val day0 = 1_770_000_000L / 86_400L
+        for (d in 0 until 300) {
+            val low = when (d) { 10 -> 40.0; 100 -> 55.0; else -> 70.0 + (d % 5) }
+            bars.add(CandleData((day0 + d) * 86_400L, 80.0, 90.0 + (d % 3), low, 85.0, 1000))
+        }
+        val lv = IntradayLevels.from("SAP", bars, 1440)
+        assertNotNull(lv); lv!!
+        assertEquals(55.0, lv.yearLow, 1e-9)
+        assertEquals(252, lv.yearDays)
     }
 }

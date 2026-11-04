@@ -265,8 +265,12 @@ object StrategyLabRunner {
                 // forever and the drag metric can never acquire a sample.
                 if (Spaces.baseOf(ns) == "de" || Spaces.baseOf(ns) == "us") {
                     try {
-                        val n = T212LiveMirror.reconcileFills(ctx)
+                        // Every algo's pass gets here at once; one read a minute serves them all.
+                        val n = T212LiveMirror.reconcileFills(ctx, maxAgeMs = 60_000L)
                         if (n > 0) Log.i(TAG, "[$ns] backfilled real fills for $n trade(s)")
+                        // Sales closed without a price at all — see the function.
+                        val p = T212LiveMirror.backfillExitPrices(ctx)
+                        if (p > 0) Log.i(TAG, "[$ns] priced $p sale(s) closed without one")
                     } catch (e: Exception) { Log.w(TAG, "t212 fill reconcile failed", e) }
                     // POSITION RECONCILIATION. Also read-only, and skipped entirely
                     // when no live row is open — with nothing mirrored there is
@@ -638,7 +642,8 @@ object StrategyLabRunner {
                     // Daily-MACD gate (3b): compound the slot; if the name was
                     // flagged and this was its natural close with the slope still
                     // ≤0, the slot releases and its capital migrates one-for-one.
-                    try { MacdGateEngine.onTradeClosed(ctx, ns, sym, t.pctReturn) }
+                    // This close is saved after the hook — say which trade it is.
+                    try { MacdGateEngine.onTradeClosed(ctx, ns, sym, t.pctReturn, closingEntryTs = t.entryTs) }
                     catch (e: Exception) { Log.w(TAG, "macd gate close hook failed", e) }
                 }
                 // "Newest bar only": compare entry/exit against the engine's own
@@ -768,10 +773,16 @@ object StrategyLabRunner {
                         // Exits reduce risk, so they are never withheld.
                         if (Spaces.isBucket(ns) &&
                             Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) {
+                            // Strategy exits switched off in the exits panel: the target,
+                            // trail and hard stop sell instead.
+                            if (!com.signalscope.app.data.ManualWatchStore.strategyExitsOn(ctx, ns))
+                                Log.i(TAG, "[$ns] $sym strategy exit not acted on — switched off (${t.exitReason})")
+                            else {
                             val out = T212LiveMirror.stopOutNow(ctx, ns, sym,
                                 t.exitReason.ifBlank { "strategy exit" },
                                 origin = "watchlist strategy exit")
                             if (!out.ok) Log.w(TAG, "[$ns] manual exit for $sym failed: ${out.error}")
+                            }
                         } else {
                             T212LiveMirror.mirrorExit(ctx, id, t, t212Space, ns)
                         }
@@ -796,7 +807,7 @@ object StrategyLabRunner {
                             else "signal came from an older bar, not the newest closed one — " +
                                  "catch-up entries stay on paper")
                     }
-                    if (newExit) {
+                    if (newExit && com.signalscope.app.data.ManualWatchStore.strategyExitsOn(ctx, ns)) {
                         ZerodhaLiveMirror.mirrorExit(ctx, id, t.symbol, t.exitPrice ?: 0.0, ns)
                     }
                 }
@@ -887,7 +898,16 @@ object StrategyLabRunner {
 
         // REAL STOP — after the ledger write, on the same bar-close clock the paper
         // stop uses. See [checkRealStop].
-        try { checkRealStop(ctx, ns, sym, cfg, candles.lastOrNull()?.close ?: 0.0, wmBar) }
+        //
+        // THE EXIT BAR'S CLOSE, NOT THE FEED BAR'S. This passed the last FEED bar —
+        // an hour on the 240/120 algos — while the paper stop, the spec it was
+        // built to (ANDROID_DUAL_STOP_SPEC §4) and the stop's two-year test
+        // (RESULTS_MATRIX_stop_fill, 19 Oct 2026) all judge it on the 2-hour close.
+        // The hourly check sold on dips the 2-hour close rides out, and late in the
+        // fall: VH2 and OHB, 30 Oct 2026, crossed their stops near 09:20 and were
+        // sold an hour later at the day's low. A gap far through the stop is still
+        // sold at once by the gap rule below.
+        try { checkRealStop(ctx, ns, sym, cfg, exitBarClose(candles, cfg, barSec) ?: 0.0, wmBar) }
         catch (e: Exception) { Log.w(TAG, "[$ns] $sym real-stop check failed", e) }
 
         // PRE-DECIDED GAP POLICY (point 2): if a live position is found gapped
@@ -1173,6 +1193,7 @@ object StrategyLabRunner {
                 Log.w(TAG, "[$ns] ${o.sym} orphan exit SUPPRESSED — ${v.note}")
                 continue
             }
+            if (!com.signalscope.app.data.ManualWatchStore.strategyExitsOn(ctx, ns)) continue
             Log.w(TAG, "[$ns] ${o.sym} orphan exit fires: ${v.reason} at ${"%.2f".format(v.price)}")
             try {
                 if (base == "in") {
@@ -1203,19 +1224,39 @@ object StrategyLabRunner {
         } catch (e: Exception) { Log.w(TAG, "[$ns] orphan note write failed", e) }
     }
 
+    /**
+     * The close of the last FINISHED exit-frame bar — the bar the strategy's own
+     * exits, its stop included, are judged on — built from the feed bars exactly
+     * as the engine builds them. Null when no exit bar has finished yet. Pure — tested.
+     */
+    internal fun exitBarClose(feed: List<CandleData>, cfg: StrategyLabConfig, feedSec: Long): Double? {
+        if (feed.isEmpty()) return null
+        val base = StrategyLabEngine.baseGranularitySec(feed)
+        val entryTf = StrategyLabEngine.clampTf(StrategyLabEngine.timeframeSeconds(cfg.resample), base)
+        val exitClamped = StrategyLabEngine.clampTf(StrategyLabEngine.timeframeSeconds(cfg.exitBars), base)
+        val exitTf = if (cfg.multiTimeframe && exitClamped in 1 until entryTf) exitClamped else entryTf
+        val complete = feed.maxOf { it.timestamp + feedSec }
+        return StrategyLabEngine.resample(feed, exitTf, complete, cfg.barAnchorSec).lastOrNull()?.close
+    }
+
     private fun checkRealStop(
         ctx: Context, ns: String, sym: String, cfg: StrategyLabConfig,
         lastClose: Double, barTs: Long
     ) {
-        if (!cfg.exit.stopLossEnabled || lastClose <= 0.0) return
+        if (lastClose <= 0.0) return
         val base = Spaces.baseOf(ns)
         if (base != "de" && base != "us") return
+        // On a watchlist the exits panel decides: on or off, and its size.
+        val w = if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID)
+            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (e: Exception) { null } else null
+        if (!(w?.hardStopOn ?: cfg.exit.stopLossEnabled)) return
+        val stopPct = w?.hardStopPct ?: cfg.exit.stopLossPct
         val row = com.signalscope.app.data.T212LiveStore.load(ctx).trades.firstOrNull {
             it.ns == ns && it.symbol.equals(sym, true) && it.status == "OPEN" && it.qty > 0.0
         } ?: return
         val paid = row.liveEntryPrice
         if (paid <= 0.0) return
-        val trigger = paid * (1 - cfg.exit.stopLossPct / 100.0)
+        val trigger = paid * (1 - stopPct / 100.0)
         if (lastClose > trigger) return
 
         // The paper trade this position belongs to, captured BEFORE the sell so the
@@ -1229,7 +1270,7 @@ object StrategyLabRunner {
         Log.w(TAG, "[$ns] REAL STOP $sym: close $lastClose ≤ $trigger (paid $paid) — " +
             "paper stop would be at $paperTrigger")
         val r = T212LiveMirror.stopOutNow(ctx, ns, sym,
-            "real stop -${cfg.exit.stopLossPct}% from fill",
+            "real stop -$stopPct% from fill",
             origin = "stop measured from what you actually paid")
         if (!r.ok) return   // still open; retried on the next bar close
 
@@ -2205,6 +2246,8 @@ object StrategyLabRunner {
         var closedAll = 0; var winsAll = 0; var traded = 0
         val per = ArrayList<PerSym>()
         val comps = ArrayList<Double>()
+        // Each name's daily closes and trades, for the equal-share account — see EqualShare.
+        val shares = ArrayList<EqualShare.Name>()
         // Progress on THIS path too. It was only wired into the 3b walk, so a
         // Manual/Monthly algo — which can still be replaying 100+ names — showed a
         // bare spinner with no counter and looked stuck next to a 3b algo's "9/106".
@@ -2235,6 +2278,8 @@ object StrategyLabRunner {
             winsAll += closed.count { it.pctReturn > 0 }
             if (closed.isNotEmpty()) traded++
             per.add(PerSym(sym, closed.size, compPct, ""))
+            val (dDays, dCloses) = GateBacktest.toDaily(candles)
+            shares.add(EqualShare.Name(dDays, dCloses, r.trades))
             try { Thread.sleep(120) } catch (_: InterruptedException) {}
         }
         budget.reason?.let { r ->
@@ -2242,6 +2287,22 @@ object StrategyLabRunner {
                 "Got through ${comps.size} of ${syms.size} names.")
         }
         if (comps.isEmpty()) return Hypothetical(false, "No symbol had enough usable history.")
+        // An equal share per name from one common start, valued daily — a yearly
+        // rate and a worst drop that mean something (26 Oct 2026).
+        EqualShare.run(shares)?.let { es ->
+            return Hypothetical(
+                ok = true, symbols = es.names, traded = traded,
+                closed = es.closed, wins = es.wins,
+                compoundedPct = es.growthPct, pnl = capital * es.growthPct / 100.0, capital = capital,
+                fromTs = es.fromDay * 86_400L, toTs = es.toDay * 86_400L,
+                spanDays = (es.toDay - es.fromDay).toDouble(),
+                interval = plan.interval, entryTf = cfg.resample,
+                exitTf = if (cfg.multiTimeframe) cfg.exitBars else cfg.resample,
+                perSymbol = per, layer = "equal_share",
+                cagrPct = es.cagrPct, maxDrawdownPct = es.maxDrawdownPct,
+                note = "each of the ${es.names} names an equal share from " +
+                    java.time.LocalDate.ofEpochDay(es.fromDay) + ", when the last of them has prices; never rebalanced")
+        }
         val portfolioPct = comps.average()
         val spanDays = if (last > first) (last - first) / 86_400.0 else 0.0
         return Hypothetical(

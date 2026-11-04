@@ -69,6 +69,19 @@ object FloorAlgoStore {
      * cost): +12.1%/yr against +10.2% for the same entry on the top-by-ROC list.
      */
     const val UNI_MONTHLY_LOW = "monthlylow"
+    /**
+     * YOUR PORTFOLIO AS THE LIST (the user's ask, 2 Nov 2026): the stocks you hold
+     * at the broker, read on every pass. A stock you buy joins; one you sell
+     * leaves, and its paper position is sold at the market. No seat limit worth
+     * the name — [PORTFOLIO_SEATS] — and the same paper money per stock.
+     */
+    const val UNI_PORTFOLIO = "portfolio"
+    const val PORTFOLIO_SEATS = 60
+    /** Paper money per stock: Zerodha's flat sale fee needs Indian trades bigger. */
+    fun portfolioPerStock(space: String): Double = if (space == "in") 10_000.0 else 100.0
+    /** What the "new algo" dialog sends for them. */
+    const val CREATE_PORT_FLOOR = "portfloor"
+    const val CREATE_PORT_MACD = "portmacd"
     /** What the "new algo" dialog sends for it; created as [KIND_MACD]. */
     const val CREATE_LOW_MACD = "lowmacd"
 
@@ -110,6 +123,15 @@ object FloorAlgoStore {
          * filter let through 0–6 stocks a day and sold dip buys the next morning).
          */
         val trendFilter: Boolean = false,
+        /**
+         * With the trend filter on: does a broken trend also SELL a held stock?
+         * Null = yes, as every algo did before this existed. False: the trend only
+         * picks what is bought; the stop, target and time limit do the selling.
+         * The two-year backtest of 24 Oct 2026 found the trend sale roughly halved
+         * a floor buy's result — the dip it buys usually turns the daily trend
+         * down, so the next morning sold it (after 1.6 days on average).
+         */
+        val trendExit: Boolean? = null,
         /**
          * Floor orders only: [MODE_DAY] — at the recent low, expiring at each
          * close; or [MODE_WEEK] — at the top of the weekly support zone, waiting
@@ -155,7 +177,14 @@ object FloorAlgoStore {
         val newsPerDay: Int = 12,
         /** Chains only: trading days a stock stays watched after its last touch of
          *  the monthly low; a half that has not bought by then never will. */
-        val watchDays: Int = 20
+        val watchDays: Int = 20,
+        // ── real money: German MACD turns only — see [com.signalscope.app.trading.FloorLive] ──
+        /** Real orders at Trading 212 alongside the paper ones. Off unless you switch it on. */
+        val liveOn: Boolean = false,
+        /** Euros for the real positions, spread evenly over the seats. */
+        val liveBudget: Double = 0.0,
+        /** When real money was switched on: only paper buys from then on are copied. */
+        val liveSince: Long = 0L
     )
 
     /** Half-spread to assume per market order when none is set: Germany sits
@@ -446,6 +475,11 @@ object FloorAlgoStore {
         /** News outlook verdicts by stock: "VERDICT|yyyy-mm-dd" — asked again after
          *  a few days, not on every pass. */
         val outlooks: Map<String, String> = emptyMap(),
+        /** Buys waiting for your Buy or Skip, and the answers given — see FloorAsks. */
+        val asks: List<Ask> = emptyList(),
+        /** The paper record set aside each time the algo started afresh for real money
+         *  — see [com.signalscope.app.trading.FloorLive.startAfresh]. Newest last. */
+        val paperLedgers: List<PaperLedger> = emptyList(),
         val orders: List<Order> = emptyList(),
         val trades: List<Trade> = emptyList(),
         val log: List<String> = emptyList(),
@@ -455,6 +489,41 @@ object FloorAlgoStore {
         /** Namespace form, so a notification can open this card like any algo's. */
         val ns: String get() = "${space}__$id"
     }
+
+    /** A buy the algo wants, waiting for your Buy or Skip — see [com.signalscope.app.trading.FloorAsks]. */
+    data class Ask(
+        /** The paper trade it becomes: "SYMBOL|day", or "<chain id>|A" / "|B". */
+        val id: String = "",
+        val symbol: String = "",
+        val name: String = "",
+        /** TURN — a MACD turn; CHAIN_A / CHAIN_B — a monthly-low chain's half. */
+        val kind: String = "",
+        val chainId: String = "",
+        val verdict: String = "",
+        /** The signal, in words. */
+        val what: String = "",
+        /** The exchange's day it was asked on. */
+        val day: String = "",
+        /** When the signal was seen, and the first bar a skipped one is followed from. */
+        val signalSec: Long = 0L,
+        val fromSec: Long = 0L,
+        /** The price when it was asked. */
+        val price: Double = 0.0,
+        val askedMs: Long = 0L,
+        /** WAITING · BUY · SKIP · NO_ANSWER · LATE */
+        val status: String = "WAITING",
+        val answeredMs: Long = 0L
+    )
+
+    /** One paper record set aside: every trade as it stood, open ones at their last price. */
+    data class PaperLedger(
+        val atMs: Long = 0L,
+        /** The first trade's day and the day it was set aside. */
+        val fromDay: String = "",
+        val toDay: String = "",
+        val why: String = "",
+        val trades: List<Trade> = emptyList()
+    )
 
     data class State(val algos: List<Algo> = emptyList())
 
@@ -525,7 +594,8 @@ object FloorAlgoStore {
 
     fun create(ctx: Context, space: String, name: String, kind: String = KIND_FLOOR): Algo {
         val lowMacd = kind == CREATE_LOW_MACD
-        val k = if (lowMacd) KIND_MACD
+        val portfolio = kind == CREATE_PORT_FLOOR || kind == CREATE_PORT_MACD
+        val k = if (lowMacd || kind == CREATE_PORT_MACD) KIND_MACD
                 else if (kind == KIND_MACD || kind == KIND_CAMPAIGN || kind == KIND_CHAIN) kind else KIND_FLOOR
         // A campaign's stop starts as the watcher's own trailing stop for this
         // market — the same unit and size — or two ATRs where none is set.
@@ -539,6 +609,10 @@ object FloorAlgoStore {
         else if (lowMacd) Settings(seats = 20, capital = 1000.0, universeMode = UNI_MONTHLY_LOW,
             useNews = true, newsPerDay = 12, watchDays = 20, stopPct = 4.0, targetPct = 7.0, holdDays = 10,
             trendFilter = false)
+        // On your portfolio: every stock you hold, the same money each, the
+        // German MACD turns algo's stop, target and time limit, no trend filter.
+        else if (portfolio) Settings(seats = PORTFOLIO_SEATS, capital = PORTFOLIO_SEATS * portfolioPerStock(space),
+            universeMode = UNI_PORTFOLIO, stopPct = 4.0, targetPct = 7.0, holdDays = 10, trendFilter = false)
         else if (k != KIND_CAMPAIGN) Settings() else try {
             val w = ManualWatchStore.load(ctx, space)
             if (w.trailPct > 0.0) Settings(stopPct = w.trailPct, stopUnit = (w.trailUnit ?: ManualWatchStore.TrailUnit.PCT).name)
@@ -546,12 +620,81 @@ object FloorAlgoStore {
         } catch (e: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
         val a = Algo(
             id = "f" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36),
-            name = name.trim().ifBlank { if (lowMacd) "AI low + MACD turns" else when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"
+            name = name.trim().ifBlank { if (portfolio) (if (k == KIND_MACD) "Portfolio · MACD swings" else "Portfolio · floor swings")
+                else if (lowMacd) "AI low + MACD turns" else when (k) { KIND_MACD -> "MACD turns"; KIND_CAMPAIGN -> "Campaigns"
                 KIND_CHAIN -> "Monthly-low chain"; else -> "Floor orders" } }.take(40),
             kind = k, space = space, createdAt = System.currentTimeMillis(), settings = settings,
             log = listOf(stamp() + " · created"))
         mutate(ctx) { it.copy(algos = it.algos + a) }
         return a
+    }
+
+    /**
+     * THE TWO MONTHLY-TREND FLOOR ALGOS (the user's ask, 24 Oct 2026), added once
+     * to the German space beside "Floor test · trend", which stays as it is. Both
+     * buy only when the monthly and daily MACD are rising and never sell on the
+     * trend; one sells by the stop, target and ten days, the other at the close of
+     * the third day, as the replay the floor orders came from did. In the two-year
+     * backtest these were the best two: +0.38% and +0.45% a buy. Deleting either
+     * is respected.
+     */
+    @Synchronized
+    fun ensureMonthTrendSeeded(ctx: Context) {
+        val marker = File(ctx.filesDir, "seeded_floor_month_trend.done")
+        if (marker.exists()) return
+        try {
+            val a = create(ctx, "de", "Floor · month trend · no trend sale", KIND_FLOOR)
+            update(ctx, a.id) { it.copy(settings = it.settings.copy(trendFilter = true, trendExit = false),
+                log = it.log + (stamp() + " · buys on the monthly and daily trend; sells by the stop, target or ten days — never on the trend")) }
+            val b = create(ctx, "de", "Floor · month trend · 3-day hold", KIND_FLOOR)
+            update(ctx, b.id) { it.copy(settings = it.settings.copy(trendFilter = true, trendExit = false,
+                holdDays = 3, stopPct = 0.0, targetPct = 0.0),
+                log = it.log + (stamp() + " · buys on the monthly and daily trend; sells at the close of the third day, nothing else")) }
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "monthly-trend seed failed", e) }
+    }
+
+    /** The two portfolio swing algos, added once to the German space (2 Nov 2026). */
+    fun ensurePortfolioSeeded(ctx: Context) {
+        val marker = File(ctx.filesDir, "seeded_portfolio_swings_de.done")
+        if (marker.exists()) return
+        try {
+            create(ctx, "de", "", CREATE_PORT_FLOOR)
+            create(ctx, "de", "", CREATE_PORT_MACD)
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "portfolio swing seed failed", e) }
+    }
+
+    /** Below this, an Indian paper algo measures Zerodha's flat fee, not its rules. */
+    const val INDIA_MIN_CAPITAL = 10_000.0
+    const val INDIA_RAISED_CAPITAL = 100_000.0
+
+    /** Does this algo trade at a size the fee swamps? Pure — tested. */
+    fun indiaTooSmall(a: Algo): Boolean =
+        a.space == "in" && (a.kind == KIND_FLOOR || a.kind == KIND_MACD) && a.settings.capital < INDIA_MIN_CAPITAL
+
+    /**
+     * INDIA'S ₹1,000 ALGOS RAISED TO ₹1,00,000, once (the user's ask, 26 Oct 2026).
+     * At ₹1,000 the ₹16 depository fee on each sale is 8–16% of an order: the
+     * backtests and the 💡 replays alike showed them wiped out by the fee alone.
+     * Trades already booked stay as they were; the old replay is dropped so the
+     * next one is run at the new size.
+     */
+    @Synchronized
+    fun ensureIndiaCapitalRaised(ctx: Context) {
+        val marker = File(ctx.filesDir, "india_floor_capital_raised.done")
+        if (marker.exists()) return
+        try {
+            for (a in list(ctx, "in").filter { indiaTooSmall(it) }) {
+                val was = a.settings.capital
+                update(ctx, a.id) { it.copy(settings = it.settings.copy(capital = INDIA_RAISED_CAPITAL),
+                    log = it.log + (stamp() + " · capital raised from ₹${"%,.0f".format(was)} to ₹1,00,000 — at " +
+                        "₹${"%,.0f".format(was)} the ₹16 fee on each sale was most of the result; trades booked before stay as they were")) }
+                WhatIfStore.remove(ctx, a.ns)
+                Log.i(TAG, "${a.name}: India capital ${was} → $INDIA_RAISED_CAPITAL")
+            }
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "India capital raise failed", e) }
     }
 
     fun update(ctx: Context, id: String, block: (Algo) -> Algo): Algo? {

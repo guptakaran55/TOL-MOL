@@ -177,6 +177,14 @@ class PositionWidget : AppWidgetProvider() {
                         if (img != null) v.setImageViewBitmap(TILE_IMG[i], img)
                     }
                 }
+                // NO PROTECTION — holdings of yours with no sell resting at the broker
+                // and no one in the app managing them. Always shown, whatever the tabs.
+                val bare = (s?.unprotected as List<String>?).orEmpty()
+                if (bare.isEmpty()) v.setViewVisibility(R.id.wp_unprot, View.GONE)
+                else {
+                    v.setViewVisibility(R.id.wp_unprot, View.VISIBLE)
+                    v.setTextViewText(R.id.wp_unprot, "⚠ No protection: " + bare.joinToString(" · "))
+                }
                 v.setOnClickPendingIntent(R.id.wp_root, open)
                 v.setOnClickPendingIntent(R.id.wp_refresh, refresh)
                 v.setTextViewText(R.id.wp_time, if (busy) "refreshing…" else s?.let {

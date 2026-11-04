@@ -27,6 +27,19 @@ class ZerodhaClient(private val config: ConfigManager) {
         private const val BASE_URL = "https://api.kite.trade"
         private const val JSON_TYPE = "application/json"
 
+        /**
+         * SHARES BOUGHT YESTERDAY ARE HELD. Zerodha's holdings list them apart, as
+         * "t1_quantity", until they settle; "quantity" is only what has settled. A
+         * buy read nothing on the day after it, so the app took it for sold: SAILIFE
+         * and PFOCUS (bought 27 Oct 2026) were written off on 28 Oct, WESTLIFE and
+         * ACMESOLAR (29 Oct) on 30 Oct — and the last two lost their stops to the
+         * stale-trigger cleanup that evening, with every share still in the account.
+         */
+        fun heldQty(o: com.google.gson.JsonObject): Int {
+            fun n(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asInt ?: 0
+            return n("quantity") + n("t1_quantity")
+        }
+
         // Custom DNS — prefer IPv4 (MIUI has flaky IPv6)
         private val ipv4PreferredDns = object : Dns {
             override fun lookup(hostname: String): List<java.net.InetAddress> {
@@ -273,7 +286,7 @@ class ZerodhaClient(private val config: ConfigManager) {
 
                 val holdings = rawData.mapNotNull { item ->
                     val obj = item.asJsonObject
-                    val qty = obj.get("quantity")?.asInt ?: 0
+                    val qty = heldQty(obj)
                     if (qty <= 0) return@mapNotNull null
 
                     val tradingSymbol = obj.get("tradingsymbol")?.asString ?: return@mapNotNull null
@@ -713,6 +726,38 @@ class ZerodhaClient(private val config: ConfigManager) {
             }
         } catch (e: Exception) {
             Log.w(TAG, "GTT $id status lookup failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * The order a FIRED trigger placed, from the trigger's own record — so the
+     * buy it made can be found by id among the fills, never guessed from the
+     * stock and the time. Null when it has not fired, Zerodha no longer keeps
+     * it, or the question could not be asked.
+     */
+    fun fetchGttOrderId(id: Long): String? {
+        if (!isConnected) return null
+        return try {
+            val req = Request.Builder()
+                .url("$BASE_URL/gtt/triggers/$id")
+                .get()
+                .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+                .build()
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                val j = try { JsonParser.parseString(body).asJsonObject } catch (e: Exception) { return null }
+                if (j.get("status")?.asString != "success") return null
+                val orders = j.getAsJsonObject("data")?.getAsJsonArray("orders") ?: return null
+                orders.firstNotNullOfOrNull { o ->
+                    try {
+                        o.asJsonObject.getAsJsonObject("result")?.getAsJsonObject("order_result")
+                            ?.get("order_id")?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() }
+                    } catch (e: Exception) { null }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "GTT $id order lookup failed: ${e.message}")
             null
         }
     }

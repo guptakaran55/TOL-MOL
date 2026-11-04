@@ -96,11 +96,43 @@ object NotificationLog {
         if (title.isEmpty() && text.isEmpty()) return
         val now = System.currentTimeMillis()
         val st = load(ctx)
+        val channel = n.channelId ?: ""
+        // The tray replaces a repeat by its id; the list must not stack it.
+        if (isRepeat(st.entries, title, text, channel, link, now)) return
         val e = Entry(key = now * 1000 + (st.entries.size % 1000), at = now, title = title, text = text,
-            channel = n.channelId ?: "", link = link)
+            channel = channel, link = link)
         val kept = (listOf(e) + st.entries).filter { now - it.at < KEEP_MS }.take(MAX)
         save(ctx, st.copy(entries = kept))
     }
+
+    /**
+     * The AI's verdict, added to the newest entry with this [title] once it
+     * arrives. The tray's alert is updated in place when the verdict comes in;
+     * without this the in-app list kept the alert as first posted, verdict-less.
+     */
+    @Synchronized
+    fun amend(ctx: Context, title: String, line: String) {
+        val st = load(ctx)
+        val t = title.trim()
+        val i = st.entries.indexOfFirst { it.title == t }
+        if (i < 0 || st.entries[i].text.startsWith(line)) return
+        save(ctx, st.copy(entries = st.entries.mapIndexed { j, e -> if (j == i) e.copy(text = line + "\n" + e.text) else e }))
+    }
+
+    /** How long the same words are one notification, not two. */
+    const val REPEAT_MS = 10 * 60_000L
+
+    /**
+     * The same notification again — same words, same place to go — within
+     * [REPEAT_MS]. TEAM, 23 Oct 2026: one sale, sixteen identical "TEAM sold"
+     * rows in four seconds. Pure — tested.
+     */
+    fun isRepeat(entries: List<Entry>, title: String, text: String, channel: String,
+                 link: Link?, now: Long): Boolean =
+        entries.any {
+            now - it.at in 0 until REPEAT_MS && it.title == title && it.text == text &&
+                it.channel == channel && it.link == link
+        }
 
     fun unread(ctx: Context): Int {
         val st = load(ctx)

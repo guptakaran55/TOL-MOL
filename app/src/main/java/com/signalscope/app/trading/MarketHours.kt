@@ -43,6 +43,38 @@ object MarketHours {
      *  that bar has finished trading; one without it may still be going. */
     fun lastBarStart(base: String): LocalTime? = sessionFor(base)?.close?.minusMinutes(15)
 
+    // ── WHEN A MARKET'S BACKGROUND WORK SLEEPS ───────────────────────────────
+    // The user's rule (31 Oct 2026): once the bars after the close are in, the app
+    // does nothing in the background for that market until it opens again. Before
+    // it, every 15-minute pass downloaded ~300 price histories — two years of
+    // hourly bars for every algo's stocks — round the clock and at weekends: about
+    // 850 MB and half the phone's battery on a Saturday, for prices that could not
+    // change. Crypto never sleeps.
+
+    /** Awake this long before the open — the morning plans and queued sales go first. */
+    const val WAKE_BEFORE_OPEN_MIN = 30L
+    /** Awake this long after the close — the last bars, delayed fifteen minutes on
+     *  Xetra, complete the day's 2- and 4-hour candles (about 18:00 in Germany). */
+    const val AWAKE_AFTER_CLOSE_MIN = 45L
+
+    /**
+     * Should this market's background work run now? Weekdays, from
+     * [WAKE_BEFORE_OPEN_MIN] before the open to [AWAKE_AFTER_CLOSE_MIN] after the
+     * close, by the exchange's own clock. Always true for a market without fixed
+     * hours (crypto). Public holidays are not known here: such a day runs as usual.
+     */
+    fun awake(base: String, nowMs: Long): Boolean {
+        val s = sessionFor(base) ?: return true
+        val t = Instant.ofEpochMilli(nowMs).atZone(s.zone)
+        if (t.dayOfWeek == DayOfWeek.SATURDAY || t.dayOfWeek == DayOfWeek.SUNDAY) return false
+        val lt = t.toLocalTime()
+        return !lt.isBefore(s.open.minusMinutes(WAKE_BEFORE_OPEN_MIN)) &&
+            !lt.isAfter(s.close.plusMinutes(AWAKE_AFTER_CLOSE_MIN))
+    }
+
+    /** Is any stock market's background work running now? */
+    fun anyStockAwake(nowMs: Long): Boolean = listOf("de", "us", "in").any { awake(it, nowMs) }
+
     /** Inside the regular session, weekdays, by the exchange's own clock. */
     fun isRegularSession(base: String, nowMs: Long): Boolean {
         val s = sessionFor(base) ?: return false

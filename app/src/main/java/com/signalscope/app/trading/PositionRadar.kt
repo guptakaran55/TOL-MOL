@@ -61,7 +61,10 @@ object PositionRadar {
         /** Who manages its exit and where its stop and target actually rest —
          *  the widget's second line: "watchlist · stop 80.12 checked by the app ·
          *  target 83.90 waiting at Trading 212". Blank when not worked out. */
-        val exitBy: String = ""
+        val exitBy: String = "",
+        /** Bought by hand with no sell resting at the broker and no one in the app
+         *  managing it: what it is worth. 0 = protected, or not yours. */
+        val unprotected: Double = 0.0
     ) {
         val gainPct: Double get() = if (paid > 0.0 && price > 0.0) (price / paid - 1.0) * 100.0 else 0.0
         val underPeakPct: Double get() = if (peak > 0.0 && price > 0.0) (1.0 - price / peak) * 100.0 else Double.NaN
@@ -113,7 +116,10 @@ object PositionRadar {
                        val full: List<String>? = null,
                        /** Every line again, with its market's flag and what manages its
                         *  exit — what the widget draws. Null on older summaries. */
-                       val rows: List<Row>? = null)
+                       val rows: List<Row>? = null,
+                       /** "AIR €387" for each holding of yours with nothing protecting it,
+                        *  largest first — the widget's warning line. Null on older summaries. */
+                       val unprotected: List<String>? = null)
 
     /** One widget row: the market's flag, the line, and who manages the exit —
      *  plus its market ("DE"/"US"/"IN"/"BN") and [Kind] name, which the widget's
@@ -186,8 +192,19 @@ object PositionRadar {
         val rows = ordered.map { (k, p) ->
             Row(flagOf(p.market), line(k, p), p.exitBy, marketCode(p.market), k.name)
         }
-        return Summary(headline, lines, ps.size, now, full = all, rows = rows)
+        return Summary(headline, lines, ps.size, now, full = all, rows = rows,
+            unprotected = unprotectedLine(ps))
     }
+
+    /** Smaller than this is dust — too little to be worth a line. */
+    fun dustFor(market: String): Double = if (market.equals("IN", true)) 2_000.0 else 20.0
+
+    /** Pure: "AIR €387" per unprotected holding of yours, largest first. */
+    fun unprotectedLine(ps: List<Pos>): List<String> =
+        ps.filter { it.unprotected >= dustFor(it.market) }.sortedByDescending { it.unprotected }.map {
+            val cur = when (it.market.uppercase()) { "DE" -> "€"; "IN" -> "₹"; else -> "$" }
+            "${it.symbol} $cur${"%.0f".format(it.unprotected)}"
+        }
 
     /** The latest summary in memory. Read through [latest] instead. */
     @Volatile private var cached: Summary? = null
@@ -285,8 +302,10 @@ object PositionRadar {
         val who = when {
             h.byHand -> "your own"
             isWatch -> "watchlist"
-            else -> "algo " + ((try { BucketStore.get(ctx, h.ns)?.name } catch (e: Exception) { null } ?: h.ns).trim())
+            else -> "algo " + ShareOwners.nameOf(ctx, h.ns).trim()
         }
+        // The German built-in algos sell on their own turn; no stop or target is theirs to show.
+        if (h.key.startsWith("floor|")) return "$who · sells on its own rules"
         val parts = arrayListOf(who)
         if (base == "in") {
             parts += if (h.gttStop > 0.0) "stop ${px(h.gttStop)} at Zerodha"
@@ -321,7 +340,9 @@ object PositionRadar {
                         *  own holdings list: what was paid, and what it is worth now. */
                        val byHand: Boolean = false, val brokerPrice: Double = 0.0,
                        /** Trading 212's instrument code, to find the orders resting on it. */
-                       val ticker: String = "")
+                       val ticker: String = "",
+                       /** Shares — known for a holding bought by hand. */
+                       val qty: Double = 0.0)
 
     private fun gather(ctx: Context, now: Long, priceMaxAgeMs: Long = 20 * 60_000L): List<Pos> {
         val held = ArrayList<Held>()
@@ -335,20 +356,33 @@ object PositionRadar {
                 if (it.buyAt > 0L) it.buyAt / 1000L else it.entryTs, it.paperTradeId,
                 ticker = it.t212Ticker))
         }
+        // ── The German built-in algos' real positions (their own record) ──────
+        // Missing here, each read as a holding of yours with nothing protecting it.
+        try {
+            com.signalscope.app.data.FloorLiveStore.load(ctx).rows
+                .filter { it.status == com.signalscope.app.data.FloorLiveStore.OPEN && it.qty > 0.0 && it.entryPrice > 0.0 }
+                .forEach {
+                    held.add(Held("floor|${it.ns}|${it.tradeId}", it.ns, it.symbol.uppercase(),
+                        it.entryPrice, it.paperPrice, it.buyAt / 1000L, it.tradeId, ticker = it.ticker))
+                }
+        } catch (e: Exception) { Log.w(TAG, "built-in algos unreadable", e) }
         // ── Zerodha: India ───────────────────────────────────────────────────
         val zRows = ZerodhaLiveStore.load(ctx).trades.filter {
             it.status == "OPEN" && it.qty > 0 && it.entryPrice > 0.0 && Spaces.isBucket(it.ns)
         }
-        if (zRows.isNotEmpty()) {
-            // Its stop and target rest AT THE BROKER, as the two sides of one
-            // trigger, so they are read from there — one call for all of them.
-            val triggers = try {
+        // Its stop and target rest AT THE BROKER, as the two sides of one trigger,
+        // so they are read from there — one call for all of them, and only when
+        // something in India needs it. Null = could not be read.
+        val zTriggers: List<ZerodhaClient.GttTrigger>? by lazy {
+            try {
                 val cfg = ConfigManager(ctx)
-                if (!cfg.isZerodhaConnected) emptyList()
+                if (!cfg.isZerodhaConnected) null
                 else (ZerodhaClient(cfg).fetchGttTriggers() as? ZerodhaClient.GttListResult.Success)
-                    ?.triggers.orEmpty()
-                    .filter { it.status == "active" && it.transactionType.equals("SELL", true) }
-            } catch (e: Exception) { Log.w(TAG, "Zerodha triggers unreadable", e); emptyList() }
+                    ?.triggers?.filter { it.status == "active" && it.transactionType.equals("SELL", true) }
+            } catch (e: Exception) { Log.w(TAG, "Zerodha triggers unreadable", e); null }
+        }
+        if (zRows.isNotEmpty()) {
+            val triggers = zTriggers.orEmpty()
             zRows.forEach { r ->
                 val g = triggers.firstOrNull { it.id == r.gttId }
                     ?: triggers.firstOrNull { it.tradingsymbol.equals(r.symbol, true) }
@@ -374,7 +408,8 @@ object PositionRadar {
                 .distinctBy { it.symbol.uppercase() }
                 .forEach { h ->
                     held.add(Held("hand|$space|${h.symbol.uppercase()}", space, h.symbol.uppercase(),
-                        h.avgCost, 0.0, 0L, "", byHand = true, brokerPrice = h.price, ticker = h.ticker))
+                        h.avgCost, 0.0, 0L, "", byHand = true, brokerPrice = h.price, ticker = h.ticker,
+                        qty = h.qty))
                 }
         }
         if (held.isEmpty()) { PositionPeakStore.save(ctx, emptyMap()); return emptyList() }
@@ -468,9 +503,17 @@ object PositionRadar {
                     target = ManualTakeProfit.tighterOf(target, it.price)
                 }
 
+            // YOURS WITH NOTHING ON IT (the user, 3 Nov 2026: AIR, the largest German
+            // holding, had no target and no stop for days, and only alerts said so).
+            // No sell resting at the broker; an unreadable Zerodha list claims nothing.
+            val bare = h.byHand && when (base) {
+                "in" -> zTriggers?.none { it.tradingsymbol.equals(h.symbol, true) } ?: false
+                else -> resting.none { h.ticker.isNotBlank() && it.ticker.equals(h.ticker, true) }
+            }
             out.add(Pos(h.key, h.symbol, base.uppercase(), h.paid, price, peak, target, stop,
                 staleSinceMs = if (current) 0L else (mark?.atMs ?: 0L), priceStale = !current,
-                exitBy = exitByOf(ctx, h, base, isWatch, stop, target, resting)))
+                exitBy = exitByOf(ctx, h, base, isWatch, stop, target, resting),
+                unprotected = if (bare && price > 0.0) h.qty * price else 0.0))
         }
         PositionPeakStore.save(ctx, nextPeaks)
         return withShortHighs(out)

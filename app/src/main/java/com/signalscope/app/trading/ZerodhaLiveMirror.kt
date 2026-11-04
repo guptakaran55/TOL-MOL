@@ -112,7 +112,8 @@ object ZerodhaLiveMirror {
         // Zerodha" is how these two paths drifted apart in the first place: the
         // manual side learned about limits, after-market orders and triggers, and
         // the algo side was left on the one order type the broker will not accept.
-        val perSeat = live.budget / live.seats
+        // The seat grows with the algo's real result, up to twice — see LiveSeats.
+        val perSeat = LiveSeats.perSeatFor(ctx, ns, live.budget, live.seats)
         val r = try {
             buyNowOrRest(ctx, ns, sym, perSeat, paperEntryPrice, paperTradeId)
         } catch (e: Exception) {
@@ -1237,8 +1238,18 @@ object ZerodhaLiveMirror {
             // as the fallback: a two-leg trigger needs an upper leg, and one set
             // far off does no harm where the range rule has nothing to offer.
             val tick = cfg.learnedTickSize(sym) ?: 0.05
+            // Your own buys take the named level — 1% under the week high, at least 3%
+            // up, else 4% (WeekTarget.levelRuleFor) — the algos keep the range rule.
+            val mine = Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID
             val range = try {
-                StrategyLabRunner.rangesBefore(ctx, ns, sym, System.currentTimeMillis() / 1000L)
+                if (mine) {
+                    val today = java.time.LocalDate.now(IndianSession.ZONE)
+                    val rule = WeekTarget.levelRuleFor("in", com.signalscope.app.data.ManualWatchStore.load(ctx, "in"))
+                    val bars = com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars("IN", listOf(sym.uppercase()), minBars = 10)
+                        .first[sym.uppercase()]?.filter { it.date.isBefore(today) }
+                    // Switched off: a two-leg trigger still needs an upper leg, so the planner's far one stands.
+                    rule?.let { WeekTarget.levelPlan(it, bars, entry, null, preExisting = false) }
+                } else StrategyLabRunner.rangesBefore(ctx, ns, sym, System.currentTimeMillis() / 1000L)
                     ?.let { WeekTarget.plan(it, entry, null, preExisting = false, minGapPct = WeekTarget.minGapFor("in")) }
             } catch (e: Exception) { null }
             val tgt = range?.takeIf { it.ok }?.let { Math.floor(it.price / tick + 1e-9) * tick }

@@ -238,6 +238,10 @@ object RvManualQueue {
      * the order is queued here and the page says so.
      * @return (queued, why, startsBy) — startsBy is the latest it will start.
      */
+    /** [submit]'s answer when a watchlist Buy has no signal standing to wait on.
+     *  Not a GO from the gate: the page must not announce a buy as started. */
+    const val NO_SIGNAL = "no entry signal standing to wait on"
+
     fun submit(ctx: Context, asked: Order): Triple<Boolean, String, Long> {
         // A WATCHLIST BUY IS A BUY ON ONE SIGNAL, so the signal is pinned now. The
         // buy re-checks it when it runs, and on intraday bars a signal is off the
@@ -249,7 +253,7 @@ object RvManualQueue {
             val ts = watchSignalTs(ctx, asked)
             if (ts == null) {
                 logAdd(ctx, logOf(asked, true, "not held", "no entry signal standing — the button answers at once"))
-                return Triple(false, "no entry signal standing to wait on", 0L)
+                return Triple(false, NO_SIGNAL, 0L)
             }
             asked.copy(signalTs = ts)
         } else asked
@@ -373,6 +377,14 @@ object RvManualQueue {
             Log.i(TAG, "${o.symbol} ${o.kind} released by the RV gate: ${gate.why}")
             val (result, fill) = try { run(ctx, config, o.copy(ticker = ticker)) }
                          catch (e: Exception) { Log.e(TAG, "${o.symbol} ${o.kind} failed", e); "failed: ${e.message}" to emptyMap() }
+            // NOTHING PLACED BECAUSE THE HOLDING COULD NOT BE READ (Trading 212 refusing
+            // too-frequent requests) is not an answer: back to waiting, tried again on the
+            // next look. NDX1, 4 Nov 2026, was dropped this way after the gate let it go.
+            if (result.contains(UNREAD) && MarketHours.isRegularSession(o.ns, System.currentTimeMillis())) {
+                update(ctx, o.id) { it.copy(status = "WAITING", why = "holding unreadable at Trading 212 — trying again") }
+                Log.w(TAG, "${o.symbol} ${o.kind}: holding unreadable — back to waiting")
+                continue
+            }
             update(ctx, o.id) { it.copy(status = "DONE", result = result) }
             jOutcome(ctx, jKey(o.id), result, fill)
             val heldMin = (System.currentTimeMillis() - maxOf(o.createdAt, RvGate.todayOpenMs(o.ns))) / 60_000L
@@ -434,6 +446,8 @@ object RvManualQueue {
      * and what filled for the record: quantity, price when the route reports one,
      * order ids when it reports those (the price can be looked up by them later).
      */
+    private const val UNREAD = "could not read your current holding"
+
     private fun run(ctx: Context, config: ConfigManager, o: Order): Pair<String, Map<String, Any?>> {
         val ys = o.yahooSymbol.ifBlank {
             com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(o.symbol, o.space)

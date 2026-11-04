@@ -52,6 +52,31 @@ class UnfulfilledEntriesTest {
         assertTrue(UnfulfilledEntries.failedForGood(listOf(row("PYPL", "ERROR", ns = "us__manual")), now, emptySet()).isEmpty())
     }
 
+    // GFT in B_Conservative, 21 Oct: armed for the name, but the order was never
+    // sent — the signal was first seen after its bar had been checked.
+    private val gftSkip = "this signal was first seen AFTER its bar had already been checked, so no real " +
+        "order was placed — buying then would mean a price the signal no longer describes. Usually the " +
+        "price feed delivered that bar late. It will trade for real on its next fresh signal."
+
+    @Test fun `an order the armed algo never sent is a miss`() {
+        assertTrue(UnfulfilledEntries.missedWhileArmed(gftSkip))
+        assertTrue(UnfulfilledEntries.missedWhileArmed("the price feed was stale on this pass — no real order placed"))
+        assertTrue(UnfulfilledEntries.missedWhileArmed(
+            "signal came from an older bar, not the newest closed one — catch-up entries stay on paper"))
+    }
+
+    @Test fun `a name never meant to be real is not`() {
+        assertTrue(!UnfulfilledEntries.missedWhileArmed("this algo is not armed for real money, or its budget is 0"))
+        assertTrue(!UnfulfilledEntries.missedWhileArmed("GFT is not in this algo's real-money list"))
+        assertTrue(!UnfulfilledEntries.missedWhileArmed("no Trading 212 credentials"))
+    }
+
+    @Test fun `the reason drops its promise of a next fresh signal`() {
+        assertEquals("this signal was first seen AFTER its bar had already been checked, so no real order " +
+            "was placed — buying then would mean a price the signal no longer describes",
+            UnfulfilledEntries.shortReason(gftSkip))
+    }
+
     @Test fun `the bar a trade was bought on comes from its id`() {
         assertEquals(1792072800L, UnfulfilledEntries.entryTsOf("ADN1-1792072800"))
         assertEquals(0L, UnfulfilledEntries.entryTsOf("broken"))

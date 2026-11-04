@@ -90,9 +90,9 @@ class WeekTargetTest {
     }
 
     @Test fun `too close everywhere - no target, and the minimum depends on fees`() {
-        // Month target 100.8 on a 100 fill: 0.8% clears the fee-free 0.5% but not US 5% or India's 1%.
+        // Month target 100.8 on a 100 fill: 0.8% clears the fee-free 0.5% but not US 5% or India's 3%.
         assertEquals(5.0, WeekTarget.minGapFor("us"), 0.0)
-        assertEquals(1.0, WeekTarget.minGapFor("in"), 0.0)
+        assertEquals(3.0, WeekTarget.minGapFor("in"), 0.0)
         assertEquals(0.5, WeekTarget.minGapFor("de"), 0.0)
         val rr = r(99.0, 100.5, 99.0, 101.0)   // month: 101 - 0.2 = 100.8
         val us = WeekTarget.plan(rr, 100.0, null, false, WeekTarget.minGapFor("us"))
@@ -248,5 +248,75 @@ class WeekTargetTest {
         assertEquals(0.38314882, q.first(), 0.0)
         assertTrue(q.all { it <= 0.38314882 })
         assertEquals(listOf(3.0), WeekTarget.qtyAttempts(3.0))
+    }
+
+    // ── the named levels (2 Nov 2026) ──
+    private fun days(n: Int, high: (Int) -> Double, low: (Int) -> Double = { high(it) - 2.0 }) =
+        (0 until n).map { com.signalscope.app.screener.DailyBar(java.time.LocalDate.of(2025, 1, 1).plusDays(it.toLong()),
+            close = high(it) - 1.0, high = high(it), low = low(it)) }
+
+    @Test fun `Germany - a tenth of the 3-month range under the 3-month high`() {
+        // 3-month high 60, low 40 over the last 63 days: target 60 - 2 = 58.
+        val bars = days(80, { if (it == 50) 60.0 else 50.0 }, { if (it == 70) 40.0 else 48.0 })
+        val p = WeekTarget.levelPlan(WeekTarget.levelRuleFor("de"), bars, 47.0, null, false)
+        assertEquals(58.0, p.price, 1e-9)
+        assertEquals("just under its 3-month high", p.label)
+        // Under 1% above the buy: no target — the stops sell.
+        assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("de"), bars, 57.8, null, false).ok)
+    }
+
+    @Test fun `US - 1 percent under the year high, at least 5 percent up`() {
+        val bars = days(260, { if (it == 30) 200.0 else 150.0 })
+        val p = WeekTarget.levelPlan(WeekTarget.levelRuleFor("us"), bars, 160.0, null, false)
+        assertEquals(198.0, p.price, 1e-9)
+        assertEquals("just under its year high", p.label)
+        assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("us"), bars, 190.0, null, false).ok)   // only +4.2%
+        // Not a year of history: no target rather than a guess.
+        assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("us"), bars.takeLast(100), 160.0, null, false).ok)
+    }
+
+    @Test fun `India - 1 percent under the week high, at least 3 percent up, else 4 percent`() {
+        val bars = days(30, { if (it == 27) 110.0 else 100.0 })
+        assertEquals(108.9, WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 100.0, null, false).price, 1e-9)
+        val near = WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 107.0, null, false)
+        assertEquals(111.28, near.price, 1e-9)                       // +4% of 107
+        assertEquals("fixed", near.kind)
+    }
+
+    @Test fun `a position already past its new target is left to you`() {
+        val bars = days(80, { if (it == 50) 60.0 else 50.0 }, { if (it == 70) 40.0 else 48.0 })
+        assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("de"), bars, 47.0, priceNow = 59.0, preExisting = true).ok)
+    }
+
+    @Test fun `the alerts name the level that sold it`() {
+        assertEquals("3-month target reached", LabNotifier.shortReason("reached its target of 58.00 (just under its 3-month high)"))
+        assertEquals("year target reached", LabNotifier.shortReason("reached its target of 198.00 (just under its year high)"))
+        assertEquals("week target reached", LabNotifier.shortReason("reached its target of 108.90 (just under its week high)"))
+        assertEquals("month target reached", LabNotifier.shortReason("reached its target of 50.30 (near its 1-month high)"))
+    }
+
+    @Test fun `the exits panel picks the level, how far under it and the minimum`() {
+        val st = com.signalscope.app.data.ManualWatchStore.State(targetLevel = "year", targetShade = "2pct", targetMinGapPct = 3.0)
+        val r = WeekTarget.levelRuleFor("de", st)!!
+        assertEquals("high1y", r.kind); assertEquals(2.0, r.underPct, 0.0); assertEquals(3.0, r.minGapPct, 0.0)
+        // Nothing set: the market's tested rule.
+        assertEquals(WeekTarget.levelRuleFor("de"), WeekTarget.levelRuleFor("de", com.signalscope.app.data.ManualWatchStore.State()))
+        // Switched off: no rule, and its own tag, so held targets come off.
+        assertNull(WeekTarget.levelRuleFor("us", com.signalscope.app.data.ManualWatchStore.State(targetOn = false)))
+        assertTrue(WeekTarget.levelSig(null) != WeekTarget.levelSig(WeekTarget.levelRuleFor("us")))
+        // Any change of a switch changes the tag.
+        assertTrue(WeekTarget.levelSig(r) != WeekTarget.levelSig(WeekTarget.levelRuleFor("de")))
+    }
+
+    @Test fun `next resistance - the nearest peak above the buy that still stands`() {
+        // Closes: a peak of 120 on day 40, a lower peak of 110 on day 80, then lower prices.
+        val bars = (0 until 260).map { i ->
+            val c = when (i) { 40 -> 120.0; 80 -> 110.0; else -> if (i < 40) 90.0 + i * 0.5 else 100.0 }
+            com.signalscope.app.screener.DailyBar(java.time.LocalDate.of(2025, 1, 1).plusDays(i.toLong()), close = c, high = c + 1, low = c - 1)
+        }
+        val rule = WeekTarget.levelRuleFor("de", com.signalscope.app.data.ManualWatchStore.State(targetLevel = "resistance", targetShade = "1pct"))!!
+        val p = WeekTarget.levelPlan(rule, bars, 100.0, null, false)
+        assertEquals(108.9, p.price, 1e-9)                       // 1% under the 110 peak
+        assertEquals("just under its next resistance", p.label)
     }
 }

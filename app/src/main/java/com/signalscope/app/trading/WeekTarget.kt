@@ -58,10 +58,21 @@ object WeekTarget {
      */
     const val MIN_GAP_PCT_US = 5.0
 
+    /**
+     * Indian delivery trades pay about 0.4% a round trip on ₹10,000 (securities
+     * tax both ways, stamp duty, the ₹15 depository charge on every sale), and
+     * 0.5–0.8% on smaller trades. The 30 round trips of Sep–Oct 2026, replayed with
+     * the same buys and −5% stop: targets of 2–3% did best, 4% next, 6% and wider
+     * worse at every step — but a target under 3% keeps too little after charges.
+     * Closer than this, the planner's own target (+4%) is used instead.
+     */
+    const val MIN_GAP_PCT_IN = 3.0
+
     /** The smallest worthwhile target for a market: "de", "us", "in"… */
     fun minGapFor(base: String): Double = when (base.lowercase()) {
         "de" -> MIN_GAP_PCT_FEE_FREE
         "us" -> MIN_GAP_PCT_US
+        "in" -> MIN_GAP_PCT_IN
         else -> MIN_GAP_PCT
     }
 
@@ -134,6 +145,12 @@ object WeekTarget {
             "month" -> "near its 1-month high"
             "monthpeak" -> "just under its last monthly peak"
             "monthzone" -> "its projected monthly resistance zone"
+            "high1w" -> "just under its week high"
+            "high1m" -> "just under its month high"
+            "resist" -> "just under its next resistance"
+            "high3m" -> "just under its 3-month high"
+            "high1y" -> "just under its year high"
+            "fixed" -> "a fixed gain over what you paid"
             "manual" -> "your own price"
             else -> "its target"
         }
@@ -142,6 +159,94 @@ object WeekTarget {
     /** Which rule version decided a stored target. A record without it was
      *  decided by the old week-high-only rule. */
     const val RULE = "range-v1"
+
+    // ── THE NAMED LEVELS (the user's choice, 2 Nov 2026) ──────────────────────
+    // Week high · month high · 3-month high · year high — the highest price of the
+    // chart span of the same name — and next resistance. A target sits just UNDER
+    // its level, so a rise that stalls a little short still sells (the user's point:
+    // "optimistically reached whenever the price goes near it"). For your own buys:
+    //   Germany  a tenth of the 3-month range under the 3-month high, at least 1% up;
+    //   US       1% under the year high, at least 5% up — the currency charge, twice;
+    //   India    1% under the week high, at least 3% up, else 4% up.
+    // Replayed 2 Nov 2026 on two years of buys near the monthly low (−4% stop, at most
+    // 60 trading days, each market's charges): Germany +0.48% a trade, reached by 20%
+    // (the month rule: +0.38%); US +0.66%, 12% (next resistance: +0.29%); India −0.46%
+    // (the month rule: −0.57%) — there the buys and the charges, not the target, decide.
+    // A tenth of the range suits three months; a year's range is so wide that a tenth
+    // of it costs (US: +0.50%), so the US and India use 1%.
+
+    /** Which rule version decided a stored target under the named levels. */
+    const val RULE_LEVELS = "levels-v1"
+
+    /** One market's rule: the level's span in trading days and how far under it. */
+    data class LevelRule(val kind: String, val name: String, val span: Int,
+                         val tenthOfRange: Boolean, val underPct: Double,
+                         val minGapPct: Double, val fallbackPct: Double)
+
+    fun levelRuleFor(base: String): LevelRule = when (base.lowercase()) {
+        "de" -> LevelRule("high3m", "3-month high", 63, tenthOfRange = true, underPct = 0.0, minGapPct = 1.0, fallbackPct = 0.0)
+        "us" -> LevelRule("high1y", "year high", 252, tenthOfRange = false, underPct = 1.0, minGapPct = 5.0, fallbackPct = 0.0)
+        else -> LevelRule("high1w", "week high", 5, tenthOfRange = false, underPct = 1.0, minGapPct = 3.0, fallbackPct = 4.0)
+    }
+
+    /** The market's rule as the exits panel has set it — null when the target is
+     *  switched off. Every unset switch falls back to [levelRuleFor]. */
+    fun levelRuleFor(base: String, s: com.signalscope.app.data.ManualWatchStore.State?): LevelRule? {
+        val d = levelRuleFor(base)
+        if (s?.targetOn == false) return null
+        val level = s?.targetLevel ?: when (d.kind) { "high3m" -> "3month"; "high1y" -> "year"; else -> "week" }
+        val shade = s?.targetShade ?: if (d.tenthOfRange) "tenth" else if (d.underPct == 2.0) "2pct" else "1pct"
+        val (kind, name, span) = when (level) {
+            "week" -> Triple("high1w", "week high", 5)
+            "month" -> Triple("high1m", "month high", 21)
+            "year" -> Triple("high1y", "year high", 252)
+            "resistance" -> Triple("resist", "next resistance", 252)
+            else -> Triple("high3m", "3-month high", 63)
+        }
+        return LevelRule(kind, name, span, tenthOfRange = shade == "tenth",
+            underPct = when (shade) { "1pct" -> 1.0; "2pct" -> 2.0; else -> 0.0 },
+            minGapPct = (s?.targetMinGapPct ?: d.minGapPct).coerceIn(0.0, 100.0), fallbackPct = d.fallbackPct)
+    }
+
+    /** The version tag a target decided under [rule] is stored with: a change of any
+     *  switch makes every held position's target be decided again. */
+    fun levelSig(rule: LevelRule?): String = if (rule == null) "$RULE_LEVELS|off"
+        else "$RULE_LEVELS|${rule.kind}|${rule.tenthOfRange}|${rule.underPct}|${rule.minGapPct}"
+
+    /**
+     * The target for a buy at [paid] under [rule], from daily bars that closed
+     * before the buy. A level under the minimum gap gives the fixed fallback where
+     * the market has one, else no target — the stops then do the selling.
+     */
+    fun levelPlan(rule: LevelRule, bars: List<com.signalscope.app.screener.DailyBar>?, paid: Double,
+                  priceNow: Double?, preExisting: Boolean): Plan {
+        if (!(paid > 0.0)) return Plan(0.0, "the fill price is not known yet")
+        if (bars == null || bars.size < (rule.span * 4) / 5)
+            return Plan(0.0, "there is not enough daily history from before the buy to find its ${rule.name}")
+        val w = bars.takeLast(rule.span)
+        val lo = w.minOf { it.low }
+        // Next resistance: the nearest monthly peak above the buy no close has passed since.
+        val hi = if (rule.kind == "resist") standingPeaks(bars).filter { it.close > paid }.minOfOrNull { it.close }
+            ?: return Plan(0.0, "no resistance above what you paid in the past year")
+            else w.maxOf { it.high }
+        if (!(hi > 0.0) || !hi.isFinite()) return Plan(0.0, "its ${rule.name} could not be read")
+        val px = floorCent(if (rule.tenthOfRange) hi - SHY_OF_HIGH * (hi - lo) else hi * (1.0 - rule.underPct / 100.0))
+        val gap = (px / paid - 1.0) * 100.0
+        val pick = when {
+            gap >= rule.minGapPct -> Plan(px, kind = rule.kind,
+                detail = "${rule.name} " + "%.2f".format(hi) + (if (rule.tenthOfRange) ", range " + "%.2f".format(lo) + "–" + "%.2f".format(hi)
+                    else ", less " + "%.0f".format(rule.underPct) + "%"))
+            rule.fallbackPct > 0.0 -> Plan(floorCent(paid * (1.0 + rule.fallbackPct / 100.0)), kind = "fixed",
+                detail = "its ${rule.name} target " + "%.2f".format(px) + " was under " + "%.0f".format(rule.minGapPct) +
+                    "% up, so +" + "%.0f".format(rule.fallbackPct) + "%")
+            else -> return Plan(0.0, "just under its ${rule.name} (" + "%.2f".format(px) + ") is only " +
+                "%.1f".format(gap) + "% above what you paid — under the " + "%.0f".format(rule.minGapPct) + "% minimum")
+        }
+        if (preExisting && priceNow != null && priceNow >= pick.price)
+            return Plan(0.0, "it was already above its target (" + "%.2f".format(pick.price) + ", " + pick.label +
+                ") when this rule was applied — left for you to decide")
+        return pick
+    }
 
     /**
      * WHERE IN ITS RANGES WAS IT BOUGHT — and so where to sell it.

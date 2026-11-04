@@ -85,7 +85,95 @@ object T212LiveMirror {
      *   and two alerts for one sale is the failure this whole change exists to fix.
      * @return how many trades gained a fill price.
      */
-    fun reconcileFills(ctx: Context, notifySettled: Boolean = true): Int {
+    /**
+     * A SALE CLOSED WITHOUT ITS PRICE, priced from the account's fill history.
+     *
+     * The sweep that finds a position's shares gone closes it without a price,
+     * and when the sale was an order the app had lost the id of, nothing ever
+     * came back for one: CDW, 27 Oct 2026, sold by its own safety stop at 160.50,
+     * the stop's id dropped, the real result missing from its seat and its card.
+     *
+     * THE ONE PLACE A FILL IS MATCHED WITHOUT ITS ORDER ID, and so held tight: only
+     * for a row with no price at all, and only when exactly one sale of that stock
+     * after the buy is the position's own share count (to half a percent — the
+     * fractional counts here are near unique) and is claimed by no other row.
+     * Anything less certain is left unpriced, as before.
+     * @return how many sales gained a price.
+     */
+    fun backfillExitPrices(ctx: Context): Int {
+        val now = System.currentTimeMillis()
+        // Every algo's pass calls this; one look per ten minutes serves them all.
+        synchronized(this) { if (now - backfillAt < 10 * 60_000L) return 0; backfillAt = now }
+        val all = T212LiveStore.load(ctx).trades
+        val rows = all.filter {
+            T212LiveStore.isT212Ns(it.ns) && it.status == "CLOSED" && it.liveExitPrice <= 0.0 &&
+                it.liveEntryPrice > 0.0 && it.buyAt > 0L && now - it.buyAt < BACKFILL_DAYS_MS
+        }
+        if (rows.isEmpty()) return 0
+        val fills = T212ClosedTrades.loadArchive(ctx).fills
+        if (fills.isEmpty()) return 0
+        val claimed = all.flatMap { it.allSellIds() }.toHashSet()
+        var n = 0
+        for (r in rows) {
+            val qty = if (r.liveQtyFilled > 0.0) r.liveQtyFilled else r.qty
+            val f = exitFillFor(fills, r.t212Ticker, r.buyAt, qty, claimed) ?: continue
+            claimed.add(f.orderId)
+            T212LiveStore.get(ctx, r.paperTradeId, r.ns)?.takeIf { it.liveExitPrice <= 0.0 }?.let { cur ->
+                T212LiveStore.upsert(ctx, cur.copy(
+                    sellOrderId = f.orderId,
+                    sellOrderIds = ((cur.sellOrderIds ?: emptyList()) + f.orderId).distinct(),
+                    liveExitPrice = f.fillPrice, liveExitQty = f.filledQuantity,
+                    sellAt = epochOf(f.dateExecuted).takeIf { it > 0L } ?: cur.sellAt,
+                    exitReasonNote = listOfNotNull(cur.exitReasonNote?.takeIf { it.isNotBlank() },
+                        "sold at ${"%.2f".format(f.fillPrice)} — the price found in Trading 212's " +
+                            "history after the position had been closed without it").joinToString("; ")))
+                n++
+                Log.w(TAG, "[${r.ns}] ${r.symbol} sale priced from the history: " +
+                    "${f.filledQuantity} @ ${f.fillPrice} (order ${f.orderId})")
+            }
+        }
+        return n
+    }
+
+    private const val BACKFILL_DAYS_MS = 120L * 24 * 3600_000L
+    @Volatile private var backfillAt = 0L
+
+    /** Pure — tested. The single SELL fill of [ticker] after [sinceMs] for [qty]
+     *  shares (to half a percent) not in [claimed]; null unless exactly one. */
+    fun exitFillFor(fills: List<Trading212Client.HistoricalFill>, ticker: String, sinceMs: Long,
+                    qty: Double, claimed: Set<Long>): Trading212Client.HistoricalFill? =
+        fills.filter {
+            it.ticker.equals(ticker, true) && it.side.equals("SELL", true) &&
+                it.filledQuantity > 0.0 && it.fillPrice > 0.0 && it.orderId !in claimed &&
+                epochOf(it.dateExecuted) >= sinceMs &&
+                Math.abs(it.filledQuantity - qty) <= qty * 0.005
+        }.singleOrNull()
+
+    private fun epochOf(iso: String): Long = try { java.time.Instant.parse(iso).toEpochMilli() }
+        catch (_: Exception) {
+            try { java.time.OffsetDateTime.parse(iso).toInstant().toEpochMilli() } catch (_: Exception) { 0L }
+        }
+
+    fun reconcileFills(ctx: Context, notifySettled: Boolean = true, maxAgeMs: Long = 0L): Int {
+        // ONE READER AT A TIME (23 Oct 2026). Every algo's pass runs on its own
+        // thread and each begins here: sixteen of them read the same history at
+        // once, each found TEAM's sale still unpriced, and each sent "TEAM sold" —
+        // sixteen alerts in four seconds. In turn, the second reader finds the
+        // price already written and has nothing to say. [maxAgeMs]: a routine
+        // caller skips the read when one finished that recently.
+        synchronized(reconcileLock) {
+            if (maxAgeMs > 0L && System.currentTimeMillis() - lastReconcileAt < maxAgeMs) return 0
+            try { return reconcileFillsLocked(ctx, notifySettled) }
+            finally { lastReconcileAt = System.currentTimeMillis() }
+        }
+    }
+
+    private val reconcileLock = Any()
+    @Volatile private var lastReconcileAt = 0L
+    /** Sales already announced with their real price, this run of the app. */
+    private val settledAnnounced = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private fun reconcileFillsLocked(ctx: Context, notifySettled: Boolean): Int {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return 0
         val state = T212LiveStore.load(ctx)
@@ -236,6 +324,8 @@ object T212LiveMirror {
         if (t.sellAt <= 0L ||
             System.currentTimeMillis() - t.sellAt > SETTLED_ALERT_WINDOW_MS) return
         val qty = t.ownExitQty().takeIf { it > 0.0 } ?: return
+        // Once per sale, even if an older copy of the row is written back over the price.
+        if (!settledAnnounced.add("${t.ns}|${t.paperTradeId}|${t.sellAt}")) return
         val cur = if (Spaces.baseOf(t.ns) == "de") "EUR" else "USD"
         try {
             LabNotifier.t212Sell(ctx, t.ns, t.symbol, qty, cur,
@@ -294,7 +384,8 @@ object T212LiveMirror {
     private data class LiveCfg(
         val enabled: Boolean,
         val allows: (String) -> Boolean,
-        val perTrade: Double
+        /** Asked only when an order is sized — it reads the algo's real sales. */
+        val perTrade: () -> Double
     )
 
     private fun liveCfgFor(ctx: Context, config: ConfigManager, ns: String): LiveCfg {
@@ -305,14 +396,15 @@ object T212LiveMirror {
         if (!Spaces.isBucket(ns)) return LiveCfg(
             enabled = false,
             allows = { false },
-            perTrade = 0.0)
+            perTrade = { 0.0 })
         val b = com.signalscope.app.data.BucketStore.get(ctx, ns)
         val allow = (b?.liveAllowlist ?: emptyList()).map { it.uppercase() }.toSet()
         // Budget is spread over the SEATS, not the whole 106-name universe — a
         // 3b algo only ever holds holdN of them at once, so dividing by the
         // universe would size every order ~20× too small to be tradeable.
         val seats = (b?.holdN ?: 0).coerceAtLeast(1)
-        val per = if (b != null && b.liveBudget > 0.0) b.liveBudget / seats else 0.0
+        // The seat grows with the algo's real result, up to twice — see LiveSeats.
+        val per = { if (b != null && b.liveBudget > 0.0) LiveSeats.perSeatFor(ctx, ns, b.liveBudget, seats) else 0.0 }
         return LiveCfg(
             // Budget joins the gate for the same reason it does on crypto: an algo
             // armed with nothing allocated should place nothing, not fall through
@@ -321,6 +413,15 @@ object T212LiveMirror {
             allows = { allow.isNotEmpty() && it.uppercase() in allow },
             perTrade = per)
     }
+
+    /** Would an entry on [symbol] in this algo be sent to Trading 212 right now —
+     *  armed, funded and on its real-money list? And the money one order gets. */
+    fun realOrdersExpected(ctx: Context, ns: String, symbol: String): Boolean {
+        val lc = liveCfgFor(ctx, ConfigManager(ctx), ns)
+        return lc.enabled && lc.allows(symbol)
+    }
+
+    fun perTradeFor(ctx: Context, ns: String): Double = liveCfgFor(ctx, ConfigManager(ctx), ns).perTrade()
 
     fun mirrorEntry(ctx: Context, paperTradeId: String, trade: StrategyLabEngine.Trade,
                     space: String = "US", ns: String = "") {
@@ -364,7 +465,7 @@ object T212LiveMirror {
 
         val price = trade.entryPrice
         if (price <= 0.0) { T212LiveStore.markError(ctx, paperTradeId, sym, ticker, trade.entryTs, "no price to size the order", ns); return }
-        val amount = lc.perTrade.coerceIn(1.0, 3000.0)
+        val amount = lc.perTrade().coerceIn(1.0, 3000.0)
         // Don't attempt an order we clearly can't fund — avoids a guaranteed
         // reject (and a possible forced FX conversion). Free cash is consolidated
         // in the account base currency; we can't isolate a USD-only sub-balance.
@@ -537,6 +638,11 @@ object T212LiveMirror {
                                 T212LiveStore.upsert(ctx, row.copy(status = "ERROR", qty = 0.0,
                                     error = why, buyOrderIds = r.orderIds, refEntryPrice = r.refPrice))
                             }
+                        }
+                        // YOU STOPPED IT: final, not queued for another try.
+                        if (r.stopped) {
+                            Log.i(TAG, "BUY ${head.sym} stopped by you: $why")
+                            return@execute
                         }
                         // Only an ACTIONABLE failure earns an interruption. A closed
                         // market cannot be worked around by hand, so telling the
@@ -744,11 +850,14 @@ object T212LiveMirror {
 
         for (row in open) {
             // Is the paper side finished with it?
-            val paperClosed = try {
+            val paper = try {
                 com.signalscope.app.data.StrategyLabStore.load(ctx, row.ns).trades
-                    .firstOrNull { it.id == row.paperTradeId }?.status == "CLOSED"
-            } catch (e: Exception) { false }
-            if (!paperClosed) continue
+                    .firstOrNull { it.id == row.paperTradeId }
+            } catch (e: Exception) { null }
+            if (paper?.status != "CLOSED") continue
+            // The rule that closed it on paper — what this sale is actually for,
+            // and what its alerts name.
+            val rule = paper.exitReason.ifBlank { "strategy exit" }
 
             // ── ALREADY GONE? THEN THE ROW IS THE ONLY THING LEFT TO CLOSE ────
             //
@@ -791,14 +900,24 @@ object T212LiveMirror {
             // 40% of today's range or on a falling price; otherwise hold, at most
             // two hours, with the safety stop under it. Under its own stop it goes.
             val since = if (row.rvSince > 0L) row.rvSince else now
-            val belowStop = try { underOwnStop(ctx, config, row) } catch (e: Exception) { false }
-            val (gate, rd) = try {
+            // A STOP-LOSS SALE NEVER WAITS — on its retry as on its first try (the
+            // fresh-exit path already skips the gate for one). This asked only
+            // whether the price was under the stop right now, so AOF's stop-loss
+            // sale (28 Oct 2026), retried with the price 2 cents above its stop,
+            // was held 38 minutes like an ordinary sale.
+            val belowStop = rule.contains("stop", ignoreCase = true) ||
+                try { underOwnStop(ctx, config, row) } catch (e: Exception) { false }
+            // An algo's sale goes at once — see [saleWaitsForGate].
+            val (gate, rd) = if (!saleWaitsForGate(row.ns))
+                RvGate.Decision(true, "an algo's sale goes at once") to null
+            else try {
                 RvGate.check(config, row.t212Ticker, row.symbol, row.ns, RvGate.Side.SELL, since, belowStop)
             } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }
-            RvJournal.look(ctx, RvJournal.algoKey(row.ns, row.paperTradeId, RvGate.Side.SELL),
-                RvJournal.base(srcOf(row.ns), RvGate.Side.SELL, row.ns, row.symbol, row.t212Ticker,
-                    mapOf("qty" to row.qty, "entry" to row.liveEntryPrice.takeIf { it > 0.0 })),
-                firstLook = row.rvSince == 0L, since = since, d = gate, rd = rd)
+            if (saleWaitsForGate(row.ns))
+                RvJournal.look(ctx, RvJournal.algoKey(row.ns, row.paperTradeId, RvGate.Side.SELL),
+                    RvJournal.base(srcOf(row.ns), RvGate.Side.SELL, row.ns, row.symbol, row.t212Ticker,
+                        mapOf("qty" to row.qty, "entry" to row.liveEntryPrice.takeIf { it > 0.0 })),
+                    firstLook = row.rvSince == 0L, since = since, d = gate, rd = rd)
             if (!gate.go) {
                 val note = "holding the sale: ${RvGate.NOTE} — ${gate.why}; sells by itself within 2 hours"
                 T212LiveStore.upsert(ctx, row.copy(error = note, rvSince = since,
@@ -807,12 +926,13 @@ object T212LiveMirror {
                 Log.i(TAG, "[${row.ns}] ${row.symbol} sale held: ${gate.why}")
                 continue
             }
-            if (gate.timedOut) try { LabNotifier.rvGateTimedOut(ctx, row.ns, row.symbol, buy = false) } catch (_: Exception) {}
+            val route = "retry of an exit the broker had not completed"
+            if (gate.timedOut) rvSaleTimedOutOnce(ctx, row, since, rule, route)
             val why = gate.why
 
             Log.w(TAG, "[${row.ns}] ${row.symbol} still held but paper has closed it — re-selling ($why)")
-            val out = stopOutNow(ctx, row.ns, row.symbol, "exit retry (paper already closed) — $why",
-                origin = "retry of an exit the broker had not completed")
+            val out = stopOutNow(ctx, row.ns, row.symbol, "$rule (exit retry, paper already closed — $why)",
+                origin = route)
             if (!out.ok) {
                 val shut = out.error.contains("is closed", true) ||
                            out.error.contains("after hours", true)
@@ -828,6 +948,19 @@ object T212LiveMirror {
     }
 
     private const val EXIT_WAITS = "t212_exit_waits"
+
+    /**
+     * The two-hour alert for a held sale, ONCE PER HOLD. Past two hours the gate
+     * answers "timed out" on every pass until the hold ends, and a sale that then
+     * fails to sell keeps its hold — so the alert went out again at each retry.
+     */
+    fun rvSaleTimedOutOnce(ctx: Context, row: T212LiveStore.LiveTrade, since: Long,
+                           rule: String, route: String) {
+        val r = T212LiveStore.get(ctx, row.paperTradeId, row.ns) ?: row
+        if (r.rvTimeoutToldFor == since) return
+        T212LiveStore.upsert(ctx, r.copy(rvTimeoutToldFor = since))
+        try { LabNotifier.rvGateTimedOut(ctx, row.ns, row.symbol, buy = false, rule = rule, route = route) } catch (_: Exception) {}
+    }
 
     /** Is a waiting sale's live price already at or under the position's own stop? */
     private fun underOwnStop(ctx: Context, config: ConfigManager, row: T212LiveStore.LiveTrade): Boolean {
@@ -1026,10 +1159,13 @@ object T212LiveMirror {
      *   Four different ones call this and they mean genuinely different things —
      *   a hand-bought position's minder is not the same event as an algo's own
      *   fill-anchored stop — so the alert and the ledger both record which.
+     * @param alertOnFail a sale that reaches Trading 212 and does not sell is
+     *   announced, once per position. False only where a tap shows the result
+     *   on screen already.
      */
     fun stopOutNow(ctx: Context, ns: String, symbol: String, reason: String,
                    origin: String = "", paperTradeId: String? = null,
-                   decisionPrice: Double = 0.0): StopOut {
+                   decisionPrice: Double = 0.0, alertOnFail: Boolean = true): StopOut {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return StopOut(false, error = "no T212 credentials")
         // [paperTradeId] pins the exact position when the caller knows it — an algo
@@ -1056,14 +1192,23 @@ object T212LiveMirror {
         val space = if (Spaces.baseOf(ns) == "de") "DE" else "US"
         val ys = com.signalscope.app.network.YahooFinanceClient.toYahooSymbol(row.symbol, space)
         T212LiveStore.upsert(ctx, row.copy(status = "EXITING"))
+        // THE FAILURE IS SAID, ONCE. Every automatic caller retries a failed sale
+        // on its next pass and used to say nothing, so a sale stuck for hours was
+        // visible only as the repeating alert of whatever had started it.
+        val tellFail = alertOnFail && row.sellFailToldAt == 0L
+        fun failed(why: String): StopOut {
+            T212LiveStore.upsert(ctx, row.copy(status = "OPEN", error = why,
+                sellFailToldAt = if (tellFail) System.currentTimeMillis() else row.sellFailToldAt))
+            if (tellFail) try { LabNotifier.t212SellFailed(ctx, ns, row.symbol, why, rule = reason, route = origin) } catch (_: Exception) {}
+            return StopOut(false, error = why)
+        }
         return try {
             val r = PatientExecutor.sell(config, row.t212Ticker, ys, space, row.qty, paid,
                 targetQty = row.qty)
             if (!r.ok || r.filled <= 0.0) {
                 val why = r.error ?: r.note.ifBlank { "exit ladder filled nothing" }
-                T212LiveStore.upsert(ctx, row.copy(status = "OPEN", error = why))
                 Log.w(TAG, "[$ns] REAL STOP ${row.symbol} could not sell: $why")
-                return StopOut(false, error = why)
+                return failed(why)
             }
             // sellAt STAMPED HERE, not left at 0. It was never written on this
             // path, so a position sold by the real stop had no record of WHEN —
@@ -1109,9 +1254,8 @@ object T212LiveMirror {
                 " (paid $paid) → ${"%.2f".format(pct)}%")
             StopOut(true, pct, exitPx, paid, r.filled)
         } catch (e: Exception) {
-            T212LiveStore.upsert(ctx, row.copy(status = "OPEN", error = e.message ?: "stop-out failed"))
             Log.e(TAG, "[$ns] REAL STOP ${row.symbol} threw", e)
-            StopOut(false, error = e.message ?: "stop-out failed")
+            failed(e.message ?: "stop-out failed")
         }
     }
 
@@ -1739,6 +1883,8 @@ object T212LiveMirror {
                 retryAfter = System.currentTimeMillis() + RETRY_CLAIM_MS))
             ladder.execute {
                 try {
+                    // Called off while it waited its turn behind another ladder.
+                    if (T212LiveStore.get(ctx, row.paperTradeId, row.ns)?.status != "RETRY") return@execute
                     // The ceiling travels INTO the ladder, not just in front of it.
                     // Clearing the gate on the opening quote does not stop a chase
                     // walking half an ATR upward while it runs — back through the
@@ -1758,6 +1904,14 @@ object T212LiveMirror {
                                 if (space == "DE") "EUR" else "USD")
                         } catch (_: Exception) {}
                         Log.i(TAG, "retry FILLED ${row.symbol} on attempt ${cur.retryCount}")
+                    } else if (r.stopped || cur.status != "RETRY") {
+                        // CALLED OFF WHILE IT RAN — stopped, or cancelled from
+                        // Waiting orders mid-ladder. Putting it back in the queue
+                        // here used to undo the cancel.
+                        T212LiveStore.upsert(ctx, cur.copy(status = "ERROR", qty = 0.0,
+                            error = if (cur.status == "ERROR" && cur.error.isNotBlank()) cur.error
+                                    else "stopped by you — nothing bought",
+                            buyOrderIds = r.orderIds, refEntryPrice = r.refPrice))
                     } else {
                         val why = r.error ?: r.note.ifBlank { "ladder filled nothing" }
                         val shut = why.contains("is closed", true) || why.contains("after hours", true)
@@ -1851,6 +2005,16 @@ object T212LiveMirror {
     /** For the RV gate's record: the watchlist's own orders, or an algo's. */
     private fun srcOf(ns: String): String =
         if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) "watch" else "algo"
+
+    /**
+     * DOES THIS SALE WAIT FOR THE RV GATE? Not an algo's (the user's decision,
+     * 30 Oct 2026). Replayed on 140 past algo sale decisions with 5-minute
+     * prices, the gate made sales 0.10% worse on average (36 worse, 20 better),
+     * about 0.25% on the 2-hour live algos: an algo sells when momentum has
+     * turned down, so the price tends to keep slipping while it waits. Buys keep
+     * the gate; the watchlist's sales keep it until they are tested the same way.
+     */
+    internal fun saleWaitsForGate(ns: String): Boolean = srcOf(ns) == "watch"
 
     internal fun entryCeiling(signalPrice: Double, stopPct: Double,
                               stopEnabled: Boolean, atr: Double): Double {
@@ -2008,7 +2172,9 @@ object T212LiveMirror {
                 // re-checked every minute, with the safety stop at the broker under
                 // it meanwhile. A stop-loss exit never waits.
                 val isStop = trade.exitReason.contains("stop", ignoreCase = true)
-                if (!isStop && MarketHours.isRegularSession(Spaces.baseOf(ns), System.currentTimeMillis())) {
+                // An algo's sale goes at once — see [saleWaitsForGate].
+                if (!isStop && saleWaitsForGate(ns) &&
+                    MarketHours.isRegularSession(Spaces.baseOf(ns), System.currentTimeMillis())) {
                     val (gate, rd) = try {
                         RvGate.check(config, live.t212Ticker, live.symbol, ns, RvGate.Side.SELL, 0L)
                     } catch (e: Exception) { RvGate.Decision(true, "gate failed: ${e.message}") to null }

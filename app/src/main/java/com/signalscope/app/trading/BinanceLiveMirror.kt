@@ -68,8 +68,10 @@ object BinanceLiveMirror {
         val seats = if (b == null) 1
             else if (!gate.enabled) b.symbols.size.coerceAtLeast(1)
             else com.signalscope.app.data.MacdGateStore.effectiveHoldN(gate, b.symbols.size.coerceAtLeast(1))
-        val per = if (b != null && b.liveBudget > 0.0)
-            b.liveBudget / seats.coerceAtLeast(1) else 0.0
+        // The seat grows with the algo's real result, up to twice — see LiveSeats.
+        val per by lazy {
+            if (b != null && b.liveBudget > 0.0) LiveSeats.perSeatFor(ctx, ns, b.liveBudget, seats) else 0.0
+        }
         return LiveCfg(
             // BUDGET IS PART OF THE GATE, not just the size. Without this an algo
             // armed with a zero budget still bought, because the order size is

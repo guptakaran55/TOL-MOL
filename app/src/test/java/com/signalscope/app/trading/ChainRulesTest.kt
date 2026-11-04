@@ -51,6 +51,25 @@ class ChainRulesTest {
         assertEquals(19_800L, ChainRules.championConfig("in")!!.barAnchorSec)
     }
 
+    @Test fun `days since the monthly low count back from the newest bar, each day judged on its own past`() {
+        val month = List(20) { 100.0 to 110.0 }
+        // touched on the newest bar
+        assertEquals(0, ChainRules.daysSinceMonthlyLow(days(month + (100.5 to 104.0)), 20))
+        // touched, then three days well up the range: 3 days ago
+        val after = List(3) { 107.0 to 109.0 }
+        assertEquals(3, ChainRules.daysSinceMonthlyLow(days(month + (100.5 to 104.0) + after), 20))
+        // the same, but looking back only 3 bars: not found
+        assertNull(ChainRules.daysSinceMonthlyLow(days(month + (100.5 to 104.0) + after), 3))
+        // a later new low makes the old touch irrelevant: the newest touch counts
+        assertEquals(0, ChainRules.daysSinceMonthlyLow(days(month + (100.5 to 104.0) + after + (95.0 to 101.0)), 20))
+        // not in the bottom tenth within the look-back: null (the flat month before it
+        // sits AT its low every day, so a look-back reaching it would find a touch)
+        assertNull(ChainRules.daysSinceMonthlyLow(days(month + List(5) { 106.0 to 109.0 }), 5))
+        assertEquals(5, ChainRules.daysSinceMonthlyLow(days(month + List(5) { 106.0 to 109.0 }), 20))
+        // too little history to judge anything
+        assertNull(ChainRules.daysSinceMonthlyLow(days(List(10) { 100.0 to 110.0 }), 20))
+    }
+
     @Test fun `a day whose low reached the bottom tenth of the month is a touch`() {
         val month = List(20) { 100.0 to 110.0 }
         assertTrue(ChainRules.touchedMonthlyLow(days(month + (100.5 to 104.0))))      // 5% up the range
@@ -144,6 +163,16 @@ class ChainRulesTest {
         // India's grid is shifted by 5:30.
         val inVisible = ChainRules.frameVisibleAt(boundary + 19_800L + delay + 60, h2, 19_800L, delay)
         assertEquals(0L, Math.floorMod(inVisible - delay - 60 - 19_800L, h2))
+    }
+
+    @Test fun `stocks followed on the side never keep a free seat empty`() {
+        // 23 Oct 2026: 7 seats, 1 taken, 20 followed on the side.
+        assertEquals(21, ChainRules.sideCap(7))
+        assertEquals(ChainRules.Room.OPEN, ChainRules.room(followedLive = 20, seatsBusy = 1, seats = 7))
+        assertEquals(ChainRules.Room.SEAT_ONLY, ChainRules.room(followedLive = 21, seatsBusy = 1, seats = 7))
+        assertEquals(ChainRules.Room.FULL, ChainRules.room(followedLive = 21, seatsBusy = 7, seats = 7))
+        // Seat-takers do not count toward the side list.
+        assertEquals(ChainRules.Room.OPEN, ChainRules.room(followedLive = 0, seatsBusy = 7, seats = 7))
     }
 
     @Test fun `the next price is the first open at or after the moment`() {

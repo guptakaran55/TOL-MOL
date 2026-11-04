@@ -40,6 +40,22 @@ object ChainRules {
     fun positive(verdict: String): Boolean = verdict.trim().uppercase() in POSITIVE
 
     /**
+     * ROOM FOR A NEW CHAIN. Chains followed on the side are bounded — each costs
+     * downloads every pass — at three per seat. That bound counts ONLY those: a
+     * stock that would take a free seat is never turned away by them. It once
+     * was (23 Oct 2026): 20 stocks the outlook called WATCH on 19–20 Oct filled
+     * the list until mid-November, and 16 fresh monthly lows a day were refused
+     * unasked with 6 of 7 seats empty.
+     */
+    enum class Room { OPEN, SEAT_ONLY, FULL }
+    fun sideCap(seats: Int): Int = seats.coerceAtLeast(1) * 3
+    fun room(followedLive: Int, seatsBusy: Int, seats: Int): Room = when {
+        followedLive < sideCap(seats) -> Room.OPEN
+        seatsBusy < seats -> Room.SEAT_ONLY
+        else -> Room.FULL
+    }
+
+    /**
      * The conservative B_SLOW champion, exactly as the desktop lab ships it
      * (runs/lab_configs/champions/B_SLOW_240m-120m_STOCKS-conservative…json),
      * minus its dataset and results. Built in rather than read from the space's

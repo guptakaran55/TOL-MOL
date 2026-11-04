@@ -106,8 +106,14 @@ object T212ExitGuards {
             try {
                 val cur = g.orderId > 0L && resting.containsKey(g.orderId)
                 val hit = if (cur) null else filledUnder(g)
+                // A CLOSED row with no real sale price is one closed WITHOUT this
+                // fill — by the sweep that saw the shares gone — and its own sell
+                // ids, if any, are of a sale that did not fill. CDW, 27 Oct 2026:
+                // this stop sold it at 160.50, and the price was dropped as "the
+                // sale went through another way".
                 if (hit != null && row != null &&
-                    (row.status == "OPEN" || (row.status == "CLOSED" && row.allSellIds().isEmpty()))) {
+                    (row.status == "OPEN" || (row.status == "CLOSED" &&
+                        (row.allSellIds().isEmpty() || row.liveExitPrice <= 0.0)))) {
                     recordFill(ctx, row, g, hit, now); sold++; continue
                 }
                 if (cur) {
@@ -286,7 +292,8 @@ object T212ExitGuards {
                            fill: Trading212Client.HistoricalFill, now: Long) {
         val px = fill.fillPrice.takeIf { it > 0.0 } ?: g.level
         T212LiveStore.get(ctx, row.paperTradeId, row.ns)?.let { cur ->
-            if (cur.status == "OPEN" || (cur.status == "CLOSED" && cur.allSellIds().isEmpty()))
+            if (cur.status == "OPEN" || (cur.status == "CLOSED" &&
+                    (cur.allSellIds().isEmpty() || cur.liveExitPrice <= 0.0)))
                 T212LiveStore.upsert(ctx, cur.copy(status = "CLOSED",
                     sellOrderId = fill.orderId, sellOrderIds = listOf(fill.orderId),
                     sellAt = if (cur.status == "CLOSED" && cur.sellAt > 0L) cur.sellAt else now,

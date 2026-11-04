@@ -86,11 +86,19 @@ object MacdGateEngine {
         return ema(raw, smoothing).last()
     }
 
-    /** Does [sym] currently have an OPEN paper trade in the lab ledger? */
-    private fun inPosition(ctx: Context, ns: String, sym: String): Boolean =
-        StrategyLabStore.load(ctx, ns).trades.any {
-            it.symbol.equals(sym, true) && it.status == "OPEN"
-        }
+    /** Does [sym] currently have an OPEN paper trade in the lab ledger? [closing]:
+     *  the entry time of a trade being closed right now, not yet saved as closed. */
+    private fun inPosition(ctx: Context, ns: String, sym: String, closing: Long = 0L): Boolean =
+        stillHeld(StrategyLabStore.load(ctx, ns).trades, sym, closing)
+
+    /**
+     * Pure — tested. A pass reports a sale to the seat BEFORE it saves the trade
+     * as closed, so the trade being closed still reads OPEN and kept its seat:
+     * Test B0 and Test D, 23 Oct 2026 — BTCUSDC flagged exit-only, sold, and the
+     * seat stayed on it, empty, until the next day's check.
+     */
+    internal fun stillHeld(trades: List<StrategyLabStore.LedgerTrade>, sym: String, closing: Long): Boolean =
+        trades.any { it.symbol.equals(sym, true) && it.status == "OPEN" && (closing <= 0L || it.entryTs != closing) }
 
     private fun setWindingDown(ctx: Context, ns: String, sym: String, on: Boolean) {
         try {
@@ -392,11 +400,34 @@ object MacdGateEngine {
             }
         }
 
+        // 3½. THE NEWS VETO, on the quality algos only (see QualityCheap). A name
+        //    seated but not bought yet is asked about again each day, and one
+        //    with clearly bad news gives its seat back before it can be bought.
+        //    The stocks it kept out are followed on these same daily closes.
+        val vetoOn = QualityCheap.vetoOn(ctx, ns)
+        val lastClose = complete.mapValues { it.value.last().close }
+        fun vetoed(sym: String) = vetoOn && QualityCheap.blocks(ctx, ns, sym, lastClose[sym] ?: 0.0, ask = true)
+        if (vetoOn) {
+            try {
+                QualityCheap.follow(ctx, ns, complete.mapValues { (_, b) -> b.last().close to b.last().date.toString() })
+            } catch (e: Exception) { Log.w(TAG, "[$ns] following the vetoed stocks failed", e) }
+            for (i in slots.indices) {
+                val sym = slots[i].symbol ?: continue
+                if (inPosition(ctx, ns, sym) || !vetoed(sym)) continue
+                try { StrategyLabStore.unenroll(ctx, sym, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $sym", e) }
+                held.remove(sym.uppercase())
+                st = MacdGateStore.closeEnrollment(st, i, sym, "news_veto", System.currentTimeMillis())
+                slots[i] = MacdGateStore.Slot(null, slots[i].capital, System.currentTimeMillis(), 0, false)
+                st = MacdGateStore.appendLog(st, "${today()} $sym kept out by the news veto — seat to cash")
+            }
+        }
+
         // 4. FILL empty slots: highest screener rank with a positive slope,
-        //    never a name already held. None eligible → the slot stays cash.
+        //    never a name already held, never one the news veto keeps out.
+        //    None eligible → the slot stays cash.
         for (i in slots.indices) {
             if (slots[i].symbol != null) continue
-            val pick = ranked.firstOrNull { it.uppercase() !in held && eligible(it) } ?: continue
+            val pick = ranked.firstOrNull { it.uppercase() !in held && eligible(it) && !vetoed(it) } ?: continue
             val now = System.currentTimeMillis()
             slots[i] = MacdGateStore.Slot(pick, slots[i].capital, now, 0, false)
             held.add(pick.uppercase())
@@ -467,7 +498,8 @@ object MacdGateEngine {
             if (slots[i].symbol != null) continue
             val pick = st.lastRanking.firstOrNull {
                 val u = it.uppercase()
-                u !in held && u !in releasedToday && (st.lastSlopes[it] ?: -1.0) > 0.0
+                u !in held && u !in releasedToday && (st.lastSlopes[it] ?: -1.0) > 0.0 &&
+                    !QualityCheap.blocks(ctx, ns, it, 0.0, ask = false)
             } ?: continue
             val now = System.currentTimeMillis()
             slots[i] = MacdGateStore.Slot(pick, slots[i].capital, now, 0, false)
@@ -483,8 +515,30 @@ object MacdGateEngine {
         if (filled > 0) {
             MacdGateStore.save(ctx, ns, st.copy(slots = slots))
             Log.i(TAG, "[$ns] refilled $filled freed seat(s) from the stored ranking")
+            slots.mapNotNull { it.symbol }.filter { it.uppercase() !in st0.slots.mapNotNull { s -> s.symbol?.uppercase() } }
+                .forEach { QualityCheap.checkLater(ctx, ns, it) }
         }
         return filled
+    }
+
+    /**
+     * A SEATED STOCK THE NEWS VETO HAS SINCE KEPT OUT, before it was bought: its
+     * seat goes back to cash and is refilled from the stored ranking. Nothing
+     * happens once the strategy has bought it — the veto only ever stops a buy.
+     */
+    fun releaseVetoed(ctx: Context, ns: String, symbol: String) {
+        val st0 = MacdGateStore.load(ctx, ns)
+        val idx = st0.slots.indexOfFirst { it.symbol?.equals(symbol, true) == true }
+        if (idx < 0 || inPosition(ctx, ns, symbol)) return
+        val now = System.currentTimeMillis()
+        try { StrategyLabStore.unenroll(ctx, symbol, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $symbol", e) }
+        var st = MacdGateStore.closeEnrollment(st0, idx, symbol, "news_veto", now)
+        val slots = st.slots.toMutableList()
+        slots[idx] = MacdGateStore.Slot(null, slots[idx].capital, now, 0, false)
+        st = MacdGateStore.appendLog(st, "${today()} $symbol kept out by the news veto — seat to cash")
+        MacdGateStore.save(ctx, ns, st.copy(slots = slots))
+        Log.w(TAG, "[$ns] $symbol kept out by the news veto after it was seated — seat refilled")
+        refillFreeSeats(ctx, ns)
     }
 
     // ── Trade-close hook (§10.8 live translation) ───────────────────────────
@@ -517,7 +571,8 @@ object MacdGateEngine {
         val held = slots.mapNotNull { it.symbol?.uppercase() }.toMutableSet()
         held.remove(symbol.uppercase())
         val replacement = st0.lastRanking.firstOrNull {
-            !it.equals(symbol, true) && it.uppercase() !in held && (st0.lastSlopes[it] ?: -1.0) > 0.0
+            !it.equals(symbol, true) && it.uppercase() !in held && (st0.lastSlopes[it] ?: -1.0) > 0.0 &&
+                !QualityCheap.blocks(ctx, ns, it, 0.0, ask = false)
         }
         try { StrategyLabStore.unenroll(ctx, symbol, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $symbol", e) }
         setWindingDown(ctx, ns, symbol, false)
@@ -535,10 +590,12 @@ object MacdGateEngine {
         }
         MacdGateStore.save(ctx, ns, st.copy(slots = slots))
         Log.w(TAG, "[$ns] seat of $symbol handed on ($why) → ${replacement ?: "cash"}")
+        replacement?.let { QualityCheap.checkLater(ctx, ns, it) }
         return replacement
     }
 
-    fun onTradeClosed(ctx: Context, ns: String, symbol: String, netPctReturn: Double) {
+    /** [closingEntryTs]: the closed trade's entry time, when the caller has not saved the close yet. */
+    fun onTradeClosed(ctx: Context, ns: String, symbol: String, netPctReturn: Double, closingEntryTs: Long = 0L) {
         val st0 = MacdGateStore.load(ctx, ns)
         if (!st0.enabled) return
         val idx = st0.slots.indexOfFirst { it.symbol?.equals(symbol, true) == true }
@@ -561,14 +618,15 @@ object MacdGateEngine {
             "${today()} $symbol trade closed ${"%+.2f".format(netPctReturn)}% → slot ${"%.2f".format(compounded)}")
 
         val slope = st.lastSlopes[symbol.uppercase()] ?: st.lastSlopes[symbol]
-        if (slots[idx].flagged && (slope == null || slope <= 0.0) && !inPosition(ctx, ns, symbol)) {
+        if (slots[idx].flagged && (slope == null || slope <= 0.0) && !inPosition(ctx, ns, symbol, closingEntryTs)) {
             // Natural close arrived and the slope is still non-positive → leave.
             setWindingDown(ctx, ns, symbol, false)
             try { StrategyLabStore.unenroll(ctx, symbol, ns) } catch (e: Exception) { Log.w(TAG, "unenroll $symbol", e) }
             val held = slots.mapNotNull { it.symbol?.uppercase() }.toMutableSet()
             held.remove(symbol.uppercase())
             val replacement = st.lastRanking.firstOrNull {
-                it.uppercase() !in held && (st.lastSlopes[it] ?: -1.0) > 0.0
+                it.uppercase() !in held && (st.lastSlopes[it] ?: -1.0) > 0.0 &&
+                    !QualityCheap.blocks(ctx, ns, it, 0.0, ask = false)
             }
             val now = System.currentTimeMillis()
             st = MacdGateStore.closeEnrollment(st, idx, symbol, "natural_close", now)
@@ -591,5 +649,6 @@ object MacdGateEngine {
         }
 
         MacdGateStore.save(ctx, ns, st.copy(slots = slots))
+        slots[idx].symbol?.takeIf { !it.equals(symbol, true) }?.let { QualityCheap.checkLater(ctx, ns, it) }
     }
 }

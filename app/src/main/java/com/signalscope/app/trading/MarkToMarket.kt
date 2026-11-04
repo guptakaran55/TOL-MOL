@@ -437,7 +437,8 @@ object MarkToMarket {
             // satisfy the freshness test — otherwise the live venue is never asked
             // and the delayed feed keeps the position looking priced.
             val delayedGerman = m != null && m.source == "stream" && Spaces.baseOf(ns) == "de"
-            m == null || delayedGerman || now - m.atMs > maxAgeMs
+            // A sleeping market's last price is its price until it opens.
+            MarketHours.awake(Spaces.baseOf(ns), now) && (m == null || delayedGerman || now - m.atMs > maxAgeMs)
         }
         if (stale.isEmpty()) { lastRefreshMs = now; return }
         Log.i(TAG, "valuing ${stale.size} open position(s) of ${wanted.size} (rest are stream-fresh)")

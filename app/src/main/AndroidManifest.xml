@@ -85,6 +85,11 @@
             android:name=".service.T212DailyTrailReceiver"
             android:exported="false" />
 
+        <!-- Buy / Skip on an AI-outlook algo's buy request (FloorAsks). -->
+        <receiver
+            android:name=".trading.FloorAskReceiver"
+            android:exported="false" />
+
         <!-- AlarmManager receiver: renews the daily Kite session before the Indian
              open, so an owner in Europe never has to log in at 5am local time. -->
         <receiver

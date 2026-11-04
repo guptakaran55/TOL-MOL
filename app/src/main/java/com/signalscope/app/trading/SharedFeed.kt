@@ -20,7 +20,9 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object SharedFeed {
 
-    private class Entry(val atMs: Long, val value: Any)
+    /** Each entry keeps the window it was stored for: the algos' bars and the
+     *  app-wide download copies (YahooFinanceClient) share this map with different ones. */
+    private class Entry(val atMs: Long, val value: Any, val ttlMs: Long)
 
     private val entries = ConcurrentHashMap<String, Entry>()
     private val locks = ConcurrentHashMap<String, Any>()
@@ -39,9 +41,9 @@ object SharedFeed {
             val v = fetch()
             downloads++
             val at = nowMs()
-            if (keep(v)) entries[key] = Entry(at, v) else entries.remove(key)
+            if (keep(v)) entries[key] = Entry(at, v, ttlMs) else entries.remove(key)
             // Nothing outlives its window: the bars are dropped, not just ignored.
-            entries.entries.removeIf { at - it.value.atMs > ttlMs }
+            entries.entries.removeIf { at - it.value.atMs > it.value.ttlMs }
             return v
         }
     }

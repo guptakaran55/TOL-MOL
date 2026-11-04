@@ -35,13 +35,14 @@ import java.util.concurrent.locks.ReentrantLock
  *   2. once a day, takes the universe from the Discovery scan — the top names by
  *      ROC, the room to the nearest resistance;
  *   3. once a day, from 06:00 on the exchange's clock, reads which of them have
- *      both the weekly and daily MACD slope rising. Floor orders rest two orders
+ *      both the long (monthly on floor orders, weekly on MACD turns) and daily
+ *      MACD slope rising. Floor orders rest two orders
  *      on each: half a seat at the recent low, half a little below. MACD turns
  *      watch them through the day;
  *   4. floor orders: looks for fills in today's fifteen-minute prices. MACD
  *      turns: looks for the 15-minute and hourly MACD turning up together with
  *      the 4-hour rising, and buys at the next price;
- *   5. once a day, checks the weekly and daily trend of what is held;
+ *   5. once a day, checks the long and daily trend of what is held;
  *   6. sells on the stop, the target, the time limit or a broken trend;
  *   7. keeps filling in what happened after each buy (1, 3 and 5 days on, and
  *      the deepest dip).
@@ -62,6 +63,8 @@ object FloorAlgoEngine {
     private val PLAN_FROM: LocalTime = LocalTime.of(6, 0)
     private const val RECHECK_MS = 3 * 60 * 60 * 1000L
     private const val GIVE_UP_DAYS = 30L
+    /** A monthly-low pick waiting for this morning's outlook — never saved past the plan. */
+    private const val PICK_ASK = "ask"
 
     fun currencyMark(space: String) = when (space) { "de" -> "€"; "in" -> "₹"; else -> "$" }
 
@@ -71,7 +74,14 @@ object FloorAlgoEngine {
 
     /** Every algo with work to do, one after another. For the fifteen-minute pass. */
     fun runAll(ctx: Context): String {
-        val ids = FloorAlgoStore.load(ctx).algos.filter { FloorAlgoStore.hasWork(it) }.map { it.id }
+        // A paused algo with real shares still held gets its pass, so they still sell.
+        val realHeld = try { com.signalscope.app.data.FloorLiveStore.load(ctx).rows.filter { it.holds }.map { it.ns }.toHashSet() }
+            catch (e: Exception) { emptySet<String>() }
+        // A sleeping market's algos wait for it to wake — see MarketHours.awake.
+        val now = System.currentTimeMillis()
+        val ids = FloorAlgoStore.load(ctx).algos.filter {
+            (FloorAlgoStore.hasWork(it) || it.ns in realHeld) && MarketHours.awake(it.space, now)
+        }.map { it.id }
         if (ids.isEmpty()) return ""
         if (!runLock.tryLock(3, TimeUnit.MINUTES)) return ""
         try { ids.forEach { runLocked(ctx, it) } } finally { runLock.unlock() }
@@ -79,6 +89,47 @@ object FloorAlgoEngine {
         val open = all.sumOf { a -> a.trades.count { it.status == "OPEN" } }
         val resting = all.sumOf { a -> a.orders.count { it.status == "RESTING" } }
         return "paper algos $open held · $resting resting"
+    }
+
+    /**
+     * A Buy or Skip from the notification or the card. Queued first, so it is never
+     * lost; settled here under the lock a pass holds, or by the next pass if one is
+     * running too long. Settled with the tap's own time either way.
+     */
+    fun answer(ctx: Context, id: String, askId: String, buy: Boolean, tapMs: Long): String {
+        FloorAsks.queue(ctx, id, askId, buy, tapMs)
+        if (!runLock.tryLock(3, TimeUnit.MINUTES)) return "saved — settled on the next check"
+        try {
+            var msg = ""
+            FloorAlgoStore.update(ctx, id) { a -> settleQueued(ctx, a) { msg = it } } ?: return "algo not found"
+            return msg.ifBlank { "already settled" }
+        } finally { runLock.unlock() }
+    }
+
+    /** Every queued tap for [a], settled at its own time. */
+    private fun settleQueued(ctx: Context, a0: Algo, said: (String) -> Unit = {}): Algo {
+        var a = a0
+        val zone = MarketHours.zoneOf(a.space) ?: ZoneId.of("Europe/Berlin")
+        for ((askId, v) in FloorAsks.queued(ctx, a.id)) {
+            val (buy, tapMs) = v
+            val ask = a.asks.firstOrNull { it.id == askId }
+            if (ask != null && ask.status == FloorAsks.WAITING) {
+                val answer = FloorAsks.answerAt(ask, buy, tapMs, MarketHours.isRegularSession(a.space, tapMs))
+                val (n, msg) = FloorAsks.resolve(a, askId, answer, tapMs,
+                    Instant.ofEpochMilli(tapMs).atZone(zone).toLocalDate())
+                a = n.copy(log = n.log + "${FloorAlgoStore.stamp()} · $msg")
+                said(msg)
+                try { LabNotifier.floorAskDone(ctx, a.id, askId) } catch (_: Exception) {}
+            }
+            FloorAsks.unqueue(ctx, a.id, askId)
+        }
+        return a
+    }
+
+    /** [block] while no pass runs — null when one held the lock past three minutes. */
+    fun <T> underLock(ctx: Context, block: () -> T): T? {
+        if (!runLock.tryLock(3, TimeUnit.MINUTES)) return null
+        try { return block() } finally { runLock.unlock() }
     }
 
     /** One algo, now — the card's "check now". False when another pass held it too long. */
@@ -103,11 +154,25 @@ object FloorAlgoEngine {
                 universeFrom = done.universeFrom, planDay = done.planDay,
                 trendCheckDay = done.trendCheckDay, journalDay = done.journalDay, planFilter = done.planFilter,
                 planMode = done.planMode, campaigns = done.campaigns, chains = done.chains, outlooks = done.outlooks,
+                asks = done.asks,
                 orders = done.orders, trades = done.trades,
                 log = (fresh.log + pass.newLog), lastRunMs = System.currentTimeMillis(),
                 lastNote = pass.summary())
         } ?: return
+        for (k in pass.asked) try { LabNotifier.floorAsk(ctx, saved, k) } catch (e: Exception) { Log.w(TAG, "request alert failed", e) }
+        for (k in pass.settled) try { LabNotifier.floorAskDone(ctx, saved.id, k) } catch (_: Exception) {}
+        // Real money follows the book just saved — see [FloorLive].
+        try { FloorLive.sync(ctx, saved) } catch (e: Exception) { Log.e(TAG, "real-money step failed for ${saved.name}", e) }
+        // ONE ALERT A TRADE (the user's ask, 2 Nov 2026): a paper buy or sale that real
+        // money copied — or decided not to copy — has its own real alert, so the paper
+        // one would only repeat it. Read after the real-money step above made its rows.
+        val realRows = if (FloorLive.eligible(saved))
+            try { com.signalscope.app.data.FloorLiveStore.rowsFor(ctx, saved.ns) } catch (e: Exception) { emptyList() }
+            else emptyList()
+        val recent = System.currentTimeMillis() - 30 * 60_000L
         if (saved.notify) for (n in pass.notices) {
+            if (!n.note && realRows.any { it.symbol.equals(n.symbol, true) &&
+                    (it.holds || maxOf(it.buyAt, it.sellAt) >= recent) }) continue
             try {
                 if (n.note) LabNotifier.campaignNote(ctx, saved.name, saved.ns, n.symbol, n.text)
                 else if (n.sold) LabNotifier.floorSold(ctx, saved.name, saved.ns, n.symbol, n.price, n.pct, n.text)
@@ -196,6 +261,13 @@ object FloorAlgoEngine {
         var a: Algo = start
         val space = start.space
         val macd = start.kind == FloorAlgoStore.KIND_MACD
+        /** The list is the stocks you hold — see [FloorAlgoStore.UNI_PORTFOLIO]. */
+        val portfolio = start.settings.universeMode == FloorAlgoStore.UNI_PORTFOLIO
+        /** Requests raised this pass, and ones settled — their alerts go out after the save. */
+        val asked = ArrayList<FloorAlgoStore.Ask>()
+        val settled = ArrayList<String>()
+        /** MACD turns on the monthly-low list, outlook-checked: see [FloorAlgoStore.UNI_MONTHLY_LOW]. */
+        val lowPick = macd && start.settings.universeMode == FloorAlgoStore.UNI_MONTHLY_LOW
         /** The weekly-and-daily trend filter, on or off for this algo. */
         val filterOn = start.settings.trendFilter
         /** Floor orders that wait in the weekly support zone instead of expiring. */
@@ -203,6 +275,10 @@ object FloorAlgoEngine {
         /** The monthly-low chain: see [ChainRules]. */
         val chain = start.kind == FloorAlgoStore.KIND_CHAIN
         val weekMode = start.kind == FloorAlgoStore.KIND_FLOOR && start.settings.orderMode == FloorAlgoStore.MODE_WEEK
+        /** Floor orders read the MONTHLY trend beside the daily one — see [trendOf]. */
+        val monthTrend = start.kind == FloorAlgoStore.KIND_FLOOR
+        private val longWord = if (monthTrend) "monthly" else "weekly"
+        private val longShort = if (monthTrend) "month" else "week"
         val orderMode = if (weekMode) FloorAlgoStore.MODE_WEEK else FloorAlgoStore.MODE_DAY
         val zone: ZoneId = MarketHours.zoneOf(space) ?: ZoneId.of("Europe/Berlin")
         val lastBar: LocalTime = MarketHours.lastBarStart(space) ?: LocalTime.of(17, 15)
@@ -223,8 +299,11 @@ object FloorAlgoEngine {
         fun px(v: Double) = String.format(Locale.US, if (v >= 1000) "%.1f" else "%.2f", v)
         fun clock(sec: Long) = Instant.ofEpochSecond(sec).atZone(zone).format(clockFmt)
 
-        /** May this stock be bought today, as far as the trend goes? Always, with the filter off. */
-        fun passes(m: Member) = !filterOn || FloorOrders.inUptrend(m.week, m.day)
+        /** May this stock be bought today, as far as the trend goes? Always, with the filter off.
+         *  On a monthly-low list, only this morning's picks are watched — the outlook's
+         *  yeses, and its noes on the side. */
+        fun passes(m: Member) = (!filterOn || FloorOrders.inUptrend(m.week, m.day)) &&
+            (!lowPick || m.pick == FloorAlgoStore.PICK_YES || m.pick == FloorAlgoStore.PICK_SIDE)
 
         fun summary(): String {
             if (chain) {
@@ -245,7 +324,12 @@ object FloorAlgoEngine {
             if (a.planDay != today.toString()) return head + (if (macd) "not watching today" else "no orders today")
             if (macd) {
                 val held = a.trades.filter { it.status == "OPEN" }.map { it.symbol }.toSet()
-                return head + "watching ${a.universe.count { passes(it) && it.symbol !in held }} for a turn"
+                val watched = a.universe.filter { passes(it) && it.symbol !in held }
+                if (lowPick) {
+                    val side = watched.count { it.pick == FloorAlgoStore.PICK_SIDE }
+                    return head + "watching ${watched.size - side} for a turn, $side more on the side (news outlook said no)"
+                }
+                return head + "watching ${watched.size} for a turn"
             }
             return head + "${a.orders.count { it.status == "RESTING" }} with orders " + (if (weekMode) "waiting" else "resting")
         }
@@ -261,6 +345,8 @@ object FloorAlgoEngine {
         fun isWeek(o: Order) = o.mode == FloorAlgoStore.MODE_WEEK
 
         fun run() {
+            if (FloorAsks.asks(a)) settleAsks()
+            if (portfolio) portfolioUniverse()
             if (campaign) { runCampaigns(); return }
             if (chain) { runChain(); return }
             // A PAUSED algo places nothing new, but still sells what it holds on
@@ -297,8 +383,8 @@ object FloorAlgoEngine {
                     // 2. The universe, once a day.
                     // A list still picked by return on capital (saved before it
                     // switched to ROC) is re-picked now rather than tomorrow.
-                    if (a.universeDay != today.toString() ||
-                        (a.universe.isNotEmpty() && a.universe.all { it.roc == null })) refreshUniverse()
+                    if (!portfolio && (a.universeDay != today.toString() ||
+                        (a.universe.isNotEmpty() && a.universe.all { it.roc == null }))) refreshUniverse()
                     // 3. Today's trend read, and the floor orders.
                     val weekday = today.dayOfWeek.value <= 5
                     if (weekday && a.planDay != today.toString() && !local.toLocalTime().isBefore(PLAN_FROM)) plan()
@@ -320,6 +406,7 @@ object FloorAlgoEngine {
             if (macd) fillTurns()
             chargeOldSales()
             manageOpen()
+            if (lowPick) followedExits()
             outcomes()
         }
 
@@ -363,7 +450,8 @@ object FloorAlgoEngine {
             // a small one — so those are left out of a TOP list. ALL keeps every
             // name the scan kept (it has already applied the market's volume ×
             // price floor), those with no figure last.
-            val all = s.universeMode == "all"
+            // A monthly-low list starts from every name too; the morning's plan picks from it.
+            val all = s.universeMode == "all" || lowPick
             val top = scan.allStocks
                 .filter { all || (it.rocPct.isFinite() && it.rocPct > 0.0) }
                 .sortedByDescending { if (it.rocPct.isFinite() && it.rocPct > 0.0) it.rocPct else -1.0 }
@@ -375,6 +463,96 @@ object FloorAlgoEngine {
             a = a.copy(universe = top, universeDay = today.toString(), universeFrom = scan.timestamp)
             if (changed) note("universe: " + (if (all) "all ${top.size} stocks that passed the volume × price floor"
                 else "top ${top.size} by ROC") + " from the Discovery scan of " + FloorAlgoStore.stamp(scan.timestamp))
+        }
+
+        /**
+         * YOUR PORTFOLIO, READ EVERY PASS. A stock you have bought joins the list;
+         * one you no longer hold leaves it, and its paper position — and anything
+         * still waiting to buy it — goes with it, sold at the latest price. An
+         * unreadable account changes nothing: that is not the same as holding none.
+         *
+         * YOURS, NOT THE ALGOS' (the user, 2 Nov 2026). Shares a live algo bought
+         * belong to that algo, so a stock counts only for what is left after them;
+         * one only an algo holds leaves the list. What you bought through the
+         * watchlist is yours. An unreadable algo record changes nothing either.
+         */
+        private fun portfolioUniverse() {
+            val r = try { BrokerHoldings.forSpace(ctx, space) } catch (e: Exception) { null }
+            val held = (r as? BrokerHoldings.Result.Ok)?.holdings ?: return
+            val owned = algoOwned() ?: return
+            val atBroker = HashMap<String, Double>()
+            for (h in held) if (h.qty > 0.0 && h.symbol.isNotBlank()) {
+                val k = MacdLadder.bare(h.symbol).uppercase()
+                atBroker[k] = (atBroker[k] ?: 0.0) + h.qty
+            }
+            val syms = atBroker.filter { (k, q) -> q - (owned[k] ?: 0.0) > maxOf(1e-6, q * 0.01) }.keys.toList()
+            val members = syms.map { sym -> a.universe.firstOrNull { it.symbol == sym } ?: Member(sym, "") }
+            val before = a.universe.map { it.symbol }.toSet()
+            val added = syms.filter { it !in before }
+            val gone = before - syms.toSet()
+            val algos = gone.filter { it in atBroker }.toSet()       // still at the broker: an algo's
+            val sold = gone - algos
+            a = a.copy(universe = members, universeDay = today.toString())
+            if (added.isNotEmpty()) note("from your portfolio: ${added.joinToString(", ")} joined the list")
+            if (sold.isNotEmpty()) {
+                note("no longer in your portfolio: ${sold.joinToString(", ")} — left the list")
+                sellGone(sold, "yours")
+            }
+            if (algos.isNotEmpty()) {
+                note("held only by a live algo, not you: ${algos.joinToString(", ")} — left the list")
+                sellGone(algos, "algo")
+            }
+        }
+
+        /** Shares the live algos bought in this market, per stock. Null when a
+         *  record cannot be read, so a bad read never empties your list. */
+        private fun algoOwned(): Map<String, Double>? = try {
+            val m = HashMap<String, Double>()
+            fun add(sym: String, q: Double) {
+                if (q <= 0.0 || sym.isBlank()) return
+                val k = MacdLadder.bare(sym).uppercase()
+                m[k] = (m[k] ?: 0.0) + q
+            }
+            val watchlist = com.signalscope.app.data.ManualWatchStore.nsFor(space)
+            val mine = { ns: String -> Spaces.baseOf(ns) == space && ns != watchlist }
+            if (space == "in") {
+                com.signalscope.app.data.ZerodhaLiveStore.load(ctx).trades
+                    .filter { it.isLive && mine(it.ns) }.forEach { add(it.symbol, it.qty.toDouble()) }
+            } else {
+                com.signalscope.app.data.T212LiveStore.load(ctx).trades
+                    .filter { mine(it.ns) && (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
+                    .forEach { add(it.symbol, it.qty) }
+                com.signalscope.app.data.FloorLiveStore.load(ctx).rows
+                    .filter { it.holds && mine(it.ns) }.forEach { add(it.symbol, it.qty) }
+            }
+            m
+        } catch (e: Exception) {
+            Log.w(TAG, "[$space] algo-held shares unreadable — portfolio list left as it was", e)
+            null
+        }
+
+        /** Paper positions in stocks no longer yours, sold at the latest price.
+         *  [why]: "yours" — you sold it; "algo" — only a live algo holds it. */
+        private fun sellGone(gone: Set<String>, why: String) {
+            for (t in a.trades.filter { it.status == "OPEN" && it.symbol in gone }) {
+                if (t.firstSec == 0L) {                     // a turn not yet bought: dropped
+                    a = a.copy(trades = a.trades.filterNot { it.id == t.id }); continue
+                }
+                val last = book.days(t.symbol)?.lastEntry()?.value?.lastOrNull()
+                val px = last?.close ?: t.lastPrice
+                if (px <= 0.0 || t.qty <= 0.0) continue
+                val fees = feesFor(t.day, t.cost, t.qty * px, today.toString())
+                val slip = slipFor(t.cost, t.qty * px, why)
+                val pnl = t.qty * px - t.cost - fees - slip
+                val pct = if (t.cost > 0) pnl / t.cost * 100.0 else 0.0
+                val n = t.copy(status = "SOLD", sellDay = today.toString(), sellPrice = px,
+                    sellSec = last?.timestamp ?: nowSec, exitReason = why, pnl = pnl, fees = fees,
+                    feesIn = true, slip = slip, slipIn = true, lastPrice = px, lastSec = last?.timestamp ?: nowSec)
+                a = a.copy(trades = a.trades.map { if (it.id == t.id) n else it })
+                note("${t.symbol}: " + (if (why == "algo") "only a live algo holds it" else "you sold it from your portfolio") +
+                    " — paper position sold at ${px(px)} (${String.format(Locale.US, "%+.2f", pct)}%)")
+            }
+            a = a.copy(orders = a.orders.map { if (it.status == "RESTING" && it.symbol in gone) it.copy(status = "ENDED") else it })
         }
 
         /** Daily bars up to yesterday for these stocks — null when the series
@@ -395,11 +573,21 @@ object FloorAlgoEngine {
             return daily.mapValues { (_, b) -> b.filter { it.date.isBefore(today) } }
         }
 
-        /** Weekly and daily slope signs from daily bars up to yesterday. */
-        private fun trendOf(bars: List<DailyBar>?, smoothing: Int): Pair<Int?, Int?> {
+        /**
+         * The long and the daily slope signs, from bars up to yesterday. The long
+         * one is WEEKLY, except on floor orders, where it is MONTHLY (24 Oct 2026)
+         * — what the replay the floor orders came from tested (+0.60% a trade over
+         * 3 days, about one buy a day on 30 stocks). On the weekly trend the
+         * trend-filtered floor algo filled nothing in eight trading days: a stock
+         * rising on the week is seldom back at its 3-day low.
+         */
+        private fun trendOf(bars: List<DailyBar>?, smoothing: Int, symbol: String): Pair<Int?, Int?> {
             if (bars.isNullOrEmpty()) return null to null
             val d = MacdSlopes.sign(MacdSlopes.latest(bars.map { it.close }.toDoubleArray(), smoothing))
-            val w = MacdSlopes.sign(MacdSlopes.latest(FloorOrders.completedWeeks(bars, today), smoothing))
+            val long = if (monthTrend)
+                MacdLadder.monthlyBars(space, symbol)?.let { FloorOrders.completedMonths(it, today) }
+            else FloorOrders.completedWeeks(bars, today)
+            val w = long?.let { MacdSlopes.sign(MacdSlopes.latest(it, smoothing)) }
             return w to d
         }
 
@@ -425,9 +613,9 @@ object FloorAlgoEngine {
                 if (o.symbol !in inUniverse || o.first.filledSec > 0L || o.second.filledSec > 0L) keep.add(o.symbol)
             }
             val members = a.universe.map { m ->
-                val (w, d) = trendOf(daily[m.symbol.uppercase()], smoothing)
+                val (w, d) = trendOf(daily[m.symbol.uppercase()], smoothing, m.symbol)
                 val base = m.copy(week = w, day = d, h4 = null, looks = 0, h4Up = 0, bothUp = 0,
-                    turnSec = 0L, turnPx = 0.0, turnBlocked = false)
+                    turnSec = 0L, turnPx = 0.0, turnBlocked = false, pick = null, verdict = null, lowAgo = null)
                 if (m.symbol in held) return@map base.copy(note =
                     if (m.symbol in keep) "held — 2nd half still waiting" else "held — nothing new")
                 // With the filter off the slopes are still read — for the dots
@@ -435,8 +623,19 @@ object FloorAlgoEngine {
                 if (filterOn) {
                     if (d == null) return@map base.copy(note = "no daily prices")
                     if (d != 1) return@map base.copy(note = "daily slope not rising")
-                    if (w == null) return@map base.copy(note = "not enough weekly history")
-                    if (w != 1) return@map base.copy(note = "weekly slope not rising")
+                    if (w == null) return@map base.copy(note = "not enough $longWord history")
+                    if (w != 1) return@map base.copy(note = "$longWord slope not rising")
+                }
+                // A monthly-low list: only a stock whose low touched its monthly low in
+                // the last few trading days (judged on yesterday's and earlier bars) goes
+                // on to the news outlook, asked below once the day is known to be priced.
+                if (lowPick) {
+                    val bars = daily[m.symbol.uppercase()]
+                        ?: return@map base.copy(pick = FloorAlgoStore.PICK_OUT, note = "no daily prices")
+                    val ago = ChainRules.daysSinceMonthlyLow(bars, s.watchDays)
+                        ?: return@map base.copy(pick = FloorAlgoStore.PICK_OUT,
+                            note = "not at its monthly low in the last ${s.watchDays} trading days")
+                    return@map base.copy(pick = PICK_ASK, lowAgo = ago)
                 }
                 if (macd) return@map base.copy(note = "watching for a turn")
                 val days = book.days(m.symbol)
@@ -476,13 +675,24 @@ object FloorAlgoEngine {
             // rest carry over beside today's new ones.
             val carried = waiting.values.filter { it.symbol in keep }
             val dropped = waiting.size - carried.size
-            a = a.copy(universe = members, planDay = today.toString(), planFilter = filterOn, planMode = orderMode,
+            val picked = if (lowPick) pickByOutlook(members, daily) else members
+            a = a.copy(universe = picked, planDay = today.toString(), planFilter = filterOn, planMode = orderMode,
                 orders = carried + orders)
-            val rising = members.count { FloorOrders.inUptrend(it.week, it.day) && it.symbol !in held }
-            val open = members.count { it.symbol !in held && passes(it) }
+            val rising = picked.count { FloorOrders.inUptrend(it.week, it.day) && it.symbol !in held }
+            val open = picked.count { it.symbol !in held && passes(it) }
+            if (lowPick) {
+                val yes = picked.count { it.pick == FloorAlgoStore.PICK_YES && it.symbol !in held }
+                val side = picked.count { it.pick == FloorAlgoStore.PICK_SIDE && it.symbol !in held }
+                val unasked = picked.count { it.pick == FloorAlgoStore.PICK_OUT && it.lowAgo != null }
+                note("${today.format(dayFmt)}: ${yes + side + unasked} of ${picked.size} at their monthly low in the last " +
+                    "${s.watchDays} trading days — $yes news outlook BUY (watched for a turn), $side followed on the side" +
+                    (if (unasked > 0) ", $unasked not asked yet" else "") +
+                    (if (held.isNotEmpty()) " (${held.size} already held)" else ""))
+                return
+            }
             note("${today.format(dayFmt)}: " +
-                (if (filterOn) "$rising of ${members.size} rising on week and day"
-                 else "trend filter off — $open of ${members.size} in play ($rising rising on week and day)") +
+                (if (filterOn) "$rising of ${members.size} rising on $longShort and day"
+                 else "trend filter off — $open of ${members.size} in play ($rising rising on $longShort and day)") +
                 (if (held.isNotEmpty()) " (${held.size} already held)" else "") +
                 when {
                     macd -> " → watching them for a turn"
@@ -490,6 +700,88 @@ object FloorAlgoEngine {
                         (if (dropped > 0) ", $dropped cancelled by the trend filter" else "")
                     else -> " → ${orders.size * 2} orders resting"
                 })
+        }
+
+        // ── THE MONTHLY-LOW LIST'S OUTLOOK ───────────────────────────────────
+
+        private fun agoText(ago: Int?) = when (ago) { null -> "lately"; 0 -> "yesterday"; else -> "${ago + 1} trading days ago" }
+
+        /** A verdict still fresh in [outlooks] ("VERDICT|day", three days), never an unread one. */
+        private fun freshVerdict(outlooks: Map<String, String>, sym: String): Pair<String, String>? {
+            val p = outlooks[sym]?.split("|")?.takeIf { it.size == 2 } ?: return null
+            if (p[0] == "UNKNOWN" || p[0].isBlank()) return null
+            val age = try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(p[1]), today) } catch (e: Exception) { 99L }
+            return if (age < 3) p[0] to p[1] else null
+        }
+
+        /**
+         * The morning's outlook for each stock at its monthly low, the freshest
+         * touches first: this algo's own recent answer, or one another algo of this
+         * market got in the last three days (the chain asks about the same stocks —
+         * one paid call, one verdict), or a new call while today's checks last.
+         * BUY / STRONG BUY is watched for the turn; any other verdict is watched on
+         * the side; no verdict yet waits for tomorrow.
+         */
+        private fun pickByOutlook(members: List<Member>, daily: Map<String, List<DailyBar>>): List<Member> {
+            val s = a.settings
+            outlookBudget = if (s.useNews) s.newsPerDay.coerceAtLeast(0) else 0
+            val siblings = try {
+                // Gson leaves a field missing from an old file null, whatever its type says.
+                FloorAlgoStore.list(ctx, space).filter { it.id != a.id }.mapNotNull { o ->
+                    @Suppress("USELESS_ELVIS") (o.outlooks ?: emptyMap())
+                }
+            } catch (e: Exception) { emptyList() }
+            val verdicts = HashMap<String, String?>()
+            val order = members.withIndex().filter { it.value.pick == PICK_ASK }
+                .sortedWith(compareBy({ it.value.lowAgo ?: 99 }, { it.index })).map { it.value }
+            for (m in order) {
+                if (!s.useNews) { verdicts[m.symbol] = "NOT ASKED"; continue }
+                val own = freshVerdict(a.outlooks, m.symbol)
+                if (own != null) { verdicts[m.symbol] = own.first; continue }
+                val shared = siblings.firstNotNullOfOrNull { freshVerdict(it, m.symbol) }
+                if (shared != null) {
+                    a = a.copy(outlooks = a.outlooks + (m.symbol to "${shared.first}|${shared.second}"))
+                    verdicts[m.symbol] = shared.first
+                    continue
+                }
+                verdicts[m.symbol] = outlookFor(m, daily[m.symbol.uppercase()]?.lastOrNull()?.close ?: 0.0)
+            }
+            return members.map { m ->
+                if (m.pick != PICK_ASK) return@map m
+                val v = verdicts[m.symbol]
+                val at = "at its monthly low ${agoText(m.lowAgo)}"
+                when {
+                    v == null -> m.copy(pick = FloorAlgoStore.PICK_OUT,
+                        note = "$at — news outlook not asked yet (today's ${s.newsPerDay} checks were used)")
+                    v.isEmpty() -> m.copy(pick = FloorAlgoStore.PICK_OUT,
+                        note = "$at — the news outlook gave no verdict; asked again tomorrow")
+                    v == "NOT ASKED" || ChainRules.positive(v) -> m.copy(pick = FloorAlgoStore.PICK_YES, verdict = v,
+                        note = "$at, news outlook $v — watching for a turn")
+                    else -> m.copy(pick = FloorAlgoStore.PICK_SIDE, verdict = v,
+                        note = "$at, news outlook $v — followed on the side")
+                }
+            }
+        }
+
+        /**
+         * Trades followed on the side, replayed through the same stop, target and
+         * time limit as a bought one — what would have sold each, and for how much
+         * before charges. That is the comparison the outlook is there to win.
+         */
+        private fun followedExits() {
+            var trades = a.trades
+            for (t in a.trades.filter { it.status == "MISSED" && it.firstSec > 0L && it.firstPrice > 0.0 && it.sideExit == null }) {
+                val days = book.days(t.symbol) ?: continue
+                val ex = position(t, days).exit ?: continue
+                val pct = if (t.entry > 0.0) (ex.price / t.entry - 1.0) * 100.0 else 0.0
+                trades = trades.map {
+                    if (it.id == t.id) it.copy(sideExit = ex.reason, sideExitPct = pct, sideExitDay = ex.day.toString()) else it
+                }
+                if (t.followWhy?.startsWith("news") == true)
+                    note("${t.symbol} (followed on the side, ${t.followWhy}): would have sold on ${ex.day.format(dayFmt)} — " +
+                        "${reasonText(ex.reason, a.settings.holdDays)} (${String.format(Locale.US, "%+.2f", pct)}% before charges)")
+            }
+            a = a.copy(trades = trades)
         }
 
         // ── FLOOR ORDERS ─────────────────────────────────────────────────────
@@ -670,7 +962,15 @@ object FloorAlgoEngine {
             val smoothing = MacdLadder.smoothingFor(ctx, space)
             val delay = FeedDelay.secFor(space)
             val todayStr = today.toString()
-            val skip = a.trades.filter { it.status == "OPEN" || it.day == todayStr }.map { it.symbol }.toSet()
+            // On a monthly-low list a FOLLOWED trade is held on paper too, until its
+            // replayed exit — so the side is followed exactly as a seat would be held,
+            // one position per stock, and the two records compare like for like.
+            // A replay that never finished (prices gone) stops holding the stock after a month.
+            val since = today.minusDays(GIVE_UP_DAYS).toString()
+            val skip = a.trades.filter {
+                it.status == "OPEN" || it.day == todayStr ||
+                    (lowPick && it.status == "MISSED" && it.sideExit == null && it.day > since)
+            }.map { it.symbol }.toSet() + a.asks.filter { it.day == todayStr }.map { it.symbol }
             val members = a.universe.map { m ->
                 if (!passes(m) || m.symbol in skip) return@map m
                 val c15 = Intraday.bars(space, m.symbol)
@@ -700,26 +1000,43 @@ object FloorAlgoEngine {
                 }
                 if (!turned) return@map seen.copy(note =
                     if (m.turnBlocked) m.note else "waiting for 15m and 1h to turn up together")
-                seen.copy(turnSec = nowSec, turnPx = last.close, turnBlocked = false, note = signal(m))
+                seen.copy(turnSec = nowSec, turnPx = last.close, turnBlocked = false, note = signal(m, last.close))
             }
             a = a.copy(universe = members)
         }
 
         /** A turn seen: a seat is taken now, and filled at the next bar's open. */
-        private fun signal(m: Member): String {
+        private fun signal(m: Member, price: Double = 0.0): String {
             val s = a.settings
             val spans = a.trades.filter { it.status != "MISSED" }
                 .map { LocalDate.parse(it.day) to it.sellDay?.let { d -> LocalDate.parse(d) } }
             val busy = FloorOrders.seatsBusy(spans, today)
-            val free = busy < s.seats
+            // The outlook said no: followed on the side whether or not a seat is free.
+            val side = lowPick && m.pick == FloorAlgoStore.PICK_SIDE
+            val free = !side && busy < s.seats
+            // ASKED, NOT BOUGHT — see FloorAsks.
+            if (free && lowPick) {
+                raiseAsk(FloorAlgoStore.Ask(id = "${m.symbol}|$today", symbol = m.symbol, name = m.name,
+                    kind = FloorAsks.TURN, verdict = m.verdict ?: "", day = today.toString(),
+                    what = "15-minute and hourly MACD turned up with the 4-hour rising",
+                    signalSec = nowSec, fromSec = ((nowSec + 899) / 900) * 900, price = price, askedMs = nowMs))
+                note("${m.symbol}: 15m and 1h MACD turned up (4h rising), news outlook ${m.verdict} — asking you before buying")
+                return "turned up ${clock(nowSec)} — asking you"
+            }
             val t = Trade(id = "${m.symbol}|$today", symbol = m.symbol, name = m.name, day = today.toString(),
                 signalSec = nowSec, fromSec = ((nowSec + 899) / 900) * 900,
-                status = if (free) "OPEN" else "MISSED")
+                status = if (free) "OPEN" else "MISSED",
+                verdict = if (lowPick) m.verdict else null,
+                followWhy = when { side -> "news outlook ${m.verdict}"; !free && lowPick -> "every seat taken"; else -> null })
             a = a.copy(trades = a.trades.filterNot { it.id == t.id } + t)
             val at = clock(nowSec)
             return if (free) {
-                note("${m.symbol}: 15m and 1h MACD turned up (4h rising) — buying at the next price (seat ${busy + 1} of ${s.seats})")
+                note("${m.symbol}: 15m and 1h MACD turned up (4h rising) — buying at the next price (seat ${busy + 1} of ${s.seats})" +
+                    (if (lowPick) " · news outlook ${m.verdict}" else ""))
                 "turned up $at — buying"
+            } else if (side) {
+                note("${m.symbol}: 15m and 1h MACD turned up (4h rising), but the news outlook said ${m.verdict} — followed on the side, not bought")
+                "turned up $at — outlook ${m.verdict}, followed"
             } else {
                 note("${m.symbol}: turned up, but all ${s.seats} seats were taken — followed on the side, not bought")
                 "turned up $at — seats full, followed"
@@ -768,6 +1085,8 @@ object FloorAlgoEngine {
             val todayStr = today.toString()
             // Bought without the filter, so never sold by it.
             if (!filterOn) { a = a.copy(trendCheckDay = todayStr); return }
+            // The trend picks what is bought but never sells here — see Settings.trendExit.
+            if (a.settings.trendExit == false) { a = a.copy(trendCheckDay = todayStr); return }
             val held = a.trades.filter {
                 it.status == "OPEN" && it.firstPrice > 0.0 && it.trendDay == null && it.day != todayStr
             }
@@ -777,10 +1096,10 @@ object FloorAlgoEngine {
                 val daily = dailyBars(held.map { it.symbol }.distinct())?.takeIf { it.isNotEmpty() } ?: return
                 var trades = a.trades
                 for (t in held) {
-                    val (w, d) = trendOf(daily[t.symbol.uppercase()], smoothing)
+                    val (w, d) = trendOf(daily[t.symbol.uppercase()], smoothing, t.symbol)
                     if (!FloorOrders.trendBroken(w, d)) continue
                     trades = trades.map { if (it.id == t.id) it.copy(trendDay = todayStr) else it }
-                    val what = listOfNotNull(if (w != 1) "weekly" else null, if (d != 1) "daily" else null).joinToString(" and ")
+                    val what = listOfNotNull(if (w != 1) longWord else null, if (d != 1) "daily" else null).joinToString(" and ")
                     note("${t.symbol}: $what MACD no longer rising — sold at today's close unless the stop or target comes first")
                 }
                 a = a.copy(trades = trades)
@@ -861,6 +1180,7 @@ object FloorAlgoEngine {
             "stop" -> "stop-loss hit"
             "target" -> "target reached"
             "trend" -> "trend broke — sold at the close"
+            "yours" -> "you sold it from your portfolio"
             else -> "held $holdDays trading days — sold at the close"
         }
 
@@ -1033,7 +1353,7 @@ object FloorAlgoEngine {
             var started = 0
             val members = a.universe.map { m ->
                 val bars = daily[m.symbol.uppercase()] ?: return@map m.copy(note = "no daily prices")
-                val (w, d) = trendOf(bars, smoothing)
+                val (w, d) = trendOf(bars, smoothing, m.symbol)
                 val base = m.copy(week = w, day = d)
                 if (m.symbol in busy) return@map base.copy(note = "campaign running")
                 val L = CampaignRules.levels(bars, s.atrFrac, s.levelSource) ?: return@map base.copy(note = "not enough history")
@@ -1231,6 +1551,24 @@ object FloorAlgoEngine {
             outcomes()
         }
 
+        private fun raiseAsk(k: FloorAlgoStore.Ask) {
+            a = FloorAsks.raise(a, k)
+            asked.add(k)
+        }
+
+        /** Taps that came in since the last pass, then requests no one answered in time. */
+        private fun settleAsks() {
+            val before = a.asks.filter { it.status == FloorAsks.WAITING }.map { it.id }.toSet()
+            a = settleQueued(ctx, a)
+            val open = MarketHours.isRegularSession(space, nowMs)
+            for (k in FloorAsks.due(a, nowMs, open)) {
+                val (n, msg) = FloorAsks.resolve(a, k.id, FloorAsks.NO_ANSWER, nowMs, today)
+                a = n
+                note(msg.replace("(no answer)", "(no answer in 30 minutes)"))
+            }
+            settled.addAll(before - a.asks.filter { it.status == FloorAsks.WAITING }.map { it.id }.toSet())
+        }
+
         private fun chainSeatsBusy(chains: List<FloorAlgoStore.Chain>) =
             chains.count { it.counted && it.state != "ENDED" }
 
@@ -1287,7 +1625,6 @@ object FloorAlgoEngine {
 
             // 2. New touches of the monthly low.
             val busySyms = chains.filter { it.state != "ENDED" }.map { it.symbol }.toSet()
-            val cap = s.seats.coerceAtLeast(1) * 3       // followed chains are bounded: each costs downloads
             val seat = s.capital / s.seats.coerceAtLeast(1)
             var started = 0
             val members = a.universe.map { m ->
@@ -1301,14 +1638,19 @@ object FloorAlgoEngine {
                     return@map m.copy(note = "day's low at ${String.format(Locale.US, "%.0f", pos)}% of its monthly range")
                 }
                 if (!a.enabled) return@map m.copy(note = "at its monthly low — algo paused")
-                if (chains.count { it.state != "ENDED" } >= cap)
-                    return@map m.copy(note = "at its monthly low — too many chains followed already")
+                val room = ChainRules.room(chains.count { it.state != "ENDED" && !it.counted },
+                    chainSeatsBusy(chains), s.seats)
+                if (room == ChainRules.Room.FULL)
+                    return@map m.copy(note = "at its monthly low — every seat taken and too many followed already")
                 val judged = bars.last().date
                 val verdict = if (s.useNews) (outlookFor(m, bars.last().close)?.ifEmpty { "NO VERDICT" } ?: "") else "NOT ASKED"
                 val c = chainDecide(FloorAlgoStore.Chain(id = "${m.symbol}|$todayStr", symbol = m.symbol, name = m.name,
                     touchDay = judged.toString(), lastTouchDay = judged.toString(),
                     expiryDay = ChainRules.addTradingDays(judged, s.watchDays).toString(),
                     watchFromSec = fromSec, verdict = verdict, seat = seat, scannedSec = fromSec), chains)
+                // Only a seat-taker may pass the full side list; anything else is not followed.
+                if (room == ChainRules.Room.SEAT_ONLY && !c.counted)
+                    return@map m.copy(note = "at its monthly low — ${c.why}; too many followed already to follow it")
                 chains = chains + c
                 started++
                 note("${m.symbol}: at its monthly low on ${judged.format(dayFmt)}" +
@@ -1326,7 +1668,7 @@ object FloorAlgoEngine {
         private fun chainMaybeEnd(c: FloorAlgoStore.Chain, why: String): FloorAlgoStore.Chain {
             if (c.state == "ENDED") return c
             val pending = a.trades.any { it.id.startsWith(c.id + "|") && it.sellDay == null }
-            val waiting = c.dots.isEmpty() || c.champ.isEmpty()
+            val waiting = c.dots.isEmpty() || c.champ.isEmpty() || c.dots == "ASK" || c.champ == "ASK"
             if (waiting || pending) return c
             val legs = a.trades.filter { it.id.startsWith(c.id + "|") }
             val reason = if (legs.isEmpty()) why else "both halves done"
@@ -1380,7 +1722,17 @@ object FloorAlgoEngine {
                             zone, after, nowSec, delay, smoothing)
                         val newest = c15.filter { FeedDelay.isComplete(it.timestamp, 900L, nowSec, 0L, delay) }
                             .maxOfOrNull { it.timestamp } ?: after
-                        if (turn != null) {
+                        if (turn != null && c.counted) {
+                            // ASKED, NOT BOUGHT — see FloorAsks.
+                            raiseAsk(FloorAlgoStore.Ask(id = "${c.id}|A", symbol = c.symbol, name = c.name,
+                                kind = FloorAsks.CHAIN_A, chainId = c.id, verdict = c.verdict, day = todayStr,
+                                what = "at its monthly low; daily, 4-hour, hourly and 15-minute MACD all turned up — the timeframes half",
+                                signalSec = turn.endSec, fromSec = ChainRules.ceil15(maxOf(turn.endSec, nowSec)),
+                                price = c15.maxByOrNull { it.timestamp }?.close ?: 0.0, askedMs = nowMs))
+                            c = c.copy(dots = "ASK", state = "HOLDING", scannedSec = turn.barSec + 900L)
+                            note("${c.symbol}: daily, 4-hour, hourly and 15-minute MACD all turned up at " +
+                                "${clock(turn.endSec)} — asking you before the timeframes half buys")
+                        } else if (turn != null) {
                             val t = Trade(id = "${c.id}|A", symbol = c.symbol, name = c.name, day = todayStr,
                                 signalSec = turn.endSec, fromSec = ChainRules.ceil15(maxOf(turn.endSec, nowSec)), status = status)
                             a = a.copy(trades = a.trades.filterNot { it.id == t.id } + t)
@@ -1408,7 +1760,17 @@ object FloorAlgoEngine {
                             if (tr != null) {
                                 val sigEnd = tr.entryTs + (if (run.exitTfSec > 0) run.exitTfSec else src)
                                 val sigDay = Instant.ofEpochSecond(sigEnd).atZone(zone).toLocalDate().toString()
-                                if (c.expiryDay.isEmpty() || sigDay <= c.expiryDay) {
+                                if ((c.expiryDay.isEmpty() || sigDay <= c.expiryDay) && c.counted) {
+                                    // ASKED, NOT BOUGHT — see FloorAsks.
+                                    raiseAsk(FloorAlgoStore.Ask(id = "${c.id}|B", symbol = c.symbol, name = c.name,
+                                        kind = FloorAsks.CHAIN_B, chainId = c.id, verdict = c.verdict, day = todayStr,
+                                        what = "at its monthly low; the conservative champion's entry fired — the champion half",
+                                        signalSec = sigEnd, fromSec = ChainRules.ceil15(maxOf(sigEnd, nowSec)),
+                                        price = candles.lastOrNull()?.close ?: 0.0, askedMs = nowMs))
+                                    c = c.copy(champ = "ASK", state = "HOLDING")
+                                    note("${c.symbol}: the conservative champion bought at ${clock(sigEnd)} " +
+                                        "(${tr.entryReason.take(60)}) — asking you before the champion half buys")
+                                } else if (c.expiryDay.isEmpty() || sigDay <= c.expiryDay) {
                                     val t = Trade(id = "${c.id}|B", symbol = c.symbol, name = c.name, day = sigDay,
                                         signalSec = sigEnd, fromSec = ChainRules.ceil15(maxOf(sigEnd, nowSec)), status = status)
                                     a = a.copy(trades = a.trades.filterNot { it.id == t.id } + t)

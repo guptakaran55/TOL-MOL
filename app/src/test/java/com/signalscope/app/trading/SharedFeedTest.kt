@@ -68,4 +68,15 @@ class SharedFeedTest {
         assertEquals(1, calls.get())
         assertEquals(7L, SharedFeed.shared)
     }
+
+    @Test fun `a long-kept download outlives a short-kept one stored after it`() {
+        var clock = 0L
+        SharedFeed.get("yahoo|SAP.DE|730d|60m|false", 120_000L, keep = { _: String -> true }, nowMs = { clock }) { "two years" }
+        clock = 90_000L
+        SharedFeed.get("de|BMW|60m", 60_000L, keep = { _: String -> true }, nowMs = { clock }) { "bars" }
+        var again = 0
+        val v = SharedFeed.get("yahoo|SAP.DE|730d|60m|false", 120_000L, keep = { _: String -> true }, nowMs = { clock }) { again++; "fresh" }
+        assertEquals("two years", v)
+        assertEquals(0, again)
+    }
 }

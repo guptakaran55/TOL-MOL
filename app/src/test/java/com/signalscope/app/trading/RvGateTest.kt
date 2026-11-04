@@ -57,6 +57,18 @@ class RvGateTest {
         assertTrue(d.why.contains("dip and a turn"))
     }
 
+    @Test fun `the order's own high keeps the range from shrinking under it`() {
+        // WAF, 29 Oct 2026: open 59.35, ATR 3.40 (half = 1.70). The delayed bars'
+        // high is 60.95; the order itself saw 61.05 two minutes ago. Without that
+        // high the range is 1.625 — "too narrow" — and the rise bought at the top.
+        var m = RvGate.remember(null, 61.05, 3.40)
+        m = RvGate.remember(m, 60.975, 3.40)
+        // The open as the feed reports it (59.349998…): the real range sat exactly on the mark.
+        val d = RvGate.decide(Side.BUY, 60.975, 60.95, 59.349998474121094, 3.40, +0.37, 120_000L, 59L, memory = m)
+        assertFalse(d.go)
+        assertTrue(d.why.contains("dip and a turn"))
+    }
+
     @Test fun `a dip from the order's own high and a turn up starts it, though still high in the range`() {
         var m = RvGate.remember(null, 109.5, 4.0)          // began waiting at 109.5
         m = RvGate.remember(m, 108.6, 4.0)                 // 0.9 under: a dip

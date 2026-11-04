@@ -117,7 +117,15 @@ object RvGate {
         if (price == null || !(price > 0.0)) return Decision(true, "no live price — not held back blind")
         if (waitedMs >= MAX_WAIT_MS) return Decision(true, "held back 2 hours — starting anyway", timedOut = true)
 
-        val hi = if (high > 0.0) maxOf(high, price) else price
+        // A WAITING BUY'S OWN HIGH IS PART OF TODAY'S RANGE. The day's high is
+        // read off 15-minute bars that run 15 minutes behind on Xetra, so a top
+        // this order itself saw could drop out minutes later and the range shrink
+        // under the half-ATR mark — switching off the top-of-range protection.
+        // WAF, 29 Oct 2026: held at 61.05 as "near today's high and rising", then
+        // bought two minutes later at 60.975 as "rising", the range having shrunk
+        // from 1.70 to 1.63 with no dip and no turn.
+        val seenHigh = memory?.peak?.takeIf { it > 0.0 } ?: 0.0
+        val hi = maxOf(if (high > 0.0) maxOf(high, price) else price, seenHigh)
         val lo = if (low > 0.0) minOf(low, price) else price
         val range = hi - lo
         val rangeMeans = range > 0.0 && (atr <= 0.0 || range >= RANGE_MIN_ATR * atr)

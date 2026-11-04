@@ -685,7 +685,16 @@ class ScanService : Service() {
         // Run the SAME list the activity check saw. runAll self-gates per
         // namespace, so inactive ones no-op — no double-run, no divergence
         // between "what we checked" and "what we run".
-        val nsList = allNs
+        // A SLEEPING MARKET'S ALGOS ARE NOT RUN — see MarketHours.awake. Their bars
+        // cannot change until the open, so a pass would only download them again.
+        val passMs = System.currentTimeMillis()
+        val awake = { b: String -> com.signalscope.app.trading.MarketHours.awake(b, passMs) }
+        val nsList = allNs.filter { awake(com.signalscope.app.trading.Spaces.baseOf(it)) }
+        val asleep = allNs.size - nsList.size
+        if (asleep > 0) Log.i(TAG, "Market sleep: $asleep algo book(s) of closed markets not run this pass")
+        val t212Awake = awake("de") || awake("us")
+        val indiaAwake = awake("in")
+        val stocksAwake = t212Awake || indiaAwake
         val latch = java.util.concurrent.CountDownLatch(nsList.size)
         for (n in nsList)
             com.signalscope.app.trading.StrategyLabRunner.runAll(applicationContext, 0L, n) { latch.countDown() }
@@ -712,13 +721,15 @@ class ScanService : Service() {
         // its first attempt before any backlog competes for the same ladder thread.
         // BEFORE the retry sweep, so a row the ladder silently filled is reopened
         // rather than retried — which would buy the same name a second time.
-        try { com.signalscope.app.trading.T212LiveMirror.adoptStrandedFills(applicationContext) }
-        catch (e: Exception) { Log.w(TAG, "stranded-fill adoption failed", e) }
-        try { com.signalscope.app.trading.T212LiveMirror.retryPendingEntries(applicationContext) }
-        catch (e: Exception) { Log.w(TAG, "entry retry failed: ${e.message}") }
+        if (t212Awake) {
+            try { com.signalscope.app.trading.T212LiveMirror.adoptStrandedFills(applicationContext) }
+            catch (e: Exception) { Log.w(TAG, "stranded-fill adoption failed", e) }
+            try { com.signalscope.app.trading.T212LiveMirror.retryPendingEntries(applicationContext) }
+            catch (e: Exception) { Log.w(TAG, "entry retry failed: ${e.message}") }
+        }
         // Indian exits that could not go through — retried, or closed if the
         // protective stop had already sold the shares. See the sweep itself.
-        try { com.signalscope.app.trading.ZerodhaLiveMirror.retryHeldExits(applicationContext) }
+        if (indiaAwake) try { com.signalscope.app.trading.ZerodhaLiveMirror.retryHeldExits(applicationContext) }
         catch (e: Exception) { Log.w(TAG, "held-exit retry failed: ${e.message}") }
         // UNSOLD EXITS come first in importance: a position the book has closed but
         // the broker still holds is real money exposed with nothing managing it.
@@ -728,28 +739,44 @@ class ScanService : Service() {
         try { com.signalscope.app.trading.RvManualQueue.expireAsks(applicationContext) } catch (_: Exception) {}
         // The RV gate's record: how each released algo order ended (fill or not).
         try { com.signalscope.app.trading.RvJournal.settle(applicationContext) } catch (_: Exception) {}
-        try { com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext) }
-        catch (e: Exception) { Log.w(TAG, "exit retry failed: ${e.message}") }
-        // ALGO POSITIONS SOLD IN THE BROKER'S OWN APP — gone from the account on two
-        // reads half an hour apart — are closed and their seats handed on.
-        try {
-            val hs = com.signalscope.app.trading.T212HandSales.sweep(applicationContext)
-            if (hs.isNotBlank()) Log.i(TAG, "Hand sales: $hs")
-        } catch (e: Exception) { Log.w(TAG, "hand-sale sweep failed: ${e.message}") }
-        // …and PART of a stock sold in Trading 212's app: the difference comes off
-        // the app's positions in it — your watchlist's first, oldest first.
-        try {
-            val ps = com.signalscope.app.trading.T212HandSales.absorbPartial(applicationContext)
-            if (ps.isNotBlank()) Log.i(TAG, "Part sales: $ps")
-        } catch (e: Exception) { Log.w(TAG, "part-sale sweep failed: ${e.message}") }
+        // A sale waiting for a sleeping market goes out at its first pass after waking.
+        if (t212Awake) {
+            try { com.signalscope.app.trading.T212LiveMirror.retryPendingExits(applicationContext) }
+            catch (e: Exception) { Log.w(TAG, "exit retry failed: ${e.message}") }
+            // ALGO POSITIONS SOLD IN THE BROKER'S OWN APP — gone from the account on two
+            // reads half an hour apart — are closed and their seats handed on.
+            try {
+                val hs = com.signalscope.app.trading.T212HandSales.sweep(applicationContext)
+                if (hs.isNotBlank()) Log.i(TAG, "Hand sales: $hs")
+            } catch (e: Exception) { Log.w(TAG, "hand-sale sweep failed: ${e.message}") }
+            // …and PART of a stock sold in Trading 212's app: the difference comes off
+            // the app's positions in it — your watchlist's first, oldest first.
+            try {
+                val ps = com.signalscope.app.trading.T212HandSales.absorbPartial(applicationContext)
+                if (ps.isNotBlank()) Log.i(TAG, "Part sales: $ps")
+            } catch (e: Exception) { Log.w(TAG, "part-sale sweep failed: ${e.message}") }
+        }
         // REAL BUYS THAT FAILED FOR GOOD: out of the book with the seat handed on,
         // and followed in each algo's Unfulfilled list with what they would have made.
-        try {
+        if (stocksAwake) try {
             val uf = com.signalscope.app.trading.UnfulfilledEntries.sweep(applicationContext)
             if (uf.isNotBlank()) Log.i(TAG, "Unfulfilled: $uf")
         } catch (e: Exception) { Log.w(TAG, "unfulfilled sweep failed: ${e.message}") }
-        // …and the same for India's algos, priced from the day's Zerodha fills.
+        // INDIA'S WAITING BUYS, SETTLED — filled ones recorded and protected, triggers
+        // whose trade has ended cancelled at Zerodha, lapsed ones closed. Before the
+        // outside-sale check below, which books any of them already sold.
         try {
+            if (indiaAwake) {
+                val zs = com.signalscope.app.trading.ZerodhaSettle.sweep(applicationContext)
+                if (zs.isNotBlank()) Log.i(TAG, "India waiting buys: $zs")
+            }
+            // Never asleep: protection for shares the app wrongly wrote off must go
+            // back on whenever Zerodha can be reached, weekends included.
+            val zh = com.signalscope.app.trading.ZerodhaSettle.stillHeld(applicationContext)
+            if (zh.isNotBlank()) Log.i(TAG, "India: $zh")
+        } catch (e: Exception) { Log.w(TAG, "India waiting-buy settle failed: ${e.message}") }
+        // …and the same for India's algos, priced from the day's Zerodha fills.
+        if (indiaAwake) try {
             val hz = com.signalscope.app.trading.ZerodhaHandSales.sweep(applicationContext)
             if (hz.isNotBlank()) Log.i(TAG, "Hand sales (India): $hz")
         } catch (e: Exception) { Log.w(TAG, "Indian hand-sale sweep failed: ${e.message}") }
@@ -758,7 +785,7 @@ class ScanService : Service() {
         // back, so a pass that does not ask loses that day's trades permanently.
         // Self-throttling and deduped, so calling it on every tick costs one small
         // request every ten minutes and nothing at all when the session is down.
-        try { com.signalscope.app.data.ZerodhaTradeStore.capture(applicationContext) }
+        if (indiaAwake) try { com.signalscope.app.data.ZerodhaTradeStore.capture(applicationContext) }
         catch (e: Exception) { Log.w(TAG, "zerodha trade capture failed: ${e.message}") }
         // MANUAL ENTRY WATCHER — after the algos, never before. It fetches a series
         // per candidate, and running it first would spend the tick's rate-limit
@@ -769,6 +796,7 @@ class ScanService : Service() {
         // What the watchers actually did, so the completion notice can SAY it.
         val watchBits = ArrayList<String>()
         for (sp in com.signalscope.app.trading.ManualEntryWatcher.WATCHED_SPACES) {
+            if (!awake(sp)) continue
             try {
                 val o = withContext(Dispatchers.IO) {
                     com.signalscope.app.trading.ManualEntryWatcher.runOnce(applicationContext, sp)
@@ -794,7 +822,7 @@ class ScanService : Service() {
         }
         // 1-WEEK-HIGH TARGETS AT TRADING 212 — after every seller above has had its
         // turn, so a target is never put back on a position this same pass sells.
-        try {
+        if (t212Awake) try {
             val tg = withContext(Dispatchers.IO) {
                 com.signalscope.app.trading.T212WeekTargets.keep(applicationContext)
             }
@@ -803,7 +831,7 @@ class ScanService : Service() {
         // SAFETY STOPS UNDER SALES THAT ARE WAITING — after the exit retry and the
         // targets, so a sale made this pass is tidied rather than protected, and a
         // sale that found no buyer gets its stop back straight away.
-        try {
+        if (t212Awake) try {
             val gd = withContext(Dispatchers.IO) {
                 com.signalscope.app.trading.T212ExitGuards.keep(applicationContext)
             }
@@ -812,7 +840,7 @@ class ScanService : Service() {
         // BUYS WAITING AT TRADING 212 — yours as well as the app's. Each holds cash
         // back from the account, so the waiting-orders list and the algos' cash
         // check both need to know they are there. Read only.
-        try {
+        if (t212Awake) try {
             val wb = withContext(Dispatchers.IO) {
                 com.signalscope.app.trading.T212WaitingOrders.refresh(applicationContext)
             }
@@ -824,10 +852,17 @@ class ScanService : Service() {
         val floorNote = try {
             withContext(Dispatchers.IO) { com.signalscope.app.trading.FloorAlgoEngine.runAll(applicationContext) }
         } catch (e: Exception) { Log.w(TAG, "floor algos failed: ${e.message}"); "" }
+        // QUALITY · CHEAP · UPTREND — once a quarter has ended, the new company list
+        // from the latest scan, left on the algo's card for approval. Paper only;
+        // reads file dates until there is something to do.
+        try {
+            val ql = withContext(Dispatchers.IO) { com.signalscope.app.trading.QualityCheap.checkQuarter(applicationContext) }
+            if (ql.isNotBlank()) Log.i(TAG, "Quality lists: $ql")
+        } catch (e: Exception) { Log.w(TAG, "quality list check failed: ${e.message}") }
         // WHAT YOU HOLD, FOR THE PINNED NOTIFICATION — last, so it reads the
         // positions, targets and stops exactly as this pass left them. Reports
         // only; it places and cancels nothing.
-        try {
+        if (stocksAwake) try {
             withContext(Dispatchers.IO) {
                 // DAX, Sensex and Nasdaq-100 for the widget's strip — three small
                 // requests, at most every ten minutes, drawn with the summary below.
@@ -2613,6 +2648,8 @@ class ScanService : Service() {
         val intent = Intent(this, MainActivity::class.java)
         if (openTab.isNotBlank()) {
             intent.putExtra(com.signalscope.app.trading.LabNotifier.EXTRA_OPEN_TAB, openTab)
+            intent.putExtra(com.signalscope.app.trading.LabNotifier.EXTRA_TAP_ID,
+                com.signalscope.app.trading.LabNotifier.tapId("scan-$openTab"))
             // Without a distinct action+data the system hands back the EXISTING
             // intent for an already-running task and the extra is dropped — the tap
             // then just brings the app forward, doing nothing.
@@ -2697,7 +2734,7 @@ class ScanService : Service() {
         val pi = PendingIntent.getActivity(this, alert.symbol.hashCode(),
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val notification = NotificationCompat.Builder(this, CHANNEL_ALERTS)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setContentTitle(title).setContentText(alert.message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigBody))
             .setSmallIcon(android.R.drawable.ic_dialog_alert).setContentIntent(pi)
@@ -2716,13 +2753,16 @@ class ScanService : Service() {
                     }
                 }
             }
-            .build()
+        val notification = builder.build()
         // The holding it is about, in the market it trades in, so the list can
         // open it again.
         val alertSpace = when (currency) { "$" -> "us"; "€" -> "de"; else -> "in" }
+        val id = alert.symbol.hashCode() + 1000
         NotificationLog.post(this, getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-            alert.symbol.hashCode() + 1000, notification,
-            NotificationLog.Link(holding = alert.symbol, space = alertSpace))
+            id, notification, NotificationLog.Link(holding = alert.symbol, space = alertSpace))
+        // The watchlist alerts' picture, added once drawn — see LabNotifier.addChart.
+        com.signalscope.app.trading.LabNotifier.addChart(this, id, builder, alertSpace,
+            alert.symbol, alert.price, title, bigBody)
     }
 
     private fun sendZerodhaExpiredNotification() {

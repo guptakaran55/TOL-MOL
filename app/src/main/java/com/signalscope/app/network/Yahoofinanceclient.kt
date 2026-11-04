@@ -822,9 +822,37 @@ object YahooFinanceClient {
          * answered here.
          */
         includePrePost: Boolean = false
-    ): CandleResult = chartFor(toYahooSymbol(symbol, exchange)) { s, min, obs ->
-        fetchCandlesInternalOnce(symbol, exchange, range, interval, includePrePost, s, min, obs)
+    ): CandleResult {
+        val ys = toYahooSymbol(symbol, exchange)
+        val whole = {
+            chartFor(ys) { s, min, obs ->
+                fetchCandlesInternalOnce(symbol, exchange, range, interval, includePrePost, s, min, obs)
+            }
+        }
+        // Long histories: whole once a day, the latest days after — see BarHistory.
+        val fetch = if (BarHistory.applies(range, interval, includePrePost) &&
+                com.signalscope.app.data.SymbolRenames.feedSuccessor(ys) == null) {
+            {
+                BarHistory.fetch("$ys|$range|$interval", ys, range, System.currentTimeMillis(), full = whole,
+                    recent = { fetchCandlesInternalOnce(symbol, exchange, BarHistory.RECENT_RANGE, interval,
+                        includePrePost, ys, 1, ys) })
+            }
+        } else whole
+        if (interval !in SHARED_INTERVALS) return fetch()
+        return com.signalscope.app.trading.SharedFeed.get("yahoo|$ys|$range|$interval|$includePrePost",
+            SAME_DOWNLOAD_MS, keep = { r: CandleResult -> r is CandleResult.Success }, fetch = fetch)
     }
+
+    /**
+     * ONE DOWNLOAD PER STOCK PER CHECK, whoever asks. The algos, the paper algos,
+     * the watchlist and the valuations each fetched their own copy: one check on
+     * 31 Oct 2026 made 305 downloads of which 39 repeated one made under two
+     * minutes before. The same request inside [SAME_DOWNLOAD_MS] is answered from
+     * that download. Only bars of 15 minutes and longer — a live price from 1- or
+     * 5-minute bars is always asked fresh.
+     */
+    private const val SAME_DOWNLOAD_MS = 2 * 60_000L
+    private val SHARED_INTERVALS = setOf("15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo")
 
     private fun fetchCandlesInternalOnce(
         symbol: String, exchange: String, range: String, interval: String,

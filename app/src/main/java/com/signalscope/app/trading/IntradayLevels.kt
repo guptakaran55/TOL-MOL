@@ -84,6 +84,7 @@ object IntradayLevels {
         // The same window over a week and a month — on the bars already in hand.
         val wk = window(candles, WEEK_DAYS, WEEK_MIN_DAYS)
         val mo = window(candles, MONTH_DAYS, MONTH_MIN_DAYS)
+        val yr = window(candles, YEAR_DAYS, YEAR_MIN_DAYS)
 
         return ManualWatchStore.Levels(
             symbol = symbol.trim().uppercase(),
@@ -96,6 +97,8 @@ object IntradayLevels {
             weekVisits = wk?.visits ?: 0, weekDays = wk?.days ?: 0,
             monthLow = mo?.low ?: 0.0, monthHigh = mo?.high ?: 0.0,
             monthVisits = mo?.visits ?: 0, monthDays = mo?.days ?: 0,
+            yearLow = yr?.low ?: 0.0, yearHigh = yr?.high ?: 0.0,
+            yearVisits = yr?.visits ?: 0, yearDays = yr?.days ?: 0,
             barMin = barMin, bars = candles.size, atMs = nowMs)
     }
 
@@ -105,8 +108,13 @@ object IntradayLevels {
     // listing, a thin history) is left out rather than shown as a "month".
     const val WEEK_DAYS = 5
     const val MONTH_DAYS = 21
+    /** A trading year — the 52-week low (asked for 21 Oct 2026). The watcher's
+     *  bars reach back about two years, so this costs no extra download; a
+     *  younger listing without most of a year is left out, not called a year. */
+    const val YEAR_DAYS = 252
     private const val WEEK_MIN_DAYS = 4
     private const val MONTH_MIN_DAYS = 15
+    private const val YEAR_MIN_DAYS = 200
 
     private class Window(val low: Double, val high: Double, val visits: Int, val days: Int)
 
@@ -120,13 +128,13 @@ object IntradayLevels {
         return Window(lo, hi, zoneVisits(recent, lo, hi), n)
     }
 
-    /** One horizon's floor: "3d", "1w" or "1m", and its range. */
+    /** One horizon's floor: "3d", "1w", "1m" or "1y", and its range. */
     data class Floor(val scale: String, val label: String, val low: Double, val high: Double,
                      val visits: Int, val days: Int)
 
     /**
      * WHICH OF ITS LOWS IS THIS PRICE SITTING AT — the 3-day, the week's, the
-     * month's — by the same rule for each: the bottom tenth of that window's own
+     * month's, the year's — by the same rule for each: the bottom tenth of that window's own
      * range (or below it). Shortest first. Pure, so it is tested on numbers.
      */
     fun floorsHit(lv: ManualWatchStore.Levels, price: Double): List<Floor> {
@@ -134,7 +142,8 @@ object IntradayLevels {
         val all = listOf(
             Floor("3d", "${lv.swingDays.takeIf { it > 0 } ?: SWING_DAYS}-day", lv.swingLow, lv.swingHigh, lv.swingVisits, lv.swingDays),
             Floor("1w", "1-week", lv.weekLow, lv.weekHigh, lv.weekVisits, lv.weekDays),
-            Floor("1m", "1-month", lv.monthLow, lv.monthHigh, lv.monthVisits, lv.monthDays))
+            Floor("1m", "1-month", lv.monthLow, lv.monthHigh, lv.monthVisits, lv.monthDays),
+            Floor("1y", "1-year", lv.yearLow, lv.yearHigh, lv.yearVisits, lv.yearDays))
         return all.filter { f ->
             f.low > 0.0 && f.high > f.low && inSupportZone(positionInRange(price, f.low, f.high))
         }

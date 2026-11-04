@@ -218,12 +218,35 @@ object T212WeekTargets {
                 // already held. One that got a target keeps it.
                 val stale = existing != null && existing.rule == null && existing.price <= 0.0 &&
                     existing.orderId == 0L && existing.filledAt == 0L
-                val t = (if (existing == null || stale) decide(ctx, row, since, now, redo = stale) else existing)
+                // YOUR WATCHLIST'S TARGETS MOVE TO THE NAMED LEVELS (2 Nov 2026), once:
+                // the waiting order comes off first, and only then is the target
+                // decided again — a sale running, or Trading 212 not confirming,
+                // leaves it as it was for the next pass.
+                val toLevels = existing != null && watcherRow(row.ns) && existing.rule != levelSigFor(ctx, row.ns) &&
+                    existing.kind != "manual" && existing.filledAt == 0L
+                if (toLevels && existing!!.orderId > 0L) {
+                    val off = SellGuard.ifIdle(row.t212Ticker) {
+                        client.cancelOrder(existing.orderId) is Trading212Client.T212Result.Success
+                    } ?: false
+                    if (!off) continue
+                    T212TargetStore.update(ctx, row.ns, row.paperTradeId, { existing }) {
+                        it.copy(prevIds = ((it.prevIds ?: emptyList()) + it.orderId).distinct(), orderId = 0L)
+                    }
+                    Thread.sleep(ORDER_SPACING_MS)
+                }
+                val t = (if (existing == null || stale || toLevels) decide(ctx, row, since, now, redo = stale || toLevels) else existing)
                     ?: continue
                 if (t.price <= 0.0) continue               // none, and the card says why
 
-                val want = ownQty(row)
-                if (want <= 0.0) continue
+                val own = ownQty(row)
+                if (own <= 0.0) continue
+                // THE DUST GOES WITH IT (4 Nov 2026). Trading 212 refuses a sell that
+                // would leave under €1 of a stock behind ("min-opened-position-
+                // exceeded"). WAF: 2.795 held, the watchlist's 2.794 targeted, 0.001
+                // left over from an algo's sale — refused every hour, no target for
+                // days. A leftover nobody claims and nobody can ever sell on its own is
+                // added to the order, exactly as the sale ladders already sweep it.
+                val want = own + dustFor(ctx, row, own, pooled)
                 // NOT HELD BACK FOR THE OPEN (20 Oct). Trading 212 takes a good-till-
                 // cancelled order while the market is shut — the safety stop under
                 // PANW went in at 18:59 New York time on 13 Oct — and a target that
@@ -334,7 +357,17 @@ object T212WeekTargets {
         val pre = redo || row.buyAt <= 0L || row.buyAt < since
         val us = Spaces.baseOf(row.ns) == "us"
         val watcher = row.ns == com.signalscope.app.data.ManualWatchStore.nsFor("us")
-        val plan = if (us) {
+        val levels = watcherRow(row.ns)
+        val plan = if (levels) {
+            // Your own buys: the named level for this market — see WeekTarget.levelRuleFor.
+            val base = Spaces.baseOf(row.ns)
+            val rule = WeekTarget.levelRuleFor(base, com.signalscope.app.data.ManualWatchStore.load(ctx, base))
+            if (rule == null) WeekTarget.Plan(0.0, "target switched off in the exits panel") else {
+                val bars = dailyBarsBefore(base, row.symbol, buySec) ?: return null
+                val pxNow = if (pre) (MarkToMarket.priceNow(ctx, row.ns, row.symbol) ?: return null) else null
+                WeekTarget.levelPlan(rule, bars, row.liveEntryPrice, pxNow, pre)
+            }
+        } else if (us) {
             // US: an algo's buy keeps none — no prices needed to say so.
             val bars = if (!watcher) null else (dailyBarsBefore(row.symbol, buySec) ?: return null)
             val pxNow = if (pre && watcher) (MarkToMarket.priceNow(ctx, row.ns, row.symbol) ?: return null) else null
@@ -356,7 +389,8 @@ object T212WeekTargets {
                 symbol = row.symbol.uppercase(), ticker = row.t212Ticker, createdAt = now)
         }) {
             it.copy(price = plan.price, paid = row.liveEntryPrice, note = plan.why.ifBlank { null },
-                kind = plan.kind.ifBlank { null }, rule = if (us) WeekTarget.RULE_US else WeekTarget.RULE)
+                kind = plan.kind.ifBlank { null },
+                rule = if (levels) levelSigFor(ctx, row.ns) else if (us) WeekTarget.RULE_US else WeekTarget.RULE)
         }
     }
 
@@ -366,12 +400,25 @@ object T212WeekTargets {
      * From the screener's daily cache, so a stock it already ranked today costs
      * no download. Null when they could not be fetched (decided on a later pass).
      */
-    private fun dailyBarsBefore(symbol: String, buySec: Long): List<com.signalscope.app.screener.DailyBar>? {
+    /** The tag of the watchlist's target rule as the exits panel has it now. */
+    private fun levelSigFor(ctx: Context, ns: String): String {
+        val base = Spaces.baseOf(ns)
+        return WeekTarget.levelSig(WeekTarget.levelRuleFor(base,
+            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (e: Exception) { null }))
+    }
+
+    /** Your watchlist's rows in Germany and the US — the ones the named levels apply to. */
+    private fun watcherRow(ns: String): Boolean =
+        ns == com.signalscope.app.data.ManualWatchStore.nsFor("de") || ns == com.signalscope.app.data.ManualWatchStore.nsFor("us")
+
+    private fun dailyBarsBefore(symbol: String, buySec: Long) = dailyBarsBefore("us", symbol, buySec)
+
+    private fun dailyBarsBefore(base: String, symbol: String, buySec: Long): List<com.signalscope.app.screener.DailyBar>? {
         val sym = symbol.uppercase()
         val bars = try {
-            com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars("US", listOf(sym), minBars = 60).first[sym]
+            com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars(base.uppercase(), listOf(sym), minBars = 60).first[sym]
         } catch (e: Exception) { null } ?: return null
-        val zone = MarketHours.zoneOf("us") ?: java.time.ZoneId.of("America/New_York")
+        val zone = MarketHours.zoneOf(base) ?: java.time.ZoneId.of("America/New_York")
         val buyDay = java.time.Instant.ofEpochSecond(buySec).atZone(zone).toLocalDate()
         return bars.filter { it.date.isBefore(buyDay) }
     }
@@ -451,6 +498,25 @@ object T212WeekTargets {
             Log.w(TAG, "[${row.ns}] ${row.symbol} target refused: ${short(err)}")
         }
         return false
+    }
+
+    /**
+     * Shares of [row]'s stock that no live row claims and that are worth under
+     * Trading 212's €1 floor — what a sell of [own] would strand. 0 when there are
+     * none, or when the holdings could not be read. Pure apart from the claims read.
+     */
+    private fun dustFor(ctx: Context, row: T212LiveStore.LiveTrade, own: Double, pooled: Map<String, Double>?): Double {
+        val have = pooled?.get(row.symbol.uppercase()) ?: return 0.0
+        return try {
+            val others = T212LiveStore.otherClaimsQty(ctx, row.t212Ticker, row.ns, row.paperTradeId)
+            dustLeft(have, own, others, row.liveEntryPrice)
+        } catch (e: Exception) { 0.0 }
+    }
+
+    /** What is left after [own] and [others] of [have], if it is dust worth under €1 at [price]. Pure. */
+    internal fun dustLeft(have: Double, own: Double, others: Double, price: Double): Double {
+        val left = have - own - others
+        return if (left > 1e-9 && price > 0.0 && left * price < Trading212Client.MIN_POSITION_VALUE) left else 0.0
     }
 
     /** The target executed: close the position everywhere it is recorded. */
