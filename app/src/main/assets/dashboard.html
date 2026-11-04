@@ -304,9 +304,16 @@ function captureRenderState(){
   }
   return st;
 }
+// Sections a pending restore will re-open at its frame, counted by key. A render
+// that runs before that frame builds their contents as if they were open — see
+// manualGateBlocks, which only builds its rows while they can be seen.
+var RENDER_REOPEN={};
 function restoreRenderState(st){
   if(!st)return;
+  var reopen=(st.details||[]).slice();
+  reopen.forEach(function(k){RENDER_REOPEN[k]=(RENDER_REOPEN[k]||0)+1});
   var run=function(){
+    reopen.forEach(function(k){if(!(--RENDER_REOPEN[k]>0))delete RENDER_REOPEN[k]});
     var nodes=document.querySelectorAll('.tw,.tabs');
     for(var i=0;i<st.scrollers.length&&i<nodes.length;i++){
       nodes[i].scrollLeft=st.scrollers[i].left||0;
@@ -3259,8 +3266,12 @@ function flushLiveRender(){
 // phone stutter while live prices were on. Five seconds keeps the prices current
 // to the eye; the Portfolio tab, a short list that is ABOUT live prices, keeps
 // its 900ms.
+// THE WATCHLIST: THREE SECONDS. Its panel holds the watcher's candidates, its
+// held positions and the full screener ranking — far more than a tick changes —
+// and at 900ms it was rebuilt about once a second while prices streamed.
 function liveRenderIntervalMs(){
   if(STATE.tab==='algos')return 6000;
+  if(STATE.tab==='watchlist')return 3000;
   if(STATE.tab==='discovery'||STATE.tab==='setups'||STATE.tab==='value'||STATE.tab==='sectors')return 5000;
   return 900;
 }
@@ -10222,7 +10233,12 @@ function slipBadge(v,big){
     '⚖ slip '+s.toFixed(2)+'%</span>';
 }
 function algosTabCount(){
-  try{ if(typeof Android==='undefined'||!Android.bucketsList)return '';
+  // A NUMBER, NOT EVERY CARD. The tab bar is drawn on every repaint of every tab,
+  // and this used to build every algo card in full (each ledger read three times)
+  // only to count them. bucketsCount reads the list of algos and nothing else.
+  try{ if(typeof Android==='undefined')return '';
+    if(Android.bucketsCount){var n=Number(Android.bucketsCount(SPACE))||0;return n>0?n:''}
+    if(!Android.bucketsList)return '';
     var r=JSON.parse(Android.bucketsList(SPACE)||'{}');
     return (r.ok&&r.buckets&&r.buckets.length)?r.buckets.length:''; }catch(e){return ''}
 }
@@ -10271,20 +10287,44 @@ function manualWatchRow(ns,r,last,dim){
 // "the watch list" the union of several lists over several symbol groups. The
 // watcher now screens the whole space universe itself, so there is exactly one
 // ranking to show, and every row carries the reason it is or is not a candidate.
+// The ranking's rows as they stand at the latest repaint — what it fills itself
+// with when it is opened (see manualGateBlocks).
+var MW_FULL={ns:'',rows:[]};
+function manualFullRowsHtml(){
+  var full=MW_FULL.rows||[], h=manualColHeader(false);
+  full.forEach(function(x,i){h+=manualWatchRow(MW_FULL.ns,x,i===full.length-1,!!x.held||x.eligible===false);});
+  return h;
+}
+// Fill the ranking the moment it opens — from the tap on its heading (before it
+// opens, so it never shows empty), or from anything else that opens it.
+function manualFullFill(d){
+  try{
+    var b=d&&d.querySelector('.mw-full-body');
+    if(!b||b.getAttribute('data-filled')==='1')return;
+    b.innerHTML=manualFullRowsHtml();
+    b.setAttribute('data-filled','1');
+  }catch(e){console.error('ranking',e)}
+}
 function manualGateBlocks(w){
   if(SPACE==='BN')return '';                     // 2-coin universe — nothing to rank
   var full=(w&&w.ranking)||[];
   if(!full.length)return '';
+  MW_FULL={ns:w.ns,rows:full};
+  // BUILT ONLY WHILE IT CAN BE SEEN. Closed — as it opens — its ~106 rows were
+  // still built on every repaint of the Watchlist and thrown away unseen. Now they
+  // are built when it is open before this repaint, or about to be re-opened by the
+  // repaint's own restore, and otherwise only when it is opened.
+  var cur=document.querySelector('details[data-dk="mw-full"]');
+  var open=!!(cur&&cur.open)||RENDER_REOPEN['mw-full']>0;
   var box='border:1px solid var(--bd);border-radius:7px;background:var(--cd);overflow:hidden;font-size:10px;font-family:monospace';
   // Collapsed by default and scroll-capped: ~106 rows sitting under the part of
   // the panel that is actually actionable.
-  var h='<details data-dk="mw-full" style="margin-top:8px">'+
-    '<summary style="cursor:pointer;font-size:9px;color:var(--t3);padding:2px 0">'+
+  var h='<details data-dk="mw-full" ontoggle="if(this.open)manualFullFill(this)" style="margin-top:8px">'+
+    '<summary onclick="manualFullFill(this.parentNode)" style="cursor:pointer;font-size:9px;color:var(--t3);padding:2px 0">'+
       'Full screener ranking · '+full.length+' names · '+(w.eligibleCount||0)+' passing the MACD gate · '+
       escHtml(w.lastEvalDay||'not screened yet')+'</summary>'+
-    '<div style="'+box+';margin-top:4px;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch">'+manualColHeader(false);
-  full.forEach(function(x,i){h+=manualWatchRow(w.ns,x,i===full.length-1,!!x.held||x.eligible===false);});
-  h+='</div></details>';
+    '<div class="mw-full-body" data-filled="'+(open?'1':'0')+'" style="'+box+';margin-top:4px;max-height:60vh;overflow-y:auto;-webkit-overflow-scrolling:touch">'+
+    (open?manualFullRowsHtml():'')+'</div></details>';
   return h;
 }
 // ── THE WATCHER'S CONFIG ────────────────────────────────────────────────────

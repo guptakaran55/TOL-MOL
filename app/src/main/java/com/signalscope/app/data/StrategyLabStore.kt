@@ -196,8 +196,10 @@ object StrategyLabStore {
 
     /** The active config: parse the uploaded JSON if present, else the preset.
      *  Parsing here is defensive — uploads are validated at the bridge first. */
-    fun activeConfig(ctx: Context, ns: String = "us"): StrategyLabConfig {
-        val st = load(ctx, ns)
+    fun activeConfig(ctx: Context, ns: String = "us", loaded: State? = null): StrategyLabConfig {
+        // [loaded]: this algo's state, when the caller has just read it — saves
+        // reading and parsing the same file a second time. Absent, read here.
+        val st = loaded ?: load(ctx, ns)
         val raw = st.configJson
         val parsed = if (raw == null) StrategyLabConfig.preset()
             else when (val r = StrategyLabConfig.fromJson(raw, st.configSource)) {

@@ -286,9 +286,11 @@ object MarkToMarket {
      * known, so a symbol the stream does not carry still shows something honest —
      * flagged stale rather than silently presented as current.
      */
-    fun snapshot(ctx: Context, ns: String): Snapshot {
+    fun snapshot(ctx: Context, ns: String, ledger: List<StrategyLabStore.LedgerTrade>? = null): Snapshot {
+        // [ledger]: the algo's trades, when the caller has just read them — saves
+        // reading and parsing the same file again. Absent, read here.
         val open = try {
-            StrategyLabStore.load(ctx, ns).trades.filter { it.status == "OPEN" }
+            (ledger ?: StrategyLabStore.load(ctx, ns).trades).filter { it.status == "OPEN" }
         } catch (e: Exception) {
             Log.w(TAG, "ledger read failed: ${e.message}"); return Snapshot()
         }

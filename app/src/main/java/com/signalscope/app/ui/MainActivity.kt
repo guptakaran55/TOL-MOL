@@ -526,9 +526,9 @@ class MainActivity : AppCompatActivity() {
                 com.signalscope.app.trading.DummyGttMonitor.onQuote(
                     applicationContext, quote.symbol, quote.price
                 )
-                runOnUiThread {
-                    pushLiveQuoteToWebView(quote, liveSignal)
-                }
+                // Batched for the page — see [queueLiveQuote]. Not one main-thread
+                // task per tick any more.
+                queueLiveQuote(quote, liveSignal)
             },
             onStatus = { status ->
                 LivePortfolioBars.updateStreamState(
@@ -827,6 +827,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        liveQuoteHandler.removeCallbacks(liveQuoteFlush)
         if (::liveStreamClient.isInitialized) {
             LivePortfolioBars.updateStreamState(false, false, 0, "Activity destroyed")
             liveStreamClient.stop("Activity destroyed")
@@ -4128,37 +4129,69 @@ class MainActivity : AppCompatActivity() {
             "BN", "BINANCE" -> "binance"; "DE" -> "de"; "IN", "INDIA" -> "in"; else -> "us"
         }
 
+        /**
+         * What showing the algos kicks off, whether it is the cards or only their
+         * count on the tab: a price top-up and the one-time seeding. Shared so the
+         * cheap count below sets up exactly what the full list did when it was the
+         * one reading the count. Returns the space's base.
+         */
+        private fun bucketsPrelude(space: String): String {
+            // Opportunistic, non-blocking, self-throttled to 30 min: opening the
+            // tab tops up prices for open positions the stream doesn't carry.
+            // Returns immediately — this call must never wait on the network.
+            try { com.signalscope.app.trading.MarkToMarket.refreshAsync(applicationContext) }
+            catch (e: Exception) { Log.w(TAG, "mark refresh kick failed", e) }
+            val base = bucketBaseNs(space)
+            // The crypto 50-day hold arrives ready to switch on, once.
+            if (base == "binance")
+                com.signalscope.app.data.BucketStore.ensureSmaHoldSeeded(applicationContext)
+            ensureQualityCheapSeeded(base)
+            // Every algo's 💡 replay, once, on the first visit after this install.
+            com.signalscope.app.trading.WhatIfBatch.startOnce(applicationContext)
+            return base
+        }
+
+        /**
+         * HOW MANY ALGOS — the number on the 🤖 Algos tab.
+         *
+         * The tab bar is drawn on every repaint of every tab, and it used to get
+         * this number from [bucketsList]: every card built in full — each algo's
+         * ledger read three times, the live ledger twice — only for the page to
+         * count them. With the Watchlist and Portfolio repainting every second
+         * while prices stream, that kept the page waiting most of the time.
+         * The count needs only the list of algos.
+         */
+        @JavascriptInterface
+        fun bucketsCount(space: String): Int = try {
+            com.signalscope.app.data.BucketStore.list(applicationContext, bucketsPrelude(space)).size
+        } catch (e: Exception) { Log.w(TAG, "bucketsCount failed", e); 0 }
+
         @JavascriptInterface
         fun bucketsList(space: String): String {
             return try {
-                // Opportunistic, non-blocking, self-throttled to 30 min: opening the
-                // tab tops up prices for open positions the stream doesn't carry.
-                // Returns immediately — this call must never wait on the network.
-                try { com.signalscope.app.trading.MarkToMarket.refreshAsync(applicationContext) }
-                catch (e: Exception) { Log.w(TAG, "mark refresh kick failed", e) }
-                val base = bucketBaseNs(space)
+                val base = bucketsPrelude(space)
                 val bucketable = com.signalscope.app.data.BucketStore.isBucketable(base)
-                // The crypto 50-day hold arrives ready to switch on, once.
-                if (base == "binance")
-                    com.signalscope.app.data.BucketStore.ensureSmaHoldSeeded(applicationContext)
-                ensureQualityCheapSeeded(base)
-                // Every algo's 💡 replay, once, on the first visit after this install.
-                com.signalscope.app.trading.WhatIfBatch.startOnce(applicationContext)
+                // READ ONCE FOR ALL THE CARDS. The live ledger and the safety stops
+                // are the same for every algo; read inside the loop, both were read
+                // and parsed again for each card (the live ledger twice per card).
+                // Lazy, so a space whose cards never ask for them never reads them.
+                val t212Live by lazy { com.signalscope.app.data.T212LiveStore.load(applicationContext).trades }
+                val guards: Map<String, Map<String, Any?>> by lazy {
+                    try { com.signalscope.app.trading.T212ExitGuards.views(applicationContext) }
+                    catch (_: Exception) { emptyMap() }
+                }
                 val rows = com.signalscope.app.data.BucketStore.list(applicationContext, base).map { b ->
                     val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, b.ns)
-                    val guards: Map<String, Map<String, Any?>> =
-                        try { com.signalscope.app.trading.T212ExitGuards.views(applicationContext) }
-                        catch (_: Exception) { emptyMap() }
+                    // This algo's crypto book, read once for both uses below.
+                    val binLive by lazy { com.signalscope.app.data.BinanceLiveStore.load(applicationContext, b.ns).trades }
                     val closed = lab.trades.filter { it.status == "CLOSED" }
                     // Live position count per algo, per broker. T212 buckets returned
                     // a hardcoded 0 because live stocks were frozen when this was
                     // written — so the arming panel could never show a German algo
                     // what it was actually holding.
                     val liveOpen = if (b.space == "binance")
-                        com.signalscope.app.data.BinanceLiveStore.load(applicationContext, b.ns)
-                            .trades.count { it.status == "OPEN" }
-                    else com.signalscope.app.data.T212LiveStore.load(applicationContext)
-                        .trades.count { it.ns == b.ns && (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
+                        binLive.count { it.status == "OPEN" }
+                    else t212Live.count { it.ns == b.ns && (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
                     // PORTFOLIO return for a 3b bucket = slot capital ÷ injected.
                     // `paperPnlPct` below is a raw SUM of every closed trade's return
                     // across every scanned name — research, not the book — so it is
@@ -4174,7 +4207,7 @@ class MainActivity : AppCompatActivity() {
                     // next position from, so they must not drift with an unclosed
                     // position. The UI adds them for the headline; the stores don't.
                     val mtm = try {
-                        com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, b.ns)
+                        com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, b.ns, lab.trades)
                     } catch (_: Exception) { com.signalscope.app.trading.MarkToMarket.Snapshot() }
                     // Contribution to the whole book: each open seat is one slot of
                     // N, so its unrealised % counts for 1/N of the portfolio.
@@ -4186,7 +4219,7 @@ class MainActivity : AppCompatActivity() {
                     // so it rides along with every algo row rather than being
                     // something the user has to open the JSON to recall.
                     val acfg = com.signalscope.app.data.StrategyLabStore
-                        .activeConfig(applicationContext, b.ns)
+                        .activeConfig(applicationContext, b.ns, lab)
                     mapOf(
                         "id" to b.id, "ns" to b.ns, "name" to b.name, "space" to b.space,
                         "symbols" to b.symbols, "mode" to b.mode.name, "capital" to b.capital,
@@ -4266,12 +4299,11 @@ class MainActivity : AppCompatActivity() {
                         // paper row has gone has no strategy exit left on it.
                         "liveRows" to (
                             if (b.space == "binance")
-                                com.signalscope.app.data.BinanceLiveStore
-                                    .load(applicationContext, b.ns).trades
+                                binLive
                                     .filter { it.status == "OPEN" }
                                     .map { listOf(it.symbol, it.paperTradeId, 0.0, "") }
-                            else com.signalscope.app.data.T212LiveStore.load(applicationContext)
-                                .trades.filter { it.ns == b.ns &&
+                            else t212Live
+                                .filter { it.ns == b.ns &&
                                     (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING") }
                                 .map { listOf(it.symbol,  it.paperTradeId,
                                     (if (it.liveQtyFilled > 0.0) it.liveQtyFilled else it.qty),
@@ -11028,7 +11060,7 @@ class MainActivity : AppCompatActivity() {
             }
             com.signalscope.app.trading.DummyGttMonitor.onQuote(
                 applicationContext, quote.symbol, quote.price)
-            runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+            queueLiveQuote(quote, liveSignal)
         },
         onStatus = { status ->
             runOnUiThread {
@@ -11054,7 +11086,7 @@ class MainActivity : AppCompatActivity() {
             }
             com.signalscope.app.trading.DummyGttMonitor.onQuote(
                 applicationContext, quote.symbol, quote.price)
-            runOnUiThread { pushLiveQuoteToWebView(quote, liveSignal) }
+            queueLiveQuote(quote, liveSignal)
         },
         onStatus = { status ->
             // Named so a stalled Indian feed is not mistaken for a stalled
@@ -11079,11 +11111,44 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript("window.updateLiveStreamState && window.updateLiveStreamState('$escaped')", null)
     }
 
-    private fun pushLiveQuoteToWebView(
+    // ── LIVE PRICES TO THE PAGE, BATCHED ─────────────────────────────────────
+    // Each tick used to be its own main-thread task and its own evaluateJavascript
+    // call, so a busy stream queued dozens of them a second ahead of your taps.
+    // Now the stream's own thread builds the quote and leaves it in [liveQuoteBatch]
+    // (every tick, in order), and the page gets everything waiting in one call
+    // every [LiveQuoteBatch.INTERVAL_MS]. What must see every tick — the alert
+    // engines, mark-to-market, the dummy-GTT alerts — still runs on every tick in
+    // the stream callbacks, before this.
+    private val liveQuoteBatch = LiveQuoteBatch()
+    private val liveQuoteHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val liveQuoteFlush = Runnable { flushLiveQuotes() }
+
+    /** Called on the stream's thread: record the quote, and schedule a delivery
+     *  if none is due yet. */
+    private fun queueLiveQuote(
         quote: YahooFinanceStreamClient.LiveQuote,
         signal: LivePortfolioBars.ReversalSignal?
     ) {
         if (!::webView.isInitialized || !config.livePriceStreamingEnabled) return
+        val json = try { gson.toJson(liveQuotePayload(quote, signal)) }
+                   catch (e: Exception) { Log.w(TAG, "live quote not serialised: ${e.message}"); return }
+        if (liveQuoteBatch.offer(quote.symbol, json))
+            liveQuoteHandler.postDelayed(liveQuoteFlush, LiveQuoteBatch.INTERVAL_MS)
+    }
+
+    /** On the main thread: hand everything waiting to the page in one call. */
+    private fun flushLiveQuotes() {
+        val batch = liveQuoteBatch.drain()
+        if (batch.isEmpty() || !::webView.isInitialized || !config.livePriceStreamingEnabled) return
+        try { webView.evaluateJavascript(LiveQuoteBatch.script(batch), null) }
+        catch (e: Exception) { Log.w(TAG, "live quotes not delivered: ${e.message}") }
+    }
+
+    /** One quote as the page reads it — the same fields each tick always carried. */
+    private fun liveQuotePayload(
+        quote: YahooFinanceStreamClient.LiveQuote,
+        signal: LivePortfolioBars.ReversalSignal?
+    ): Map<String, Any?> {
         val payload = mapOf(
             "symbol" to quote.symbol,
             "price" to quote.price,
@@ -11118,8 +11183,7 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         )
-        val escaped = gson.toJson(payload).replace("\\", "\\\\").replace("'", "\\'")
-        webView.evaluateJavascript("window.updateLiveQuote && window.updateLiveQuote('$escaped')", null)
+        return payload
     }
 
     private fun framePayload(frame: LivePortfolioBars.FrameMacdSignal): Map<String, Any> = mapOf(
