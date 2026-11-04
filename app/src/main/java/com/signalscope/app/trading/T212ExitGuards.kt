@@ -54,7 +54,7 @@ object T212ExitGuards {
                 try {
                     StrategyLabStore.load(ctx, r.ns).trades
                         .filter { it.status == "CLOSED" }.map { it.id }.toHashSet()
-                } catch (e: Exception) { emptySet() }
+                } catch (_: Exception) { emptySet() }
             }
             r.paperTradeId in closed
         }.map { T212ExitGuardStore.key(it.ns, it.paperTradeId) }.toSet()
@@ -210,11 +210,11 @@ object T212ExitGuards {
         val decision = try {
             StrategyLabStore.load(ctx, row.ns).trades
                 .firstOrNull { it.id == row.paperTradeId }?.exitPrice ?: 0.0
-        } catch (e: Exception) { 0.0 }
+        } catch (_: Exception) { 0.0 }
         val anchor = listOf(decision, priceNow ?: 0.0, row.liveEntryPrice).firstOrNull { it > 0.0 } ?: 0.0
         val ys = YahooFinanceClient.toYahooSymbol(row.symbol, Spaces.exchangeOf(base))
         val atr = try { PatientExecutor.dailyAtr(ys, if (base == "de") "DE" else "US", anchor) }
-                  catch (e: Exception) { 0.0 }
+                  catch (_: Exception) { 0.0 }
         val lv = ExitGuard.level(decision, priceNow, atr) ?: return null
         Log.i(TAG, "[${row.ns}] ${row.symbol} safety stop level $lv " +
             "(sold on paper at $decision, now ${priceNow ?: "?"}, daily range $atr)")

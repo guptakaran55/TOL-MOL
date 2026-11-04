@@ -666,9 +666,9 @@ class ScanService : Service() {
             val s = StrategyLabStore.load(applicationContext, n)
             val gateArmed = try {
                 com.signalscope.app.data.MacdGateStore.load(applicationContext, n).enabled
-            } catch (e: Exception) { false }
+            } catch (_: Exception) { false }
             s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
-        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(applicationContext) } catch (e: Exception) { false }
+        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(applicationContext) } catch (_: Exception) { false }
         if (!anyActive) {
             Log.i(TAG, "Strategy Lab tick skipped ($reason): no enabled/enrolled paper labs")
             updateScanNotification("Strategy Lab: nothing enabled")
@@ -883,7 +883,7 @@ class ScanService : Service() {
                     .distinct()
                     .sumOf { n -> StrategyLabStore.load(applicationContext, n)
                         .trades.count { it.status == "OPEN" } }
-            } catch (e: Exception) { -1 }
+            } catch (_: Exception) { -1 }
             // WITH EVERY STOCK MARKET SHUT, say that instead. The watchlist sizes and
             // held counts are unchanged all night and read like a scan; what is
             // worth knowing is that nothing can trade, and when that changes.
@@ -897,7 +897,7 @@ class ScanService : Service() {
                         StrategyLabStore.load(applicationContext, n).let { s ->
                             s.enabled && (s.enrolled.isNotEmpty() || try {
                                 com.signalscope.app.data.MacdGateStore.load(applicationContext, n).enabled
-                            } catch (e: Exception) { false })
+                            } catch (_: Exception) { false })
                         }
                 }
                 if (cryptoOn) append(" · crypto checked")
@@ -1353,7 +1353,7 @@ class ScanService : Service() {
         // pin would ever be recognised and every one could be cut.
         fun liqKey(x: String) = x.trim().uppercase(Locale.US).removeSuffix(".NS").removeSuffix(".DE")
         val liqBase = discoveryBase(marketName)
-        val liqFloor = try { config.minTurnoverFor(liqBase) } catch (e: Exception) { 0.0 }
+        val liqFloor = try { config.minTurnoverFor(liqBase) } catch (_: Exception) { 0.0 }
         val liqExempt: Set<String>? = if (liqFloor <= 0.0) emptySet() else try {
             val st = com.signalscope.app.data.ManualWatchStore.load(this@ScanService, liqBase)
             HashSet<String>().apply {
@@ -2900,7 +2900,7 @@ fun deScreenedUniverse(live: List<String>): List<String> {
 fun deScreenedUniverse(ctx: android.content.Context): List<String> {
     val cached = try {
         com.signalscope.app.data.ConfigManager(ctx).deUniverseCached
-    } catch (e: Exception) { "" }
+    } catch (_: Exception) { "" }
     return deScreenedUniverse(
         cached.split(' ', '\n', '\r', '\t', ',').filter { it.isNotBlank() })
 }
@@ -2911,7 +2911,7 @@ fun deScreenedUniverse(ctx: android.content.Context): List<String> {
 fun nseScreenedUniverse(ctx: android.content.Context): List<String> {
     val cached = try {
         com.signalscope.app.data.ConfigManager(ctx).nseUniverseCached
-    } catch (e: Exception) { "" }
+    } catch (_: Exception) { "" }
     return nseScreenedUniverse(
         cached.split(' ', '\n', '\r', '\t', ',').filter { it.isNotBlank() })
 }
@@ -3139,9 +3139,9 @@ object StrategyLabScheduler {
             // evaluation that is the only way seats ever fill again.
             val gateArmed = try {
                 com.signalscope.app.data.MacdGateStore.load(ctx, ns).enabled
-            } catch (e: Exception) { false }
+            } catch (_: Exception) { false }
             s.enabled && (s.enrolled.isNotEmpty() || gateArmed)
-        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(ctx) } catch (e: Exception) { false }
+        } || try { com.signalscope.app.data.FloorAlgoStore.anyRunning(ctx) } catch (_: Exception) { false }
 
     /**
      * The next pass slot still ahead of [now].

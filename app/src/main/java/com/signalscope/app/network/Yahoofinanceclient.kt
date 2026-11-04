@@ -1155,7 +1155,7 @@ object YahooFinanceClient {
                         val ex = o.get("exchDisp")?.asString
                             ?: o.get("exchange")?.asString ?: ""
                         SearchHit(sym, name, ex, qt)
-                    } catch (e: Exception) { null }
+                    } catch (_: Exception) { null }
                 }
                 SearchResult.Success(hits)
             }

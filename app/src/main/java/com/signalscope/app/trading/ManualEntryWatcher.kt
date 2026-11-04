@@ -88,7 +88,7 @@ object ManualEntryWatcher {
      * the feed's patience within a pass.
      */
     fun depthFor(ctx: Context): Int =
-        try { ConfigManager(ctx).watcherDepth.coerceIn(5, 60) } catch (e: Exception) { DEFAULT_LIMIT }
+        try { ConfigManager(ctx).watcherDepth.coerceIn(5, 60) } catch (_: Exception) { DEFAULT_LIMIT }
 
     /**
      * Spaces the watcher runs in. Deliberately NOT the bucketable-spaces list.
@@ -155,7 +155,7 @@ object ManualEntryWatcher {
         // against a hundred or six hundred is not a number anyone could see.
         val pinned = try {
             ManualWatchStore.load(ctx, base).pinned.map { it.trim().uppercase() }
-        } catch (e: Exception) { emptyList() }
+        } catch (_: Exception) { emptyList() }
         return (index + pinned).distinct()
     }
 
@@ -321,7 +321,7 @@ object ManualEntryWatcher {
         // being absent from one broker read. A pin is an explicit instruction and
         // outranks a general rule by definition.
         val floor = try { ConfigManager(ctx).minTurnoverFor(base) }
-                    catch (e: Exception) { 0.0 }
+                    catch (_: Exception) { 0.0 }
         var cut = 0
         if (floor > 0.0) {
             // UNREADABLE MEANS DO NOT FILTER AT ALL. Without the exemption list
@@ -415,7 +415,7 @@ object ManualEntryWatcher {
                 // window's first bar spends its first fifty bars warming up, and
                 // an average that is still warming up is not a trend line.
                 val proj = try { Indicators.projectWaveRange(full.toList(), 20) }
-                           catch (e: Exception) { null }
+                           catch (_: Exception) { null }
                 spark[sym.uppercase()] = com.signalscope.app.data.ManualSparkStore.Series(
                     projFloor = proj?.projectedFloor ?: 0.0,
                     projCeiling = proj?.projectedCeiling ?: 0.0,
@@ -453,7 +453,7 @@ object ManualEntryWatcher {
                 val w = try {
                     com.signalscope.app.screener.SqueezeScanner.scan(
                         com.signalscope.app.screener.SqueezeScanner.toWeekly(bars))
-                } catch (e: Exception) { com.signalscope.app.screener.SqueezeScanner.Verdict() }
+                } catch (_: Exception) { com.signalscope.app.screener.SqueezeScanner.Verdict() }
                 if (!v.ok && !w.ok) { unscored++; continue }
                 val nothing = v.tier <= 0.0 && !v.fired && w.tier <= 0.0 && !w.fired
                 if (nothing) continue
@@ -1572,7 +1572,7 @@ object ManualEntryWatcher {
                         (it.status == "OPEN" || it.status == "PENDING" || it.status == "EXITING")
                 }.sumOf { it.qty } +
                 (if (base == "de") com.signalscope.app.data.FloorLiveStore.heldQtyOf(ctx, sym) else 0.0)
-        } catch (e: Exception) { 0.0 }
+        } catch (_: Exception) { 0.0 }
         val mineQty = (held.qty - byAlgos).coerceAtLeast(0.0)
         if (mineQty <= maxOf(1e-6, held.qty * 0.01)) return BuyResult(false, sym,
             error = "An algo already manages all ${"%.4f".format(held.qty)} of $sym. There is nothing " +
@@ -1755,7 +1755,7 @@ object ManualEntryWatcher {
             else snap.orders.filter { !it.isBuy && it.space.equals(base, true) }
                 .map { MacdLadder.bare(it.symbol).uppercase() }.toSet()
         }
-    } catch (e: Exception) { null }
+    } catch (_: Exception) { null }
 
     private fun autoAdopt(ctx: Context, base: String): List<String> {
         val st = ManualWatchStore.load(ctx, base)
@@ -2007,14 +2007,14 @@ object ManualEntryWatcher {
         if (pending.isEmpty() && retired.isEmpty()) return
         // Fills: the saved history, plus the latest orders when a buy has just been cut
         // off (the saved history may not have reached it). Unreadable = decide nothing.
-        val saved = try { T212ClosedTrades.loadArchive(ctx).fills } catch (e: Exception) { emptyList() }
+        val saved = try { T212ClosedTrades.loadArchive(ctx).fills } catch (_: Exception) { emptyList() }
         val recent = if (pending.isEmpty()) emptyList() else
             (com.signalscope.app.network.Trading212Client(ConfigManager(ctx)).fetchOrderHistory(limit = 50)
                 as? com.signalscope.app.network.Trading212Client.T212Result.Success)?.data
         val fills = (saved + recent.orEmpty()).filter { it.filledQuantity > 0.0 }
         val claimed = HashSet<Long>()
         try { com.signalscope.app.data.T212LiveStore.load(ctx).trades.forEach { claimed.addAll(it.allBuyIds()) } }
-        catch (e: Exception) { return }
+        catch (_: Exception) { return }
         // Gson leaves a list missing from an older row null, whatever its type says.
         entries.forEach { claimed.addAll((it.orderIds as List<Long>?).orEmpty()) }
         for (e in pending + retired) {
@@ -2774,7 +2774,7 @@ object ManualEntryWatcher {
         val engineHolds = try {
             StrategyLabStore.load(ctx, ns).trades
                 .filter { it.status == "OPEN" }.map { it.symbol.uppercase() }.toHashSet()
-        } catch (e: Exception) { return }
+        } catch (_: Exception) { return }
 
         for (e in open) {
             val sym = e.symbol.uppercase()

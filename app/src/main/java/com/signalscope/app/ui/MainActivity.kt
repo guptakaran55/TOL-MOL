@@ -153,7 +153,7 @@ class MainActivity : AppCompatActivity() {
                 val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                 if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
             } ?: uri.lastPathSegment ?: "config.json"
-        } catch (e: Exception) { uri.lastPathSegment ?: "config.json" }
+        } catch (_: Exception) { uri.lastPathSegment ?: "config.json" }
     }
 
     private fun handleConfigJson(uri: Uri) {
@@ -1593,7 +1593,7 @@ class MainActivity : AppCompatActivity() {
                     val acc = config.accountCurrency.ifBlank { "EUR" }
                     val inst = if (sp == "DE") "EUR" else "USD"
                     val rate = try { com.signalscope.app.trading.FxRates.rate(applicationContext, acc, inst).rate }
-                               catch (e: Exception) { 1.0 }.takeIf { it > 0.0 } ?: 1.0
+                               catch (_: Exception) { 1.0 }.takeIf { it > 0.0 } ?: 1.0
                     val qty = java.math.BigDecimal(cash * rate / limit)
                         .setScale(4, java.math.RoundingMode.DOWN).toDouble()
                     if (qty <= 0.0) throw IllegalStateException("the amount buys less than one ten-thousandth of a share")
@@ -1660,9 +1660,9 @@ class MainActivity : AppCompatActivity() {
                     "from" to cs.first().timestamp * 1000L, "to" to cs.last().timestamp * 1000L)
             }
             val m1 = try { panel(com.signalscope.app.network.YahooFinanceClient.fetchCandlesAt(sym, exch, "60m", "1mo")) }
-                     catch (e: Exception) { null }
+                     catch (_: Exception) { null }
             val d5 = try { panel(com.signalscope.app.network.YahooFinanceClient.fetchCandles15mRange(sym, exch, "5d")) }
-                     catch (e: Exception) { null }
+                     catch (_: Exception) { null }
             return gson.toJson(mapOf("ok" to (m1 != null || d5 != null), "m1" to m1, "d5" to d5,
                 "error" to (if (m1 == null && d5 == null) "the price feed did not answer — try again" else "")))
         }
@@ -2126,7 +2126,7 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun notificationUnread(): Int = try {
             com.signalscope.app.data.NotificationLog.unread(applicationContext)
-        } catch (e: Exception) { 0 }
+        } catch (_: Exception) { 0 }
 
         @JavascriptInterface
         fun notificationSeen() {
@@ -3418,7 +3418,7 @@ class MainActivity : AppCompatActivity() {
                             .joinToString(" ")
                     else -> ""
                 }
-            } catch (e: Exception) { "" }
+            } catch (_: Exception) { "" }
         }
 
         @JavascriptInterface
@@ -3859,7 +3859,7 @@ class MainActivity : AppCompatActivity() {
                 // would otherwise re-read and re-value it once per seat.
                 val mtmAll = try {
                     com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, gns).values
-                } catch (e: Exception) { emptyList() }
+                } catch (_: Exception) { emptyList() }
                 gson.toJson(mapOf(
                     "ok" to true, "enabled" to s.enabled, "holdN" to s.holdN,
                     "notional" to s.notionalPerSlot, "smoothing" to s.smoothing,
@@ -4142,7 +4142,7 @@ class MainActivity : AppCompatActivity() {
                     val lab = com.signalscope.app.data.StrategyLabStore.load(applicationContext, b.ns)
                     val guards: Map<String, Map<String, Any?>> =
                         try { com.signalscope.app.trading.T212ExitGuards.views(applicationContext) }
-                        catch (e: Exception) { emptyMap() }
+                        catch (_: Exception) { emptyMap() }
                     val closed = lab.trades.filter { it.status == "CLOSED" }
                     // Live position count per algo, per broker. T212 buckets returned
                     // a hardcoded 0 because live stocks were frozen when this was
@@ -4169,7 +4169,7 @@ class MainActivity : AppCompatActivity() {
                     // position. The UI adds them for the headline; the stores don't.
                     val mtm = try {
                         com.signalscope.app.trading.MarkToMarket.snapshot(applicationContext, b.ns)
-                    } catch (e: Exception) { com.signalscope.app.trading.MarkToMarket.Snapshot() }
+                    } catch (_: Exception) { com.signalscope.app.trading.MarkToMarket.Snapshot() }
                     // Contribution to the whole book: each open seat is one slot of
                     // N, so its unrealised % counts for 1/N of the portfolio.
                     val seatsForMtm = if (gateOn) gate.slots.size.coerceAtLeast(1)
@@ -4312,7 +4312,7 @@ class MainActivity : AppCompatActivity() {
                         "currency" to com.signalscope.app.trading.Spaces.currencyOf(b.ns),
                         // The quarter's list and the news veto, on the quality algos only.
                         "quality" to try { com.signalscope.app.trading.QualityCheap.cardInfo(applicationContext, b.ns) }
-                            catch (e: Exception) { null })
+                            catch (_: Exception) { null })
                 }
                 gson.toJson(mapOf("ok" to true, "bucketable" to bucketable, "space" to base, "buckets" to rows))
             } catch (e: Exception) {
@@ -4917,7 +4917,7 @@ class MainActivity : AppCompatActivity() {
                     p.getBoolean("useScreenerSelection")
                 else try {
                     com.signalscope.app.data.MacdGateStore.load(applicationContext, ns).useScreenerSelection
-                } catch (e: Exception) { true }
+                } catch (_: Exception) { true }
                 var gateReshapeBlocked = false
                 var gateHeldSeats = 0
                 var gateSeatsNow = 0
@@ -5010,7 +5010,7 @@ class MainActivity : AppCompatActivity() {
                                     .load(applicationContext, ns).trades
                                     .filter { it.status == "OPEN" }
                                     .map { it.symbol.uppercase() }.toSet()
-                            } catch (e: Exception) { emptySet<String>() }
+                            } catch (_: Exception) { emptySet<String>() }
                             val allCash = armed.slots.none {
                                 it.symbol?.uppercase()?.let { s -> s in investedSyms } == true
                             }
@@ -5433,17 +5433,17 @@ class MainActivity : AppCompatActivity() {
                             }
                         is com.signalscope.app.trading.BrokerHoldings.Result.Unreadable -> holdOk = false
                     }
-                } catch (e: Exception) { holdOk = false }
+                } catch (_: Exception) { holdOk = false }
                 val managedQty = try {
                     com.signalscope.app.trading.ManualEntryWatcher.managedQtyFor(applicationContext, base)
-                } catch (e: Exception) { emptyMap() }
+                } catch (_: Exception) { emptyMap() }
                 val managedOwners = try {
                     com.signalscope.app.trading.ManualEntryWatcher
                         .managedOwnersFor(applicationContext, base)
-                } catch (e: Exception) { emptyMap() }
+                } catch (_: Exception) { emptyMap() }
                 val trackState = try {
                     com.signalscope.app.data.PortfolioTrackStore.load(applicationContext, base)
-                } catch (e: Exception) { null }
+                } catch (_: Exception) { null }
                 // A dead attempt is not coverage. Counting one here hid a real
                 // holding of the same company from the held-outside list — the
                 // book "had" it, as a row with no shares in it.
@@ -5470,7 +5470,7 @@ class MainActivity : AppCompatActivity() {
                                 if (com.signalscope.app.trading.Spaces.bucketIdOf(n) ==
                                     com.signalscope.app.data.ManualWatchStore.ID) "the watchlist"
                                 else com.signalscope.app.trading.ShareOwners.nameOf(applicationContext, n)
-                            } catch (e: Exception) { n }
+                            } catch (_: Exception) { n }
                         },
                         "reason" to (trackState?.tracks?.get(sym)?.lastReason ?: ""),
                         "alertedDay" to (trackState?.tracks?.get(sym)?.alertedDay ?: ""))
@@ -5667,7 +5667,7 @@ class MainActivity : AppCompatActivity() {
             return try {
                 val base = com.signalscope.app.trading.Spaces.baseOf(space.lowercase())
                 val u = try { com.signalscope.app.data.ManualWatchStore.TrailUnit.valueOf(unit.uppercase()) }
-                        catch (e: Exception) { com.signalscope.app.data.ManualWatchStore.TrailUnit.PCT }
+                        catch (_: Exception) { com.signalscope.app.data.ManualWatchStore.TrailUnit.PCT }
                 com.signalscope.app.data.ManualWatchStore.mutate(applicationContext, base) { it.copy(trailUnit = u) }
                 Log.w(TAG, "[$base] manual trailing stop unit set to $u")
                 gson.toJson(mapOf("ok" to true, "unit" to u.name))
@@ -5831,9 +5831,9 @@ class MainActivity : AppCompatActivity() {
                     if (com.signalscope.app.trading.Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID)
                         "Your watchlist"
                     else "Algo · " + (try { com.signalscope.app.data.BucketStore.get(applicationContext, ns)?.name }
-                                      catch (e: Exception) { null } ?: ns)
+                                      catch (_: Exception) { null } ?: ns)
                 fun note(n: String?): org.json.JSONObject? =
-                    if (n.isNullOrBlank()) null else try { org.json.JSONObject(n) } catch (e: Exception) { null }
+                    if (n.isNullOrBlank()) null else try { org.json.JSONObject(n) } catch (_: Exception) { null }
                 // The RV gate's two ways to start, as two conditions joined by "or".
                 fun rvConds(n: org.json.JSONObject?, buy: Boolean): List<Map<String, Any?>> {
                     if (n == null || !n.has("dir")) return emptyList()
@@ -5858,7 +5858,7 @@ class MainActivity : AppCompatActivity() {
                     val cfg = com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns)
                     com.signalscope.app.trading.T212LiveMirror.entryCeiling(signal, cfg.exit.stopLossPct,
                         cfg.exit.stopLossEnabled, atr)
-                } catch (e: Exception) { 0.0 }
+                } catch (_: Exception) { 0.0 }
 
                 // Trading 212: ladders in flight, and entries queued for a moment
                 // that has not arrived.
@@ -6137,7 +6137,7 @@ class MainActivity : AppCompatActivity() {
                         else -> Unit
                     }
                     m
-                } catch (e: Exception) { emptySet<String>() }
+                } catch (_: Exception) { emptySet<String>() }
                 val rows = com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
                     .filter {
                         com.signalscope.app.trading.Spaces.baseOf(it.ns) == base &&
@@ -6188,7 +6188,7 @@ class MainActivity : AppCompatActivity() {
                 else -> false
             }
             managed > 0.0 || atBroker
-        } catch (e: Exception) { false }
+        } catch (_: Exception) { false }
 
         @JavascriptInterface
         fun requeueDeclinedEntry(ns: String, paperTradeId: String) {
@@ -6819,7 +6819,7 @@ class MainActivity : AppCompatActivity() {
             val assumedFor = HashMap<String, Double>()
             fun assumedOf(ns: String): Double = assumedFor.getOrPut(ns) {
                 try { com.signalscope.app.data.StrategyLabStore.activeConfig(ctx, ns).slippagePct }
-                catch (e: Exception) { 0.0 }
+                catch (_: Exception) { 0.0 }
             }
             fun day(ms: Long): String =
                 if (ms > 0L) java.time.Instant.ofEpochMilli(ms).toString().take(10) else ""
@@ -6833,7 +6833,7 @@ class MainActivity : AppCompatActivity() {
                 try {
                     com.signalscope.app.data.StrategyLabStore.load(ctx, ns).trades
                         .mapNotNull { tr -> tr.exitPrice?.takeIf { it > 0.0 }?.let { tr.id to it } }.toMap()
-                } catch (e: Exception) { emptyMap() }
+                } catch (_: Exception) { emptyMap() }
             }[id]
             val trailRx = Regex("""trailing stop -([0-9.]+)% from a high of ([0-9.]+)""")
             val tpRx = Regex("""take profit \+([0-9.]+)% from a fill of ([0-9.]+)""")
@@ -6854,7 +6854,7 @@ class MainActivity : AppCompatActivity() {
                 if (com.signalscope.app.trading.Spaces.bucketIdOf(t.ns) != com.signalscope.app.data.ManualWatchStore.ID) return null
                 val base = com.signalscope.app.trading.Spaces.baseOf(t.ns)
                 val book = watchBooks.getOrPut(base) {
-                    try { com.signalscope.app.data.ManualWatchStore.load(ctx, base).entries } catch (e: Exception) { emptyList() }
+                    try { com.signalscope.app.data.ManualWatchStore.load(ctx, base).entries } catch (_: Exception) { emptyList() }
                 }
                 return book.firstOrNull {
                     it.symbol.equals(t.symbol, true) && it.status == "CLOSED" &&
@@ -7012,7 +7012,7 @@ class MainActivity : AppCompatActivity() {
                 val assumedFor = HashMap<String, Double>()
                 fun assumedOf(ns: String): Double = assumedFor.getOrPut(ns) {
                     try { com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns).slippagePct }
-                    catch (e: Exception) { 0.0 }
+                    catch (_: Exception) { 0.0 }
                 }
                 val rows = fills.map { f ->
                     val m = byBuy[f.orderId] ?: bySell[f.orderId]
@@ -7172,7 +7172,7 @@ class MainActivity : AppCompatActivity() {
             }.map { mapOf("since" to it.createdAt, "cash" to it.cash, "qty" to it.qty,
                 "status" to it.status, "startsBy" to com.signalscope.app.trading.RvManualQueue.startsBy(it)) }
             gson.toJson(mapOf("ok" to true, "rows" to rows))
-        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
+        } catch (_: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
 
         /**
          * A button order placed with the RV gate box UNticked. It has already run;
@@ -7193,7 +7193,7 @@ class MainActivity : AppCompatActivity() {
             val since = System.currentTimeMillis() - 3 * 24 * 3_600_000L
             gson.toJson(mapOf("ok" to true,
                 "rows" to com.signalscope.app.trading.RvManualQueue.history(applicationContext, space, since)))
-        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
+        } catch (_: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
 
         /** You said buy anyway to a waiting buy that stopped at its price limit. The
          *  ladder runs in the background; the result arrives as a notification. */
@@ -7227,7 +7227,7 @@ class MainActivity : AppCompatActivity() {
                     .distinct()
             } else com.signalscope.app.trading.BrokerHoldings.heldSymbols(applicationContext, base)
             gson.toJson(syms)
-        } catch (e: Exception) { "[]" }
+        } catch (_: Exception) { "[]" }
 
         /** An algo's unfulfilled buys — real buys that failed for good — and what each
          *  would have made by the algo's own rules. No network. */
@@ -7235,13 +7235,13 @@ class MainActivity : AppCompatActivity() {
         fun unfulfilledEntries(ns: String): String = try {
             gson.toJson(mapOf("ok" to true,
                 "rows" to com.signalscope.app.trading.UnfulfilledEntries.forNs(applicationContext, ns)))
-        } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
+        } catch (_: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
 
         /** Price feeds judged stopped ("CRZK.DE") — the value floor leaves them out. No network. */
         @JavascriptInterface
         fun stoppedFeeds(): String = try {
             gson.toJson(com.signalscope.app.network.FeedHealth.stoppedSymbols())
-        } catch (e: Exception) { "[]" }
+        } catch (_: Exception) { "[]" }
 
         /** When the automatic Discovery scan for [space] next runs, as epoch ms; "0" = none. */
         @JavascriptInterface
@@ -7250,7 +7250,7 @@ class MainActivity : AppCompatActivity() {
                 "IN" -> "nifty500"; "US" -> "nasdaq100"; "DE" -> "dax"; else -> null
             }
             (market?.let { com.signalscope.app.service.DiscoveryAutoScheduler.nextRunAt(applicationContext, it) } ?: 0L).toString()
-        } catch (e: Exception) { "0" }
+        } catch (_: Exception) { "0" }
 
         @JavascriptInterface
         fun t212ClosedTrades(force: Boolean, space: String): String {
@@ -7364,7 +7364,7 @@ class MainActivity : AppCompatActivity() {
                         else com.signalscope.app.trading.T212PositionAudit.last(applicationContext)
                 // Shortfalls being taken off the app's positions as a sale of yours.
                 val absorbing = try { com.signalscope.app.trading.T212HandSales.pendingPartial(applicationContext) }
-                                catch (e: Exception) { emptySet<String>() }
+                                catch (_: Exception) { emptySet<String>() }
                 gson.toJson(mapOf(
                     "ok" to r.ok, "error" to r.error, "checkedAt" to r.checkedAt,
                     "positionsSeen" to r.positionsSeen, "rowsChecked" to r.rowsChecked,
@@ -7646,7 +7646,7 @@ class MainActivity : AppCompatActivity() {
                         val px = p.optDouble("currentPrice", 0.0)
                         if (px > 0.0) t212Px[p.optString("ticker")] = px
                     }
-                } catch (e: Exception) { }
+                } catch (_: Exception) { }
                 fun markOf(sym: String) = com.signalscope.app.trading.MarkToMarket.get(sym)?.price?.takeIf { it > 0.0 }
                 val cur = when (base) { "in" -> "INR"; "binance" -> "USDC"; else -> config.accountCurrency }
                 val algos = com.signalscope.app.data.BucketStore.allNamespaces(ctx)
@@ -7699,7 +7699,7 @@ class MainActivity : AppCompatActivity() {
                         val paperEntry = try {
                             com.signalscope.app.data.StrategyLabStore.load(ctx, n).trades
                                 .filter { it.status == "OPEN" }.associate { it.symbol.uppercase() to it.entryPrice }
-                        } catch (e: Exception) { emptyMap<String, Double>() }
+                        } catch (_: Exception) { emptyMap<String, Double>() }
                         // Who sits in each seat: the gate's own seats; with no gate, the
                         // companies themselves when there are no more of them than seats,
                         // otherwise only what is held.
@@ -8102,7 +8102,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val assumed = try {
                     com.signalscope.app.data.StrategyLabStore.activeConfig(applicationContext, ns).slippagePct
-                } catch (e: Exception) { 0.0 }
+                } catch (_: Exception) { 0.0 }
                 // EVERY ALGO'S YARDSTICK, not just this one's.
                 //
                 // The bench belongs to no algo, so its "assumed" figure is whatever
@@ -8128,7 +8128,7 @@ class MainActivity : AppCompatActivity() {
                         val a = try {
                             com.signalscope.app.data.StrategyLabStore
                                 .activeConfig(applicationContext, n).slippagePct
-                        } catch (e: Exception) { 0.0 }
+                        } catch (_: Exception) { 0.0 }
                         if (a <= 0.0) null else mapOf(
                             "algo" to nm, "ns" to n, "assumedPct" to a,
                             "deviationPp" to (if (med == null) null else med - a))
@@ -8383,7 +8383,7 @@ class MainActivity : AppCompatActivity() {
                         .filter { it.status == "OPEN" }
                         .map { it.symbol.uppercase() }.distinct()
                         .filter { it !in held }
-                } catch (e: Exception) { emptyList<String>() }
+                } catch (_: Exception) { emptyList<String>() }
                 // Walk the ranking ONCE, in order, splitting unheld names into the
                 // bench (slope > 0 — these fill the next empty slot, in this order)
                 // and blocked (slope ≤ 0 — ranked high but the gate refuses them).
@@ -8676,7 +8676,7 @@ class MainActivity : AppCompatActivity() {
                 // paper position with nothing behind it always raises.
                 val skips = try {
                     com.signalscope.app.data.LiveSkipStore.forNs(applicationContext, ns)
-                } catch (e: Exception) { emptyMap<String, String>() }
+                } catch (_: Exception) { emptyMap<String, String>() }
                 // WHAT HAPPENED TO THE REAL ORDER, per paper trade. A position the
                 // strategy holds with a failed or waiting order behind it looked
                 // exactly like one with shares behind it — Nemetschek sat on this
@@ -8705,7 +8705,7 @@ class MainActivity : AppCompatActivity() {
                         else -> {
                             // The 1-week-high target waiting at the broker, when there is one.
                             val tg = try { com.signalscope.app.trading.T212WeekTargets.views(applicationContext) }
-                                     catch (e: Exception) { emptyMap() }
+                                     catch (_: Exception) { emptyMap() }
                             com.signalscope.app.data.T212LiveStore.load(applicationContext).trades
                                 .filter { it.ns == ns }
                                 .associate { r ->
@@ -8720,7 +8720,7 @@ class MainActivity : AppCompatActivity() {
                                 }
                         }
                     }
-                } catch (e: Exception) { emptyMap<String, Any>() }
+                } catch (_: Exception) { emptyMap<String, Any>() }
                 gson.toJson(mapOf("ok" to true, "skips" to skips,
                     "liveRows" to liveRows,
                     // Seconds the price feed trails the exchange here. A bar is judged
@@ -9772,7 +9772,7 @@ class MainActivity : AppCompatActivity() {
          *  can't use this to send the user anywhere else. */
         @JavascriptInterface
         fun openNewsLink(url: String) {
-            val uri = try { android.net.Uri.parse(url) } catch (e: Exception) { return }
+            val uri = try { android.net.Uri.parse(url) } catch (_: Exception) { return }
             if (uri.scheme != "https" || uri.host != "news.google.com") return
             runOnUiThread {
                 try {
@@ -10974,8 +10974,8 @@ class MainActivity : AppCompatActivity() {
         //
         // Both feeds emit the SAME Yahoo-style symbol, so nothing downstream
         // knows or cares which one a price came from.
-        val useKite = try { config.useZerodhaLiveTicks } catch (e: Exception) { false }
-        val useFinnhub = try { config.useFinnhubLiveTicks } catch (e: Exception) { false }
+        val useKite = try { config.useZerodhaLiveTicks } catch (_: Exception) { false }
+        val useFinnhub = try { config.useFinnhubLiveTicks } catch (_: Exception) { false }
 
         // Partition by SYMBOL SHAPE, once, so each feed gets exactly the names it
         // can serve and Yahoo keeps the remainder. Written as a partition rather

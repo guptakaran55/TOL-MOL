@@ -1561,7 +1561,7 @@ object StrategyLabEngine {
     private fun fmtTs(sec: Long): String = try {
         java.time.format.DateTimeFormatter.ofPattern("d MMM HH:mm", java.util.Locale.US)
             .format(Instant.ofEpochSecond(sec).atZone(ZoneId.systemDefault()))
-    } catch (e: Exception) { sec.toString() }
+    } catch (_: Exception) { sec.toString() }
 
     /**
      * THE EXIT CARD — DISPLAY ONLY. Every `ok` here is the same test the engine runs;

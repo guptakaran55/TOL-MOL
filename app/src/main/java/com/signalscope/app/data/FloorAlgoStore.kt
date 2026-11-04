@@ -617,7 +617,7 @@ object FloorAlgoStore {
             val w = ManualWatchStore.load(ctx, space)
             if (w.trailPct > 0.0) Settings(stopPct = w.trailPct, stopUnit = (w.trailUnit ?: ManualWatchStore.TrailUnit.PCT).name)
             else Settings(stopPct = 2.0, stopUnit = "ATR")
-        } catch (e: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
+        } catch (_: Exception) { Settings(stopPct = 2.0, stopUnit = "ATR") }
         val a = Algo(
             id = "f" + java.lang.Long.toString(System.currentTimeMillis() % 1_000_000_000L, 36),
             name = name.trim().ifBlank { if (portfolio) (if (k == KIND_MACD) "Portfolio · MACD swings" else "Portfolio · floor swings")

@@ -188,8 +188,8 @@ object RvGate {
         val openMs = todayOpenMs(base, now)
         val mins = if (openMs > 0L) (now - openMs) / 60_000L else Long.MAX_VALUE
         val ys = YahooFinanceClient.toYahooSymbol(symbol, space)
-        val live = try { PatientExecutor.currentRefOrNull(config, ticker, ys, space) } catch (e: Exception) { null }
-        val atr = try { DailyVolatility.of(symbol, exch)?.atr ?: 0.0 } catch (e: Exception) { 0.0 }
+        val live = try { PatientExecutor.currentRefOrNull(config, ticker, ys, space) } catch (_: Exception) { null }
+        val atr = try { DailyVolatility.of(symbol, exch)?.atr ?: 0.0 } catch (_: Exception) { 0.0 }
         var high = 0.0; var low = 0.0; var velocity: Double? = null
         try {
             // FIVE DAYS, NOT ONE — AND ONLY TODAY'S ARE USED. The price feed's
@@ -240,7 +240,7 @@ object RvGate {
         val waited = if (since > 0L) now - maxOf(since, todayOpenMs(base, now)) else 0L
         if (side == Side.SELL && belowStop)
             return Decision(true, "under its stop — stop sales never wait") to null
-        val r = try { read(config, ticker, symbol, base) } catch (e: Exception) { null }
+        val r = try { read(config, ticker, symbol, base) } catch (_: Exception) { null }
             ?: return Decision(true, "prices unreadable — not held back blind") to null
         // A buy's memory, brought up to date with this look's price.
         val m = if (side == Side.BUY) r.price?.let { remember(memory, it, r.atr) } else null
@@ -280,7 +280,7 @@ object RvGate {
         }
         d.memory?.let { o.put("peak", it.peak).put("trough", it.trough) }
         o.toString()
-    } catch (e: Exception) { "" }
+    } catch (_: Exception) { "" }
 
     /** True when a waiting-sale or waiting-buy note came from this gate. */
     const val NOTE = "RV gate"
@@ -303,7 +303,7 @@ object RvGate {
                 T212LiveStore.isT212Ns(it.ns) &&
                 MarketHours.isRegularSession(Spaces.baseOf(it.ns), now)
         }
-    } catch (e: Exception) { false }
+    } catch (_: Exception) { false }
 
     /** Arm the next minute's check if something waits; do nothing otherwise. */
     fun ensureTick(ctx: Context) {

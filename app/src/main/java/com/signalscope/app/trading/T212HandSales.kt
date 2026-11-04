@@ -173,7 +173,7 @@ object T212HandSales {
     private fun label(ctx: Context, ns: String): String =
         if (isWatcher(ns)) "Your watchlist"
         else try { com.signalscope.app.data.BucketStore.list(ctx, Spaces.baseOf(ns))
-                .firstOrNull { it.ns == ns }?.name } catch (e: Exception) { null } ?: "The algo"
+                .firstOrNull { it.ns == ns }?.name } catch (_: Exception) { null } ?: "The algo"
 
     /** Close one position everywhere at the sale's price, and move its seat on. */
     private fun closeOne(ctx: Context, r: T212LiveStore.LiveTrade, orderIds: List<Long>,
@@ -235,7 +235,7 @@ object T212HandSales {
             val open = StrategyLabStore.load(ctx, r.ns).trades
                 .firstOrNull { it.id == r.paperTradeId && it.status == "OPEN" }
             if (open != null) AlgoTakeProfit.bookPaperExit(ctx, r.ns, open, px, now, REASON_YOURS)
-            seat = try { MacdGateEngine.handOn(ctx, r.ns, r.symbol, REASON_YOURS) } catch (e: Exception) { null }
+            seat = try { MacdGateEngine.handOn(ctx, r.ns, r.symbol, REASON_YOURS) } catch (_: Exception) { null }
             true
         }
         try { T212LiveMirror.reconcileFills(ctx) } catch (_: Exception) {}
@@ -278,7 +278,7 @@ object T212HandSales {
         // in their own record. Any row of theirs, even one mid-buy or mid-sale.
         val floorBy = try {
             FloorLiveStore.load(ctx).rows.filter { it.holds && it.ticker.isNotBlank() }.groupBy { it.ticker.uppercase() }
-        } catch (e: Exception) { emptyMap() }
+        } catch (_: Exception) { emptyMap() }
         val tickers = byTicker.keys + floorBy.keys
         p.all.keys.filter { it.removePrefix("part|") !in tickers }.forEach { p.edit().remove(it).apply() }
         if (tickers.isEmpty()) return ""
@@ -385,7 +385,7 @@ object T212HandSales {
         FloorLiveStore.load(ctx).rows.filter {
             it.status == FloorLiveStore.OPEN && it.qty > 0.0 && it.ticker.equals(ticker, true)
         }
-    } catch (e: Exception) { emptyList() }
+    } catch (_: Exception) { emptyList() }
 
     /** How [sold] shares fall across built-in algo rows, oldest first. Pure. */
     internal fun floorAllocate(rows: List<FloorLiveStore.Row>, sold: Double): List<Pair<FloorLiveStore.Row, Double>> {

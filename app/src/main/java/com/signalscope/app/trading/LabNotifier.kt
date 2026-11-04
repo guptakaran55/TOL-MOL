@@ -116,7 +116,7 @@ object LabNotifier {
                 (com.signalscope.app.network.YahooFinanceClient.fetchCandles15m(
                     sym, Spaces.exchangeOf(base), includePrePost = false)
                     as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             val v = if (base == "us") velocity15m(space, sym)
                     else c15?.let { PriceVelocity.last15m(it, System.currentTimeMillis() / 1000L, FeedDelay.secFor(base)) }
             val slopes = macdSlopes(ctx, base, sym, s?.macdRecent.orEmpty(), c15)
@@ -144,7 +144,7 @@ object LabNotifier {
             (com.signalscope.app.network.YahooFinanceClient.fetchCandles15m(
                 sym, Spaces.exchangeOf(base), includePrePost = false)
                 as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
         val v = if (base == "us") velocity15m(space, sym)
                 else c15?.let { PriceVelocity.last15m(it, System.currentTimeMillis() / 1000L, FeedDelay.secFor(base)) }
         val slopes = macdSlopes(ctx, base, sym, curve, c15)
@@ -219,7 +219,7 @@ object LabNotifier {
             sym, Spaces.exchangeOf(base), includePrePost = base == "us")
         (res as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles
             ?.let { PriceVelocity.last15m(it, System.currentTimeMillis() / 1000L, FeedDelay.secFor(base)) }
-    } catch (e: Exception) { null }
+    } catch (_: Exception) { null }
 
     /** "15m to 20:45" — or with the date when that candle is not from today, so
      *  an evening read of the close's last candle never passes for "now". */
@@ -358,7 +358,7 @@ object LabNotifier {
         if (com.signalscope.app.trading.Spaces.bucketIdOf(ns) ==
             com.signalscope.app.data.ManualWatchStore.ID) "${spaceLabel(ns)} watchlist"
         else com.signalscope.app.data.BucketStore.get(ctx, ns)?.name ?: ns.uppercase()
-    } catch (e: Exception) { ns.uppercase() }
+    } catch (_: Exception) { ns.uppercase() }
 
     private fun spaceLabel(ns: String): String =
         when (com.signalscope.app.trading.Spaces.baseOf(ns)) {
@@ -404,7 +404,7 @@ object LabNotifier {
             com.signalscope.app.data.BucketStore.get(ctx, ns)?.notify ?: true
         else true
         isScan || !(spaceOn && algoOn)
-    } catch (e: Exception) { false }
+    } catch (_: Exception) { false }
 
     /**
      * A gate-passing name the user does NOT hold has just fired an entry under the
@@ -828,7 +828,7 @@ object LabNotifier {
     private fun whoBought(ctx: Context, ns: String, origin: String): String {
         val watcher = try {
             com.signalscope.app.trading.Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID
-        } catch (e: Exception) { false }
+        } catch (_: Exception) { false }
         val yours = origin.contains("yourself", true) || origin.contains("your own", true)
         return when {
             watcher && yours -> "Watcher · your buy"
@@ -1020,7 +1020,7 @@ object LabNotifier {
         if (!com.signalscope.app.trading.Spaces.isBucket(ns)) true
         else com.signalscope.app.data.BucketStore.get(ctx, ns)
             ?.let { !(it.live && it.liveBudget > 0.0 && it.liveAllowlist.isNotEmpty()) } ?: true
-    } catch (e: Exception) { true }
+    } catch (_: Exception) { true }
 
     /**
      * A holding the trailing stop cannot protect, because nothing is guarding it.

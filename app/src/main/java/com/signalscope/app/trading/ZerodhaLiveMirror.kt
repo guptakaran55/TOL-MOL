@@ -365,7 +365,7 @@ object ZerodhaLiveMirror {
         }
         var last: ZerodhaClient.OrderFill? = null
         for (i in 0 until FILL_POLL_TRIES) {
-            try { Thread.sleep(FILL_POLL_GAP_MS) } catch (e: InterruptedException) { break }
+            try { Thread.sleep(FILL_POLL_GAP_MS) } catch (_: InterruptedException) { break }
             last = client.fetchOrderFill(id) ?: continue
             if (last.status == "COMPLETE" || last.status == "REJECTED" ||
                 last.status == "CANCELLED") break
@@ -393,7 +393,7 @@ object ZerodhaLiveMirror {
      * the number a real order is built around. Stale in, wrong order out.
      */
     private fun referencePrice(client: ZerodhaClient, sym: String): Double {
-        val mark = try { MarkToMarket.get(sym) } catch (e: Exception) { null }
+        val mark = try { MarkToMarket.get(sym) } catch (_: Exception) { null }
         if (mark != null && mark.price > 0.0 &&
             (System.currentTimeMillis() - mark.atMs) < 60_000L) return mark.price
         return when (val r = client.fetchLtp(EXCHANGE, sym)) {
@@ -1097,7 +1097,7 @@ object ZerodhaLiveMirror {
         val row = ZerodhaLiveStore.forTrade(ctx, ns, paperTradeId) ?: return null
         if (row.status != "OPEN") return null
         val cfg = ConfigManager(ctx)
-        val g = if (cfg.isZerodhaConnected) try { restingTriggerOf(ZerodhaClient(cfg), row) } catch (e: Exception) { null } else null
+        val g = if (cfg.isZerodhaConnected) try { restingTriggerOf(ZerodhaClient(cfg), row) } catch (_: Exception) { null } else null
         return mapOf("ok" to true, "broker" to "zerodha", "ns" to ns, "pid" to paperTradeId,
             "ticker" to row.symbol.uppercase(), "symbol" to row.symbol.uppercase(),
             "qty" to row.qty.toDouble(), "paid" to row.entryPrice,
@@ -1107,7 +1107,7 @@ object ZerodhaLiveMirror {
                 ?: MarkToMarket.priceNow(ctx, ns, row.symbol) ?: 0.0),
             "currency" to "INR", "space" to "IN",
             "owner" to (if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID) "your watchlist"
-                        else "the algo " + (try { com.signalscope.app.data.BucketStore.get(ctx, ns)?.name } catch (e: Exception) { null } ?: ns)),
+                        else "the algo " + (try { com.signalscope.app.data.BucketStore.get(ctx, ns)?.name } catch (_: Exception) { null } ?: ns)),
             "target" to (g?.triggerPriceAux ?: 0.0), "targetLabel" to (if ((g?.triggerPriceAux ?: 0.0) > 0.0) "the trigger at Zerodha" else ""),
             "stop" to (g?.triggerPrice ?: 0.0),
             "resting" to ((g?.triggerPriceAux ?: 0.0) > 0.0), "noTargetLeg" to (g != null && (g.triggerPriceAux ?: 0.0) <= 0.0),
@@ -1117,7 +1117,7 @@ object ZerodhaLiveMirror {
                 val st = com.signalscope.app.data.ManualWatchStore.load(ctx, "in")
                 val e = st.entries.firstOrNull { it.status == "OPEN" && "${it.symbol.uppercase()}-${it.signalBarTs}" == paperTradeId }
                 if (e != null && st.takeProfitPct > 0.0) ManualTakeProfit.targetFor(e.filledPrice, st.takeProfitPct) else 0.0
-            } catch (e: Exception) { 0.0 } else 0.0))
+            } catch (_: Exception) { 0.0 } else 0.0))
     }
 
     /**
@@ -1251,7 +1251,7 @@ object ZerodhaLiveMirror {
                     rule?.let { WeekTarget.levelPlan(it, bars, entry, null, preExisting = false) }
                 } else StrategyLabRunner.rangesBefore(ctx, ns, sym, System.currentTimeMillis() / 1000L)
                     ?.let { WeekTarget.plan(it, entry, null, preExisting = false, minGapPct = WeekTarget.minGapFor("in")) }
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             val tgt = range?.takeIf { it.ok }?.let { Math.floor(it.price / tick + 1e-9) * tick }
                 ?.takeIf { it > plan.sl }
             val target = tgt?.let { Math.round(it * 10_000.0) / 10_000.0 } ?: plan.target
@@ -1487,7 +1487,7 @@ object ZerodhaLiveMirror {
      */
     internal fun heldQuantity(ctx: Context, symbol: String): Int? {
         val sym = symbol.uppercase()
-        val today = try { ZerodhaClient(ConfigManager(ctx)).fetchTodayPositionSymbols() } catch (e: Exception) { null }
+        val today = try { ZerodhaClient(ConfigManager(ctx)).fetchTodayPositionSymbols() } catch (_: Exception) { null }
             ?: return null
         if (sym in today.map { it.uppercase() }) return null
         val h = (BrokerHoldings.zerodha(ctx) as? BrokerHoldings.Result.Ok)?.holdings ?: return null
@@ -1539,7 +1539,7 @@ object ZerodhaLiveMirror {
                 val paper = try {
                     com.signalscope.app.data.StrategyLabStore.load(ctx, row.ns).trades
                         .firstOrNull { it.id == row.paperTradeId }
-                } catch (e: Exception) { null }
+                } catch (_: Exception) { null }
                 if (paper != null && paper.status == "OPEN") {
                     // The strategy is holding it again: the exit it wanted is void.
                     ZerodhaLiveStore.upsert(ctx, row.copy(exitHeld = false, exitTries = 0, error = ""))
@@ -1561,5 +1561,5 @@ object ZerodhaLiveMirror {
         BucketStore.list(ctx, "in")
             .filter { it.live && it.liveBudget > 0.0 && it.liveAllowlist.isNotEmpty() }
             .map { it.ns to it.name }
-    } catch (e: Exception) { emptyList() }
+    } catch (_: Exception) { emptyList() }
 }

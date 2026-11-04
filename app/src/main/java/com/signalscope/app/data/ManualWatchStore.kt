@@ -897,7 +897,7 @@ object ManualWatchStore {
     /** Do the attached config's own sales act on this watchlist? True for anything not a watchlist. */
     fun strategyExitsOn(ctx: Context, ns: String): Boolean {
         if (Spaces.bucketIdOf(ns) != ID) return true
-        return try { load(ctx, Spaces.baseOf(ns)).strategyExitsOn != false } catch (e: Exception) { true }
+        return try { load(ctx, Spaces.baseOf(ns)).strategyExitsOn != false } catch (_: Exception) { true }
     }
 
     /** The German watchlist's +4% take-profit off, once — the user's call, 2 Nov 2026,

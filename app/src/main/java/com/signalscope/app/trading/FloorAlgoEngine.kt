@@ -76,7 +76,7 @@ object FloorAlgoEngine {
     fun runAll(ctx: Context): String {
         // A paused algo with real shares still held gets its pass, so they still sell.
         val realHeld = try { com.signalscope.app.data.FloorLiveStore.load(ctx).rows.filter { it.holds }.map { it.ns }.toHashSet() }
-            catch (e: Exception) { emptySet<String>() }
+            catch (_: Exception) { emptySet<String>() }
         // A sleeping market's algos wait for it to wake — see MarketHours.awake.
         val now = System.currentTimeMillis()
         val ids = FloorAlgoStore.load(ctx).algos.filter {
@@ -167,7 +167,7 @@ object FloorAlgoEngine {
         // money copied — or decided not to copy — has its own real alert, so the paper
         // one would only repeat it. Read after the real-money step above made its rows.
         val realRows = if (FloorLive.eligible(saved))
-            try { com.signalscope.app.data.FloorLiveStore.rowsFor(ctx, saved.ns) } catch (e: Exception) { emptyList() }
+            try { com.signalscope.app.data.FloorLiveStore.rowsFor(ctx, saved.ns) } catch (_: Exception) { emptyList() }
             else emptyList()
         val recent = System.currentTimeMillis() - 30 * 60_000L
         if (saved.notify) for (n in pass.notices) {
@@ -233,7 +233,7 @@ object FloorAlgoEngine {
             // "not current". Five days is 125–170 bars: accepted, and still small.
             val r = try {
                 YahooFinanceClient.fetchCandles15mRange(sym, Spaces.exchangeOf(space), if (cur == null) "60d" else "5d")
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             try { Thread.sleep(250) } catch (_: InterruptedException) {}
             val c = (r as? YahooFinanceClient.CandleResult.Success)?.candles
                 ?: return cur?.bars?.values?.toList() to true
@@ -422,7 +422,7 @@ object FloorAlgoEngine {
             val day = LocalDate.parse(pd)
             val pending = try {
                 FloorJournalStore.load(ctx, a.id).rows.filter { !it.done }.map { it.symbol }
-            } catch (e: Exception) { emptyList() }
+            } catch (_: Exception) { emptyList() }
             val daily = dailyBars((a.universe.map { it.symbol } + pending).distinct()) ?: return false
             // Nothing came back at all: a download failure, not a verdict.
             if (daily.isEmpty()) return false
@@ -440,7 +440,7 @@ object FloorAlgoEngine {
             val market = marketFor(space)
             val scan = try {
                 DiscoveryResultStore.loadLatestComplete(ctx, market) ?: DiscoveryResultStore.load(ctx, market)
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             if (scan == null) {
                 if (a.universe.isEmpty()) note("no Discovery scan for this market yet — run one, then check again")
                 return
@@ -477,7 +477,7 @@ object FloorAlgoEngine {
          * watchlist is yours. An unreadable algo record changes nothing either.
          */
         private fun portfolioUniverse() {
-            val r = try { BrokerHoldings.forSpace(ctx, space) } catch (e: Exception) { null }
+            val r = try { BrokerHoldings.forSpace(ctx, space) } catch (_: Exception) { null }
             val held = (r as? BrokerHoldings.Result.Ok)?.holdings ?: return
             val owned = algoOwned() ?: return
             val atBroker = HashMap<String, Double>()
@@ -561,7 +561,7 @@ object FloorAlgoEngine {
             val daily = try {
                 com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars(
                     Spaces.dataSpaceOf(space), symbols, minBars = MacdSlopes.MIN_BARS).first
-            } catch (e: Exception) { LinkedHashMap() }
+            } catch (_: Exception) { LinkedHashMap() }
             // The daily trend must include the last finished session. A series
             // missing it is a day behind; the read waits for the next pass.
             val newest = daily.values.mapNotNull { b -> b.lastOrNull { it.date.isBefore(today) }?.date }.maxOrNull()
@@ -710,7 +710,7 @@ object FloorAlgoEngine {
         private fun freshVerdict(outlooks: Map<String, String>, sym: String): Pair<String, String>? {
             val p = outlooks[sym]?.split("|")?.takeIf { it.size == 2 } ?: return null
             if (p[0] == "UNKNOWN" || p[0].isBlank()) return null
-            val age = try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(p[1]), today) } catch (e: Exception) { 99L }
+            val age = try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(p[1]), today) } catch (_: Exception) { 99L }
             return if (age < 3) p[0] to p[1] else null
         }
 
@@ -730,7 +730,7 @@ object FloorAlgoEngine {
                 FloorAlgoStore.list(ctx, space).filter { it.id != a.id }.mapNotNull { o ->
                     @Suppress("USELESS_ELVIS") (o.outlooks ?: emptyMap())
                 }
-            } catch (e: Exception) { emptyList() }
+            } catch (_: Exception) { emptyList() }
             val verdicts = HashMap<String, String?>()
             val order = members.withIndex().filter { it.value.pick == PICK_ASK }
                 .sortedWith(compareBy({ it.value.lowAgo ?: 99 }, { it.index })).map { it.value }
@@ -1115,15 +1115,15 @@ object FloorAlgoEngine {
         // charges, a flat depository fee per sale, GST on the services, and the
         // intraday card when bought and sold the same day.
         private val config = com.signalscope.app.data.ConfigManager(ctx)
-        private val accountCurrency = try { config.accountCurrency } catch (e: Exception) { "EUR" }
-        private val fxPct = try { config.fxConversionPct } catch (e: Exception) { TradingCosts.T212_FX_PCT_PER_SIDE }
+        private val accountCurrency = try { config.accountCurrency } catch (_: Exception) { "EUR" }
+        private val fxPct = try { config.fxConversionPct } catch (_: Exception) { TradingCosts.T212_FX_PCT_PER_SIDE }
 
         /** The charges on a round trip bought on [buyDay] for [buyValue] and sold on
          *  [sellDay] for [sellValue], in the market's currency. */
         fun feesFor(buyDay: String, buyValue: Double, sellValue: Double, sellDay: String): Double = try {
             TradingCosts.chargesFor(space, buyValue, sellValue, accountCurrency, fxPct,
                 intraday = buyDay == sellDay).cashRoundTrip
-        } catch (e: Exception) { 0.0 }
+        } catch (_: Exception) { 0.0 }
 
         /** Half the spread, in percent, per market execution. */
         private val spreadPct = (start.settings.spreadPct ?: FloorAlgoStore.defaultSpreadPct(space)).coerceAtLeast(0.0)
@@ -1394,7 +1394,7 @@ object FloorAlgoEngine {
         private fun outlookFor(m: Member, price: Double): String? {
             val cached = a.outlooks[m.symbol]?.split("|")
             if (cached != null && cached.size == 2) {
-                val age = try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(cached[1]), today) } catch (e: Exception) { 99L }
+                val age = try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(cached[1]), today) } catch (_: Exception) { 99L }
                 // A failed or unread answer is asked again the next day, not in three.
                 if (age < (if (cached[0] == "UNKNOWN") 1 else 3)) return if (cached[0] == "UNKNOWN") "" else cached[0]
             }
@@ -1420,7 +1420,7 @@ object FloorAlgoEngine {
                  else "the reply ended: “${com.signalscope.app.network.OutlookReply.tail(text, 120).replace('\n', ' ')}”"))
             // Old answers fall away after ten days.
             val keep = a.outlooks.filterValues { val p = it.split("|")
-                p.size == 2 && try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(p[1]), today) < 10 } catch (e: Exception) { false } }
+                p.size == 2 && try { java.time.temporal.ChronoUnit.DAYS.between(LocalDate.parse(p[1]), today) < 10 } catch (_: Exception) { false } }
             a = a.copy(outlooks = keep + (m.symbol to "$v|$today"))
             if (v != "UNKNOWN") note("${m.symbol}: news outlook $v")
             return if (v == "UNKNOWN") "" else v

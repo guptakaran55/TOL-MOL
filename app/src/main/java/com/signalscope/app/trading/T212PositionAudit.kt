@@ -239,7 +239,7 @@ object T212PositionAudit {
         // still in progress has no settled quantity, so it is claimed but not compared.
         val floorRows = try {
             com.signalscope.app.data.FloorLiveStore.load(ctx).rows.filter { it.holds && it.ticker.isNotBlank() }
-        } catch (e: Exception) { emptyList() }
+        } catch (_: Exception) { emptyList() }
         val floorByTicker = floorRows.filter { it.status != com.signalscope.app.data.FloorLiveStore.BUYING && it.qty > 0.0 }
             .groupBy { it.ticker }
 

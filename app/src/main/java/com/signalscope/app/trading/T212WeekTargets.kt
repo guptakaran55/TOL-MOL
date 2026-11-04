@@ -404,7 +404,7 @@ object T212WeekTargets {
     private fun levelSigFor(ctx: Context, ns: String): String {
         val base = Spaces.baseOf(ns)
         return WeekTarget.levelSig(WeekTarget.levelRuleFor(base,
-            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (e: Exception) { null }))
+            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (_: Exception) { null }))
     }
 
     /** Your watchlist's rows in Germany and the US — the ones the named levels apply to. */
@@ -417,7 +417,7 @@ object T212WeekTargets {
         val sym = symbol.uppercase()
         val bars = try {
             com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars(base.uppercase(), listOf(sym), minBars = 60).first[sym]
-        } catch (e: Exception) { null } ?: return null
+        } catch (_: Exception) { null } ?: return null
         val zone = MarketHours.zoneOf(base) ?: java.time.ZoneId.of("America/New_York")
         val buyDay = java.time.Instant.ofEpochSecond(buySec).atZone(zone).toLocalDate()
         return bars.filter { it.date.isBefore(buyDay) }
@@ -510,7 +510,7 @@ object T212WeekTargets {
         return try {
             val others = T212LiveStore.otherClaimsQty(ctx, row.t212Ticker, row.ns, row.paperTradeId)
             dustLeft(have, own, others, row.liveEntryPrice)
-        } catch (e: Exception) { 0.0 }
+        } catch (_: Exception) { 0.0 }
     }
 
     /** What is left after [own] and [others] of [have], if it is dust worth under €1 at [price]. Pure. */
@@ -673,7 +673,7 @@ object T212WeekTargets {
     /** "the algo B_Conservative" / "your watchlist" — for messages. */
     private fun ownerLabel(ctx: Context, ns: String): String =
         if (Spaces.bucketIdOf(ns) == ManualWatchStore.ID) "your watchlist"
-        else "the algo " + (try { com.signalscope.app.data.BucketStore.get(ctx, ns)?.name } catch (e: Exception) { null }
+        else "the algo " + (try { com.signalscope.app.data.BucketStore.get(ctx, ns)?.name } catch (_: Exception) { null }
             ?: ns)
 
     /** What the target window needs to open on a Trading 212 position. */
@@ -688,7 +688,7 @@ object T212WeekTargets {
             val st = ManualWatchStore.load(ctx, base)
             val e = st.entries.firstOrNull { it.status == "OPEN" && "${it.symbol.uppercase()}-${it.signalBarTs}" == paperTradeId }
             if (e != null && st.takeProfitPct > 0.0) ManualTakeProfit.targetFor(e.filledPrice, st.takeProfitPct) else 0.0
-        } catch (e: Exception) { 0.0 } else 0.0
+        } catch (_: Exception) { 0.0 } else 0.0
         return mapOf("ok" to true, "broker" to "t212", "ns" to ns, "pid" to paperTradeId,
             "ticker" to row.t212Ticker, "symbol" to row.symbol.uppercase(),
             "qty" to ownQty(row), "paid" to row.liveEntryPrice,

@@ -8,8 +8,6 @@ import com.signalscope.app.data.ConfigManager
 import com.signalscope.app.data.PortfolioHolding
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
@@ -717,7 +715,7 @@ class ZerodhaClient(private val config: ConfigManager) {
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (resp.code == 404) return "missing"
-                val j = try { JsonParser.parseString(body).asJsonObject } catch (e: Exception) { return null }
+                val j = try { JsonParser.parseString(body).asJsonObject } catch (_: Exception) { return null }
                 if (j.get("status")?.asString != "success") {
                     val msg = j.get("message")?.asString.orEmpty().lowercase()
                     return if (msg.contains("not found") || msg.contains("does not exist")) "missing" else null
@@ -746,14 +744,14 @@ class ZerodhaClient(private val config: ConfigManager) {
                 .build()
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
-                val j = try { JsonParser.parseString(body).asJsonObject } catch (e: Exception) { return null }
+                val j = try { JsonParser.parseString(body).asJsonObject } catch (_: Exception) { return null }
                 if (j.get("status")?.asString != "success") return null
                 val orders = j.getAsJsonObject("data")?.getAsJsonArray("orders") ?: return null
                 orders.firstNotNullOfOrNull { o ->
                     try {
                         o.asJsonObject.getAsJsonObject("result")?.getAsJsonObject("order_result")
                             ?.get("order_id")?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() }
-                    } catch (e: Exception) { null }
+                    } catch (_: Exception) { null }
                 }
             }
         } catch (e: Exception) {
@@ -1119,10 +1117,10 @@ class ZerodhaClient(private val config: ConfigManager) {
                 val o = arr[arr.size() - 1].asJsonObject
                 fun str(k: String): String = try {
                     o.get(k)?.takeIf { !it.isJsonNull }?.asString ?: ""
-                } catch (e: Exception) { "" }
+                } catch (_: Exception) { "" }
                 fun num(k: String): Double = try {
                     o.get(k)?.takeIf { !it.isJsonNull }?.asDouble ?: 0.0
-                } catch (e: Exception) { 0.0 }
+                } catch (_: Exception) { 0.0 }
                 OrderFill(
                     status = str("status"),
                     filledQty = num("filled_quantity").toInt(),
@@ -1203,7 +1201,7 @@ class ZerodhaClient(private val config: ConfigManager) {
                             price = num("average_price"),
                             filledAt = str("fill_timestamp").ifBlank { str("exchange_timestamp") },
                             product = str("product"))
-                    } catch (e: Exception) { null }
+                    } catch (_: Exception) { null }
                 }
             }
         } catch (e: Exception) {

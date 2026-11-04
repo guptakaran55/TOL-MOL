@@ -110,6 +110,18 @@ object PatientExecutor {
 
     // ── shared helpers (verbatim) ───────────────────────────────────────────
 
+    /** Shares of [ticker] held at Trading 212: 0.0 when the portfolio was read and
+     *  it is not in it, -1.0 only when the portfolio could not be read at all.
+     *  The two used to be the same -1.0, so a name not yet held looked
+     *  "unreadable" and every first buy of it was refused (TPE, 4 Nov 2026) —
+     *  and the RV gate put each such buy back to waiting, again and again. */
+    private fun heldQty(client: Trading212Client, ticker: String): Double =
+        when (val r = client.fetchPortfolio()) {
+            is Trading212Client.T212Result.Success ->
+                r.data.firstOrNull { it.ticker.equals(ticker, true) }?.quantity ?: 0.0
+            else -> -1.0
+        }
+
     /**
      * Re-anchor on a FRESH price at start, ignoring how stale the caller's
      * reference was. Root cause this kills: for a stock that isn't held and isn't
@@ -310,7 +322,7 @@ object PatientExecutor {
                 }
                 else -> CancelOutcome(false, false)   // couldn't check — assume it may still rest
             }
-        } catch (e: Exception) { CancelOutcome(false, false) }
+        } catch (_: Exception) { CancelOutcome(false, false) }
     }
 
     /**
@@ -409,11 +421,11 @@ object PatientExecutor {
 
             // Live position = SINGLE SOURCE OF TRUTH, re-read after every rung so a
             // fill during a dwell can never double-sell.
-            fun ownedQty(): Double =
-                (client.fetchPortfolio() as? Trading212Client.T212Result.Success)
-                    ?.data?.firstOrNull { it.ticker.equals(t, true) }?.quantity ?: -1.0
+            fun ownedQty(): Double = heldQty(client, t)
 
-            val startOwned = ownedQty().let { if (it < 0) quantity else it }
+            // Unreadable, or not listed yet (a buy that has only just filled), sells
+            // what the caller says it holds — as before.
+            val startOwned = ownedQty().let { if (it <= 0.0) quantity else it }
             // THE CLAIM. Never more than the caller owns, never more than exists.
             // With targetQty == null this is startOwned and every expression below
             // reduces exactly to the original liquidate behaviour.
@@ -659,9 +671,7 @@ object PatientExecutor {
             // cash asked for by more than the ATR cap. Baseline the position so
             // "how much have I already bought" is re-derived every rung.
             val targetShares = cashAmount / ref
-            fun ownedQty(): Double =
-                (client.fetchPortfolio() as? Trading212Client.T212Result.Success)
-                    ?.data?.firstOrNull { it.ticker.equals(ticker, true) }?.quantity ?: -1.0
+            fun ownedQty(): Double = heldQty(client, ticker)
             // THE STARTING HOLDING MUST BE KNOWN (4 Nov 2026). An unreadable first
             // look used to count as 0, so the next good look took every share already
             // held as just bought: S92, 11.958 shares "bought" with no order placed,

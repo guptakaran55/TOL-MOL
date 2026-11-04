@@ -121,7 +121,7 @@ object MarkToMarket {
             val mins = et.hour * 60 + et.minute
             mins >= 9 * 60 + 30 && mins < 16 * 60
         }
-    } catch (e: Exception) { true }
+    } catch (_: Exception) { true }
 
     /** A mark is stale once it is older than 2 bars, floored at [STALE_AFTER_MS]
      *  so a fast feed still gets a sensible grace window. */
@@ -326,11 +326,11 @@ object MarkToMarket {
             .map { com.signalscope.app.data.ManualWatchStore.nsFor(it) }
         val namespaces = try {
             com.signalscope.app.data.BucketStore.allNamespaces(ctx) + listOf("us", "de", "binance") + manualNs
-        } catch (e: Exception) { listOf("us", "de", "binance") + manualNs }
+        } catch (_: Exception) { listOf("us", "de", "binance") + manualNs }
         for (ns in namespaces.distinct()) {
             val open = try {
                 StrategyLabStore.load(ctx, ns).trades.filter { it.status == "OPEN" }
-            } catch (e: Exception) { emptyList() }
+            } catch (_: Exception) { emptyList() }
             for (t in open) out.putIfAbsent(key(t.symbol), ns)
         }
         return out
@@ -477,7 +477,7 @@ object MarkToMarket {
      *  this moment rather than a display that can wait for the next poll. */
     fun priceNow(ctx: Context, ns: String, symbol: String): Double? = try {
         lastPrice(ctx, ns, symbol)?.regular?.takeIf { it > 0.0 && it.isFinite() }
-    } catch (e: Exception) { null }
+    } catch (_: Exception) { null }
 
     private fun lastPrice(ctx: Context, ns: String, symbol: String): Polled? {
         if (Spaces.baseOf(ns) == "binance") {
@@ -499,7 +499,7 @@ object MarkToMarket {
                 // price outvoted the live venue and the position stayed blind.
                 val stale = isStale(m!!, System.currentTimeMillis()) || GermanRealtime.feedStopped(symbol)
                 val live = try { GermanRealtime.mid(ctx, symbol, ref, stale) }
-                           catch (e: Exception) { null }
+                           catch (_: Exception) { null }
                 if (live != null && live > 0.0) return Polled(live, 0.0, realtime = true)
             }
         }

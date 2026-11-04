@@ -243,7 +243,7 @@ object StrategyLabRunner {
         // "not evaluated yet · 0/N slots" forever. Let the pass run whenever the
         // gate is armed, even with an empty roster.
         val gateArmed = try { com.signalscope.app.data.MacdGateStore.load(ctx, ns).enabled }
-                        catch (e: Exception) { false }
+                        catch (_: Exception) { false }
         if (state.enrolled.isEmpty() && !gateArmed) { bail(); return }
         // Throttle background ticks; "Run now" passes 0 to force.
         if (minIntervalMs > 0 && System.currentTimeMillis() - state.lastRunAt < minIntervalMs) { bail(); return }
@@ -1116,7 +1116,7 @@ object StrategyLabRunner {
         val base = Spaces.baseOf(ns)
         if (base != "de" && base != "us" && base != "in") return
         val cfg = StrategyLabStore.activeConfig(ctx, ns)
-        val paper = try { StrategyLabStore.load(ctx, ns).trades } catch (e: Exception) { return }
+        val paper = try { StrategyLabStore.load(ctx, ns).trades } catch (_: Exception) { return }
         val knownIds = paper.map { it.id }.toHashSet()
         val engineHolds = paper.filter { it.status == "OPEN" }.map { it.symbol.uppercase() }.toHashSet()
         // ── THE WATCHLIST MANAGES ITS OWN, AND MUST KEEP DOING SO ────────────
@@ -1248,7 +1248,7 @@ object StrategyLabRunner {
         if (base != "de" && base != "us") return
         // On a watchlist the exits panel decides: on or off, and its size.
         val w = if (Spaces.bucketIdOf(ns) == com.signalscope.app.data.ManualWatchStore.ID)
-            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (e: Exception) { null } else null
+            try { com.signalscope.app.data.ManualWatchStore.load(ctx, base) } catch (_: Exception) { null } else null
         if (!(w?.hardStopOn ?: cfg.exit.stopLossEnabled)) return
         val stopPct = w?.hardStopPct ?: cfg.exit.stopLossPct
         val row = com.signalscope.app.data.T212LiveStore.load(ctx).trades.firstOrNull {
@@ -1473,7 +1473,7 @@ object StrategyLabRunner {
         // panel still has a row to draw.
         lastLevels = try {
             IntradayLevels.from(sym, candles, (plan.sourceSec / 60L).toInt())
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
         val run = StrategyLabEngine.runLiveClosed(sym, candles, cfg, plan.sourceSec, entriesFromTs)
         lastRunBarTs = run.lastBarTs
 
@@ -1557,7 +1557,7 @@ object StrategyLabRunner {
             val last = candles.lastOrNull() ?: return null
             LatestBar(last.timestamp, last.close,
                 try { IntradayLevels.from(sym, candles, (plan.sourceSec / 60L).toInt()) }
-                catch (e: Exception) { null })
+                catch (_: Exception) { null })
         } catch (e: Exception) {
             Log.w(TAG, "[$ns] $sym latest-bar lookup failed", e); null
         }
@@ -1818,7 +1818,7 @@ object StrategyLabRunner {
             StrategyLabStore.load(ctx, ns).trades
                 .filter { it.exitReason.isNotBlank() }
                 .associate { it.id to it.exitReason }
-        } catch (e: Exception) { emptyMap() }
+        } catch (_: Exception) { emptyMap() }
         when (base) {
             "binance" -> com.signalscope.app.data.BinanceLiveStore.load(ctx, ns).trades
                 .filter { it.symbol.equals(sym, true) && it.liveAvgBuyPrice > 0.0 }
@@ -2224,7 +2224,7 @@ object StrategyLabRunner {
         // time it needs while a 2-coin crypto one keeps the short deadline.
         val universeSize = try {
             com.signalscope.app.data.BucketStore.get(ctx, ns)?.symbols?.size ?: 0
-        } catch (e: Exception) { 0 }
+        } catch (_: Exception) { 0 }
         val budget = Budget(universeSize)
         val cfg = StrategyLabStore.activeConfig(ctx, ns)
         val plan = FeedPlan.plan(cfg, ns)
@@ -2380,7 +2380,7 @@ object StrategyLabRunner {
         // experiment for a rule belonging to a part that was switched off.
         val selectionOn = try {
             com.signalscope.app.data.MacdGateStore.load(ctx, ns).useScreenerSelection
-        } catch (e: Exception) { true }
+        } catch (_: Exception) { true }
         if (selectionOn && bucket.symbols.distinct().size < 2) return Feasibility(false,
             title = "Not enough companies to rank",
             detail = "Mode 3b ranks a universe against itself; this algo has " +
@@ -2564,7 +2564,7 @@ object StrategyLabRunner {
                 else GateBacktest.build(sym, StrategyLabEngine.backAdjust(candles), r.trades, smoothing)
                 barsDaily += sd.days.size
                 data.add(sd)
-            } catch (e: Exception) { skipped++; budget.consecutiveFailures++ }
+            } catch (_: Exception) { skipped++; budget.consecutiveFailures++ }
             try { Thread.sleep(120) } catch (_: InterruptedException) {}
         }
         wprog(ns, total, total)
@@ -2609,7 +2609,7 @@ object StrategyLabRunner {
         // its own seat under the daily gate, which one company satisfies fine.
         val rankingOn = try {
             com.signalscope.app.data.MacdGateStore.load(ctx, ns).useScreenerSelection
-        } catch (e: Exception) { true }
+        } catch (_: Exception) { true }
         if (data.isEmpty())
             return Hypothetical(false,
                 "No company in this algo returned usable history.")
@@ -2708,7 +2708,7 @@ object StrategyLabRunner {
                 "Fetched ${gd.data.size} of ${roster.size} companies; a partial universe " +
                 "cannot be ranked, so no file was written.")
         }
-        val csvRankingOn = try { gate.useScreenerSelection } catch (e: Exception) { true }
+        val csvRankingOn = try { gate.useScreenerSelection } catch (_: Exception) { true }
         if (gd.data.isEmpty())
             return PortfolioCsv(false, "No company in this algo returned usable history.")
         if (csvRankingOn && gd.data.size < 2)
@@ -2960,7 +2960,7 @@ object StrategyLabRunner {
         w.append("run_id,layer,ns,algo,symbol,configured_entry_frame,configured_exit_frame,")
         w.append("base_granularity_sec,effective_entry_tf_sec,effective_exit_tf_sec,")
         w.append("source_bars,entry_bars,warmup_bars,first_tradable_time,last_run,ok,note\n")
-        val cfgNow = try { StrategyLabStore.activeConfig(ctx, ns) } catch (e: Exception) { null }
+        val cfgNow = try { StrategyLabStore.activeConfig(ctx, ns) } catch (_: Exception) { null }
         for (stt in lab.statuses.values.sortedBy { it.symbol }) {
             w.append(head).append(',')
             w.append(csvCell(stt.symbol)).append(',')

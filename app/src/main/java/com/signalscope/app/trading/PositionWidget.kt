@@ -129,7 +129,7 @@ class PositionWidget : AppWidgetProvider() {
                     val wd = try {
                         java.time.LocalDate.parse(r.day).dayOfWeek
                             .getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.UK)
-                    } catch (e: Exception) { r.day }
+                    } catch (_: Exception) { r.day }
                     val f2 = sb.length
                     sb.append(" ").append(wd)
                     sb.setSpan(android.text.style.ForegroundColorSpan(0x99FFFFFF.toInt()), f2, sb.length, 0)

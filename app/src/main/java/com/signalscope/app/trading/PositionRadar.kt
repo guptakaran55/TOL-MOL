@@ -2,7 +2,6 @@ package com.signalscope.app.trading
 
 import android.content.Context
 import android.util.Log
-import com.signalscope.app.data.BucketStore
 import com.signalscope.app.data.ConfigManager
 import com.signalscope.app.data.ManualWatchStore
 import com.signalscope.app.data.PositionPeakStore
@@ -231,7 +230,7 @@ object PositionRadar {
                 cached = try {
                     val f = file(ctx)
                     if (f.exists()) com.google.gson.Gson().fromJson(f.readText(), Summary::class.java) else null
-                } catch (e: Exception) { null }
+                } catch (_: Exception) { null }
                 loaded = true
             }
         }
@@ -400,7 +399,7 @@ object PositionRadar {
         // so no extra call to a broker; an unreadable one simply adds nothing.
         val brokerPx = HashMap<String, Double>()
         for (space in listOf("de", "us", "in")) {
-            val hs = (try { BrokerHoldings.forSpace(ctx, space) } catch (e: Exception) { null })
+            val hs = (try { BrokerHoldings.forSpace(ctx, space) } catch (_: Exception) { null })
                 as? BrokerHoldings.Result.Ok ?: continue
             hs.holdings.forEach { if (it.price > 0.0) brokerPx["$space|${it.symbol.uppercase()}"] = it.price }
             val covered = held.filter { Spaces.baseOf(it.ns) == space }.map { it.symbol }.toSet()
@@ -427,8 +426,8 @@ object PositionRadar {
         val nextPeaks = HashMap<String, PositionPeakStore.Peak>()
         // The sell orders waiting at Trading 212, from the last pass's read — no
         // request here. Which of a holding's protections actually rest at the broker.
-        val resting = try { T212WaitingOrders.last(ctx).orders.filter { !it.isBuy } } catch (e: Exception) { emptyList() }
-        val configs = HashMap<String, com.signalscope.app.trading.StrategyLabConfig?>()
+        val resting = try { T212WaitingOrders.last(ctx).orders.filter { !it.isBuy } } catch (_: Exception) { emptyList() }
+        val configs = HashMap<String, StrategyLabConfig?>()
         val watch = HashMap<String, ManualWatchStore.State>()
         val out = ArrayList<Pos>()
         for (h in held) {
@@ -448,7 +447,7 @@ object PositionRadar {
             // the market reopens.
             val brokerPrice = if (h.byHand) h.brokerPrice else brokerPx["$base|${h.symbol}"] ?: 0.0
             val current = markCurrent || brokerPrice > 0.0
-            val price = if (markCurrent) mark!!.price else if (current) brokerPrice else 0.0
+            val price = if (markCurrent) mark.price else if (current) brokerPrice else 0.0
             // A FEED THAT HAS STOPPED is said out loud, once a day — the widget
             // alone shows a stale price, not that nothing will ever refresh it.
             val feedSym = com.signalscope.app.network.YahooFinanceClient
@@ -479,7 +478,7 @@ object PositionRadar {
             // ── the stops and targets watching it ──
             // None the app knows of for a holding bought by hand.
             val cfg = if (h.byHand) null else configs.getOrPut(h.ns) {
-                try { StrategyLabStore.activeConfig(ctx, h.ns) } catch (e: Exception) { null }
+                try { StrategyLabStore.activeConfig(ctx, h.ns) } catch (_: Exception) { null }
             }
             val x = cfg?.exit
             var stop = 0.0
@@ -495,9 +494,9 @@ object PositionRadar {
                 target = ManualTakeProfit.tighterOf(target, h.paperEntry * (1 + x.takeProfitPct / 100.0))
             stop = maxOf(stop, h.gttStop, entry?.trailLevel ?: 0.0)
             target = ManualTakeProfit.tighterOf(target, h.gttTarget)
-            if (entry != null && (ws?.takeProfitPct ?: 0.0) > 0.0)
+            if (entry != null && ws.takeProfitPct > 0.0)
                 target = ManualTakeProfit.tighterOf(target,
-                    ManualTakeProfit.targetFor(entry.filledPrice, ws!!.takeProfitPct))
+                    ManualTakeProfit.targetFor(entry.filledPrice, ws.takeProfitPct))
             if (h.key.startsWith("t212|"))
                 T212TargetStore.get(ctx, h.ns, h.tradeId)?.takeIf { !it.done && it.price > 0.0 }?.let {
                     target = ManualTakeProfit.tighterOf(target, it.price)

@@ -56,7 +56,7 @@ object IntradayLevels {
         val sr = try {
             Indicators.findSupportResistanceDetailed(
                 candles.map { it.high }, candles.map { it.low }, closes)
-        } catch (e: Exception) { return null }
+        } catch (_: Exception) { return null }
 
         // A LEVEL ON THE WRONG SIDE OF PRICE IS NOT A LEVEL. The finder falls back
         // to the window's extremes when no cluster passes its distance filter, and

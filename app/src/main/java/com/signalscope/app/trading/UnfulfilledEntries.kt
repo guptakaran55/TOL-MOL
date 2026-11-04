@@ -163,7 +163,7 @@ object UnfulfilledEntries {
             val holdings = (BrokerHoldings.t212(ctx) as? BrokerHoldings.Result.Ok)?.holdings
             if (holdings != null) for (r in failed) {
                 val held = holdings.filter { it.ticker.equals(r.t212Ticker, true) }.sumOf { it.qty }
-                val claimed = try { T212LiveStore.otherClaimsQty(ctx, r.t212Ticker, r.ns, r.paperTradeId) } catch (e: Exception) { 0.0 }
+                val claimed = try { T212LiveStore.otherClaimsQty(ctx, r.t212Ticker, r.ns, r.paperTradeId) } catch (_: Exception) { 0.0 }
                 if (held - claimed > 1e-6) {
                     Log.w(TAG, "[${r.ns}] ${r.symbol}: the buy is marked failed but the account holds shares — left alone")
                     continue
@@ -180,10 +180,10 @@ object UnfulfilledEntries {
         // and only with no live row at all — a sent order is the path above.
         val armed = listOf("de", "us").flatMap { sp ->
             try { com.signalscope.app.data.BucketStore.list(ctx, sp).filter { it.live }.map { it.ns } }
-            catch (e: Exception) { emptyList() }
+            catch (_: Exception) { emptyList() }
         }
         for (ns in armed) {
-            val skips = try { com.signalscope.app.data.LiveSkipStore.skipsFor(ctx, ns) } catch (e: Exception) { emptyList() }
+            val skips = try { com.signalscope.app.data.LiveSkipStore.skipsFor(ctx, ns) } catch (_: Exception) { emptyList() }
             for (sk in skips) {
                 if (!missedWhileArmed(sk.reason)) continue
                 if (sk.at <= 0L || now - sk.at < SETTLE_MS || now - sk.at > WINDOW_MS) continue
@@ -213,7 +213,7 @@ object UnfulfilledEntries {
     private fun record(ctx: Context, r: Miss, now: Long): Row? {
         val lab = StrategyLabStore.load(ctx, r.ns)
         val paper = lab.trades.firstOrNull { it.id == r.paperTradeId }
-        val seats = try { MacdGateStore.load(ctx, r.ns).enabled } catch (e: Exception) { false }
+        val seats = try { MacdGateStore.load(ctx, r.ns).enabled } catch (_: Exception) { false }
         var seatTo: String? = null
         val paperWas = when {
             paper?.status == "OPEN" && seats -> {
@@ -225,7 +225,7 @@ object UnfulfilledEntries {
                         MacdGateEngine.handOn(ctx, r.ns, r.symbol,
                             (if (r.reason.startsWith("no real order")) "real buy never placed"
                              else "real buy failed") + " — moved to Unfulfilled")
-                    } catch (e: Exception) { null }
+                    } catch (_: Exception) { null }
                     true
                 } ?: return null   // the algo is mid-pass; next time
                 if (ok) "taken out of the book" else return null

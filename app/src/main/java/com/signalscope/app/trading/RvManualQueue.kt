@@ -289,7 +289,7 @@ object RvManualQueue {
             val tk = o.ticker.ifBlank { resolve(config, o.symbol, o.space) }
             val r = RvGate.read(config, tk, o.symbol, Spaces.baseOf(o.ns))
             (r.price?.takeIf { it > 0.0 } ?: o.refPrice) to r.atr
-        } catch (e: Exception) { o.refPrice to 0.0 }
+        } catch (_: Exception) { o.refPrice to 0.0 }
         val q = o.copy(id = "rv${now}${(Math.random() * 1000).toInt()}", createdAt = now,
             status = "WAITING", why = "the market is closed — the RV gate starts looking at the open",
             capRef = if (ref > 0.0) ref else 0.0, capLimit = limitFor(ref, atr))
@@ -331,7 +331,7 @@ object RvManualQueue {
 
     private fun resolve(config: ConfigManager, symbol: String, space: String): String = try {
         Trading212Client(config).resolveT212Ticker(symbol.uppercase().removeSuffix(".DE"), space) ?: ""
-    } catch (e: Exception) { "" }
+    } catch (_: Exception) { "" }
 
     /**
      * Every minute while anything waits, and every pass: start each waiting order
@@ -460,7 +460,7 @@ object RvManualQueue {
                 (if (r.error != null) "nothing sold: ${r.error}" else {
                     val handled = if (r.filled > 0.0) try {
                         T212HandSales.afterAppSale(ctx, r.ticker, r.orderIds, r.refPrice)
-                    } catch (e: Exception) { "" } else ""
+                    } catch (_: Exception) { "" } else ""
                     (if (r.filled > 0.0) "sold ${"%.4f".format(r.filled)}" +
                         (if (r.remaining > 0.0) ", ${"%.4f".format(r.remaining)} left unsold" else "")
                      else "nothing sold: ${r.note.ifBlank { "the ladder found no buyer" }}") +

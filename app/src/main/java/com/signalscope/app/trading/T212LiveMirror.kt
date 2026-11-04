@@ -846,14 +846,14 @@ object T212LiveMirror {
         val heldQty: Map<String, Double>? = try {
             (BrokerHoldings.t212(ctx) as? BrokerHoldings.Result.Ok)
                 ?.holdings?.associate { it.symbol.uppercase() to it.qty }
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
 
         for (row in open) {
             // Is the paper side finished with it?
             val paper = try {
                 com.signalscope.app.data.StrategyLabStore.load(ctx, row.ns).trades
                     .firstOrNull { it.id == row.paperTradeId }
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             if (paper?.status != "CLOSED") continue
             // The rule that closed it on paper — what this sale is actually for,
             // and what its alerts name.
@@ -906,7 +906,7 @@ object T212LiveMirror {
             // sale (28 Oct 2026), retried with the price 2 cents above its stop,
             // was held 38 minutes like an ordinary sale.
             val belowStop = rule.contains("stop", ignoreCase = true) ||
-                try { underOwnStop(ctx, config, row) } catch (e: Exception) { false }
+                try { underOwnStop(ctx, config, row) } catch (_: Exception) { false }
             // An algo's sale goes at once — see [saleWaitsForGate].
             val (gate, rd) = if (!saleWaitsForGate(row.ns))
                 RvGate.Decision(true, "an algo's sale goes at once") to null
@@ -1077,7 +1077,7 @@ object T212LiveMirror {
     internal fun gateFlagged(ctx: Context, ns: String, symbol: String): Boolean = try {
         val g = com.signalscope.app.data.MacdGateStore.load(ctx, ns)
         g.enabled && g.slots.any { it.flagged && it.symbol.equals(symbol, ignoreCase = true) }
-    } catch (e: Exception) { false }
+    } catch (_: Exception) { false }
 
     /** How far past its close a 15-minute bar stops being evidence about now.
      *  Two bars' worth: enough slack for the feed to publish late, far short of
@@ -1117,7 +1117,7 @@ object T212LiveMirror {
     private fun cachedAtr(ys: String, space: String, ref: Double): Double {
         val day = java.time.LocalDate.now(java.time.ZoneOffset.UTC).toString()
         atrCache[ys]?.let { if (it.first == day) return it.second }
-        val v = try { PatientExecutor.dailyAtr(ys, space, ref) } catch (e: Exception) { 0.0 }
+        val v = try { PatientExecutor.dailyAtr(ys, space, ref) } catch (_: Exception) { 0.0 }
         if (v > 0.0) atrCache[ys] = day to v
         return v
     }
@@ -1322,7 +1322,7 @@ object T212LiveMirror {
         val session = try {
             com.signalscope.app.network.YahooFinanceClient
                 .fetchTradingWindow(ys, includeExtended = false)
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
         val nowMs = System.currentTimeMillis()
         val nowSec = nowMs / 1000
         // A START ALREADY IN THE PAST MEANS "NOT PUBLISHED YET", not "this
@@ -1446,7 +1446,7 @@ object T212LiveMirror {
         val config = ConfigManager(ctx)
         if (!config.hasT212Credentials) return 0
         val now = System.currentTimeMillis()
-        val all = try { T212LiveStore.load(ctx).trades } catch (e: Exception) { return 0 }
+        val all = try { T212LiveStore.load(ctx).trades } catch (_: Exception) { return 0 }
         val candidates = all.filter {
             T212LiveStore.isT212Ns(it.ns) && it.status == "ERROR" &&
                 it.qty <= 0.0 && it.amount > 0.0 && it.buyAt > now - ADOPT_WINDOW_MS
@@ -1640,7 +1640,7 @@ object T212LiveMirror {
             val session = try {
                 com.signalscope.app.network.YahooFinanceClient
                     .fetchTradingWindow(ys, includeExtended = false)
-            } catch (e: Exception) { null }
+            } catch (_: Exception) { null }
             val nowSec = System.currentTimeMillis() / 1000
             // UNKNOWN IS NOT CLOSED. When the lookup fails, fall through and let
             // the ladder's own market check decide — the same policy that check
