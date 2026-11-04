@@ -835,6 +835,14 @@ function openPendingOrders(keepTab){
     '<span style="flex:1"></span>'+
     '<div onclick="closePendingOrders()" style="cursor:pointer;font-size:13px;font-weight:800;color:var(--t3);padding:4px 10px;border:1px solid var(--bd);border-radius:7px">Close</div></div>';
   h+='<div style="display:flex;gap:8px;padding:0 12px 8px">'+tab('BUY','Buys',buys.length)+tab('SELL','Sales',sells.length)+'</div>';
+  // RV GATE ANALYSIS: every order the gate holds here, on today's chart, and its record.
+  if(SPACE==='DE'||SPACE==='US'){
+    var nRv=all.filter(function(p){return !!p.rvSrc}).length;
+    h+='<div onclick="openRvAnalysis()" style="margin:0 12px 8px;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 11px;border:1px solid rgba(124,58,237,.45);border-radius:8px;background:rgba(124,58,237,.06)">'+
+      '<div style="font-size:18px">📈</div><div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:var(--pu)">RV gate analysis</div>'+
+      '<div style="font-size:9px;color:var(--t3)">'+(nRv?(nRv+' order'+(nRv===1?'':'s')+' held by the gate — where each stands on today’s chart, and what it waits for'):'nothing held right now — see whether its waiting has paid')+'</div></div>'+
+      '<div style="font-size:14px;color:var(--pu)">›</div></div>';
+  }
   h+='<div style="font-size:9px;color:var(--t3);padding:0 14px 6px">'+pendingDot(true)+' met &nbsp; '+pendingDot(false)+' not yet &nbsp; '+pendingDot(null)+' unknown</div>';
   h+=waitingBuysReadLine(all);
   if(!rows.length){
@@ -864,6 +872,7 @@ function openPendingOrders(keepTab){
       if(p.dueAt>0)meta.push((rvHeld?'starts by ':'next look ')+new Date(p.dueAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})+(rvHeld?' at the latest':''));
       if(p.tries)meta.push(p.tries+'/24 tried');
       var acts=[];
+      if(p.rvSrc)acts.push(btn('openRvAnalysis(\''+escHtml(p.rvSrc)+'\',\''+escHtml(p.rvSrc==='you'?'':(p.ns||''))+'\',\''+escHtml(String(p.rvSrc==='you'?p.rvManualId:p.id))+'\')','📈 Analyse','var(--pu)','rgba(124,58,237,.45)'));
       if(p.cancellable){
         var call=(r.space==='in')
           ? 'cancelTriggerPrompt(\''+escHtml(p.symbol)+'\',\''+escHtml(String(p.signalBarTs||0))+'\')'
@@ -1023,6 +1032,344 @@ function watchClearInterruptedPrompt(sym,barTs){
     });
 }
 function closePendingOrders(){var o=document.getElementById('pending-sheet');if(o&&o.parentNode)o.parentNode.removeChild(o)}
+// ── RV GATE ANALYSIS ─────────────────────────────────────────────────────────
+// Waiting orders › 📈 RV gate analysis. One order the gate is holding, laid open:
+// today's 15-minute prices with the lines the rule draws on them, every look the
+// gate has taken since the order began waiting, each way it can still start and
+// how far the price is from it, and what the wait is doing for and against it.
+// Below: the gate's own track record from its journal — the price it let held
+// orders go at against the price at its first look, by the reason it let them go.
+// Nothing here decides anything: the verdict is the gate's own, on its own reading.
+var RVA={src:'',ns:'',id:'',side:'BUY'}, RVA_REC_SIDE='', RVA_REC_DAYS=30;
+function rvaRows(){
+  var rows=[];try{rows=(JSON.parse(Android.pendingOrders(SPACE)||'{}').rows)||[]}catch(e){}
+  return rows.filter(function(p){return !!p.rvSrc}).map(function(p){
+    return {src:p.rvSrc, ns:(p.rvSrc==='you'?'':String(p.ns||'')), id:String(p.rvSrc==='you'?p.rvManualId:p.id),
+      symbol:p.symbol, side:pendingSideOf(p), from:p.from||'', ask:p.status==='RVASK'};
+  });
+}
+function openRvAnalysis(src,ns,id){
+  if(!(SPACE==='DE'||SPACE==='US')){uiAlert('RV gate analysis','The RV gate works on Trading 212 orders only — Germany and the US.');return}
+  if(typeof Android==='undefined'||!Android.callAsync){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  var rows=rvaRows();
+  if(src){RVA={src:src,ns:ns||'',id:String(id||''),side:'BUY'};
+    rows.forEach(function(r){if(r.src===src&&r.id===String(id))RVA.side=r.side});}
+  else if(rows.length&&!rows.some(function(r){return r.src===RVA.src&&r.id===RVA.id}))
+    RVA={src:rows[0].src,ns:rows[0].ns,id:rows[0].id,side:rows[0].side};
+  else if(!rows.length)RVA={src:'',ns:'',id:'',side:PENDING_TAB==='SELL'?'SELL':'BUY'};
+  if(!RVA_REC_SIDE)RVA_REC_SIDE=RVA.side;
+  closeRvAnalysis();
+  var ov=document.createElement('div');ov.id='rva-sheet';
+  ov.style.cssText='position:fixed;inset:0;z-index:10003;background:var(--bg);overflow-y:auto;-webkit-overflow-scrolling:touch';
+  var h='<div style="padding:14px 14px 6px;display:flex;align-items:center;gap:8px">'+
+    '<div style="font-size:15px;font-weight:800;color:var(--t1)">📈 RV gate analysis</div><span style="flex:1"></span>'+
+    '<div onclick="closeRvAnalysis()" style="cursor:pointer;font-size:13px;font-weight:800;color:var(--t3);padding:4px 10px;border:1px solid var(--bd);border-radius:7px">‹ Back</div></div>';
+  h+='<div style="font-size:10px;color:var(--t3);padding:0 14px 8px;line-height:1.5">What the gate sees for each order it is holding in '+(SPACE==='DE'?'Germany':'the US')+
+    ', what would start it, and whether waiting has paid so far. '+
+    '<span onclick="rvaRulesToggle()" style="color:var(--bl);font-weight:700;cursor:pointer">How it decides ›</span></div>';
+  h+='<div id="rva-rules" style="display:none">'+rvaRulesHtml()+'</div>';
+  if(rows.length){
+    h+='<div style="display:flex;gap:6px;flex-wrap:wrap;padding:0 12px 8px">';
+    rows.forEach(function(r){
+      var on=(r.src===RVA.src&&r.id===RVA.id);
+      h+='<span onclick="openRvAnalysis(\''+escHtml(r.src)+'\',\''+escHtml(r.ns)+'\',\''+escHtml(r.id)+'\')" style="cursor:pointer;font-size:11px;font-weight:800;padding:5px 10px;border-radius:14px;'+
+        (on?'background:var(--pu);color:#fff;border:1px solid var(--pu)':'background:var(--cd);color:var(--t2);border:1px solid var(--bd)')+'">'+
+        (r.side==='SELL'?'▼ ':'▲ ')+escHtml(r.symbol)+(r.ask?' ?':'')+'</span>';
+    });
+    h+='</div><div id="rva-body" style="padding:0 12px"><div style="padding:28px 0;text-align:center;color:var(--t3);font-size:11px">Reading the market the way the gate does…</div></div>';
+  }else{
+    h+='<div style="margin:0 12px 8px;padding:14px;border:1px dashed var(--bd);border-radius:8px;text-align:center;color:var(--t3);font-size:11px">Nothing is held by the RV gate in this market right now.<br/>The track record below still shows how its waiting has worked out.</div>';
+  }
+  h+='<div id="rva-record" style="padding:4px 12px 24px"></div>';
+  ov.innerHTML=h;document.body.appendChild(ov);
+  if(rows.length)androidAsync('rvGateAnalysis',[RVA.src,RVA.ns,RVA.id],function(raw){
+    var el=document.getElementById('rva-body');if(!el)return;
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    if(!r||!r.ok){el.innerHTML='<div style="padding:18px 0;color:var(--rd);font-size:11px">'+escHtml((r&&r.error)||'No answer.')+'</div>';return}
+    el.innerHTML=rvaOrderHtml(r);
+  });
+  rvaLoadRecord();
+}
+function closeRvAnalysis(){var o=document.getElementById('rva-sheet');if(o&&o.parentNode)o.parentNode.removeChild(o)}
+function rvaRulesToggle(){var e=document.getElementById('rva-rules');if(e)e.style.display=(e.style.display==='none'?'block':'none')}
+function rvaRulesHtml(){
+  var li=function(t){return '<div style="margin:3px 0">• '+t+'</div>'};
+  return '<div style="margin:0 12px 10px;padding:10px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--cd);font-size:10px;color:var(--t2);line-height:1.55">'+
+    '<b style="color:var(--t1)">A buy starts at once when any one of these holds</b>'+
+    li('the price is in the <b>bottom 40%</b> of today’s range;')+
+    li('it is <b>rising</b> — over the last finished 15-minute close by more than 0.05 ATR — <i>unless</i> it is in the top 20% of the range, where a rise is a chase;')+
+    li('it has <b>dipped</b> 0.2 ATR under the highest price since the order began waiting and <b>turned up</b> 0.1 ATR off that low;')+
+    li('it has waited <b>two trading hours</b>.')+
+    '<b style="color:var(--t1)">A sale starts at once when</b>'+
+    li('the price is in the <b>top 40%</b> of today’s range, or it is <b>falling</b> by more than 0.05 ATR, or it is under its stop, or two hours are up.')+
+    '<b style="color:var(--t1)">Fine print that matters</b>'+
+    li('The range only counts once it is at least <b>½ ATR</b> wide. On a quiet day — or early on — only the direction decides.')+
+    li('The direction is the live price against one 15-minute close. In Germany those bars arrive ~15 minutes late.')+
+    li('With no live price, or no 15-minute prices 20 minutes after the open, it does not hold an order blind: it goes.')+
+    li('Your waiting buys carry a price limit ½ ATR over where you asked; over it, it asks you instead of buying.')+
+    '</div>';
+}
+function rvaT(ms){return new Date(Number(ms)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
+function rvaOrderHtml(r){
+  var c=r.cur||'', buy=r.side!=='SELL', d=r.decision||{}, lv=r.levels||{};
+  var f2=function(x){return Number(x).toFixed(2)};
+  var h='<div style="border:1px solid var(--bd);border-radius:10px;background:var(--cd);padding:10px 11px;margin-bottom:10px">';
+  // ── who, and the verdict now
+  h+='<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
+    '<span style="font-size:15px;font-weight:900;color:var(--t1)">'+escHtml(r.symbol)+'</span>'+
+    '<span style="font-size:9px;font-weight:900;color:'+(buy?'var(--gn)':'var(--rd)')+';border:1px solid currentColor;border-radius:3px;padding:1px 5px">'+(buy?'BUY':'SALE')+'</span>'+
+    '<span style="font-size:10px;color:var(--t3)">'+escHtml(r.from||'')+'</span><span style="flex:1"></span>'+
+    (Number(r.price)>0?'<span style="font-size:13px;font-weight:800;color:var(--t1);font-family:monospace">'+c+f2(r.price)+'</span>':'')+'</div>';
+  var go=!!d.go;
+  h+='<div style="margin-top:7px;padding:7px 9px;border-radius:7px;background:'+(go?'rgba(5,150,105,.10)':'rgba(217,119,6,.10)')+';font-size:11px;line-height:1.5;color:var(--t1)">'+
+    '<b style="color:'+(go?'var(--gn)':'var(--am)')+'">'+(go?'✓ The gate would let it go now':'⏳ Not yet')+'</b> — '+escHtml(d.why||'')+
+    (go?'<div style="font-size:9px;color:var(--t3)">It starts at the gate’s next look (every minute).</div>':'')+'</div>';
+  // ── the two-hour clock
+  var waited=Number(r.waitedMin||0), frac=Math.max(0,Math.min(1,waited/120));
+  h+='<div style="margin-top:8px;font-size:9px;color:var(--t3);display:flex;justify-content:space-between"><span>waited '+waited+' of 120 min</span><span>starts by <b style="color:var(--t2)">'+rvaT(r.startsBy)+'</b> at the latest</span></div>'+
+    '<div style="height:5px;border-radius:3px;background:var(--bg2);overflow:hidden;margin-top:2px"><div style="height:100%;width:'+Math.round(frac*100)+'%;background:'+(frac>.85?'var(--rd)':'var(--am)')+'"></div></div>';
+  // ── one line: what it is waiting for
+  h+=rvaWaitingForLine(r);
+  // ── the chart
+  var ch=rvaChart(r);
+  h+='<div style="margin-top:8px">'+ch.svg+'</div>';
+  h+='<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:3px 10px;font-size:9px;color:var(--t2)">'+ch.legend.map(function(l){
+      if(l.dot)return '<span style="white-space:nowrap"><span style="color:'+l.col+'">●</span> '+escHtml(l.text)+'</span>';
+      return '<span style="white-space:nowrap"><span style="display:inline-block;width:14px;height:0;border-top:2px '+(l.dash?'dashed':'solid')+' '+l.col+';vertical-align:middle;margin-right:3px'+(l.band?';height:7px;border:0;background:'+l.col:'')+'"></span>'+escHtml(l.text)+'</span>'}).join('')+'</div>';
+  if(ch.off.length)h+='<div style="font-size:9px;color:var(--t3);margin-top:3px">Off the chart: '+escHtml(ch.off.join(' · '))+'</div>';
+  if(Number(r.barLagMin)>0)h+='<div style="font-size:9px;color:var(--t3);margin-top:3px">15-minute bars from this feed run ~'+Number(r.barLagMin)+' min behind; the dotted line joins the last one to the live price.</div>';
+  h+='</div>';
+  // ── every way it can start
+  h+='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:2px 2px 4px;letter-spacing:.03em">WHAT WOULD START IT — ANY ONE</div>';
+  (r.ways||[]).forEach(function(w,i){
+    var col=w.met===true?'var(--gn)':w.met===false?'var(--t3)':'var(--am)';
+    if(i>0)h+='<div style="text-align:center;font-size:9px;color:var(--t3);margin:-2px 0 2px">or</div>';
+    h+='<div style="border:1px solid var(--bd);border-left:3px solid '+col+';border-radius:7px;background:var(--cd);padding:7px 9px;margin-bottom:4px">'+
+      '<div style="font-size:11px;font-weight:800;color:var(--t1)">'+pendingDot(w.met)+' '+escHtml(w.title)+'</div>'+
+      '<div style="font-size:10px;color:var(--t2);margin-top:2px;line-height:1.5">'+escHtml(w.detail)+'</div></div>';
+  });
+  // ── for and against
+  var notes=r.notes||[];
+  if(notes.length){
+    h+='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:10px 2px 4px;letter-spacing:.03em">WHAT THE WAIT IS DOING FOR THIS ORDER</div>';
+    h+='<div style="border:1px solid var(--bd);border-radius:8px;background:var(--cd);padding:6px 9px">';
+    notes.forEach(function(n){
+      var ic=n.tone==='plus'?'<span style="color:var(--gn);font-weight:900">＋</span>':n.tone==='minus'?'<span style="color:var(--rd);font-weight:900">－</span>':'<span style="color:var(--bl);font-weight:900">i</span>';
+      h+='<div style="display:flex;gap:7px;font-size:10px;line-height:1.5;color:var(--t2);padding:4px 0;border-bottom:1px solid var(--bg2)"><div style="flex:0 0 12px;text-align:center">'+ic+'</div><div style="flex:1">'+escHtml(n.text)+'</div></div>';
+    });
+    h+='</div>';
+  }
+  // ── its looks so far
+  var tr=r.trail||[];
+  if(tr.length){
+    var waits=tr.filter(function(t){return !t[2]}).length;
+    var lo=Math.min.apply(null,tr.map(function(t){return t[1]})), hi=Math.max.apply(null,tr.map(function(t){return t[1]}));
+    h+='<div style="font-size:9px;color:var(--t3);padding:6px 2px 0;line-height:1.5">'+tr.length+' look'+(tr.length===1?'':'s')+' since it began waiting ('+waits+' said “not yet”); the price ranged '+c+f2(lo)+'–'+c+f2(hi)+' over them. '+
+      'Best moment so far for this '+(buy?'buy':'sale')+': '+c+f2(buy?lo:hi)+'.</div>';
+  }
+  return h;
+}
+// "Waiting for: ▲ over €28.95 (+0.04) · ▼ to €28.10 (−0.85) · ⏱ 19:49"
+function rvaWaitingForLine(r){
+  if((r.decision||{}).go)return '';
+  var c=r.cur||'', p=Number(r.price||0), parts=[];
+  (r.ways||[]).forEach(function(w){
+    if(w.met===true)return;
+    if(w.id==='time'){parts.push('⏱ '+rvaT(r.startsBy));return}
+    if(w.level==null||!(p>0))return;
+    if(w.id==='dir'&&/near today/.test(w.title))return;
+    var up=w.level>p;
+    parts.push((up?'▲ over ':'▼ to ')+c+Number(w.level).toFixed(2)+' ('+(up?'+':'−')+Math.abs(w.level-p).toFixed(2)+')');
+  });
+  if(!parts.length)return '';
+  return '<div style="margin-top:7px;font-size:10px;color:var(--t2);line-height:1.6"><b style="color:var(--t1)">Waiting for any of:</b> '+escHtml(parts.join('  ·  '))+'</div>';
+}
+// TODAY ON ONE CHART: candles, the gate's zones and lines, its looks, the clock.
+function rvaChart(r){
+  var buy=r.side!=='SELL', lv=r.levels||{}, c=r.cur||'';
+  var W=340,H=220,L=4,R=46,T=8,B=20, pw=W-L-R, ph=H-T-B;
+  var bars=r.bars||[], tr=r.trail||[], now=Number(r.now), price=Number(r.price||0);
+  var x0=Number(r.openMs)||((bars[0]&&bars[0][0])||now-3600e3);
+  // Today so far, through the 2-hour mark — not the empty rest of the session.
+  var x1=Math.max(now,Number(r.startsBy||now))+20*60e3;
+  if(Number(r.closeMs)>x0)x1=Math.min(x1,Number(r.closeMs));
+  if(now>x1)x1=now;
+  var X=function(t){return L+(Math.max(x0,Math.min(x1,t))-x0)/(x1-x0)*pw};
+  var hi=Number(r.high||0), lo=Number(r.low||0), unit=Number(lv.unit||0)||(price*0.02);
+  var vals=[];bars.forEach(function(b){vals.push(b[2],b[3])});tr.forEach(function(t){vals.push(t[1])});
+  if(price>0)vals.push(price);if(hi>0)vals.push(hi);if(lo>0)vals.push(lo);
+  var near=function(v){return v!=null&&isFinite(v)&&v>=lo-1.2*unit&&v<=hi+1.2*unit};
+  var lines=[], off=[], legend=[];
+  function line(v,col,dash,label,tag,from,to){
+    if(v==null||!isFinite(Number(v)))return;v=Number(v);
+    if(!near(v)){off.push(label+' '+c+v.toFixed(2));return}
+    vals.push(v);lines.push({v:v,col:col,dash:dash,tag:tag,from:from,to:to});
+    legend.push({col:col,dash:dash,text:label+' '+c+v.toFixed(2)});
+  }
+  var GN='#059669',RD='#dc2626',AM='#d97706',BL='#2563eb',PU='#7c3aed',GR='#94a3b8';
+  if(buy){
+    if(lv.rangeMeans&&lv.zoneEdge!=null)line(lv.zoneEdge,GN,true,'bottom 40% up to','40%');
+    if(lv.widenAt!=null)line(lv.widenAt,GN,true,'a fall to here starts it','go');
+    var chase=lv.rangeMeans&&lv.pos!=null&&lv.pos>=0.8;
+    if(lv.goLine!=null)line(lv.goLine,BL,true,chase?'“rising” over (not counted near the high)':'“rising” over','up',Number(lv.velRefAt||0)-15*60e3,now);
+    if(lv.peak!=null)line(lv.peak,PU,false,'its high since waiting','pk',Number(r.since),now);
+    if(lv.dipAt!=null)line(lv.dipAt,PU,true,'dip begins at','dip',Number(r.since),now);
+    if(lv.turnAt!=null)line(lv.turnAt,PU,true,'turn up at','turn',Number(r.since),now);
+    if(lv.limit!=null)line(lv.limit,RD,true,lv.limitIsAlgo?'ceiling':'your limit','lim');
+  }else{
+    if(lv.rangeMeans&&lv.zoneEdge!=null)line(lv.zoneEdge,GN,true,'top 40% from','40%');
+    if(lv.widenAt!=null)line(lv.widenAt,GN,true,'a rise to here starts it','go');
+    if(lv.goLine!=null)line(lv.goLine,BL,true,'“falling” under','dn',Number(lv.velRefAt||0)-15*60e3,now);
+  }
+  if(lv.velRef!=null&&near(Number(lv.velRef))){vals.push(Number(lv.velRef))}
+  var ymin=Math.min.apply(null,vals), ymax=Math.max.apply(null,vals);
+  if(!(ymax>ymin)){ymin-=unit*0.5||1;ymax+=unit*0.5||1}
+  var pad=(ymax-ymin)*0.08;ymin-=pad;ymax+=pad;
+  var Y=function(v){return T+(ymax-v)/(ymax-ymin)*ph};
+  var s='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="display:block;font-family:monospace">';
+  // zones
+  if(lv.rangeMeans&&hi>lo){
+    if(buy){
+      s+='<rect x="'+L+'" y="'+Y(lv.zoneEdge)+'" width="'+pw+'" height="'+(Y(lo)-Y(lv.zoneEdge))+'" style="fill:rgba(5,150,105,.11)"/>';
+      if(lv.chaseFloor!=null)s+='<rect x="'+L+'" y="'+Y(hi)+'" width="'+pw+'" height="'+(Y(lv.chaseFloor)-Y(hi))+'" style="fill:rgba(220,38,38,.09)"/>';
+      legend.unshift({col:'rgba(220,38,38,.25)',band:true,text:'top 20%: a rise does not count'});
+      legend.unshift({col:'rgba(5,150,105,.3)',band:true,text:'buys here'});
+    }else{
+      s+='<rect x="'+L+'" y="'+Y(hi)+'" width="'+pw+'" height="'+(Y(lv.zoneEdge)-Y(hi))+'" style="fill:rgba(5,150,105,.11)"/>';
+      legend.unshift({col:'rgba(5,150,105,.3)',band:true,text:'sells here'});
+    }
+  }
+  // future and the waiting window
+  if(now<x1)s+='<rect x="'+X(now)+'" y="'+T+'" width="'+(X(x1)-X(now))+'" height="'+ph+'" style="fill:rgba(148,163,184,.10)"/>';
+  // hour grid + labels
+  var d0=new Date(x0);d0.setMinutes(0,0,0);
+  for(var t=d0.getTime()+3600e3;t<x1;t+=3600e3){
+    s+='<line x1="'+X(t)+'" x2="'+X(t)+'" y1="'+T+'" y2="'+(T+ph)+'" style="stroke:rgba(148,163,184,.18)"/>';
+    s+='<text x="'+X(t)+'" y="'+(H-6)+'" text-anchor="middle" style="font-size:8px;fill:'+GR+'">'+new Date(t).getHours()+':00</text>';
+  }
+  // day high / low
+  if(hi>0){s+='<line x1="'+L+'" x2="'+(L+pw)+'" y1="'+Y(hi)+'" y2="'+Y(hi)+'" style="stroke:'+GR+';stroke-dasharray:1 3"/>';}
+  if(lo>0){s+='<line x1="'+L+'" x2="'+(L+pw)+'" y1="'+Y(lo)+'" y2="'+Y(lo)+'" style="stroke:'+GR+';stroke-dasharray:1 3"/>';}
+  if(r.prevClose!=null&&near(Number(r.prevClose)))s+='<line x1="'+L+'" x2="'+(L+pw)+'" y1="'+Y(r.prevClose)+'" y2="'+Y(r.prevClose)+'" style="stroke:'+GR+';stroke-dasharray:6 3;opacity:.6"/>';
+  // since / deadline
+  var since=Number(r.since||0), by=Number(r.startsBy||0);
+  if(since>x0&&since<x1)s+='<line x1="'+X(since)+'" x2="'+X(since)+'" y1="'+T+'" y2="'+(T+ph)+'" style="stroke:'+PU+';stroke-dasharray:3 3"/>'+
+    '<text x="'+(X(since)+2)+'" y="'+(T+8)+'" style="font-size:7px;fill:'+PU+'">waiting from</text>';
+  if(by>x0&&by<=x1)s+='<line x1="'+X(by)+'" x2="'+X(by)+'" y1="'+T+'" y2="'+(T+ph)+'" style="stroke:'+AM+';stroke-width:1.5"/>'+
+    '<text x="'+(X(by)-2)+'" y="'+(T+ph-4)+'" text-anchor="end" style="font-size:7px;fill:'+AM+'">2 h: '+rvaT(by)+'</text>';
+  else if(by>x1)off.push('the 2-hour limit '+rvaT(by)+' falls after today’s close');
+  // candles
+  var bw=Math.max(2,(pw/((x1-x0)/(15*60e3)))*0.62);
+  bars.forEach(function(b){
+    var xm=X(b[0]+7.5*60e3), up=b[4]>=b[1], col=up?GN:RD;
+    s+='<line x1="'+xm+'" x2="'+xm+'" y1="'+Y(b[2])+'" y2="'+Y(b[3])+'" style="stroke:'+col+'"/>';
+    var yt=Y(Math.max(b[1],b[4])), yb=Y(Math.min(b[1],b[4]));
+    s+='<rect x="'+(xm-bw/2)+'" y="'+yt+'" width="'+bw+'" height="'+Math.max(1,yb-yt)+'" style="fill:'+col+';opacity:.85"/>';
+  });
+  if(bars.length&&price>0){var lb=bars[bars.length-1];
+    s+='<line x1="'+X(lb[0]+15*60e3)+'" x2="'+X(now)+'" y1="'+Y(lb[4])+'" y2="'+Y(price)+'" style="stroke:'+GR+';stroke-dasharray:2 2"/>';}
+  // the rule's lines
+  if(lv.velRef!=null&&near(Number(lv.velRef))&&lv.goLine!=null){
+    var vx=X(Number(lv.velRefAt||now)-15*60e3);
+    s+='<rect x="'+vx+'" y="'+Math.min(Y(lv.velRef),Y(lv.goLine))+'" width="'+(X(now)+6-vx)+'" height="'+Math.abs(Y(lv.goLine)-Y(lv.velRef))+'" style="fill:rgba(37,99,235,.12)"/>';
+    s+='<line x1="'+vx+'" x2="'+(X(now)+6)+'" y1="'+Y(lv.velRef)+'" y2="'+Y(lv.velRef)+'" style="stroke:'+BL+';opacity:.6"/>';
+  }
+  lines.forEach(function(l){
+    var a=l.from?X(l.from):L, b=l.to?X(l.to)+6:L+pw;
+    s+='<line x1="'+a+'" x2="'+b+'" y1="'+Y(l.v)+'" y2="'+Y(l.v)+'" style="stroke:'+l.col+';stroke-width:1.3'+(l.dash?';stroke-dasharray:4 3':'')+'"/>';
+  });
+  // the gate's looks
+  tr.forEach(function(t){s+='<circle cx="'+X(t[0])+'" cy="'+Y(t[1])+'" r="1.4" style="fill:'+(t[2]?GN:AM)+';opacity:.85"/>'});
+  // now
+  if(price>0)s+='<circle cx="'+X(now)+'" cy="'+Y(price)+'" r="3.6" style="fill:var(--t1);stroke:var(--cd);stroke-width:1.5"/>';
+  // right-hand price labels, pushed apart so none overlap
+  var labs=[];
+  if(price>0)labs.push({v:price,col:'var(--t1)',txt:Number(price).toFixed(2),bold:1});
+  lines.forEach(function(l){labs.push({v:l.v,col:l.col,txt:l.v.toFixed(2)})});
+  if(hi>0)labs.push({v:hi,col:GR,txt:'H '+hi.toFixed(2)});if(lo>0)labs.push({v:lo,col:GR,txt:'L '+lo.toFixed(2)});
+  labs.forEach(function(a){a.y=Y(a.v)+3});labs.sort(function(a,b){return a.y-b.y});
+  for(var i=1;i<labs.length;i++)if(labs[i].y-labs[i-1].y<9)labs[i].y=labs[i-1].y+9;
+  for(i=labs.length-2;i>=0;i--)if(labs[i].y>labs[i+1].y-9)labs[i].y=labs[i+1].y-9;
+  labs.forEach(function(a){s+='<text x="'+(L+pw+3)+'" y="'+a.y+'" style="font-size:8px;fill:'+a.col+(a.bold?';font-weight:700':'')+'">'+escHtml(a.txt)+'</text>'});
+  s+='<rect x="'+L+'" y="'+T+'" width="'+pw+'" height="'+ph+'" style="fill:none;stroke:rgba(148,163,184,.35)"/>';
+  s+='</svg>';
+  if(tr.length){legend.push({col:AM,dot:true,text:'a look: not yet'});
+    if(tr.some(function(t){return t[2]}))legend.push({col:GN,dot:true,text:'a look: go'});}
+  legend.push({col:'var(--t1)',dot:true,text:'live price now'});
+  return {svg:s,legend:legend,off:off};
+}
+// ── THE TRACK RECORD ─────────────────────────────────────────────────────────
+function rvaRecSide(s){RVA_REC_SIDE=s;rvaLoadRecord()}
+function rvaRecDays(d){RVA_REC_DAYS=d;rvaLoadRecord()}
+function rvaLoadRecord(){
+  var el=document.getElementById('rva-record');if(!el)return;
+  el.innerHTML='<div style="font-size:10px;color:var(--t3);padding:8px 2px">Reading the gate’s journal…</div>';
+  androidAsync('rvGateRecord',[SPACE,RVA_REC_SIDE||'BUY',RVA_REC_DAYS],function(raw){
+    var el2=document.getElementById('rva-record');if(!el2)return;
+    var j=null;try{j=JSON.parse(raw||'{}')}catch(e){}
+    if(!j||!j.ok){el2.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((j&&j.error)||'The journal could not be read.')+'</div>';return}
+    el2.innerHTML=rvaRecordHtml(j.record||{});
+  });
+}
+function rvaPct(x){return (x>0?'+':x<0?'−':'')+Math.abs(Number(x)).toFixed(2)+'%'}
+function rvaRecordHtml(rec){
+  var buy=(RVA_REC_SIDE||'BUY')!=='SELL', mk=buy?'buys':'sales';
+  var tab=function(on,label,fn){return '<span onclick="'+fn+'" style="cursor:pointer;font-size:10px;font-weight:800;padding:4px 10px;border-radius:12px;'+
+    (on?'background:var(--pu);color:#fff':'background:var(--cd);color:var(--t2);border:1px solid var(--bd)')+'">'+label+'</span>'};
+  var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:10px 2px 6px;letter-spacing:.03em">THE GATE’S TRACK RECORD — DOES WAITING PAY?</div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'+tab(buy,'Buys','rvaRecSide(\'BUY\')')+tab(!buy,'Sales','rvaRecSide(\'SELL\')')+
+    '<span style="flex:1"></span>'+tab(RVA_REC_DAYS===7,'7 d','rvaRecDays(7)')+tab(RVA_REC_DAYS===30,'30 d','rvaRecDays(30)')+tab(RVA_REC_DAYS===90,'90 d','rvaRecDays(90)')+'</div>';
+  var looked=Number(rec.looked||0);
+  if(!looked)return h+'<div style="font-size:10px;color:var(--t3);padding:6px 2px">No '+mk+' through the gate in '+(SPACE==='DE'?'Germany':'the US')+' in the last '+RVA_REC_DAYS+' days.</div>';
+  var a=rec.all;
+  h+='<div style="border:1px solid var(--bd);border-radius:8px;background:var(--cd);padding:9px 10px;font-size:10px;color:var(--t2);line-height:1.6">';
+  h+='The gate looked at <b>'+looked+'</b> '+mk+'. <b>'+Number(rec.atOnce||0)+'</b> went at its first look — there it changed nothing. '+
+    '<b>'+Number(rec.held||0)+'</b> were held and then let go'+(Number(rec.neverLetGo)>0?'; <b>'+rec.neverLetGo+'</b> were never let go (called off, lapsed, or still waiting)':'')+'.';
+  if(a&&a.n){
+    var good=a.avgPct>0;
+    h+='<div style="margin-top:6px;padding:7px 8px;border-radius:6px;background:'+(good?'rgba(5,150,105,.10)':'rgba(220,38,38,.08)')+';color:var(--t1)">'+
+      'Held '+mk+' started on average <b style="color:'+(good?'var(--gn)':'var(--rd)')+'">'+Math.abs(a.avgPct).toFixed(2)+'% '+(buy?(good?'cheaper':'dearer'):(good?'higher':'lower'))+'</b> than at the first look. '+
+      '<b>'+a.better+' of '+a.n+'</b> ('+Math.round(a.better/a.n*100)+'%) got a better price; they waited '+Math.round(a.avgWaitMin)+' min on average. '+
+      'Best '+rvaPct(a.bestPct)+', worst '+rvaPct(a.worstPct)+'.</div>';
+  }
+  if(Number(rec.fills)>0&&rec.avgFillPct!=null)
+    h+='<div style="margin-top:5px;font-size:9px;color:var(--t3)">Against what Trading 212 actually filled ('+rec.fills+' with a known price, the ladder’s own steps included): '+rvaPct(rec.avgFillPct)+' on average.</div>';
+  h+='</div>';
+  var gs=rec.groups||[];
+  if(gs.length){
+    h+='<div style="font-size:9px;font-weight:900;color:var(--t3);padding:9px 2px 4px">BY WHAT LET THEM GO</div>';
+    var mx=Math.max.apply(null,gs.map(function(g){return Math.abs(g.avgPct)}).concat([0.01]));
+    gs.forEach(function(g){
+      var good=g.avgPct>0, w=Math.round(Math.abs(g.avgPct)/mx*46);
+      h+='<div style="border:1px solid var(--bd);border-radius:7px;background:var(--cd);padding:7px 9px;margin-bottom:5px">'+
+        '<div style="display:flex;align-items:center;gap:6px;font-size:10px">'+
+          '<b style="color:var(--t1);flex:0 0 auto">'+escHtml(g.reason)+'</b><span style="color:var(--t3)">· '+g.n+'</span><span style="flex:1"></span>'+
+          '<span style="display:inline-block;width:50px;height:6px;position:relative;background:var(--bg2);border-radius:3px">'+
+            '<span style="position:absolute;top:0;height:6px;border-radius:3px;'+(good?'left:50%;':'right:50%;')+'width:'+(w/2)+'px;background:'+(good?'var(--gn)':'var(--rd)')+'"></span></span>'+
+          '<b style="font-family:monospace;color:'+(good?'var(--gn)':'var(--rd)')+'">'+rvaPct(g.avgPct)+'</b></div>'+
+        '<div style="font-size:9px;color:var(--t3);margin-top:2px">'+g.better+'/'+g.n+' better · waited '+Math.round(g.avgWaitMin)+' min · best '+rvaPct(g.bestPct)+', worst '+rvaPct(g.worstPct)+'</div>'+
+        '<div style="font-size:9px;color:var(--t2);margin-top:3px;line-height:1.45">'+escHtml(rvaReasonRead(g,buy))+'</div></div>';
+    });
+  }
+  h+='<div style="font-size:9px;color:var(--t3);padding:6px 2px;line-height:1.5">Measured from the live price at the gate’s first look to the live price when it let the order go — the gate’s timing alone, before the ladder. '+
+    '+ means waiting got the better price. A handful of orders swings a lot: read the count beside each line.</div>';
+  return h;
+}
+// What a line of the record says about the rule, in a sentence.
+function rvaReasonRead(g,buy){
+  var good=g.avgPct>0, few=g.n<5?' (Few orders — not conclusive yet.)':'';
+  switch(g.reason){
+    case '2-hour limit': return (good?'Even the orders that waited the full two hours ended up '+(buy?'cheaper':'higher')+' — the price drifted their way while nothing triggered.':
+      'These waited the full two hours for a moment that never came and paid for it: '+(buy?'the price rose':'the price fell')+' while they waited. This is the gate’s main cost.')+few;
+    case 'bottom of range': return (good?'Waiting for the low end of the day worked: these bought after the price came down.':'They reached the bottom of the range only after first going up — or the range itself moved lower than the first look.')+few;
+    case 'top of range': return (good?'Waiting for the high end of the day worked: these sold after the price came up.':'They reached the top of the range only after the range itself had moved down.')+few;
+    case 'rising': return (good?'Waiting for the turn up worked: they bought after the fall had stopped, lower than at first.':'“Rising” means the price is already over a 15-minute close — so these often paid a little more than at the first look. The price of waiting for confirmation.')+few;
+    case 'falling': return (good?'Waiting for the turn down still sold higher than at first: the rise it waited through paid.':'“Falling” means the price is already under a 15-minute close — so these often sold a little lower than at the first look.')+few;
+    case 'dip and turn': return (good?'The dip-and-turn near the top of the day avoided the chase: these bought after a pullback.':'The dip came, but from a higher high — the turn was still above the first look.')+few;
+    case 'under its stop': return 'Stop sales never wait; any difference is just the minute between looks.'+few;
+    default: return 'Let go without a reading (no live or 15-minute prices) — the gate does not hold blind.'+few;
+  }
+}
 // ── THE RV GATE'S DECISIONS ON YOUR BUTTON ORDERS (last three days) ──────────
 // Every one: started at once, held, released, called off — and orders placed
 // with the box unticked, with what the gate would have said. Where the price

@@ -75,6 +75,7 @@ object RvJournal {
         try {
             val r = reading(rd)
             if (firstLook) add(ctx, "first", key, base + r)
+            rd?.price?.takeIf { it > 0.0 }?.let { trailAdd(ctx, key, Look(System.currentTimeMillis(), it, d.go, d.why)) }
             if (d.go) {
                 val now = System.currentTimeMillis()
                 add(ctx, "release", key, r + mapOf("why" to d.why, "timedOut" to d.timedOut,
@@ -122,6 +123,53 @@ object RvJournal {
             tmp.renameTo(f)
         } catch (e: Exception) { Log.w(TAG, "prune failed: ${e.message}") }
     }
+
+    // ── EVERY LOOK OF THE LAST DAY AND A HALF, for the analysis chart ──────
+    // The record above keeps only the first look and the release; the chart in
+    // Waiting orders › RV gate analysis also shows each minute's verdict between
+    // them — where the price was every time the gate said "not yet".
+
+    private const val TRAIL_FILE = "rv_gate_trail.json"
+    private const val TRAIL_KEEP_MS = 36L * 3_600_000L
+    private const val TRAIL_MAX = 480
+
+    /** One look: when, the live price, and what the gate said. */
+    data class Look(val at: Long, val price: Double, val go: Boolean, val why: String)
+
+    private val trailType = object : TypeToken<Map<String, List<Look>>>() {}.type
+
+    @Synchronized
+    private fun trailLoad(ctx: Context): Map<String, List<Look>> = try {
+        val f = File(ctx.filesDir, TRAIL_FILE)
+        if (!f.exists()) emptyMap() else gson.fromJson<Map<String, List<Look>>>(f.readText(), trailType) ?: emptyMap()
+    } catch (e: Exception) { emptyMap() }
+
+    @Synchronized
+    private fun trailAdd(ctx: Context, key: String, look: Look) {
+        try {
+            val cutoff = look.at - TRAIL_KEEP_MS
+            val m = HashMap<String, List<Look>>()
+            for ((k, v) in trailLoad(ctx)) {
+                val keep = v.filter { it.at >= cutoff }
+                if (keep.isNotEmpty()) m[k] = keep
+            }
+            m[key] = (m[key].orEmpty() + look).takeLast(TRAIL_MAX)
+            File(ctx.filesDir, TRAIL_FILE).writeText(gson.toJson(m))
+        } catch (e: Exception) { Log.w(TAG, "trail not recorded: ${e.message}") }
+    }
+
+    /** The gate's looks at the order behind [key], oldest first — the last 36 hours. */
+    fun trail(ctx: Context, key: String): List<Look> = trailLoad(ctx)[key].orEmpty()
+
+    /** The record's lines from [sinceMs] on — for the analysis's track record. */
+    @Synchronized
+    fun lines(ctx: Context, sinceMs: Long): List<String> = try {
+        val f = File(ctx.filesDir, FILE)
+        if (!f.exists()) emptyList() else f.readLines().filter { l ->
+            val at = Regex("\"at\":(\\d+)").find(l)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            at >= sinceMs
+        }
+    } catch (e: Exception) { Log.w(TAG, "record unreadable: ${e.message}"); emptyList() }
 
     // ── ALGO ORDERS WAITING FOR AN OUTCOME ──────────────────────────────────
 

@@ -180,8 +180,11 @@ object RvGate {
             .atTime(open).atZone(zone).toInstant().toEpochMilli()
     }
 
-    /** Live price, today's range, ATR and velocity for [symbol] — network. */
-    fun read(config: ConfigManager, ticker: String, symbol: String, base: String): Reading {
+    /** Live price, today's range, ATR and velocity for [symbol] — network.
+     *  [barsOut], when given, receives the 15-minute bars the reading was made
+     *  from (several days of them) — for [RvGateAnalysis]'s chart. */
+    fun read(config: ConfigManager, ticker: String, symbol: String, base: String,
+             barsOut: MutableList<com.signalscope.app.data.CandleData>? = null): Reading {
         val space = if (base == "de") "DE" else "US"
         val exch = if (base == "de") "DE" else "NASDAQ"
         val now = System.currentTimeMillis()
@@ -201,6 +204,7 @@ object RvGate {
             // by its own record on 19 Oct. Five days clears the rule on any morning.
             val res = YahooFinanceClient.fetchCandles15mRange(symbol.trim(), exch, "5d")
             val cs = (res as? YahooFinanceClient.CandleResult.Success)?.candles.orEmpty()
+            barsOut?.addAll(cs)
             val lag = if (base == "de") FeedDelay.XETRA_SEC else 0L
             val shape = todayShape(cs, openMs / 1000L, now / 1000L, lag, live)
             high = shape.first; low = shape.second; velocity = shape.third

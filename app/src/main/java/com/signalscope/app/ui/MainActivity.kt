@@ -2017,6 +2017,12 @@ class MainActivity : AppCompatActivity() {
                         "t212SoleOwner" -> gson.toJson(com.signalscope.app.trading.T212WeekTargets
                             .soleOwner(applicationContext, a[0].asString, a[1].asDouble) ?: mapOf("ns" to ""))
                         "dailyMacd" -> dailyMacdJson(a[0].asString, a[1].asString)
+                        // WAITING ORDERS › RV GATE ANALYSIS: one held order laid open,
+                        // and the gate's track record from its journal.
+                        "rvGateAnalysis" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
+                            .forOrder(applicationContext, a[0].asString, a[1].asString, a[2].asString))
+                        "rvGateRecord" -> gson.toJson(com.signalscope.app.trading.RvGateAnalysis
+                            .recordFor(applicationContext, a[0].asString, a[1].asString, a[2].asInt))
                         "exitLevels" -> exitLevelsJson(a[0].asString, a[1].asString)
                         "pricePanels" -> pricePanelsJson(a[0].asString, a[1].asString)
                         // A first full history rebuild can take minutes at Trading
@@ -5904,6 +5910,8 @@ class MainActivity : AppCompatActivity() {
                                 // a control that does nothing.
                                 "parked" to r.parkedForOpen,
                                 "side" to (if (r.status == "EXITING" || r.status == "OPEN") "SELL" else "BUY"),
+                                // Held by the RV gate: opens in RV gate analysis.
+                                "rvSrc" to (if (rv && (r.status == "RETRY" || r.status == "OPEN")) "algo" else ""),
                                 "from" to fromNs(r.ns),
                                 "conds" to run {
                                     val n = note(r.rvNote)
@@ -6034,7 +6042,7 @@ class MainActivity : AppCompatActivity() {
                         out.add(mapOf(
                             "id" to o.id, "ns" to o.algoNs, "symbol" to o.symbol,
                             "kind" to "your ${if (o.isSell) "sale" else "buy"} held by the RV gate",
-                            "status" to "RVMANUAL", "rvManualId" to o.id,
+                            "status" to "RVMANUAL", "rvManualId" to o.id, "rvSrc" to "you",
                             "side" to (if (o.isSell) "SELL" else "BUY"),
                             "from" to when (o.kind) {
                                 com.signalscope.app.trading.RvManualQueue.Kind.WATCH_BUY -> "You · watchlist Buy"
@@ -6055,7 +6063,7 @@ class MainActivity : AppCompatActivity() {
                         out.add(mapOf(
                             "id" to o.id, "ns" to o.algoNs, "symbol" to o.symbol,
                             "kind" to "your buy — waiting for your answer",
-                            "status" to "RVASK", "rvManualId" to o.id, "side" to "BUY",
+                            "status" to "RVASK", "rvManualId" to o.id, "rvSrc" to "you", "side" to "BUY",
                             "from" to (if (o.kind == com.signalscope.app.trading.RvManualQueue.Kind.WATCH_BUY)
                                 "You · watchlist Buy" else "You · stock page"),
                             "conds" to listOf(cond(false, "Price at or under your limit ${px(o.capLimit)} " +
