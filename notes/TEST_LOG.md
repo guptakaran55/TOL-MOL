@@ -1,0 +1,94 @@
+# Test log — one line per change, by date
+
+Each change made to the app, with a one-line way to check it on the phone. Newest day at the bottom;
+a new day gets its own heading. "Installed" is when the change reached the phone.
+
+## 26 Oct 2026
+
+- **Blue dot on algo-held stocks** (installed 18:12) — Portfolio → US → Invested: Workday and Airbnb show a small blue dot after the name; Paychex, Vertex, Mondelez (watchlist buys) do not.
+- **"Quality · cheap · uptrend" paper algos** (installed 19:09) — open the Algos tab in Germany, US and India once: each shows a new paper algo by that name with 15 / 9 / 17 companies.
+- **Quarterly list with approval** (installed 19:42) — on a quality algo card tap "check the list now": it says "unchanged" or shows a blue "list ready" bar; nothing changes until you tap Accept list.
+- **News veto** (installed 19:42) — quality algo card shows "News veto on · N checked"; tap it to see every verdict and any stock kept out with its % since.
+- **Watchlist alert AI verdicts use the company name** (installed 19:42) — the next German watchlist alert's AI line talks about the company itself (e.g. "Atoss"), not a ticker look-alike.
+- **Two alerts for one stock both get the AI verdict** (installed 19:42) — when a near-low and an entry alert for the same stock arrive together, both show the AI line.
+- **AI verdict also in the in-app notification list** (installed 19:42) — open the bell list after an alert's AI line appears: the same line is at the top of that entry.
+
+## 30 Oct 2026
+
+- **India waiting buys settled** (installed 12:57) — Algos → India → Conservative shows only real seats; Waiting orders lists only the watchlist's own India triggers (SBI Life, Tata Steel, SBFC, MTAR, Pine Labs).
+- **Seat dots count only shares actually held** (installed 12:57) — the India live algo shows its 5 seats, not 10.
+- **Charts on portfolio and Discovery alerts** (installed 13:10) — the next "Peak Approaching" or "Smooth MACD Turn" notification gains a price chart a few seconds after it arrives.
+- **A notification tap is acted on once** (installed 13:25) — tap a stock notification, swipe the app away from recents, reopen it: it opens where you left it, not on that stock again.
+- **App survives its page being killed for memory** (installed 13:25) — after a freeze the screen reloads instead of the whole app restarting and jumping to a stock.
+- **Sales closed without a price get their real price** (installed 13:25) — Algos → B_Conservative → BOOK ledger: NEM, HLAG and AOF show a REAL sale price; Us conservative: CDW shows @160.50.
+- **Safety stop records its own sale** (installed 13:25) — the next time a waiting sale is sold by its safety stop, its card shows the stop's real fill price, not "went through another way".
+- **Real prices next to strategy prices in the ledger** (installed 14:24) — Algos → Us conservative → BOOK ledger → CDW: STRATEGY 153.08 → 163.21, and a blue REAL line 152.20 → 160.50 on 27.10, +5.45%.
+- **A stop-loss sale never waits, on its retry too** (installed 14:24) — if a stop-loss sale fails and retries, it sells on the next pass with no "holding the sale" note.
+- **Real stop judged on the 2-hour close** (installed 14:52) — a German "real stop" sale only happens just after 11:15, 13:15, 15:15 or 17:15, never at times like 10:25 (VH2 this morning).
+- **Algo sales skip the RV gate** (installed 15:08) — the next algo sale sells at once: no "holding the sale: RV gate" note on its card, and its sold notification comes within minutes of the strategy's decision.
+- **Watchlist trailing stop judged on hourly closes** (installed 15:08) — Watchlist → settings: the trailing stop source reads "bar close" for Germany and the US; a brief dip below the trail inside an hour no longer sells.
+- **RV gate keeps a waiting buy's own high in today's range** (installed 15:23) — on a gated buy near the day's high, Waiting orders keeps "near today's high and rising — waiting for a dip and a turn"; it does not flip to "rising on the 15-minute prices" a minute later at the same price (WAF, 29 Oct).
+- **A buy cut off by the app stopping is recorded if it filled** (installed 15:51) — Watchlist (Germany) shows AIR held, 0.254 at €196.98, with a note that the app was stopped while it ran; a notification "AIR — cut-off buy had filled" arrives once. Waiting orders no longer lists it as interrupted.
+
+## 31 Oct 2026
+
+- **Rebuild counter for the freeze investigation** (installed 11:10) — nothing visible changes: the app looks and behaves exactly as before; the desktop recorder now logs what triggers each page rebuild while you use the app with the phone connected.
+- **Shares bought yesterday count as held** (installed 11:58) — buy any Indian stock; the next morning it stays OPEN in the watchlist (no "✋ sold outside the app" alert), and Settings → Delete stale GTTs does not list it.
+- **Written-off India positions found and protected** (installed 11:58) — a "🇮🇳 India position(s) were never sold — protected again" alert names SAILIFE, PFOCUS, WESTLIFE, ACMESOLAR; in Kite → GTT, WESTLIFE and ACMESOLAR each have a two-leg stop/target again; Watchlist (India) shows SAILIFE open. Needs a Zerodha login in the app first.
+- **India targets never closer than +3%** (installed 11:58) — the next Indian buy's GTT target in Kite is at least 3% above the fill price (+4% when the range rule offers less).
+- **Zerodha named in India "sold outside" alerts** (installed 11:58) — the next such alert for an Indian stock says "Zerodha account", not "Trading 212 account".
+- **Algos overview: real money and floor results corrected** (file only, 21:40) — notes\ALGOS_OVERVIEW.md: Germany B_Conservative "Real" reads −€68.28 (not +€281.54); Germany Macd swing reads "40 sold (25 won), +2.40% a trade".
+- **Real money for Germany's MACD swing** (installed 22:13) — Algos → Germany → Macd swing → open the card: a "REAL MONEY · TRADING 212" box reads "Off — paper only" with a red "Switch on…" button; switch on with €200, and after the next paper buy in market hours a "🇩🇪 … bought — Macd swing (real)" alert arrives and the box lists it as held with its real and paper price.
+- **A held real position sells with its paper trade** (installed 22:13) — when Macd swing sells a stock on paper that it also holds for real, a "🇩🇪 … sold — Macd swing (real)" alert follows within half an hour in market hours, and the box shows it sold with both prices and the result.
+- **An algo holding real shares cannot be deleted** (installed 22:13) — with a real position held, Delete on the Macd swing card says it still holds real shares.
+- **Real money needs at least €5 a buy** (installed 22:31) — Macd swing → Switch on… with €50 over its 20 seats: it refuses and says €100 is needed for €5 a buy.
+- **AI-outlook low-buy algos ask before every paper buy** (installed 22:44) — on Monday in market hours, when "AI low + MACD turns" or "Ai low buy-algo exit" would buy, a "🛒 Buy SYMBOL? — … (paper)" notification arrives with a chart and Buy / Skip; nothing is bought until you tap.
+- **Buy fills after the tap** (installed 22:44) — tap Buy at e.g. 10:07: the card's Held list shows the stock bought at the 10:15 price, not the signal's price.
+- **Skip or no answer is followed on the side** (installed 22:44) — tap Skip (or leave it 30 minutes): the request disappears, and the Closed list shows the stock "not bought — skipped by you" (or "— no answer") with what it would have made.
+- **Waiting for you list** (installed 22:44) — open either algo's card while a request is waiting: a blue "WAITING FOR YOU" box shows it with minutes left and the same Buy / Skip buttons; tapping one shows "Buy sent…" and the request settles within a minute.
+- **A tap after the close lapses** (installed 22:44) — tap Buy on a request after 17:30: nothing is bought, and it is followed on the side as "answered after the close".
+- **Stock markets sleep after the close** (installed after 23:20) — tonight and all Sunday: Settings → Battery → app usage shows the app far lower than Saturday's ~50%; on Monday the German algos come alive at 08:30 and stop after 18:15 (the Algos tab's last-checked time for a German algo stays at about 18:15 in the evening).
+- **Crypto keeps running while stocks sleep** (installed after 23:20) — at any hour on the weekend, the crypto algos' last-checked time on the Algos tab is under 20 minutes old.
+- **One download shared by every part of the app** (installed after 23:20) — nothing visible changes: the same stock's prices are fetched once per check instead of up to five times.
+- **Long price histories downloaded once a day** (installed 23:49) — nothing visible changes; on Monday the first German check after 08:30 downloads the full histories, and every later check downloads only the last 5 days (the battery screen's mobile-data figure for the app stays a small fraction of Saturday's ~200 MB).
+
+## 2 Nov 2026
+
+- **Start afresh for real money** (installed 13:35) — Algos → Germany → Macd swing → the red real-money box says "20 of its 20 seats hold paper buys from before real money went on" with a "Start afresh" button; tap it and confirm: within a minute the card shows 0 of 20 seats held, BOOK at 0%, and a new "Before real money" tab with the earlier paper record (sold trades and the 20 held at their last price).
+- **The next signal buys for real** (installed 13:35) — after starting afresh, the next MACD turn in market hours brings both the paper buy and a "🇩🇪 … bought — Macd swing (real)" alert.
+- **Switching on asks to start afresh** (installed 13:35) — on any German MACD-turns algo still on paper, Switch on… shows a ticked "Start afresh" box when it holds paper positions.
+- **Live algos at the top, built-in ones included** (installed after 14:05) — Algos → Germany: Macd swing is the first card, labelled "LIVE · MACD turns" in red with "REAL €200", above every paper algo.
+- **Paper swings on your own portfolio** (installed after 15:30) — Algos → Germany: two new paper algos, "Portfolio · floor swings" and "Portfolio · MACD swings"; after the next check each card's Universe tab lists exactly the German stocks you hold at Trading 212 (e.g. OHB).
+- **A stock you sell leaves the list** (installed after 15:30) — sell a German holding in Trading 212: at the next check it disappears from both cards' Universe tab, and any paper position in it shows in Closed as "you sold" at that check's price.
+- **A stock you buy joins** (installed after 15:30) — buy a new German stock: at the next check it appears in both cards' Universe tab, and floor orders for it start the next morning.
+- **One alert per trade on a live algo** (installed after 16:00) — the next Macd swing buy brings only "🇩🇪 … bought — Macd swing (real)", no "📥 Macd swing bought … (paper)" beside it; its next sale only the real "sold" alert.
+- **A paper buy not copied says why** (installed after 16:00) — if a Macd swing paper buy is not bought for real (e.g. seen over an hour late), a "⚠️ … — Macd swing (real)" alert says "bought on paper at €…, not for real — …".
+- **German targets just under the 3-month high** (installed this evening) — Watchlist (Germany) → a held stock's 🎯 Target line reads "just under its 3-month high" with a price a tenth of its 3-month range below that high; the old "near its 1-month high" targets are replaced at the next check.
+- **US targets 1% under the year high** (installed this evening) — Watchlist (US) → a held stock's 🎯 Target reads "just under its year high", at least 5% above what you paid, or "none" with the reason when that is closer.
+- **India targets 1% under the week high** (installed this evening) — the next Indian watchlist buy's GTT target in Kite is 1% under its week high, or +4% when that is under 3% above the fill.
+- **Alerts name the level** (installed this evening) — the next target sale reads "3-month target reached", "year target reached" or "week target reached".
+- **Compact exits panel** (installed this evening) — Watchlist → any market: one "Exits" box with a switch per row — Target (level · how far under · min %), Take profit, Trail, Hard stop, Strategy, Judged on — and one line per held stock "SYM tgt … · trail … · stop …"; tap a row's ⓘ for the details.
+- **German take profit off** (installed this evening) — Watchlist (Germany) → Exits: Take profit unticked; a German position rising past +4% is no longer sold for that.
+- **Target switches move held targets** (installed this evening) — change Germany's Target to "Year high": at the next check in market hours each held German stock's line shows its new target, and Trading 212 shows the new limit sells.
+- **Hard stop and Strategy switches** (installed this evening) — untick Strategy: the next MACD-turn-down on a watchlist stock is logged but not sold; untick Hard stop: a fall past −4% from your fill no longer sells (the trail still does).
+- **Watchlist folds** (installed this evening) — Watchlist: Held, Candidates, Settings, History each open/close alone; shut Held, open Settings, wait 10 s and switch tabs/restart: they stay as left.
+- **Portfolio algos: your shares only** (installed this evening) — tomorrow after Germany's open, Algos → Portfolio · MACD swings: its log says "held only by a live algo, not you: …", those stocks leave its list, and their paper positions show as sold with the grey "algo's" tag; RWE/HAG/OHB stay.
+- **German live algo's shares counted** (installed this evening) — Watchlist (Germany) → Held: SZG/IFX etc. no longer show as "PORTFOLIO, bought outside"; the MACD swing's stocks read as held by it; no "sell?" alert on them.
+- **Owner split on Portfolio** (installed this evening) — Portfolio (Germany): under SZG a line like "2 MACD swing · 3 you ≈€…"; a stock only you hold shows no line.
+- **Your hand sale reaches the German live algo** — sell 1 share of a MACD-swing stock in Trading 212: within about half an hour its count drops by 1 ("keeps …" alert) instead of the ledger check flagging a shortfall.
+- **Ladder strip clears** (installed tonight) — Patient buy any stock: when it fills the strip says "✓ BUY … bought N" and disappears after ~6 s; never stays on "Rung x/6".
+- **↻ orders** (installed tonight) — Watchlist → Held (or Portfolio header): tap "↻ orders" → "⏳ reading…" then "HH:MM · N settled / up to date"; a just-filled buy shows its paid price without waiting 15 min.
+- **Compact watchlist rows** (installed tonight) — Watchlist → Held and History → Ledger: one line per stock (paid · now ▼stop ▲target · P&L / bought · sold · net); tap a line → the full card opens under it.
+- **Watchlist "+" back** (installed tonight) — Watchlist → Held: a stock you hold outside the watchlist shows a "+" beside its name; tap it → the move-to-watcher prompt opens (the row stays folded); no "+" on a stock only an algo holds.
+- **Chart: one zero** (installed tonight) — Watchlist → AIR chart, pin 7 May 16:00: the teal entry-slope line sits just under the dashed 0 (it is −0.09), and the header shows entry-slope and exit-slope values.
+- **Auto-add your buys** (installed tonight) — buy any stock by hand in Trading 212 for ≥ €100: ~30–45 min later a "SYM → watchlist" alert and the stock shows in Held with a target; AIR/HAG/OHB/TKMS are NOT taken (held before). Off: Settings → Auto-add.
+- **Widget: No protection line** (installed tonight) — home-screen widget after the next check in market hours: amber "⚠ No protection: AIR €387 · TKMS €179 · OHB €169 · HAG €109 …"; tap + on AIR in the watchlist and AIR drops off the line at the next check.
+- **Exit card explains the momentum exit** (installed tonight) — open a watchlist stock's chart, pin a bar inside a held trade: slope row reads "240min MACD slope flips + → − (smoothed 10: a→b)", qualifier shows "MACD moved N% of 30% needed — … would be taken/blocked", stop row shows "fires at ≤ X, Y% away", grey note under the verdict says when it's checked; an amber warning appears when a blocked down-turn left only the stop.
+- **Chart: raw slope, real legend, why line, less text** (installed tonight) — open a watchlist chart: legend is 2 short lines ("Exit slope = avg 10 (18%/candle)") + "ⓘ more"; tap the "Raw slope" chip → a thin grey line that swings far more than the exit line; pin a 120min bar between 4h closes → line under the header says "unchanged until the 240min close at HH:MM"; while the exit slope is above 0 and raw below, it shows "≈k more like this to cross 0".
+- **Chart header names the candles plainly** (installed tonight) — open AIR's chart: the top reads "240min MACD · checked every 120min" (not "240min entries / 120min exits"); the qualifier says "next down-turn: taken/blocked".
+- **WAF/AIXA targets go in (leftover swept)** (installed 4 Nov) — after the next check in Xetra hours: Waiting orders shows WAF SELL LIMIT 87.99 for 2.795 and AIXA SELL LIMIT 42.59 for 4.492; the watchlist's WAF line shows ▲87.99; no more "min-opened-position-exceeded" notes.
+- **No phantom buys** (installed 4 Nov) — Algos → Macd swing: S92 shows no 11.958-share position (failed: "no buy order was placed"); MTX shows 0.029 with its order found in history. Next live-algo buy of a stock you already hold: its recorded qty equals only what that buy filled.
+- **S92 records repaired; watchlist S92 sold** (4 Nov 11:20) — Watchlist → History → Ledger: S92 sold 5.957 @56.10 (+8.6%); Held: S92 6.001 shows as yours with a +.
+- **Real-money algo stays on top when off** (installed 4 Nov) — Algos (Germany): "Macd swing" sits at the top with an amber "REAL OFF · 17 held" badge; switch real money back on from its card → badge turns red "REAL €200".
+- **Red dot = not tracked** (installed 4 Nov) — Portfolio (Germany): HAG, OHB, S92 show a small red dot by the name (no algo/watchlist, no sell resting); DAI, AIR, WAF don't; tap + on S92 in the watchlist → after the target goes in, its red dot disappears.
+- **Gated buy retries an unreadable holding** (installed 4 Nov) — Waiting orders: a buy let go by the RV gate while Trading 212 is rate-limiting shows "holding unreadable — trying again" and stays waiting, instead of ending "nothing bought".

@@ -1,0 +1,4 @@
+# Test reference data is compared byte for byte, so keep its line endings plain
+# (LF) on every checkout — Windows would otherwise turn them into CR LF and a
+# fresh copy of the repo fails the engine parity test with identical trades.
+app/src/test/resources/** text eol=lf
