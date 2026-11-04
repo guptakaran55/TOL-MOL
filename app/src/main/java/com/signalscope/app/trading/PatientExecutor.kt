@@ -115,11 +115,20 @@ object PatientExecutor {
      *  The two used to be the same -1.0, so a name not yet held looked
      *  "unreadable" and every first buy of it was refused (TPE, 4 Nov 2026) —
      *  and the RV gate put each such buy back to waiting, again and again. */
-    private fun heldQty(client: Trading212Client, ticker: String): Double =
-        when (val r = client.fetchPortfolio()) {
+    // WAITS FOR ITS TURN at the portfolio (see Trading212Client.fetchPortfolio):
+    // a ladder must know what it holds, and a read refused because something else
+    // read a second earlier abandoned buys (NEE, 5 Nov 2026). [why] receives
+    // what Trading 212 said when there is no answer.
+    private fun heldQty(client: Trading212Client, ticker: String, why: ((String) -> Unit)? = null): Double =
+        when (val r = client.fetchPortfolio(waitForTurn = true)) {
             is Trading212Client.T212Result.Success ->
                 r.data.firstOrNull { it.ticker.equals(ticker, true) }?.quantity ?: 0.0
-            else -> -1.0
+            is Trading212Client.T212Result.Failure -> {
+                why?.invoke(if (r.httpCode > 0 && !r.message.contains("${r.httpCode}"))
+                    "${r.message} (HTTP ${r.httpCode})" else r.message)
+                -1.0
+            }
+            else -> { why?.invoke("Trading 212 is not set up in Settings"); -1.0 }
         }
 
     /**
@@ -671,7 +680,8 @@ object PatientExecutor {
             // cash asked for by more than the ATR cap. Baseline the position so
             // "how much have I already bought" is re-derived every rung.
             val targetShares = cashAmount / ref
-            fun ownedQty(): Double = heldQty(client, ticker)
+            var unreadWhy = ""
+            fun ownedQty(): Double = heldQty(client, ticker) { unreadWhy = it }
             // THE STARTING HOLDING MUST BE KNOWN (4 Nov 2026). An unreadable first
             // look used to count as 0, so the next good look took every share already
             // held as just bought: S92, 11.958 shares "bought" with no order placed,
@@ -682,8 +692,11 @@ object PatientExecutor {
                 if (firstLook >= 0) break
                 Thread.sleep(wait); firstLook = ownedQty()
             }
+            // The wording up to "holding" is what RvManualQueue recognises (UNREAD);
+            // what Trading 212 actually said follows it.
             if (firstLook < 0)
-                throw IllegalStateException("could not read your current holding from Trading 212 — nothing placed")
+                throw IllegalStateException("could not read your current holding from Trading 212 — nothing placed" +
+                    (if (unreadWhy.isNotBlank()) ". Trading 212 said: $unreadWhy" else ""))
             var baseline = firstLook
             val dustShares = maxOf(1e-6, targetShares * DUST_FRAC)
             val placedIds = ArrayList<Long>()

@@ -45,6 +45,16 @@ class Trading212Client(private val config: ConfigManager) {
         }
 
         private const val TAG = "Trading212Client"
+
+        /** Trading 212 answers /equity/portfolio once every 5 s per account; a
+         *  little more, so network jitter cannot land two inside one window. */
+        private const val PORTFOLIO_SPACING_MS = 5_200L
+
+        /** EVERY PORTFOLIO READ IN THE APP, IN TURN — see [fetchPortfolio]. */
+        private val PORTFOLIO_READS = SpacedReads<T212Result<List<Position>>>(
+            PORTFOLIO_SPACING_MS,
+            busy = { T212Result.Failure("Trading 212 allows one portfolio read every 5 s — another one is due first", 429) },
+            failed = { T212Result.Failure(it) })
         private const val OPEN_ORDERS_CACHE_MS = 2_500L
         @Volatile private var openOrdersCacheBaseUrl: String = ""
         @Volatile private var openOrdersCacheJson: String = ""
@@ -881,8 +891,36 @@ class Trading212Client(private val config: ConfigManager) {
         }
     }
 
-    fun fetchPortfolio(): T212Result<List<Position>> {
+    /**
+     * Every position in the account.
+     *
+     * ONE READ EVERY 5 SECONDS, APP-WIDE. Trading 212 refuses more, and eight
+     * parts of the app read the portfolio — ladders after every rung, the holdings
+     * check, the position audit, hand sales, the trailing manager, the German
+     * algos, the Portfolio tab. Uncoordinated, the ones that came second were
+     * refused, and a refused read cost a buy its "how much do I hold already"
+     * (NEE, 5 Nov 2026: "could not read your current holding").
+     *
+     * [waitForTurn]: true for a caller that must have the answer — it waits for
+     * the next turn (callers arriving together share one read that starts after
+     * all of them asked), and a refusal is tried again in the turns after. False
+     * (the default): never waits — when no read may start now, the answer is the
+     * same "rate limited" failure the broker would have given, at once, and no
+     * request is sent to take a waiting caller's turn. See [SpacedReads].
+     */
+    fun fetchPortfolio(waitForTurn: Boolean = false): T212Result<List<Position>> {
         if (!config.hasT212Credentials) return T212Result.NotConfigured
+        var r = PORTFOLIO_READS.read(waitForTurn) { fetchPortfolioNow() }
+        var tries = 1
+        while (waitForTurn && tries < 3 && r is T212Result.Failure && r.httpCode == 429) {
+            Log.w(TAG, "portfolio read refused (429) — trying again in the next turn")
+            r = PORTFOLIO_READS.read(true) { fetchPortfolioNow() }
+            tries++
+        }
+        return r
+    }
+
+    private fun fetchPortfolioNow(): T212Result<List<Position>> {
         return try {
             val url = "${config.t212BaseUrl}/equity/portfolio".toHttpUrlOrNull()
                 ?: return T212Result.Failure("invalid base URL")

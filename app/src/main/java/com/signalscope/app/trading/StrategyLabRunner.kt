@@ -1539,27 +1539,48 @@ object StrategyLabRunner {
      * and anchoring a position to a half-formed one would make its very first
      * exit check measure from a price that never finally existed.
      */
-    fun latestClosedBar(ctx: Context, ns: String, symbol: String, exchange: String = ""): LatestBar? {
+    fun latestClosedBar(ctx: Context, ns: String, symbol: String, exchange: String = "",
+                        tries: Int = 1, why: ((String) -> Unit)? = null): LatestBar? {
         val sym = symbol.trim().uppercase()
         if (sym.isBlank()) return null
         return try {
             val cfg = StrategyLabStore.activeConfig(ctx, ns)
             val plan = FeedPlan.plan(cfg, ns)
-            if (!plan.ok) return null
+            if (!plan.ok) { why?.invoke("this config's timeframe cannot be served by the price feed (${plan.problem})"); return null }
             val ex = exchange.trim().ifBlank { Spaces.exchangeOf(ns) }
-            val res = fetchCandlesFor(ctx, ns, sym, ex, plan)
-            if (res !is YahooFinanceClient.CandleResult.Success) return null
+            var res = fetchCandlesFor(ctx, ns, sym, ex, plan)
+            // ASKED AGAIN WHEN SOMEONE IS WAITING ON IT ([tries] > 1 — a buy you
+            // pressed). A busy moment gets downloads refused for a few seconds,
+            // and one refusal used to be the whole answer: "No usable price data"
+            // (GEV, 5 Nov 2026). Successful downloads are shared, so a retry after
+            // one costs nothing.
+            var attempt = 1
+            while (res !is YahooFinanceClient.CandleResult.Success && attempt < tries) {
+                Thread.sleep(if (attempt == 1) 2_000L else 5_000L)
+                res = fetchCandlesFor(ctx, ns, sym, ex, plan)
+                attempt++
+            }
+            if (res !is YahooFinanceClient.CandleResult.Success) {
+                why?.invoke(when (res) {
+                    is YahooFinanceClient.CandleResult.RateLimited ->
+                        "the price feed is refusing requests for a moment (too many from this phone)"
+                    is YahooFinanceClient.CandleResult.Error -> "the price download failed: ${res.message}"
+                    else -> "the price feed returned no bars for it"
+                })
+                return null
+            }
             val nowSec = System.currentTimeMillis() / 1000
             val closed = res.candles.filter {
                 FeedDelay.isComplete(it.timestamp, plan.sourceSec, nowSec, GRACE_SEC, FeedDelay.secFor(ns))
             }
             val candles = sanitizeCandles(closed, nowSec, plan.sourceSec).clean
-            val last = candles.lastOrNull() ?: return null
+            val last = candles.lastOrNull() ?: run { why?.invoke("no completed bar on its feed yet"); return null }
             LatestBar(last.timestamp, last.close,
                 try { IntradayLevels.from(sym, candles, (plan.sourceSec / 60L).toInt()) }
                 catch (_: Exception) { null })
         } catch (e: Exception) {
-            Log.w(TAG, "[$ns] $sym latest-bar lookup failed", e); null
+            Log.w(TAG, "[$ns] $sym latest-bar lookup failed", e)
+            why?.invoke("the price lookup failed: ${e.message ?: e.javaClass.simpleName}"); null
         }
     }
 

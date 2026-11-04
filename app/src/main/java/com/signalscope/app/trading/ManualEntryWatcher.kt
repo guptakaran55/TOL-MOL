@@ -1145,6 +1145,12 @@ object ManualEntryWatcher {
         val toppedUp: Boolean = false
     )
 
+    /** Why a buy could not start: its prices could not be had — said as such,
+     *  not as a missing signal, and with what the feed said. */
+    private fun noPrices(sym: String, why: String): String =
+        "No usable price data for $sym right now" + (if (why.isNotBlank()) " — $why" else "") +
+            ". Nothing was placed; try again in a minute."
+
     /**
      * Buy [cash] worth of [symbol] with the patient ladder, then hand the position
      * to the engine so its exit is managed by the watcher config.
@@ -1229,8 +1235,20 @@ object ManualEntryWatcher {
         // ones — conviction trades in the book that the strategy had actually
         // chosen.
         val since = ManualWatchStore.load(ctx, base).watchingSince[sym] ?: 0L
-        val signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since,
+        var signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since,
             stillOpenFromTs = signalTs)
+        // NO SIGNAL — OR NO PRICES? Both used to come back as "nothing": a download
+        // refused at a busy moment read as "the setup has passed", and a forced buy
+        // gave up after one try (GEV, 5 Nov 2026). The bars are asked for again,
+        // with retries; when they come through, the signal is asked about again
+        // (on the download just made — shared, so no second request).
+        var priceWhy = ""
+        val bar = if (signalled != null) null
+            else StrategyLabRunner.latestClosedBar(ctx, ns, sym, Spaces.exchangeOf(base), tries = 3) { priceWhy = it }
+        if (signalled == null && bar == null) return BuyResult(false, sym, error = noPrices(sym, priceWhy))
+        if (signalled == null)
+            signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since,
+                stillOpenFromTs = signalTs)
         // A FORCED BUY BORROWS THE SHAPE OF A SIGNAL, NOT ITS AUTHORITY.
         //
         // Everything downstream — the ladder anchor, the book row, the live-order
@@ -1240,8 +1258,8 @@ object ManualEntryWatcher {
         // the [forced] flag on the stored row is what keeps them distinguishable
         // afterwards, which is the part that actually matters.
         val fresh = signalled ?: if (force) {
-            val lb = StrategyLabRunner.latestClosedBar(ctx, ns, sym, Spaces.exchangeOf(base))
-                ?: return BuyResult(false, sym, error = "No usable price data for $sym right now.")
+            // Fetched above, with retries — non-null whenever no signal was found.
+            val lb = bar ?: return BuyResult(false, sym, error = noPrices(sym, priceWhy))
             StrategyLabRunner.FreshEntry(sym, lb.ts, lb.close,
                 "forced entry — no signal, bought on your call", lb.ts, lb.close, 0, 0)
         } else return BuyResult(false, sym,
@@ -1409,10 +1427,17 @@ object ManualEntryWatcher {
         // question than the one that produced the notification and refuses buys
         // the app just recommended. See the long note in [buyAndHandOver].
         val since = ManualWatchStore.load(ctx, base).watchingSince[sym] ?: 0L
-        val signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since)
+        var signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since)
+        // No signal — or no prices? See the same step in [buyAndHandOver].
+        var priceWhy = ""
+        val bar = if (signalled != null) null
+            else StrategyLabRunner.latestClosedBar(ctx, ns, sym, Spaces.exchangeOf(base), tries = 3) { priceWhy = it }
+        if (signalled == null && bar == null) return BuyResult(false, sym, error = noPrices(sym, priceWhy))
+        if (signalled == null)
+            signalled = StrategyLabRunner.freshEntrySignal(ctx, ns, sym, Spaces.exchangeOf(base), since)
         val fresh = signalled ?: if (force) {
-            val lb = StrategyLabRunner.latestClosedBar(ctx, ns, sym, Spaces.exchangeOf(base))
-                ?: return BuyResult(false, sym, error = "No usable price data for $sym right now.")
+            // Fetched above, with retries — non-null whenever no signal was found.
+            val lb = bar ?: return BuyResult(false, sym, error = noPrices(sym, priceWhy))
             StrategyLabRunner.FreshEntry(sym, lb.ts, lb.close,
                 "forced entry — no signal, bought on your call", lb.ts, lb.close, 0, 0)
         } else return BuyResult(false, sym,

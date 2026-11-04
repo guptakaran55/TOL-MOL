@@ -2708,7 +2708,8 @@ class MainActivity : AppCompatActivity() {
                             null
                         }
                         val cashRes = t212.fetchAccountSummary()
-                        val portRes = t212.fetchPortfolio()
+                        // Waits for its turn: you opened the tab, so an answer beats a refusal.
+                        val portRes = t212.fetchPortfolio(waitForTurn = true)
                         val positions = when (portRes) {
                             is com.signalscope.app.network.Trading212Client.T212Result.Success -> portRes.data
                             is com.signalscope.app.network.Trading212Client.T212Result.Failure ->
