@@ -44,7 +44,11 @@ object ClosedTrades {
         /** BUY / SELL. */
         val side: String,
         /** ISO-8601, sortable as text. The matcher orders by this and nothing else. */
-        val at: String
+        val at: String,
+        /** The broker's order id — what [TradeReasons] looks up. Blank when unknown. */
+        val orderId: String = "",
+        /** Trading 212: "TYPE|initiatedFrom" (LIMIT|API, STOP|ANDROID…). Blank elsewhere. */
+        val meta: String = ""
     )
 
     data class RoundTrip(
@@ -76,7 +80,13 @@ object ClosedTrades {
          *  Null on a broker that is not costed. */
         val chargeParts: Map<String, Double>? = null,
         /** Bought and sold the same day — charged as intraday where that differs. */
-        val sameDay: Boolean = false
+        val sameDay: Boolean = false,
+        /** The orders behind each leg, and their broker fields — see [TradeReasons].
+         *  Nullable: reports stored before these existed come back without them. */
+        val buyOrderId: String? = null,
+        val sellOrderId: String? = null,
+        val buyMeta: String? = null,
+        val sellMeta: String? = null
     ) {
         /** What actually reached the account. */
         val netPnl: Double get() = pnl - charges
@@ -117,7 +127,7 @@ object ClosedTrades {
     )
 
     private data class Lot(var qty: Double, val origQty: Double, val price: Double,
-                           val cash: Double, val at: String)
+                           val cash: Double, val at: String, val orderId: String = "", val meta: String = "")
 
     /**
      * THE CASH A SHARE ACTUALLY COST, sanity-checked against its own price.
@@ -211,7 +221,7 @@ object ClosedTrades {
             if (f.qty <= 0.0 || f.ticker.isBlank()) continue
             val q = open.getOrPut(f.ticker) { ArrayDeque() }
             if (f.side.equals("BUY", true)) {
-                q.addLast(Lot(f.qty, f.qty, f.price, f.cash, f.at))
+                q.addLast(Lot(f.qty, f.qty, f.price, f.cash, f.at, f.orderId, f.meta))
                 continue
             }
             // A SELL eats the oldest shares first.
@@ -234,7 +244,8 @@ object ClosedTrades {
                     cashIn = cashIn, cashOut = cashOut,
                     pnl = cashOut - cashIn,
                     pctReturn = if (cashIn > 0.0) (cashOut / cashIn - 1.0) * 100.0 else 0.0,
-                    heldDays = daysBetween(lot.at, f.at)))
+                    heldDays = daysBetween(lot.at, f.at),
+                    buyOrderId = lot.orderId, sellOrderId = f.orderId, buyMeta = lot.meta, sellMeta = f.meta))
                 lot.qty -= take
                 remaining -= take
                 if (lot.qty <= 1e-9) q.removeFirst()

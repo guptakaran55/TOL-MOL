@@ -1109,7 +1109,11 @@ class Trading212Client(private val config: ConfigManager) {
         val status: String,
         /** The limit we placed. fillPrice vs this IS the execution quality of the
          *  patient ladder — a fill better than the limit is price improvement. */
-        val limitPrice: Double = 0.0
+        val limitPrice: Double = 0.0,
+        /** LIMIT / STOP / MARKET, and who placed it (API = this app; ANDROID, IOS,
+         *  WEB = you in Trading 212). Null on fills archived before 6 Nov 2026. */
+        val orderType: String? = null,
+        val initiatedFrom: String? = null
     )
 
     /**
@@ -1400,7 +1404,9 @@ class Trading212Client(private val config: ConfigManager) {
                     status = order.str("status", "state").ifBlank { "FILLED" },
                     // What we asked for, so execution quality is directly visible:
                     // your AIXA rung asked 38.68 and filled at 38.46.
-                    limitPrice = order.num("limitPrice", "stopPrice")))
+                    limitPrice = order.num("limitPrice", "stopPrice"),
+                    orderType = order.str("type", "orderType").ifBlank { null },
+                    initiatedFrom = order.str("initiatedFrom", "executor", "origin").ifBlank { null }))
             }
         } catch (e: Exception) {
             Log.w(TAG, "order-history parse failed: ${e.message}")

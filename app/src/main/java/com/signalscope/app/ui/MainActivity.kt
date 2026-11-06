@@ -7429,7 +7429,12 @@ class MainActivity : AppCompatActivity() {
                     "totalPnl" to r.totalPnl, "wins" to r.wins, "losses" to r.losses,
                     "stillOpen" to r.stillOpen, "unmatchedSells" to r.unmatchedSells,
                     "totalCharges" to r.totalCharges, "costed" to r.costed,
-                    "trips" to r.trips.map { t ->
+                    "trips" to run {
+                        // WHY EACH WAS BOUGHT AND SOLD — see TradeReasons.
+                        val why = try { com.signalscope.app.trading.TradeReasons.t212(applicationContext,
+                            com.signalscope.app.trading.Spaces.baseOf(space.lowercase()), r.trips) }
+                            catch (e: Exception) { Log.w(TAG, "trade reasons failed", e); emptyList() }
+                        r.trips.mapIndexed { i, t ->
                         mapOf("ticker" to t.ticker, "symbol" to t.symbol, "qty" to t.qty,
                             "buyPrice" to t.buyPrice, "sellPrice" to t.sellPrice,
                             "boughtAt" to t.boughtAt, "soldAt" to t.soldAt,
@@ -7438,8 +7443,9 @@ class MainActivity : AppCompatActivity() {
                             "heldDays" to t.heldDays,
                             "charges" to t.charges, "netPnl" to t.netPnl,
                             "netPctReturn" to t.netPctReturn,
-                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay)
-                    }))
+                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay,
+                            "buyBy" to why.getOrNull(i)?.buy.orEmpty(), "sellBy" to why.getOrNull(i)?.sell.orEmpty())
+                    } }))
             } catch (e: Exception) {
                 gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
             }
@@ -7468,7 +7474,10 @@ class MainActivity : AppCompatActivity() {
                     "knownSince" to com.signalscope.app.trading.ZerodhaClosedTrades
                         .knownSince(applicationContext),
                     "totalCharges" to r.totalCharges, "costed" to r.costed,
-                    "trips" to r.trips.map { t ->
+                    "trips" to run {
+                        val why = try { com.signalscope.app.trading.TradeReasons.india(applicationContext, r.trips) }
+                            catch (e: Exception) { Log.w(TAG, "trade reasons failed", e); emptyList() }
+                        r.trips.mapIndexed { i, t ->
                         mapOf("ticker" to t.ticker, "symbol" to t.symbol, "qty" to t.qty,
                             "buyPrice" to t.buyPrice, "sellPrice" to t.sellPrice,
                             "boughtAt" to t.boughtAt, "soldAt" to t.soldAt,
@@ -7483,8 +7492,9 @@ class MainActivity : AppCompatActivity() {
                             // What the charges are made of, and whether the
                             // trade was same-day — the panel's breakdown and its
                             // intraday mark read these.
-                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay)
-                    }))
+                            "chargeParts" to t.chargeParts, "sameDay" to t.sameDay,
+                            "buyBy" to why.getOrNull(i)?.buy.orEmpty(), "sellBy" to why.getOrNull(i)?.sell.orEmpty())
+                    } }))
             } catch (e: Exception) {
                 gson.toJson(mapOf("ok" to false, "error" to (e.message ?: "unknown")))
             }

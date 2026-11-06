@@ -86,7 +86,9 @@ object T212ClosedTrades {
             ClosedTrades.Fill(
                 ticker = it.ticker, symbol = bare(it.ticker),
                 qty = it.filledQuantity, price = it.fillPrice, cash = it.filledValue,
-                side = it.side, at = it.dateExecuted)
+                side = it.side, at = it.dateExecuted,
+                orderId = if (it.orderId > 0L) it.orderId.toString() else "",
+                meta = "${it.orderType.orEmpty()}|${it.initiatedFrom.orEmpty()}")
         })
 
     /** Kept as a door onto the shared rule so the tests that pin its thresholds —

@@ -138,7 +138,8 @@ object ZerodhaTradeStore {
                     // that makes the Trading 212 side check its own arithmetic.
                     cash = it.qty * it.price,
                     side = it.side,
-                    at = isoOf(it.filledAt))
+                    at = isoOf(it.filledAt),
+                    orderId = it.orderId)
             }
 
     /**

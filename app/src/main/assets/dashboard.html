@@ -6349,6 +6349,47 @@ function applySortFromSheet(scope,k){
   if(scope==='portfolio')doPSort(k);else doSort(k);
   openSortSheet(scope);
 }
+// ✕ IN EVERY SEARCH BOX (the user, 6 Nov 2026): any text box whose placeholder
+// says search / filter / name or ticker gets a clear button on its right, shown
+// while it holds text. Clearing fires the box's own input handler, so each list
+// reacts exactly as if the text had been deleted by hand. A box with its own ✕
+// opts out with data-noclear.
+function isSearchBox(el){
+  if(!el||el.tagName!=='INPUT'||(el.dataset&&el.dataset.noclear))return false;
+  var t=String(el.type||'text').toLowerCase();if(t!=='text'&&t!=='search')return false;
+  return /search|filter|name or ticker|e\.g\. tata/i.test(el.getAttribute('placeholder')||'');
+}
+function addSearchClear(el){
+  if(el.dataset.clearAdded)return;el.dataset.clearAdded='1';
+  var wrap=el.closest('.srch');
+  if(!wrap){
+    var cs=getComputedStyle(el);
+    wrap=document.createElement('span');
+    wrap.style.cssText='position:relative;display:'+(cs.display==='inline'?'inline-block':cs.display)+
+      ';flex:'+cs.flex+';min-width:'+cs.minWidth+';margin:'+cs.margin+';box-sizing:border-box';
+    if(el.style.width)wrap.style.width=el.style.width;
+    el.parentNode.insertBefore(wrap,el);wrap.appendChild(el);
+    el.style.margin='0';el.style.width='100%';el.style.boxSizing='border-box';
+  }
+  el.style.paddingRight='26px';
+  var x=document.createElement('span');
+  x.textContent='✕';x.title='Clear';
+  x.style.cssText='position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:12px;line-height:1;color:var(--t3);padding:3px 4px;z-index:2;display:'+(el.value?'block':'none');
+  x.addEventListener('mousedown',function(e){e.preventDefault()});
+  x.addEventListener('click',function(e){
+    e.stopPropagation();el.value='';x.style.display='none';
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    if(el.getAttribute('onblur'))el.blur();else el.focus();
+  });
+  el.addEventListener('input',function(){x.style.display=el.value?'block':'none'});
+  wrap.appendChild(x);
+}
+(function(){
+  var due=false;
+  function scan(){due=false;var ins=document.querySelectorAll('input');for(var i=0;i<ins.length;i++)if(isSearchBox(ins[i]))addSearchClear(ins[i]);}
+  function start(){scan();try{new MutationObserver(function(){if(!due){due=true;setTimeout(scan,0)}}).observe(document.body,{childList:true,subtree:true})}catch(e){}}
+  if(document.body)start();else document.addEventListener('DOMContentLoaded',start);
+})();
 function searchInputAttrs(){
   return " oninput=\"setSearch(this.value)\" onblur=\"commitSearch()\" onkeydown=\"if(event.key==='Enter')this.blur()\"";
 }
@@ -9269,7 +9310,9 @@ function closedTripsByDay(trips){
     var k=String(t.ticker||t.symbol)+'|'+String(t.boughtAt||'').slice(0,10)+'|'+String(t.soldAt||'').slice(0,10);
     var g=by[k];
     if(!g){g=by[k]={ticker:t.ticker,symbol:t.symbol,qty:0,bv:0,sv:0,cashIn:0,cashOut:0,pnl:0,charges:0,
-                    boughtAt:String(t.boughtAt||''),soldAt:String(t.soldAt||''),pieces:0,parts:{},sameDay:!!t.sameDay};order.push(g)}
+                    boughtAt:String(t.boughtAt||''),soldAt:String(t.soldAt||''),pieces:0,parts:{},sameDay:!!t.sameDay,bb:[],sb:[]};order.push(g)}
+    if(t.buyBy&&g.bb.indexOf(t.buyBy)<0)g.bb.push(t.buyBy);
+    if(t.sellBy&&g.sb.indexOf(t.sellBy)<0)g.sb.push(t.sellBy);
     var q=Number(t.qty)||0;
     g.qty+=q; g.bv+=q*(Number(t.buyPrice)||0); g.sv+=q*(Number(t.sellPrice)||0);
     g.cashIn+=Number(t.cashIn)||0; g.cashOut+=Number(t.cashOut)||0;
@@ -9290,7 +9333,7 @@ function closedTripsByDay(trips){
       buyPrice:g.qty>0?g.bv/g.qty:0, sellPrice:g.qty>0?g.sv/g.qty:0,
       boughtAt:g.boughtAt, soldAt:g.soldAt, cashIn:g.cashIn, cashOut:g.cashOut,
       pnl:g.pnl, charges:g.charges, pieces:g.pieces, heldDays:held,
-      chargeParts:g.parts, sameDay:g.sameDay,
+      chargeParts:g.parts, sameDay:g.sameDay, buyBy:g.bb.join(' + '), sellBy:g.sb.join(' + '),
       pctReturn:g.cashIn>0?(g.cashOut/g.cashIn-1)*100:0,
       netPnl:g.pnl-g.charges, netPctReturn:g.cashIn>0?(g.pnl-g.charges)/g.cashIn*100:0};
   });
@@ -9572,7 +9615,9 @@ function closedAnalysisBody(r){
   // quietly dropped — a total that excludes something should say what.
   var so=r.stillOpen||{}, us=r.unmatchedSells||{};
   var soKeys=Object.keys(so), usKeys=Object.keys(us);
-  if(soKeys.length||usKeys.length){
+  // NOT SHOWN (the user, 6 Nov 2026): the still-held / older-buy list repeated
+  // what Portfolio already says. Kept off rather than deleted.
+  if(false&&(soKeys.length||usKeys.length)){
     h+='<div style="font-size:9px;color:var(--t3);line-height:1.6;margin-bottom:9px;padding:6px 8px;background:var(--bg2);border:1px solid var(--bd);border-radius:6px">';
     if(soKeys.length)h+='<b>Not counted — still held:</b> '+soKeys.map(function(k){return escHtml(t212Bare(k))+' '+Number(so[k]).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')}).join(' · ')+'<br/>';
     if(usKeys.length)h+='<b>Sold, buy older than this history:</b> '+usKeys.map(function(k){return escHtml(t212Bare(k))+' '+Number(us[k]).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')}).join(' · ')+' — no honest entry price, so left out.';
@@ -9628,14 +9673,19 @@ function closedAnalysisBody(r){
             :hasFills?[19,24,24,15,18]
             :costed?[19,24,24,14,19]
             :[21,29,29,21];
-  h+='<div data-scroll-key="closed-trips" style="overflow-y:auto;overflow-x:hidden;max-height:55vh;border:1px solid var(--bd);border-radius:6px;-webkit-overflow-scrolling:touch">'+
-    '<table style="width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:10px">'+
+  // WHY IT WAS BOUGHT AND SOLD (the user, 6 Nov 2026): one more column on the right,
+  // reached by scrolling sideways — the table still opens on its left edge.
+  var RW=42, rsc=100/(100+RW);
+  widths=widths.map(function(w){return w*rsc}).concat([RW*rsc]);
+  h+='<div data-scroll-key="closed-trips" style="overflow-y:auto;overflow-x:auto;max-height:55vh;border:1px solid var(--bd);border-radius:6px;-webkit-overflow-scrolling:touch">'+
+    '<table style="width:'+(100+RW)+'%;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:10px">'+
     '<colgroup>'+widths.map(function(w){return '<col style="width:'+w+'%"/>'}).join('')+'</colgroup>'+
     '<thead><tr style="color:var(--t3);font-size:8px;text-align:left">'+
     th('STOCK','symbol')+th('BOUGHT','buy')+th('SOLD','sell')+
     (hasFills?th('FILL','fill'):'')+
     (costed?th('FEES','feepct',true):'')+
     th(costed?'NET':'P&amp;L','pnl',true)+
+    '<th title="Blue: who bought it. Grey: what sold it." style="padding:5px 3px 5px 8px;position:sticky;top:0;z-index:1;background:var(--cd);border-bottom:1px solid var(--bd);white-space:normal">BUY · SELL</th>'+
     '</tr></thead><tbody>';
   sorted.forEach(function(t,i){
     var c=(Number(t.pnl)>=0)?'var(--gn)':'var(--rd)';
@@ -9667,6 +9717,9 @@ function closedAnalysisBody(r){
           : ((Number(t.pnl)>=0?'+':'')+Number(t.pnl).toFixed(2)+
              sub((Number(t.pctReturn)>=0?'+':'')+Number(t.pctReturn).toFixed(2)+'%')))+
         '</td>'+
+      '<td style="'+cell+'padding-left:8px;font-size:9px;line-height:1.35">'+
+        '<div style="color:var(--bl);font-weight:700">'+escHtml(t.buyBy||'—')+'</div>'+
+        '<div style="color:var(--t3);margin-top:2px">'+escHtml(t.sellBy||'—')+'</div></td>'+
       '</tr>';
   });
   h+='</tbody></table></div>';
@@ -12386,7 +12439,9 @@ function manualWatchPanel(){
     openN+' open'+(waitingN?' · '+waitingN+' waiting':'')+(heldOnly.length?' · '+heldOnly.length+' outside':''),held);
 
   // ── CANDIDATES ──
-  var c=manualSeatBanner(w,cands.length);
+  // NO SEATS BANNER, NO "SIGNALLED RECENTLY" CHIPS (the user, 6 Nov 2026): the
+  // filter chips below ("latest entries") show the same. Both functions stay for reuse.
+  var c='';
   // WHY THE LIST CAN BE EMPTY. The watcher screens once a UTC day on the
   // background tick, so a freshly attached config shows nothing for a while. A
   // button beats leaving the user to wonder whether it is broken.
@@ -12401,7 +12456,6 @@ function manualWatchPanel(){
           : 'not screened · next pass, or tap (~'+escHtml(String(w.universeSize||100))+' series, few min)')+
       '</span></div>';
   }
-  c+=manualAlertLog(w);
   if(cands.length){
     // Sorted before the heading is drawn: the AI button there counts from it.
     MW_AI_ORDER=mwSortCands(cands);
@@ -12412,7 +12466,7 @@ function manualWatchPanel(){
     // The search box. Its id is what lets the page keep the cursor in it while
     // live prices redraw everything around it.
     c+='<div style="display:flex;gap:6px;align-items:center;margin:0 0 5px">'+
-      '<input id="mw-search" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Search a stock" value="'+escHtml(MW_SEARCH)+'" '+
+      '<input id="mw-search" data-noclear="1" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Search a stock" value="'+escHtml(MW_SEARCH)+'" '+
         'oninput="mwSearchSet(this.value)" style="flex:1;min-width:0;padding:5px 8px;font-size:11px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1)"/>'+
       '<span onclick="mwSearchClear()" title="Clear the search" style="cursor:pointer;font-size:11px;color:var(--t3);padding:2px 6px">✕</span>'+
       '<span id="mw-search-count" style="font-size:9px;color:var(--t3);white-space:nowrap">'+(MW_SEARCH.trim()?(nShown+' of '+cands.length):'')+'</span>'+
@@ -12432,7 +12486,7 @@ function manualWatchPanel(){
   }
   c+=rankings;
   var seatsFull=Number(w.seatsTotal||0)>0&&Number(w.seatsFilled||0)>=Number(w.seatsTotal||0);
-  h+=mwFold('cands','Candidates',cands.length+(seatsFull?' · algo seats full':''),c);
+  h+=mwFold('cands','Candidates',String(cands.length),c);
 
   // ── SETTINGS ── config, exits, liquidity. Open by force while there is no
   // config: attaching one is the only thing to do then.
