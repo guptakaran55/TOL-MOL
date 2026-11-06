@@ -389,7 +389,9 @@ object StockAiClient {
         support: Double? = null,
         resistance: Double? = null,
         ctx: MarketContext = MarketContext.IN,
-        name: String? = null
+        name: String? = null,
+        /** The results record — facts, see ResultsBook.forPrompt. "" = none. */
+        record: String = ""
     ): AiResult {
         val headlines = fetchNewsHeadlines(symbol, 12, ctx, name)  // increased from 8 to 12 for richer context
         val displayName = name?.trim()?.takeIf { it.isNotBlank() }
@@ -408,7 +410,8 @@ Evaluate whether this pullback is:
 
 Prioritize recent news over older stories. A headline marked "(+N more outlets)" is ONE story that several outlets covered.
 Be concise (3-4 sentences max). If you rely on a headline, name its outlet and date in words — never bracketed reference numbers.
-If you're unsure, answer UNCERTAIN rather than guessing."""
+If you're unsure, answer UNCERTAIN rather than guessing.
+A "Results record", when given, is factual: reported earnings against expectations and big price moves with their headlines. Weigh it as evidence alongside the news."""
 
         val trendDesc = if (adx != null) {
             "ADX = ${String.format("%.1f", adx)} (${if (adx > 25) "trending" else if (adx > 15) "emerging trend" else "choppy"})"
@@ -439,6 +442,7 @@ If you're unsure, answer UNCERTAIN rather than guessing."""
             append("$rsiDesc\n")
             append("$trendDesc\n")
             append("$srDesc\n\n")
+            if (record.isNotBlank()) append(record).append("\n")
 
             // Bullets, not numbers: the headlines are never shown, so a "[3]" in
             // the answer would point at nothing the user can see.
@@ -479,7 +483,9 @@ If you're unsure, answer UNCERTAIN rather than guessing."""
         priceVel: Double,
         isInPortfolio: Boolean = false,
         ctx: MarketContext = MarketContext.IN,
-        name: String? = null
+        name: String? = null,
+        /** The results record — facts, see ResultsBook.forPrompt. "" = none. */
+        record: String = ""
     ): AiResult {
         val displayName = name?.trim()?.takeIf { it.isNotBlank() }
         val stories = fetchStories(symbol, HEADLINES, ctx, name)
@@ -505,7 +511,8 @@ If you're unsure, answer UNCERTAIN rather than guessing."""
         val middle = if (isInPortfolio) "HOLD" else "WATCH"
 
         val system = """You are a stock market analyst writing a short, news-based outlook on ${ctx.analystPersona}.
-You are given only the company, today's price, whether the user owns it, and recent headlines. Form your own view; assume no bullish or bearish lean.
+You are given only the company, today's price, whether the user owns it, recent headlines and, when known, its results record. Form your own view; assume no bullish or bearish lean.
+- A "Results record" is factual: reported earnings against expectations, and big price moves with their headlines. Weigh it as evidence; it is nobody's opinion. Refer to it in words, never with a bracketed number.
 
 Reading the headlines:
 - Each headline carries its date and age, and they are sorted newest first. Weigh the newest most; treat news more than two weeks old as background.
@@ -528,6 +535,7 @@ When a sentence rests on a headline, put that headline's number in square bracke
             append("${todayLine()}\n")
             append("Current price: ${ctx.currencySymbol}${String.format("%.2f", price)}\n")
             append("User owns it: ${if (isInPortfolio) "YES" else "NO"}\n\n")
+            if (record.isNotBlank()) append(record).append("\n")
             // Technical context intentionally withheld here to keep the LLM
             // outlook independent from app-generated SMA/MACD bias.
             if (stories.isNotEmpty()) {

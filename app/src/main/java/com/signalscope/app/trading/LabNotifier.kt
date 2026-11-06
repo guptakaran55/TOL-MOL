@@ -82,6 +82,7 @@ object LabNotifier {
     /** Real STOCK fills, separate from crypto's channel so one can be silenced
      *  without the other — the two move at completely different rates. */
     private const val CH_T212 = "t212_live_trades"
+    private const val CH_NEWS = "news_moves"
 
     /**
      * [openNs] deep-links the tap to one algo. Without it the notification opens
@@ -966,6 +967,22 @@ object LabNotifier {
      * the app noticing sooner than its once-a-day pass would. Saying "sold" here
      * when nothing sold would be the worst possible error on this channel.
      */
+    /**
+     * NEWS MOVES: a big move on news — a holding either way, a watchlist stock up.
+     * Opens the stock; it buys and sells nothing. One per stock per day ([NewsMoves]).
+     */
+    fun newsMove(ctx: Context, space: String, symbol: String, pct: Double, volX: Double, results: Boolean,
+                 surprise: Double?, headline: String?, outlet: String?, held: Boolean) {
+        val up = pct > 0
+        val why = if (results) "results " + ResultsBook.word(surprise).let { if (it == "?") "out" else it } else "news"
+        notify(ctx, CH_NEWS, NotificationManager.IMPORTANCE_HIGH, "News moves",
+            "${if (up) "🟢" else "🔴"} ${flagOf(space)} $symbol ${"%+.1f".format(pct)}% · $why" + (if (held) " · you hold it" else ""),
+            (headline?.takeIf { it.isNotBlank() }?.let { "$it${outlet?.takeIf { o -> o.isNotBlank() }?.let { o -> " — $o" } ?: ""}" }
+                ?: "No headline found yet.") + " · ${"%.1f".format(volX)}× usual volume",
+            "nm-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
+            openSymbol = symbol, openSpace = space)
+    }
+
     fun heldPositionBreak(ctx: Context, space: String, symbol: String,
                           price: Double, stop: Double, pct: Double, qty: Double) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",

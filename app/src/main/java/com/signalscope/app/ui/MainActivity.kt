@@ -2016,6 +2016,9 @@ class MainActivity : AppCompatActivity() {
                         // EARNINGS DATES for the keys on screen (network: Yahoo, paced).
                         "earningsDates" -> gson.toJson(com.signalscope.app.trading.EarningsDates
                             .forKeys(applicationContext, a.map { it.asString }))
+                        // THE RESULTS RECORD for the stock page (network when stale).
+                        "resultsRecord" -> gson.toJson(com.signalscope.app.trading.ResultsBook.forPage(
+                            com.signalscope.app.trading.ResultsBook.read(applicationContext, a[0].asString)))
                         "aiChipsLearn" -> { com.signalscope.app.trading.AiChips.learn(applicationContext, a.map { it.asString }); "{}" }
                         "t212SoleOwner" -> gson.toJson(com.signalscope.app.trading.T212WeekTargets
                             .soleOwner(applicationContext, a[0].asString, a[1].asDouble) ?: mapOf("ns" to ""))
@@ -9870,7 +9873,8 @@ class MainActivity : AppCompatActivity() {
                         if (support > 0) support else null,
                         if (resistance > 0) resistance else null,
                         ctx = aiCtx,
-                        name = name.ifBlank { null }
+                        name = name.ifBlank { null },
+                        record = resultsRecordFor(symbol)
                     )
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text
@@ -9908,6 +9912,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** THE RESULTS RECORD as facts for the AI cards (read fresh when stale);
+         *  "" when there is none. Never the AI's own earlier verdicts. */
+        private fun resultsRecordFor(symbol: String): String = try {
+            val k = com.signalscope.app.trading.AiChips.keyOf(symbol, config.currentSpace.toString())
+            com.signalscope.app.trading.ResultsBook.forPrompt(com.signalscope.app.trading.ResultsBook.read(applicationContext, k))
+        } catch (e: Exception) { Log.w(TAG, "results record for $symbol failed", e); "" }
+
         /** Called from detail modal — full stock outlook analysis */
         @JvmOverloads
         @JavascriptInterface
@@ -9925,7 +9936,8 @@ class MainActivity : AppCompatActivity() {
                         if (sma200 == 0.0) null else sma200,
                         ema21PctDiff, rrRatio, priceVel, isInPortfolio,
                         ctx = aiCtx,
-                        name = name.ifBlank { null }
+                        name = name.ifBlank { null },
+                        record = resultsRecordFor(symbol)
                     )
                     when (result) {
                         is StockAiClient.AiResult.Success -> result.text

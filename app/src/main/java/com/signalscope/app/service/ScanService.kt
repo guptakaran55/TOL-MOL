@@ -818,6 +818,12 @@ class ScanService : Service() {
                 val hp = withContext(Dispatchers.IO) {
                     com.signalscope.app.trading.HeldPositionWatch.runOnce(applicationContext, sp)
                 }
+                // BIG MOVES ON NEWS — holdings and the top of the watchlist, one
+                // batch quote; news read only for the few that moved. Tells only.
+                try {
+                    val nm = withContext(Dispatchers.IO) { com.signalscope.app.trading.NewsMoves.runOnce(applicationContext, sp) }
+                    if (nm.isNotBlank()) { Log.i(TAG, "News moves [$sp]: $nm"); watchBits.add(nm) }
+                } catch (e: Exception) { Log.w(TAG, "news moves [$sp] failed: ${e.message}") }
                 if (hp.alerted.isNotEmpty()) {
                     Log.w(TAG, "Held-position break [$sp]: ${hp.alerted.joinToString(",")}")
                     val label = when (sp) { "de" -> "DE"; "in" -> "IN"; "us" -> "US"; else -> sp }

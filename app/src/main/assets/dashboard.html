@@ -627,6 +627,34 @@ function aiDisagreeHtml(sym){
 function aiDisagreePaint(){
   var el=document.getElementById('ai-disagree');if(el&&DETAIL_STOCK)el.innerHTML=aiDisagreeHtml(DETAIL_STOCK.symbol);
 }
+// ── THE RESULTS RECORD on the stock page (the user, 6 Nov 2026) ───────────────
+// "📊 Jun beat 9.7% · Mar beat 3.1% · … · reported 13 Nov → +6.1%", and the
+// latest big move with its headline. Read from ResultsBook (Yahoo when stale).
+var RES={d:{}};
+function resLineSlot(sym,sp){
+  if(!sym)return '';var k=aicKey(sym,sp);if(k.indexOf('XX:')===0)return '';
+  if(!RES.d[k]){RES.d[k]={loading:1};
+    androidAsync('resultsRecord',[k],function(raw){
+      try{RES.d[k]=JSON.parse(raw||'{}')||{}}catch(e){RES.d[k]={}}
+      var el=document.getElementById('res-line');if(el&&el.getAttribute('data-k')===k)el.innerHTML=resLineInner(k);
+    });
+  }
+  return '<div id="res-line" data-k="'+escHtml(k)+'" style="font-size:9px;color:var(--t2);margin-top:3px;line-height:1.45">'+resLineInner(k)+'</div>';
+}
+function resLineInner(k){
+  var r=RES.d[k];if(!r||r.loading)return '';
+  var mo=function(ms){return new Date(Number(ms)).toLocaleDateString([], {month:'short'})};
+  var dd=function(ms){return new Date(Number(ms)).toLocaleDateString([], {day:'numeric',month:'short'})};
+  var w=function(s){if(s==null)return '?';s=Number(s);return s>=1?'<b style="color:var(--gn)">beat '+s.toFixed(1)+'%</b>':s<=-1?'<b style="color:var(--rd)">miss '+(-s).toFixed(1)+'%</b>':'in line'};
+  var parts=[];
+  var qs=r.quarters||[];
+  if(qs.length)parts.push('📊 '+qs.map(function(q){return mo(q.q)+' '+w(q.s)}).join(' · '));
+  if(Number(r.lastReport)>0&&r.reaction!=null)parts.push('reported '+dd(r.lastReport)+' → '+(Number(r.reaction)>=0?'+':'')+Number(r.reaction).toFixed(1)+'%');
+  var mv=(r.moves||[])[0];
+  if(mv&&Date.now()-Number(mv.day)<30*86400000)parts.push('<span title="'+escHtml(String(mv.headline||''))+'">⚡ '+dd(mv.day)+' '+(Number(mv.pct)>=0?'+':'')+Number(mv.pct).toFixed(1)+'%'+
+    (mv.headline?' · '+escHtml(String(mv.headline).slice(0,60))+(String(mv.headline).length>60?'…':''):'')+'</span>');
+  return parts.join('<br/>');
+}
 (function(){for(var sec in SECTOR_MAP_DATA){if(SECTOR_MAP_DATA.hasOwnProperty(sec)){SECTOR_MAP_DATA[sec].forEach(function(sym){SECTOR_MAP[sym]=sec});}}})();
 // ── SPACE state (IN ↔ US) ──────────────────────────────────────────────────
 // Persisted via Kotlin bridge so the user lands back where they left.
@@ -20387,6 +20415,7 @@ function showDetail(idx,focus){
   hh+=ernChip(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE),true);
   hh+='</div>';
   hh+='<div id="dt-px" data-cur="'+escHtml(cur)+'" style="margin-top:4px">'+detailPxHtml(s,cur)+'</div>';
+  hh+=resLineSlot(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE));
   // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a
   // two-month-old price shown bare reads as today's.
   var fromScan=(typeof idx==='number')||(STATE.data&&STATE.data.indexOf(s)>=0);

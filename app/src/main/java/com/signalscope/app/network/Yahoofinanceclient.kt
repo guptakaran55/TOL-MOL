@@ -1278,6 +1278,88 @@ object YahooFinanceClient {
         }
     } catch (e: Exception) { Log.w(TAG, "earnings date failed for $yahooSymbol: ${e.message}"); EarningsAnswer(false) }
 
+    /** One stock's day so far, from the batch quote. */
+    data class DayQuote(val symbol: String, val price: Double, val changePct: Double,
+                        val volume: Long, val avgVolume10d: Long, val earningsAtMs: Long, val name: String = "")
+
+    /**
+     * NEWS MOVES (6 Nov 2026): today's move and volume for many stocks in one
+     * request — up to 40 a call. Null when Yahoo could not be asked.
+     */
+    fun fetchQuotes(yahooSymbols: List<String>): Map<String, DayQuote>? = try {
+        val crumb = fetchCrumb() ?: return null
+        val out = HashMap<String, DayQuote>()
+        for (chunk in yahooSymbols.distinct().chunked(40)) {
+            val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
+                .addPathSegments("v7/finance/quote")
+                .addQueryParameter("symbols", chunk.joinToString(","))
+                .addQueryParameter("crumb", crumb).build()
+            val req = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json").build()
+            val body = client.newCall(req).execute().use { r ->
+                if (r.code == 401 || r.code == 403) cachedCrumb = null
+                if (!r.isSuccessful) null else r.body?.string()
+            } ?: return if (out.isEmpty()) null else out
+            out.putAll(parseQuotes(body))
+        }
+        out
+    } catch (e: Exception) { Log.w(TAG, "batch quote failed: ${e.message}"); null }
+
+    /** Pure: a v7 quote reply. */
+    fun parseQuotes(body: String): Map<String, DayQuote> {
+        val out = HashMap<String, DayQuote>()
+        val arr = JSONObject(body).optJSONObject("quoteResponse")?.optJSONArray("result") ?: return out
+        for (i in 0 until arr.length()) {
+            val q = arr.optJSONObject(i) ?: continue
+            val sym = q.optString("symbol", "")
+            if (sym.isBlank()) continue
+            out[sym.uppercase()] = DayQuote(sym, q.optDouble("regularMarketPrice", 0.0),
+                q.optDouble("regularMarketChangePercent", 0.0), q.optLong("regularMarketVolume", 0L),
+                q.optLong("averageDailyVolume10Day", 0L), q.optLong("earningsTimestamp", 0L) * 1000L,
+                q.optString("longName", "").ifBlank { q.optString("shortName", "") })
+        }
+        return out
+    }
+
+    /** One reported quarter: earnings a share against what analysts expected. */
+    data class QuarterResult(val quarterEndMs: Long, val eps: Double?, val estimate: Double?, val surprisePct: Double?)
+
+    /** The last four quarters, oldest first. Null when Yahoo could not be asked. */
+    fun fetchEarningsHistory(yahooSymbol: String): List<QuarterResult>? = try {
+        val crumb = fetchCrumb() ?: return null
+        val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
+            .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
+            .addQueryParameter("modules", "earningsHistory")
+            .addQueryParameter("crumb", crumb).build()
+        val req = Request.Builder().url(url)
+            .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+            .addHeader("Accept", "application/json").build()
+        client.newCall(req).execute().use { r ->
+            when (r.code) {
+                200 -> parseEarningsHistory(r.body?.string().orEmpty())
+                404 -> emptyList()
+                401, 403 -> { cachedCrumb = null; null }
+                else -> null
+            }
+        }
+    } catch (e: Exception) { Log.w(TAG, "earnings history failed for $yahooSymbol: ${e.message}"); null }
+
+    /** Pure: an earningsHistory reply, oldest quarter first. Surprise in %. */
+    fun parseEarningsHistory(body: String): List<QuarterResult> = try {
+        val res = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
+        val arr = res?.optJSONObject("earningsHistory")?.optJSONArray("history")
+        fun raw(o: JSONObject, k: String): Double? = o.optJSONObject(k)?.let { if (it.has("raw")) it.optDouble("raw") else null }
+            ?.takeIf { it.isFinite() }
+        (0 until (arr?.length() ?: 0)).mapNotNull { i ->
+            val o = arr!!.optJSONObject(i) ?: return@mapNotNull null
+            val q = o.optJSONObject("quarter")?.optLong("raw", 0L) ?: 0L
+            val eps = raw(o, "epsActual"); val est = raw(o, "epsEstimate")
+            if (q <= 0L || eps == null) null
+            else QuarterResult(q * 1000L, eps, est, raw(o, "surprisePercent")?.let { it * 100.0 })
+        }.sortedBy { it.quarterEndMs }
+    } catch (e: Exception) { emptyList() }
+
     /** Pure: the next results day out of a calendarEvents reply. */
     fun parseEarningsDate(body: String, nowMs: Long): EarningsAnswer = try {
         val res = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
