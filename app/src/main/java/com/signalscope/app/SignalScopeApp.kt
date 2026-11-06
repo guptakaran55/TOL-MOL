@@ -11,4 +11,11 @@ class SignalScopeApp : Application() {
         // Long price histories kept a day at a time on the phone — see BarHistory.
         com.signalscope.app.network.BarHistory.init(this)
     }
+
+    /** The screen went to the background, or the phone is short of memory — see
+     *  PageWarmup.release. */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        try { com.signalscope.app.ui.PageWarmup.release(level) } catch (_: Exception) {}
+    }
 }

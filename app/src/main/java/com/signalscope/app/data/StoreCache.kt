@@ -101,6 +101,10 @@ object StoreCache {
         }
     }
 
+    /** The phone is short of memory: drop every kept copy. Each file is parsed
+     *  again on its next read, exactly as on a fresh start. */
+    fun clear() { synchronized(this) { kept.clear() } }
+
     /** How many files are kept right now — for tests. */
     internal fun size(): Int = synchronized(this) { kept.size }
 

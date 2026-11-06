@@ -1801,6 +1801,10 @@ class ScanService : Service() {
 
         // Persist to disk so results survive process death
         DiscoveryResultStore.save(this@ScanService, lastDiscoveryResult!!)
+        // Saved, and the screen's holder has it: the service keeps no second
+        // reference, so the holder can let go while the screen is hidden
+        // (PageWarmup.release) and the memory is really freed.
+        lastDiscoveryResult = null
 
         // WHAT THE SCAN THREW AWAY, IN THE SCAN'S OWN SUMMARY.
         //

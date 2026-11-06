@@ -426,6 +426,10 @@ class MainActivity : AppCompatActivity() {
         Thread(r, "discovery-push").apply { isDaemon = true }
     }
     @Volatile private var pageReady = false
+    /** The current page has drawn its first frame — scan results are sent only
+     *  after it, so a rebuilt screen is never white while it swallows them. */
+    @Volatile private var pagePainted = false
+    private var visualReq = 0L
     @Volatile private var pageGen = 0
     private val pushedDiscoverySig = java.util.concurrent.ConcurrentHashMap<String, String>()
     @Volatile private var livePushInFlight = false
@@ -629,9 +633,11 @@ class MainActivity : AppCompatActivity() {
 
         refreshStatusBar()
 
-        // Push whatever results we have (live or cached) to WebView
+        if (::webView.isInitialized) webView.onResume()
+        // Push whatever results we have (live or cached) to WebView — to a page
+        // already drawn; a page still loading is sent everything once it has.
         pushDiscoveryResultsToWebView(force = true)
-        pushPortfolioResultsToWebView()
+        if (pageReady && pagePainted) pushPortfolioResultsToWebView()
         // Strategy Lab paper loops (US, Germany, crypto) — each self-gates on
         // enabled and is throttled so a resume doesn't re-fetch more than every
         // 10 min.
@@ -814,6 +820,8 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         pollHandler.removeCallbacks(pollRunnable)
+        // The hidden page does no drawing work (its own timers still run).
+        if (::webView.isInitialized) try { webView.onPause() } catch (_: Exception) {}
         if (::liveStreamClient.isInitialized) {
             LivePortfolioBars.updateStreamState(false, false, 0, "Paused")
             liveStreamClient.stop("Paused")
@@ -1124,6 +1132,7 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "page process gone (crashed=${detail?.didCrash()}, " +
                     "priority=${detail?.rendererPriorityAtExit()}) — rebuilding the screen")
                 pageReady = false
+                pagePainted = false
                 try {
                     (view?.parent as? android.view.ViewGroup)?.removeView(view)
                     view?.destroy()
@@ -1142,40 +1151,22 @@ class MainActivity : AppCompatActivity() {
                 // market is sent to it once, whatever the last page had.
                 pageGen++
                 pushedDiscoverySig.clear()
+                pagePainted = false
                 pageReady = true
                 // After the flag, which it now waits for.
                 consumeAlgoDeepLink(intent)
-                // Push any existing results once page is loaded
-                pushDiscoveryResultsToWebView(force = true)
-                pollHandler.postDelayed({ pushCachedDiscoveryResultsToWebViewAsync() }, 250L)
-                if (ScanServiceResultHolder.lastZerodhaResult != null) {
-                    pushPortfolioResultsToWebView()
-                } else {
-                    // Cold start (process was killed): rehydrate Portfolio tab from
-                    // the last persisted snapshot so the user doesn't see an empty
-                    // table while waiting for the next 15-min scan tick.
-                    PortfolioResultStore.load(applicationContext)?.let { snap ->
-                        val escaped = snap.payloadJson
-                            .replace("\\", "\\\\")
-                            .replace("'", "\\'")
-                        webView.evaluateJavascript(
-                            "window.updatePortfolioData('$escaped')", null
-                        )
-                        Log.d(TAG, "Rehydrated portfolio from disk snapshot")
-                    }
-                }
                 updateLiveStreamSubscriptions()
                 pushLiveStreamStateToWebView()
-                // Fetch market context in background
-                fetchMarketIndexData()
-                // Fetch sector data in background
-                fetchSectorData()
+                // DRAWN FIRST, FILLED IN AFTER (6 Nov 2026) — see PageWarmup.
+                val gen = pageGen
+                afterFirstPaint(gen) { hydratePage(gen) }
             }
         }
 
         // Load dashboard from assets after the client is attached so the
         // onPageFinished hydration hook cannot be missed on a fast load.
         pageReady = false
+        pagePainted = false
         webView.loadUrl("file:///android_asset/dashboard.html")
     }
 
@@ -10696,14 +10687,81 @@ class MainActivity : AppCompatActivity() {
         lastDiscoveryPayloadComplete = result.isComplete
     }
 
+    /**
+     * [block] once the page of generation [gen] has drawn its first frame — or
+     * after [PageWarmup.PAINT_FALLBACK_MS] if the page never says so. On the
+     * drawing thread.
+     */
+    private fun afterFirstPaint(gen: Int, block: () -> Unit) {
+        val once = java.util.concurrent.atomic.AtomicBoolean(false)
+        val run = Runnable {
+            if (gen == pageGen && pageReady && once.compareAndSet(false, true)) {
+                pagePainted = true
+                block()
+            }
+        }
+        try {
+            webView.postVisualStateCallback(++visualReq, object : WebView.VisualStateCallback() {
+                override fun onComplete(requestId: Long) { pollHandler.post(run) }
+            })
+        } catch (e: Exception) { Log.w(TAG, "first-frame callback unavailable: ${e.message}") }
+        pollHandler.postDelayed(run, PageWarmup.PAINT_FALLBACK_MS)
+    }
+
+    /**
+     * A drawn page, filled in: the portfolio (small), then the market on screen,
+     * then the newest scan, then every other market — one at a time, with a
+     * pause between, so the screen keeps drawing. Then the index and sector tiles.
+     */
+    private fun hydratePage(gen: Int) {
+        if (gen != pageGen) return
+        val t0 = System.currentTimeMillis()
+        if (ScanServiceResultHolder.lastZerodhaResult != null) {
+            pushPortfolioResultsToWebView()
+        } else {
+            // Cold start (process was killed): rehydrate Portfolio tab from the
+            // last persisted snapshot — read off the drawing thread.
+            thread(isDaemon = true, name = "portfolio-rehydrate") {
+                val snap = try { PortfolioResultStore.load(applicationContext) } catch (_: Exception) { null }
+                    ?: return@thread
+                val escaped = snap.payloadJson.replace("\\", "\\\\").replace("'", "\\'")
+                runOnUiThread {
+                    if (gen == pageGen && !isDestroyed) {
+                        webView.evaluateJavascript("window.updatePortfolioData('$escaped')", null)
+                        Log.d(TAG, "Rehydrated portfolio from disk snapshot")
+                    }
+                }
+            }
+        }
+        // Which market the page shows, so it is filled in first.
+        webView.evaluateJavascript("(function(){try{return SPACE}catch(e){return ''}})()") { raw ->
+            if (gen != pageGen) return@evaluateJavascript
+            val visible = (raw ?: "").trim('"').uppercase()
+            // The newest scan is held in memory and sent on its own; it goes first
+            // when it is the market on screen, else after it.
+            val live = ScanServiceResultHolder.lastDiscoveryResult
+            val liveOnScreen = live != null && PageWarmup.onScreen(live.market, live.currency, visible)
+            val pause = Runnable { try { Thread.sleep(PageWarmup.GAP_MS) } catch (_: InterruptedException) {} }
+            if (liveOnScreen) { pushDiscoveryResultsToWebView(force = true); discoveryPushExec.execute(pause) }
+            pushCachedDiscoveryResultsToWebViewAsync(onScreen = true, visible = visible)
+            if (!liveOnScreen) { pushDiscoveryResultsToWebView(force = true); discoveryPushExec.execute(pause) }
+            pushCachedDiscoveryResultsToWebViewAsync(onScreen = false, visible = visible)
+            discoveryPushExec.execute {
+                Log.i(TAG, "page filled in ${System.currentTimeMillis() - t0} ms after its first frame (on screen: $visible)")
+            }
+        }
+        fetchMarketIndexData()
+        fetchSectorData()
+    }
+
     private fun pushDiscoveryResultsToWebView(force: Boolean = false, thenJs: String? = null) {
         // Access the service's static result holder
         val result = ScanServiceResultHolder.lastDiscoveryResult
         val runThen = { if (thenJs != null) try { webView.evaluateJavascript(thenJs, null) } catch (_: Exception) {} }
         if (result == null) { runThen(); return }
         try {
-            // No page yet: it asks for everything the moment it finishes loading.
-            if (!pageReady) { runThen(); return }
+            // No page yet, or not drawn yet: it is sent everything once it has.
+            if (!pageReady || !pagePainted) { runThen(); return }
             if (!shouldPushDiscoveryPayload(result, force)) { runThen(); return }
             // A scan in progress sends at most one update at a time; the next
             // poll carries the newer numbers anyway.
@@ -10762,16 +10820,23 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun pushCachedDiscoveryResultsToWebViewAsync() {
-        // Same rules as the live result: never before the page exists, never a
+    /**
+     * [onScreen]: null = every market; true = only the market the page shows
+     * ([visible]); false = only the others.
+     */
+    private fun pushCachedDiscoveryResultsToWebViewAsync(onScreen: Boolean? = null, visible: String = "") {
+        // Same rules as the live result: never before the page has drawn, never a
         // market this page already holds, and on the same single background
         // thread so sends cannot overtake each other.
-        if (!pageReady) return
+        if (!pageReady || !pagePainted) return
         val gen = pageGen
         discoveryPushExec.execute {
             try {
                 val live = ScanServiceResultHolder.lastDiscoveryResult
                 DiscoveryResultStore.loadAll(applicationContext).forEach { cached ->
+                    if (gen != pageGen) return@forEach
+                    if (onScreen != null &&
+                        PageWarmup.onScreen(cached.market, cached.currency, visible) != onScreen) return@forEach
                     if (live != null && live.market == cached.market) return@forEach
                     val sig = discoverySig(cached, true)
                     if (pushedDiscoverySig[cached.market] == sig) return@forEach
@@ -10785,6 +10850,8 @@ class MainActivity : AppCompatActivity() {
                             pushedDiscoverySig[cached.market] = sig
                         }
                     }
+                    // A breath for the drawing thread before the next market.
+                    try { Thread.sleep(PageWarmup.GAP_MS) } catch (_: InterruptedException) {}
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error pushing cached discovery results", e)
