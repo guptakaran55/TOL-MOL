@@ -547,6 +547,86 @@ function aicAfterBuy(sym,sp,cash){
   var pct=(Number(e.ai||0)+v)/t*100;
   return pct>lim?pct:null;
 }
+// ── EARNINGS DATES (the user, 6 Nov 2026) ─────────────────────────────────────
+// "📅 3d" beside a stock that reports results within two weeks — holdings, the
+// watchlist and the stock page. A results day can gap past a stop. Asked of
+// Yahoo in the background (EarningsDates.kt) and filled into the chips in place.
+var ERN={d:{},want:{},t:0,busy:false};
+function ernDays(at){
+  var d0=new Date();d0.setHours(0,0,0,0);var d1=new Date(Number(at));d1.setHours(0,0,0,0);
+  return Math.round((d1-d0)/86400000);
+}
+function ernInner(k,long){
+  var e=ERN.d[k];if(!e||!(Number(e.at)>0))return '';
+  var n=ernDays(e.at);if(n<0||n>14)return '';
+  var when=new Date(Number(e.at)).toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'});
+  var near=n<=3;
+  var txt=long?('📅 Results '+(n===0?'today':n===1?'tomorrow':'in '+n+'d')+' · '+when+(e.est?' (est.)':''))
+              :('📅'+(n===0?'today':n+'d'));
+  return '<span title="Results '+escHtml(when)+(e.est?' — Yahoo\'s estimate':'')+'" style="display:inline-block;font-size:'+(long?'9':'7')+'px;font-weight:800;line-height:10px;'+
+    'margin-left:3px;padding:'+(long?'1px 5px':'0 2px')+';border-radius:3px;vertical-align:middle;font-family:-apple-system,sans-serif;'+
+    (near?'color:#fff;background:var(--pu);border:1px solid var(--pu)':'color:var(--pu);border:1px solid var(--pu)')+'">'+txt+'</span>';
+}
+function ernChip(sym,sp,long){
+  if(!sym)return '';
+  var k=aicKey(sym,sp);if(k.indexOf('XX:')===0)return '';
+  if(!ERN.d[k]&&!ERN.want[k]){ERN.want[k]=1;ernSchedule()}
+  return '<span data-ern="'+escHtml(k)+'"'+(long?' data-ern-long="1"':'')+'>'+ernInner(k,long)+'</span>';
+}
+function ernSchedule(){
+  if(ERN.t||ERN.busy)return;
+  ERN.t=setTimeout(ernFetch,1200);
+}
+function ernFetch(){
+  ERN.t=0;
+  var keys=Object.keys(ERN.want);if(!keys.length||typeof Android==='undefined')return;
+  ERN.want={};ERN.busy=true;
+  androidAsync('earningsDates',keys,function(raw){
+    ERN.busy=false;
+    var j={};try{j=JSON.parse(raw||'{}')||{}}catch(e){}
+    keys.forEach(function(k){ERN.d[k]=j[k]||{at:0,est:false,miss:!j[k]}});
+    ernPaint();
+    // Yahoo answers at most 30 a call: the rest go next.
+    var again=keys.filter(function(k){return ERN.d[k].miss});
+    if(again.length&&again.length<keys.length){again.forEach(function(k){delete ERN.d[k];ERN.want[k]=1});ernSchedule()}
+    else if(Object.keys(ERN.want).length)ernSchedule();
+  });
+}
+function ernPaint(){
+  var els=document.querySelectorAll('[data-ern]');
+  for(var i=0;i<els.length;i++){var k=els[i].getAttribute('data-ern');els[i].innerHTML=ernInner(k,els[i].getAttribute('data-ern-long')==='1')}
+}
+// Days to results when known and 0–3 away; null otherwise. For the buy heads-up.
+function ernNear(sym,sp){
+  var e=ERN.d[aicKey(sym,sp)];if(!e||!(Number(e.at)>0))return null;
+  var n=ernDays(e.at);return (n>=0&&n<=3)?{days:n,when:new Date(Number(e.at)).toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'})}:null;
+}
+// ── THE TWO AI READS DISAGREE (the user, 6 Nov 2026) ──────────────────────────
+// Pullback analysis says buy the dip / avoid / wait; the outlook says buy /
+// watch / avoid. When they point different ways, a note between the two cards.
+function aiSideOfPullback(text){
+  var t=String(text||''),best=-1,side=null;
+  [['TEMPORARY','buy'],['STRUCTURAL','avoid'],['UNCERTAIN','wait']].forEach(function(p){
+    var i=t.lastIndexOf(p[0]);if(i>best){best=i;side=p[1]}});
+  return side;
+}
+function aiSideOfOutlook(v){
+  v=String(v||'').toUpperCase();
+  if(v==='BUY'||v==='STRONG BUY')return 'buy';
+  if(v==='AVOID'||v==='STRONG AVOID'||v==='SELL'||v==='REDUCE')return 'avoid';
+  if(v==='HOLD'||v==='WATCH')return 'wait';
+  return null;
+}
+function aiDisagreeHtml(sym){
+  var c=AI_CACHE[sym]||{},a=c.pbSide,b=c.olSide;
+  if(!a||!b||a===b)return '';
+  var w={buy:'buy',avoid:'avoid',wait:'wait'};
+  return '<div style="margin-top:8px;padding:6px 9px;border:1px dashed #a16207;border-radius:7px;background:#fef9c3;color:#a16207;font-size:10px;line-height:1.45">'+
+    '⚖ <b>The two AI reads disagree</b>: pullback says <b>'+w[a]+'</b>, outlook says <b>'+w[b]+'</b>. Same few headlines, different question — treat neither as settled.</div>';
+}
+function aiDisagreePaint(){
+  var el=document.getElementById('ai-disagree');if(el&&DETAIL_STOCK)el.innerHTML=aiDisagreeHtml(DETAIL_STOCK.symbol);
+}
 (function(){for(var sec in SECTOR_MAP_DATA){if(SECTOR_MAP_DATA.hasOwnProperty(sec)){SECTOR_MAP_DATA[sec].forEach(function(sym){SECTOR_MAP[sym]=sec});}}})();
 // ── SPACE state (IN ↔ US) ──────────────────────────────────────────────────
 // Persisted via Kotlin bridge so the user lands back where they left.
@@ -1819,11 +1899,17 @@ function rvGateOrRun(on,kind,args,sym,now,dupOk,aiOk){
   // order can wait up to two trading hours out of sight, and a second tap in that
   // time placed a second order (PYPL, 19 Oct: two €50 buys, both filled).
   var sell=/[Ss]ell|algoTp/.test(kind), sp0=String((args&&args.space)||'').toUpperCase();
-  // AI & CHIPS OVER YOUR LIMIT: said before the buy goes, never blocks it.
-  var aiPct=(!sell&&!aiOk)?aicAfterBuy((args&&(args.yahooSymbol||args.symbol))||sym,sp0,args&&args.cash):null;
-  if(aiPct!=null){
-    uiConfirm('⚠ AI & chips over your limit',
-      '<div style="font-size:11px;line-height:1.6;color:var(--t2)">This buy takes AI & chips to <b>'+aiPct.toFixed(0)+'%</b> of your holdings. Your limit is <b>'+AIC.limit.toFixed(0)+'%</b>.</div>',
+  // BEFORE YOUR BUY GOES (never blocks it): AI & chips over your limit, and
+  // results within three days — a results day can gap past the stop.
+  var bSym=(args&&(args.yahooSymbol||args.symbol))||sym;
+  var aiPct=(!sell&&!aiOk)?aicAfterBuy(bSym,sp0,args&&args.cash):null;
+  var ern=(!sell&&!aiOk)?ernNear(bSym,sp0):null;
+  if(aiPct!=null||ern){
+    var lines=[];
+    if(ern)lines.push('📅 Results <b>'+(ern.days===0?'today':ern.days===1?'tomorrow':'in '+ern.days+' days')+'</b> ('+escHtml(ern.when)+'). The price can jump past a stop that day.');
+    if(aiPct!=null)lines.push('This buy takes AI & chips to <b>'+aiPct.toFixed(0)+'%</b> of your holdings. Your limit is <b>'+AIC.limit.toFixed(0)+'%</b>.');
+    uiConfirm(aiPct!=null&&!ern?'⚠ AI & chips over your limit':ern&&aiPct==null?'📅 Results soon':'⚠ Before this buy',
+      '<div style="font-size:11px;line-height:1.6;color:var(--t2)">'+lines.join('<br/><br/>')+'</div>',
       function(ok){ if(ok)rvGateOrRun(on,kind,args,sym,now,dupOk,true); });
     var y=document.getElementById('ui-confirm-yes');if(y)y.textContent='Buy anyway';
     return;
@@ -9892,7 +9978,7 @@ function renderT212PortfolioTable(t212pos){
     var vrdCls=intent==='STRONG EXIT'?'vrd-exit':intent==='BOOK PROFIT'?'vrd-profit':intent==='PROTECT CAPITAL'?'vrd-protect':'vrd-hold';
     var pair=T212_PAIRS.filter(function(x){return x.ticker===p.ticker})[0];
     h+='<tr onclick="showT212Detail('+idx+')" style="cursor:pointer">';
-    h+='<td'+aicTd(p.yahooSymbol||p.symbol,p.industry)+'><div class="sn"><span class="sns">'+(p.ticker||p.symbol||'—')+'</span>'+aicChip(p.yahooSymbol||p.symbol,p.industry);
+    h+='<td'+aicTd(p.yahooSymbol||p.symbol,p.industry)+'><div class="sn"><span class="sns">'+(p.ticker||p.symbol||'—')+'</span>'+aicChip(p.yahooSymbol||p.symbol,p.industry)+ernChip(p.yahooSymbol||p.symbol);
     // Same stack as the other two tables. This one used to run its chips inline
     // beside the ticker, so a holding with three of them set the column width for
     // every holding that had none.
@@ -10246,7 +10332,7 @@ function renderUnifiedPortfolioTable(rows,opts){
       h+='<tr data-search="'+escHtml(rowSearchText(r.symbol,r.sub,r.name))+'" onclick="'+r.detailCall+'" style="cursor:pointer">';
       // A long company name gets a smaller size rather than being cut off; always bold.
       var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
-      h+='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+algoHeldDot(r)+untrackedDot(r);
+      h+='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+algoHeldDot(r)+untrackedDot(r);
       var notes='';
       notes+=portfolioWarningBadges(r);
       if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
@@ -11703,7 +11789,7 @@ function manualCandRow(w,c,last){
   // important control on the panel, gone, with no error to explain it.
   var row='<div style="display:flex;gap:4px;align-items:center;font-size:10px">'+
     '<span style="flex:0 0 20px;color:var(--t3);font-size:9px">#'+c.rank+'</span>'+
-    '<span style="flex:0 0 52px;color:var(--t1);font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden">'+escHtml(c.symbol)+aicChip(c.symbol,c.industry)+
+    '<span style="flex:0 0 52px;color:var(--t1);font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden">'+escHtml(c.symbol)+aicChip(c.symbol,c.industry)+ernChip(c.symbol)+
       // A pin explains an otherwise puzzling row: a name with a flat or negative
       // slope sitting on a list the gate is supposed to keep clear. Tap to remove.
       (c.pinned?'<span onclick="watchUnpinPrompt(\''+escHtml(c.symbol)+'\',event)" title="You added this one by hand — it skips the momentum ranking. Tap to remove it." style="margin-left:2px;cursor:pointer;color:var(--pu)">📌</span>':'')+
@@ -11954,7 +12040,7 @@ function manualEntryLine(w,e,last){
   var net=(pct==null)?null:Number(pct)-mwCostPct(w,e);
   var col=net==null?'var(--t3)':(net>=0?'var(--gn)':'var(--rd)');
   var tag=e.forced?' <span style="font-size:7px;color:#b45309">F</span>':'';
-  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+tag+'<br/><span style="font-size:8px;color:var(--t3)">'+
+  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+ernChip(e.symbol)+tag+'<br/><span style="font-size:8px;color:var(--t3)">'+
     (q>0?mwQty(q)+' sh':escHtml(String(e.status||'').toLowerCase()))+(days?' · '+days:'')+'</span></span>';
   var c2='<span>'+(en>0?mwFmtPx(en):'—')+'<br/><span style="font-size:8px;color:var(--t3)">'+mwDay(t0)+'</span></span>';
   var c3,c4;
@@ -11994,7 +12080,7 @@ function heldOnlyLine(w,e,last){
         'title="Move to watcher: target + exits managed" style="cursor:pointer;display:inline-block;min-width:16px;text-align:center;'+
         'font-size:11px;font-weight:900;line-height:15px;color:var(--bl);border:1px solid rgba(37,99,235,.45);border-radius:4px;padding:0 3px">+</span>'
     : '';
-  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+plus+'<br/><span style="font-size:8px;color:var(--t3)">'+mwQty(q)+' sh · '+escHtml(who)+'</span></span>';
+  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+ernChip(e.symbol)+plus+'<br/><span style="font-size:8px;color:var(--t3)">'+mwQty(q)+' sh · '+escHtml(who)+'</span></span>';
   var c2='<span>'+(c>0?mwFmtPx(c):'—')+'<br/><span style="font-size:8px;color:var(--t3)">avg</span></span>';
   var c3='<span>'+(p>0?mwFmtPx(p):'—')+'</span>';
   var c4='<span style="text-align:right"><b style="color:'+col+'">'+(pct==null?'—':(Number(pct)>=0?'+':'')+Number(pct).toFixed(2)+'%')+'</b><br/>'+
@@ -19158,7 +19244,7 @@ function renderPortfolio(){
     h+='<tr onclick="showPortfolioDetail(\''+hd.symbol+'\')" style="cursor:pointer">';
 
     // Col 1: Stock — symbol + exchange + day% subtitle + MACD-flip badge if fired today
-    h+='<td'+aicTd(hd.symbol,hd.industry,'IN')+'><div class="sn"><span class="sns">'+hd.symbol+'</span>'+aicChip(hd.symbol,hd.industry,'IN');
+    h+='<td'+aicTd(hd.symbol,hd.industry,'IN')+'><div class="sn"><span class="sns">'+hd.symbol+'</span>'+aicChip(hd.symbol,hd.industry,'IN')+ernChip(hd.symbol,'IN');
     if(hd.macdFlipFiredToday){
       // 🚨 indicator — DPM watchdog confirmed sell at 15:20 today.
       // Sniper GTT was set (if autoCreateGtt) and the BOOK_PROFIT alert is suppressed.
@@ -20298,6 +20384,7 @@ function showDetail(idx,focus){
   hh+='<span style="font-size:16px;font-weight:800">'+escHtml(detailName)+'</span>';
   if(detailSub)hh+='<span style="font-size:10px;color:var(--t3);font-family:monospace">'+escHtml(detailSub)+'</span>';
   hh+=aicToggleHtml(s.yahooSymbol||s.symbol,s.industry,s._t212?'':(s.space||SPACE));
+  hh+=ernChip(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE),true);
   hh+='</div>';
   hh+='<div id="dt-px" data-cur="'+escHtml(cur)+'" style="margin-top:4px">'+detailPxHtml(s,cur)+'</div>';
   // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a
@@ -20705,6 +20792,8 @@ function showDetail(idx,focus){
     b+='</div>';
   }
 
+  // THE TWO AI READS DISAGREE — filled when both have answered.
+  if(hasAi)b+='<div id="ai-disagree">'+aiDisagreeHtml(s.symbol)+'</div>';
   // Manual outlook button (always visible if AI configured)
   if(hasAi){
     var cachedOL=AI_CACHE[s.symbol]&&AI_CACHE[s.symbol].outlook;
@@ -20809,7 +20898,8 @@ window.onPullbackResult=function(text){
     formatted=formatted.replace(/UNCERTAIN/g,'<span style="background:#fef9c3;color:#a16207;padding:1px 6px;border-radius:3px;font-weight:700;font-size:10px">UNCERTAIN \u2014 wait</span>');
     var html='<div style="white-space:pre-wrap">'+formatted+'</div>';
     el.innerHTML=html;
-    if(DETAIL_STOCK){if(!AI_CACHE[DETAIL_STOCK.symbol])AI_CACHE[DETAIL_STOCK.symbol]={};AI_CACHE[DETAIL_STOCK.symbol].pullback=html;}
+    if(DETAIL_STOCK){if(!AI_CACHE[DETAIL_STOCK.symbol])AI_CACHE[DETAIL_STOCK.symbol]={};AI_CACHE[DETAIL_STOCK.symbol].pullback=html;
+      AI_CACHE[DETAIL_STOCK.symbol].pbSide=aiSideOfPullback(text);aiDisagreePaint();}
     // Show follow-up chat input after analysis completes
     var chatBox=document.getElementById('ai-followup-chat');
     if(chatBox)chatBox.style.display='block';
@@ -20969,12 +21059,13 @@ window.onOutlookResult=function(text){
   }
   var html=renderOutlook(o);
   var sym=o.symbol||(DETAIL_STOCK&&DETAIL_STOCK.symbol);
-  if(sym){if(!AI_CACHE[sym])AI_CACHE[sym]={};AI_CACHE[sym].outlook=html;AI_CACHE[sym].outlookText=outlookPlain(o);}
+  if(sym){if(!AI_CACHE[sym])AI_CACHE[sym]={};AI_CACHE[sym].outlook=html;AI_CACHE[sym].outlookText=outlookPlain(o);AI_CACHE[sym].olSide=aiSideOfOutlook(o.verdict);}
   // An answer for a stock that is no longer open is kept for when it is reopened,
   // not written into the card now showing.
   if(DETAIL_STOCK&&o.symbol&&o.symbol!==DETAIL_STOCK.symbol)return;
   if(btn)btn.innerHTML='\u2705 Refresh Stock Outlook';
   if(el)el.innerHTML=html;
+  aiDisagreePaint();
 };
 
 function closeDetail(){document.getElementById('modal').classList.remove('show')}

@@ -1247,6 +1247,54 @@ object YahooFinanceClient {
         }
     }
 
+    /** The next results day. [ok] false: Yahoo could not be asked (retry later);
+     *  [atMs] 0: asked, and no date is known. [estimate]: Yahoo's own guess. */
+    data class EarningsAnswer(val ok: Boolean, val atMs: Long = 0L, val estimate: Boolean = false)
+
+    /**
+     * EARNINGS DATES (the user, 6 Nov 2026): when the company next reports, from
+     * Yahoo's calendar. A swing trade held over a results day can gap straight
+     * past its stop. Only the earliest date not more than a day gone is kept.
+     */
+    fun fetchEarningsDate(yahooSymbol: String): EarningsAnswer = try {
+        val crumb = fetchCrumb()
+        if (crumb == null) EarningsAnswer(false)
+        else {
+            val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
+                .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
+                .addQueryParameter("modules", "calendarEvents")
+                .addQueryParameter("crumb", crumb).build()
+            val req = Request.Builder().url(url)
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+                .addHeader("Accept", "application/json").build()
+            client.newCall(req).execute().use { resp ->
+                when (resp.code) {
+                    200 -> parseEarningsDate(resp.body?.string().orEmpty(), System.currentTimeMillis())
+                    404 -> EarningsAnswer(true)
+                    401, 403 -> { cachedCrumb = null; EarningsAnswer(false) }
+                    else -> EarningsAnswer(false)
+                }
+            }
+        }
+    } catch (e: Exception) { Log.w(TAG, "earnings date failed for $yahooSymbol: ${e.message}"); EarningsAnswer(false) }
+
+    /** Pure: the next results day out of a calendarEvents reply. */
+    fun parseEarningsDate(body: String, nowMs: Long): EarningsAnswer = try {
+        val res = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
+        val earn = res?.optJSONObject("calendarEvents")?.optJSONObject("earnings")
+        val arr = earn?.optJSONArray("earningsDate")
+        var best = 0L
+        for (i in 0 until (arr?.length() ?: 0)) {
+            val v = arr!!.opt(i)
+            val sec = when (v) { is JSONObject -> v.optLong("raw", 0L); is Number -> v.toLong(); else -> 0L }
+            val ms = sec * 1000L
+            if (ms > 0L && ms >= nowMs - 86_400_000L && (best == 0L || ms < best)) best = ms
+        }
+        val est = earn?.opt("isEarningsDateEstimate").let {
+            when (it) { is Boolean -> it; is JSONObject -> it.optBoolean("raw", false); else -> false } }
+        EarningsAnswer(true, best, est)
+    } catch (e: Exception) { EarningsAnswer(true) }
+
     private fun parseFundamentals(body: String, symbol: String): FundamentalResult {
         return try {
             val json = JSONObject(body)

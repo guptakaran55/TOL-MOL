@@ -2013,6 +2013,9 @@ class MainActivity : AppCompatActivity() {
                             gson.toJson(com.signalscope.app.trading.AiChips.config(applicationContext)) }
                         "aiChipsLimit" -> { com.signalscope.app.trading.AiChips.setLimit(applicationContext, a[0].asDouble)
                             gson.toJson(com.signalscope.app.trading.AiChips.config(applicationContext)) }
+                        // EARNINGS DATES for the keys on screen (network: Yahoo, paced).
+                        "earningsDates" -> gson.toJson(com.signalscope.app.trading.EarningsDates
+                            .forKeys(applicationContext, a.map { it.asString }))
                         "aiChipsLearn" -> { com.signalscope.app.trading.AiChips.learn(applicationContext, a.map { it.asString }); "{}" }
                         "t212SoleOwner" -> gson.toJson(com.signalscope.app.trading.T212WeekTargets
                             .soleOwner(applicationContext, a[0].asString, a[1].asDouble) ?: mapOf("ns" to ""))
