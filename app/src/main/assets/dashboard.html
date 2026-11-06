@@ -11795,7 +11795,10 @@ function heldOnlyLine(w,e,last){
   var cur=w.currency||'', q=Number(e.qty||0), c=Number(e.avgCost||0), p=Number(e.price||0), pct=e.pct;
   var mgd=Number(e.managedQty||0), mine=q-mgd;
   var col=pct==null?'var(--t3)':(Number(pct)>=0?'var(--gn)':'var(--rd)');
-  var who=mgd>0?((mine<=q*0.01)?'algo':mwQty(mgd)+' algo'):'yours';
+  // THE OWNER BY NAME (the user, 6 Nov 2026: "Macd swing", not "algo").
+  var owners=(e.managedBy||[]).filter(function(x){return x}).map(function(n){n=String(n);return n.length>14?n.slice(0,13)+'…':n});
+  var algoNm=owners.length?owners.join(' + '):'algo';
+  var who=mgd>0?((mine<=q*0.01)?algoNm:mwQty(mgd)+' '+algoNm):'yours';
   // THE "+" STAYS ON THE LINE (the user, 3 Nov 2026: folding the card hid it).
   // Hands the holding to the watcher for its target and exits. Not on one an
   // algo owns whole — two managers on one holding is what the card guards against.
