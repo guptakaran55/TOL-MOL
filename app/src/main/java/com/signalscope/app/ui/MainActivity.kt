@@ -2006,6 +2006,14 @@ class MainActivity : AppCompatActivity() {
                                 com.signalscope.app.trading.ZerodhaLiveMirror.setTargetLeg(applicationContext, ns, pid, px)
                             else com.signalscope.app.trading.T212WeekTargets.setManual(applicationContext, ns, pid, px))))
                         }
+                        // AI & CHIPS: the share across both brokers (network: rates),
+                        // your mark on one stock, the warning limit, chip stocks seen.
+                        "aiChipsExposure" -> gson.toJson(com.signalscope.app.trading.AiChips.exposure(applicationContext))
+                        "aiChipsMark" -> { com.signalscope.app.trading.AiChips.mark(applicationContext, a[0].asString, a[1].asString)
+                            gson.toJson(com.signalscope.app.trading.AiChips.config(applicationContext)) }
+                        "aiChipsLimit" -> { com.signalscope.app.trading.AiChips.setLimit(applicationContext, a[0].asDouble)
+                            gson.toJson(com.signalscope.app.trading.AiChips.config(applicationContext)) }
+                        "aiChipsLearn" -> { com.signalscope.app.trading.AiChips.learn(applicationContext, a.map { it.asString }); "{}" }
                         "t212SoleOwner" -> gson.toJson(com.signalscope.app.trading.T212WeekTargets
                             .soleOwner(applicationContext, a[0].asString, a[1].asDouble) ?: mapOf("ns" to ""))
                         "dailyMacd" -> dailyMacdJson(a[0].asString, a[1].asString)
@@ -7329,6 +7337,12 @@ class MainActivity : AppCompatActivity() {
          * second tap can say one is already there (PYPL, 19 Oct: €50 at 16:19 was
          * still waiting when a second €50 went in at 17:47, and both bought). No network.
          */
+        /** AI & CHIPS: the list, your marks and the limit — read once when the page loads. */
+        @JavascriptInterface
+        fun aiChipsConfig(): String = try {
+            gson.toJson(com.signalscope.app.trading.AiChips.config(applicationContext))
+        } catch (e: Exception) { "{}" }
+
         @JavascriptInterface
         fun rvManualSame(space: String, symbol: String, sell: Boolean): String = try {
             val sym = symbol.trim().uppercase().removeSuffix(".DE").removeSuffix(".NS")

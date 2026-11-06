@@ -30,7 +30,7 @@ th{padding:4px 2px;text-align:left;font-size:8px;font-weight:700;text-transform:
 td{padding:3px 2px;border-bottom:1px solid var(--bd);white-space:nowrap;font-family:monospace;font-size:11px}
 tr:active{background:var(--cdh)}
 .held-u{text-decoration:underline;text-decoration-color:var(--gn);text-decoration-thickness:2px;text-underline-offset:3px}
-.sn{font-family:-apple-system,sans-serif;line-height:1.12}.sns{font-weight:700;font-size:11px;color:var(--t1)}.snn{font-size:8px;color:var(--t3)}
+.aic{display:inline-block;font-size:7px;font-weight:900;line-height:10px;color:#b45309;border:1px solid #d97706;background:rgba(217,119,6,.12);border-radius:3px;padding:0 2px;margin-left:3px;vertical-align:middle;font-family:-apple-system,sans-serif}.aicrow{box-shadow:inset 3px 0 0 #d97706}.sn{font-family:-apple-system,sans-serif;line-height:1.12}.sns{font-weight:700;font-size:11px;color:var(--t1)}.snn{font-size:8px;color:var(--t3)}
 .snnotes{display:flex;flex-direction:column;align-items:flex-start;gap:1px;margin-top:1px;max-width:54px;white-space:normal;line-height:1}
 /* Roomier variant, for the two tables whose chips were 7px before they were
    stacked. Once they sit one per line the column is set by the WIDEST SINGLE
@@ -423,6 +423,129 @@ function sectorRule(name){var r=SECTOR_RULES[SPACE];return r&&r[name]}
 function inSector(row,name){
   if(SPACE==='IN')return SECTOR_MAP[(row.symbol||'').replace('.NS','')]===name;
   var r=sectorRule(name);return !!r&&r(String(row.sector||''),String(row.industry||''));
+}
+// ── AI & CHIPS (the user, 6 Nov 2026) ─────────────────────────────────────────
+// Every AI and chip stock carries the same amber "AI" chip in every space, and
+// Portfolio shows their share of all holdings — Trading 212 and Zerodha added up.
+// A limit you set WARNS on your buys and on the algos' buy alerts; it never blocks.
+// Which stocks count: your mark on the stock page, else the app's list, else a
+// Yahoo industry starting "Semiconductor" (see AiChips.kt — the same rule).
+var AIC={loaded:false,list:{},on:{},off:{},learned:{},limit:0,exp:null,expAt:0,busy:false,push:[],pushT:0};
+function aicLoad(){
+  if(AIC.loaded)return;AIC.loaded=true;
+  var j={};try{if(typeof Android!=='undefined'&&Android.aiChipsConfig)j=JSON.parse(Android.aiChipsConfig()||'{}')}catch(e){}
+  aicApply(j);
+}
+function aicApply(j){
+  if(!j)return;
+  function set(a){var o={};(a||[]).forEach(function(k){o[String(k)]=1});return o}
+  if(j.builtIn)AIC.list=set(j.builtIn);
+  if(j.on)AIC.on=set(j.on);if(j.off)AIC.off=set(j.off);
+  if(j.learned){var l=set(j.learned);for(var k in AIC.learned)l[k]=1;AIC.learned=l}
+  if(j.limit!=null)AIC.limit=Number(j.limit)||0;
+}
+function aicKey(sym,sp){
+  var s=String(sym||'').toUpperCase().trim(),d=s.lastIndexOf('.');
+  if(d>0){var b=s.slice(0,d),x=s.slice(d+1);return (x==='NS'||x==='BO')?'IN:'+b:(x==='DE'||x==='F')?'DE:'+b:'XX:'+s}
+  sp=String(sp||SPACE).toUpperCase();return (sp==='IN'?'IN':sp==='DE'?'DE':'US')+':'+s;
+}
+function aicSemis(ind){return /^\s*semiconductor/i.test(String(ind||''))}
+function aicBase(k,ind){
+  if(aicSemis(ind)&&!AIC.learned[k]){AIC.learned[k]=1;AIC.push.push(k);
+    if(!AIC.pushT)AIC.pushT=setTimeout(function(){var p=AIC.push;AIC.push=[];AIC.pushT=0;if(p.length)androidAsync('aiChipsLearn',p,function(){})},4000)}
+  return !!(AIC.list[k]||AIC.learned[k]);
+}
+function aicIs(sym,ind,sp){
+  if(!sym)return false;aicLoad();
+  var k=aicKey(sym,sp);
+  if(AIC.on[k])return true;if(AIC.off[k])return false;
+  return aicBase(k,ind);
+}
+function aicChip(sym,ind,sp){
+  return aicIs(sym,ind,sp)?'<span class="aic" title="AI &amp; chips">AI</span>':'';
+}
+function aicTd(sym,ind,sp){return aicIs(sym,ind,sp)?' class="aicrow"':''}
+// ON THE STOCK PAGE: tap to count it in or out — your mark beats the list.
+function aicToggleHtml(sym,ind,sp){
+  var on=aicIs(sym,ind,sp);
+  return '<span id="aic-tg" onclick="aicToggle(\''+escHtml(String(sym))+'\',\''+escHtml(String(ind||''))+'\',\''+escHtml(String(sp||SPACE))+'\')" '+
+    'title="'+(on?'Counted in AI &amp; chips — tap to leave it out':'Tap to count it in AI &amp; chips')+'" '+
+    'style="cursor:pointer;font-size:9px;font-weight:800;padding:1px 6px;border-radius:4px;'+
+    (on?'color:#b45309;border:1px solid #d97706;background:rgba(217,119,6,.12)">AI &amp; chips ✓':'color:var(--t3);border:1px dashed var(--bd)">+ AI &amp; chips')+'</span>';
+}
+function aicToggle(sym,ind,sp){
+  var k=aicKey(sym,sp),now=aicIs(sym,ind,sp),want=!now,dflt=aicBase(k,ind);
+  var mode=(want===dflt)?'auto':(want?'on':'off');
+  delete AIC.on[k];delete AIC.off[k];if(mode==='on')AIC.on[k]=1;if(mode==='off')AIC.off[k]=1;
+  var el=document.getElementById('aic-tg');if(el)el.outerHTML=aicToggleHtml(sym,ind,sp);
+  AIC.expAt=0;
+  androidAsync('aiChipsMark',[k,mode],function(raw){try{aicApply(JSON.parse(raw||'{}'))}catch(e){}});
+}
+function aicFmt(v){v=Number(v||0);return v>=10000?Math.round(v/1000)+'k':v>=1000?(v/1000).toFixed(1)+'k':v.toFixed(0)}
+function aicCurSym(c){return c==='EUR'?'€':c==='USD'?'$':c==='GBP'?'£':c==='INR'?'₹':(c||'')+' '}
+function aicRefresh(force){
+  if(AIC.busy||typeof Android==='undefined')return;
+  if(!force&&AIC.exp&&Date.now()-AIC.expAt<20000)return;
+  AIC.busy=true;
+  androidAsync('aiChipsExposure',[],function(raw){
+    AIC.busy=false;AIC.expAt=Date.now();
+    try{var j=JSON.parse(raw||'{}');if(j&&j.ok){AIC.exp=j;if(j.limit!=null)AIC.limit=Number(j.limit)||0}}catch(e){}
+    var el=document.getElementById('aic-line');if(el)el.outerHTML=aicLine(true);
+  });
+}
+// THE LINE ON PORTFOLIO, every space: the share now, and your limit.
+function aicLine(noFetch){
+  aicLoad();if(!noFetch)aicRefresh(false);
+  var e=AIC.exp,lim=AIC.limit;
+  if(!e)return '<div id="aic-line" style="margin:4px 8px;font-size:10px;color:var(--t3)"><span class="aic">AI</span> AI &amp; chips …</div>';
+  var pct=Number(e.pct||0),over=lim>0&&pct>lim;
+  return '<div id="aic-line" onclick="aicSheet()" style="cursor:pointer;margin:4px 8px;padding:5px 9px;border-radius:7px;font-size:10px;display:flex;gap:6px;align-items:center;'+
+    (over?'background:rgba(217,119,6,.14);border:1px solid #d97706;color:#b45309':'border:1px solid var(--bd);color:var(--t2)')+'">'+
+    '<span class="aic">AI</span><b>AI &amp; chips '+pct.toFixed(0)+'%</b>'+
+    '<span style="color:var(--t3)">of holdings · '+aicCurSym(e.cur)+aicFmt(e.ai)+'</span>'+
+    '<span style="flex:1"></span>'+
+    (lim>0?(over?'<b>over your '+lim.toFixed(0)+'%</b>':'<span>limit '+lim.toFixed(0)+'%</span>'):'<span style="color:var(--bl)">set limit</span>')+
+    '<span style="color:var(--t3)">ⓘ</span></div>';
+}
+function aicSheet(){
+  var e=AIC.exp||{rows:[]},cs=aicCurSym(e.cur),tot=Number(e.total||0);
+  var age=function(ms){ms=Number(ms||0);return ms>0?new Date(ms).toLocaleDateString([], {day:'numeric',month:'short'}):'never'};
+  var b='<div style="font-size:11px;line-height:1.5">';
+  b+='<div style="max-height:40vh;overflow-y:auto;margin-bottom:8px">';
+  (e.rows||[]).forEach(function(r){
+    b+='<div style="display:flex;gap:6px;padding:2px 0;border-bottom:1px dashed var(--bd)"><b style="min-width:70px">'+escHtml(String(r.symbol||''))+'</b>'+
+      '<span style="flex:1;color:var(--t3);overflow:hidden;white-space:nowrap;text-overflow:ellipsis">'+escHtml(String(r.name||''))+'</span>'+
+      '<span>'+cs+aicFmt(r.value)+'</span><span style="min-width:34px;text-align:right;color:var(--t3)">'+(tot>0?(r.value/tot*100).toFixed(1):'0')+'%</span></div>';
+  });
+  if(!(e.rows||[]).length)b+='<div style="color:var(--t3)">None held.</div>';
+  b+='</div>';
+  b+='<div style="display:flex;gap:6px;align-items:center">Warn above <input id="aic-lim" type="number" inputmode="decimal" min="0" max="100" value="'+(AIC.limit>0?AIC.limit:'')+'" placeholder="off" '+
+    'style="width:60px;padding:4px 6px;border:1px solid var(--bd);border-radius:6px;background:var(--bg2);color:var(--t1)"/> %</div>';
+  b+='<div style="font-size:9px;color:var(--t3);margin-top:6px">Warns on buys, never blocks. Chips by industry, AI by the app\'s list; change one on its stock page.<br/>'+
+    'Trading 212 as of '+age(e.t212At)+' · Zerodha as of '+age(e.inAt)+
+    ((e.missing||[]).length?' · no rate for '+escHtml(e.missing.join(', '))+' (left out)':'')+'</div></div>';
+  uiConfirm('AI & chips · '+Number(e.pct||0).toFixed(1)+'%',b,function(ok){
+    if(!ok)return;
+    var el=document.getElementById('aic-lim'),v=el?Number(el.value||0):0;
+    if(!(v>0&&v<=100))v=0;
+    AIC.limit=v;
+    var ln=document.getElementById('aic-line');if(ln)ln.outerHTML=aicLine(true);
+    androidAsync('aiChipsLimit',[v],function(raw){try{aicApply(JSON.parse(raw||'{}'))}catch(e){}});
+  });
+  var yes=document.getElementById('ui-confirm-yes');if(yes)yes.textContent='Save';
+}
+// YOUR BUY, BEFORE IT GOES: where it would leave AI & chips, when over the limit.
+// [cash] in the market's money: euros/dollars at Trading 212 (taken as the
+// account's), rupees in India. Null: not AI, no limit, or no total yet.
+function aicAfterBuy(sym,sp,cash){
+  aicLoad();
+  var e=AIC.exp,lim=AIC.limit;
+  if(!(lim>0)||!e||!aicIs(sym,'',sp))return null;
+  var v=Number(cash||0);
+  if(String(sp).toUpperCase()==='IN'){var r=Number((e.fx||{}).INR||0);v=r>0?v/r:0}
+  var t=Number(e.total||0)+v;if(!(t>0))return null;
+  var pct=(Number(e.ai||0)+v)/t*100;
+  return pct>lim?pct:null;
 }
 (function(){for(var sec in SECTOR_MAP_DATA){if(SECTOR_MAP_DATA.hasOwnProperty(sec)){SECTOR_MAP_DATA[sec].forEach(function(sym){SECTOR_MAP[sym]=sec});}}})();
 // ── SPACE state (IN ↔ US) ──────────────────────────────────────────────────
@@ -1691,11 +1814,20 @@ function rvGateChecked(id,dontRemember){
 }
 // Run [now] straight away, or hand the order to the RV gate. [now] receives the
 // gate's reason when the gate says "go".
-function rvGateOrRun(on,kind,args,sym,now,dupOk){
+function rvGateOrRun(on,kind,args,sym,now,dupOk,aiOk){
   // ONE WAITING ORDER PER STOCK AND SIDE, unless you say otherwise. A patient
   // order can wait up to two trading hours out of sight, and a second tap in that
   // time placed a second order (PYPL, 19 Oct: two €50 buys, both filled).
   var sell=/[Ss]ell|algoTp/.test(kind), sp0=String((args&&args.space)||'').toUpperCase();
+  // AI & CHIPS OVER YOUR LIMIT: said before the buy goes, never blocks it.
+  var aiPct=(!sell&&!aiOk)?aicAfterBuy((args&&(args.yahooSymbol||args.symbol))||sym,sp0,args&&args.cash):null;
+  if(aiPct!=null){
+    uiConfirm('⚠ AI & chips over your limit',
+      '<div style="font-size:11px;line-height:1.6;color:var(--t2)">This buy takes AI & chips to <b>'+aiPct.toFixed(0)+'%</b> of your holdings. Your limit is <b>'+AIC.limit.toFixed(0)+'%</b>.</div>',
+      function(ok){ if(ok)rvGateOrRun(on,kind,args,sym,now,dupOk,true); });
+    var y=document.getElementById('ui-confirm-yes');if(y)y.textContent='Buy anyway';
+    return;
+  }
   if(!dupOk&&typeof Android!=='undefined'&&Android.rvManualSame&&kind!=='algoTp'){
     var same=[];try{same=(JSON.parse(Android.rvManualSame(sp0,String(sym||''),sell)||'{}').rows)||[]}catch(e){}
     if(same.length){
@@ -1706,7 +1838,7 @@ function rvGateOrRun(on,kind,args,sym,now,dupOk){
         ' placed at <b>'+at(o.since)+'</b> is '+(o.status==='ASK'?'waiting for your answer — it ran over its price limit':
           ('still waiting for the RV gate and starts by <b>'+at(o.startsBy)+'</b> at the latest'))+'.<br/><br/>'+
         'Continuing places a <b>second</b> order on top of it. To change the first instead, call it off in <b>Waiting orders</b>.</div>',
-        function(ok){ if(ok)rvGateOrRun(on,kind,args,sym,now,true); });
+        function(ok){ if(ok)rvGateOrRun(on,kind,args,sym,now,true,true); });
       return;
     }
   }
@@ -6826,7 +6958,7 @@ function render(){
       var subLine=s.avgVol20?fmtV(s.avgVol20)+'/d':'';
       h+='<tr data-search="'+escHtml(rowSearchText(s.symbol,s.name,s.sector,s.industry))+'" onclick="showDetail('+i+')">';
       // Stock (symbol + volume)
-      h+='<td><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>';
+      h+='<td'+aicTd(s.symbol,s.industry)+'><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>'+aicChip(s.symbol,s.industry);
       if(subLine)h+='<br/><span class="snn">'+escHtml(subLine)+'</span>';
       // The squeeze sits with the name, not out in the indicator columns. It is a
       // statement about the stock's character right now — quiet, or just done
@@ -9760,7 +9892,7 @@ function renderT212PortfolioTable(t212pos){
     var vrdCls=intent==='STRONG EXIT'?'vrd-exit':intent==='BOOK PROFIT'?'vrd-profit':intent==='PROTECT CAPITAL'?'vrd-protect':'vrd-hold';
     var pair=T212_PAIRS.filter(function(x){return x.ticker===p.ticker})[0];
     h+='<tr onclick="showT212Detail('+idx+')" style="cursor:pointer">';
-    h+='<td><div class="sn"><span class="sns">'+(p.ticker||p.symbol||'—')+'</span>';
+    h+='<td'+aicTd(p.yahooSymbol||p.symbol,p.industry)+'><div class="sn"><span class="sns">'+(p.ticker||p.symbol||'—')+'</span>'+aicChip(p.yahooSymbol||p.symbol,p.industry);
     // Same stack as the other two tables. This one used to run its chips inline
     // beside the ticker, so a holding with three of them set the column width for
     // every holding that had none.
@@ -10114,7 +10246,7 @@ function renderUnifiedPortfolioTable(rows,opts){
       h+='<tr data-search="'+escHtml(rowSearchText(r.symbol,r.sub,r.name))+'" onclick="'+r.detailCall+'" style="cursor:pointer">';
       // A long company name gets a smaller size rather than being cut off; always bold.
       var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
-      h+='<td><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+algoHeldDot(r)+untrackedDot(r);
+      h+='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+algoHeldDot(r)+untrackedDot(r);
       var notes='';
       notes+=portfolioWarningBadges(r);
       if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
@@ -11571,7 +11703,7 @@ function manualCandRow(w,c,last){
   // important control on the panel, gone, with no error to explain it.
   var row='<div style="display:flex;gap:4px;align-items:center;font-size:10px">'+
     '<span style="flex:0 0 20px;color:var(--t3);font-size:9px">#'+c.rank+'</span>'+
-    '<span style="flex:0 0 52px;color:var(--t1);font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden">'+escHtml(c.symbol)+
+    '<span style="flex:0 0 52px;color:var(--t1);font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden">'+escHtml(c.symbol)+aicChip(c.symbol,c.industry)+
       // A pin explains an otherwise puzzling row: a name with a flat or negative
       // slope sitting on a list the gate is supposed to keep clear. Tap to remove.
       (c.pinned?'<span onclick="watchUnpinPrompt(\''+escHtml(c.symbol)+'\',event)" title="You added this one by hand — it skips the momentum ranking. Tap to remove it." style="margin-left:2px;cursor:pointer;color:var(--pu)">📌</span>':'')+
@@ -11822,7 +11954,7 @@ function manualEntryLine(w,e,last){
   var net=(pct==null)?null:Number(pct)-mwCostPct(w,e);
   var col=net==null?'var(--t3)':(net>=0?'var(--gn)':'var(--rd)');
   var tag=e.forced?' <span style="font-size:7px;color:#b45309">F</span>':'';
-  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+tag+'<br/><span style="font-size:8px;color:var(--t3)">'+
+  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+tag+'<br/><span style="font-size:8px;color:var(--t3)">'+
     (q>0?mwQty(q)+' sh':escHtml(String(e.status||'').toLowerCase()))+(days?' · '+days:'')+'</span></span>';
   var c2='<span>'+(en>0?mwFmtPx(en):'—')+'<br/><span style="font-size:8px;color:var(--t3)">'+mwDay(t0)+'</span></span>';
   var c3,c4;
@@ -11862,7 +11994,7 @@ function heldOnlyLine(w,e,last){
         'title="Move to watcher: target + exits managed" style="cursor:pointer;display:inline-block;min-width:16px;text-align:center;'+
         'font-size:11px;font-weight:900;line-height:15px;color:var(--bl);border:1px solid rgba(37,99,235,.45);border-radius:4px;padding:0 3px">+</span>'
     : '';
-  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+plus+'<br/><span style="font-size:8px;color:var(--t3)">'+mwQty(q)+' sh · '+escHtml(who)+'</span></span>';
+  var c1='<span><b style="color:var(--t1)">'+escHtml(e.symbol)+'</b>'+aicChip(e.symbol)+plus+'<br/><span style="font-size:8px;color:var(--t3)">'+mwQty(q)+' sh · '+escHtml(who)+'</span></span>';
   var c2='<span>'+(c>0?mwFmtPx(c):'—')+'<br/><span style="font-size:8px;color:var(--t3)">avg</span></span>';
   var c3='<span>'+(p>0?mwFmtPx(p):'—')+'</span>';
   var c4='<span style="text-align:right"><b style="color:'+col+'">'+(pct==null?'—':(Number(pct)>=0?'+':'')+Number(pct).toFixed(2)+'%')+'</b><br/>'+
@@ -18705,6 +18837,7 @@ function renderPortfolio(){
   // Auto-fetches on first paint if no snapshot yet. Zerodha data is fully
   // walled off — even with 14 IN holdings live, T212 spaces show ONLY T212.
   h+=renderAnalysisStaleBanner();
+  h+=aicLine();
 
   if(isT212Space()){
     var t212Connected=false;try{t212Connected=Android.isT212Connected()}catch(e){}
@@ -19025,7 +19158,7 @@ function renderPortfolio(){
     h+='<tr onclick="showPortfolioDetail(\''+hd.symbol+'\')" style="cursor:pointer">';
 
     // Col 1: Stock — symbol + exchange + day% subtitle + MACD-flip badge if fired today
-    h+='<td><div class="sn"><span class="sns">'+hd.symbol+'</span>';
+    h+='<td'+aicTd(hd.symbol,hd.industry,'IN')+'><div class="sn"><span class="sns">'+hd.symbol+'</span>'+aicChip(hd.symbol,hd.industry,'IN');
     if(hd.macdFlipFiredToday){
       // 🚨 indicator — DPM watchdog confirmed sell at 15:20 today.
       // Sniper GTT was set (if autoCreateGtt) and the BOOK_PROFIT alert is suppressed.
@@ -19300,7 +19433,7 @@ function renderValue(){
       var primaryName=displayNameFor(s);
       var tickerLine=displayTickerFor(s);
       h+='<tr data-search="'+escHtml(rowSearchText(s.symbol,s.name,s.valueRating,s.sector,s.industry))+'" onclick="showDetail('+i+')">';
-      h+='<td><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>';
+      h+='<td'+aicTd(s.symbol,s.industry)+'><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>'+aicChip(s.symbol,s.industry);
       if(tickerLine)h+='<br/><span class="snn">'+escHtml(tickerLine)+'</span>';
       h+='<br/><span class="sig '+rCls+'">'+s.valueRating+'</span></div></td>';
       h+='<td style="font-weight:700;font-size:12px">'+cur+fmt(s.price)+'</td>';
@@ -20164,6 +20297,7 @@ function showDetail(idx,focus){
   var hh='<div><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">';
   hh+='<span style="font-size:16px;font-weight:800">'+escHtml(detailName)+'</span>';
   if(detailSub)hh+='<span style="font-size:10px;color:var(--t3);font-family:monospace">'+escHtml(detailSub)+'</span>';
+  hh+=aicToggleHtml(s.yahooSymbol||s.symbol,s.industry,s._t212?'':(s.space||SPACE));
   hh+='</div>';
   hh+='<div id="dt-px" data-cur="'+escHtml(cur)+'" style="margin-top:4px">'+detailPxHtml(s,cur)+'</div>';
   // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a

@@ -630,7 +630,8 @@ object LabNotifier {
     fun t212Buy(ctx: Context, ns: String, symbol: String, qty: Double, spent: Double, cur: String) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             "${flagOf(ns)} $symbol bought",
-            whoBought(ctx, ns, ""),
+            // India's callers pass the price a share, the others the cash spent.
+            withAiNote(whoBought(ctx, ns, ""), ctx, ns, symbol, if (cur.equals("INR", true)) qty * spent else spent, cur),
             "t2b-$ns-$symbol-${System.currentTimeMillis() / 60000}", openNs = ns)
 
     /**
@@ -788,6 +789,13 @@ object LabNotifier {
         val body = listOf(who, shortReason(reason)).filter { it.isNotBlank() }.joinToString(" · ") +
             (if (settled) "" else " · result once $broker reports the price")
         return Pair(title, body)
+    }
+
+    /** AI & CHIPS over your limit after this buy: said on the buy's own alert,
+     *  nothing more — it warns, it never stops the algo (see [AiChips]). */
+    private fun withAiNote(body: String, ctx: Context, ns: String, symbol: String, cash: Double, cur: String): String {
+        val note = AiChips.afterBuy(ctx, ns, symbol, cash, cur)
+        return if (note.isBlank()) body else "$body\n$note"
     }
 
     /** The market's flag, for the front of a trade alert. */
@@ -1108,10 +1116,10 @@ object LabNotifier {
     fun zerodhaFoundBought(ctx: Context, ns: String, symbol: String, qty: Int, price: Double, held: Boolean) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             "🇮🇳 $symbol — waiting buy had filled: $qty at ₹${"%.2f".format(price)}",
-            "${algoLabel(ctx, ns)} · the app still had this buy as waiting at Zerodha, but it had filled. " +
+            withAiNote("${algoLabel(ctx, ns)} · the app still had this buy as waiting at Zerodha, but it had filled. " +
                 (if (held) "It is now recorded as held, with the usual stop and target placed at Zerodha, " +
                     "and the strategy sells it as it would any position."
-                 else "The shares have since been sold; that sale is booked on the next check."),
+                 else "The shares have since been sold; that sale is booked on the next check."), ctx, ns, symbol, qty * price, "INR"),
             "zfb-$ns-$symbol-$qty", openNs = ns)
 
     /** A watchlist buy cut off by the app stopping had in fact filled — now recorded and managed. */
@@ -1241,8 +1249,8 @@ object LabNotifier {
                         amount: Double, paperPrice: Double) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             "🇩🇪 $symbol bought — $algo (real)",
-            "${"%.4f".format(qty)} shares for about €${"%.2f".format(amount)}, after the paper buy at " +
-                "€${"%.2f".format(paperPrice)}. Its paper stop, target and time limit sell it here too.",
+            withAiNote("${"%.4f".format(qty)} shares for about €${"%.2f".format(amount)}, after the paper buy at " +
+                "€${"%.2f".format(paperPrice)}. Its paper stop, target and time limit sell it here too.", ctx, ns, symbol, amount, "EUR"),
             "flb-$ns-$symbol-${System.currentTimeMillis() / 60000}", openNs = ns)
 
     fun floorLiveSold(ctx: Context, algo: String, ns: String, symbol: String, qty: Double,
