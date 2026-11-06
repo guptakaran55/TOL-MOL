@@ -47,8 +47,9 @@ import com.signalscope.app.network.YahooFinanceClient
  *
  * Applies to the algos' automatic buys and sales and the watchlist's automatic
  * strategy exits on Trading 212, and to your own patient orders when their box
- * is ticked (it opens ticked on every buy). India is not gated: its exits rest
- * at Zerodha as triggers.
+ * is ticked (it opens ticked on every buy). India's buy buttons too, since
+ * 6 Nov 2026 (Zerodha's live price; the order goes in once released). India's
+ * exits are not gated: they rest at Zerodha as triggers.
  */
 object RvGate {
     private const val TAG = "RvGate"
@@ -185,13 +186,17 @@ object RvGate {
      *  from (several days of them) — for [RvGateAnalysis]'s chart. */
     fun read(config: ConfigManager, ticker: String, symbol: String, base: String,
              barsOut: MutableList<com.signalscope.app.data.CandleData>? = null): Reading {
-        val space = if (base == "de") "DE" else "US"
-        val exch = if (base == "de") "DE" else "NASDAQ"
+        val india = base == "in"
+        val space = when (base) { "de" -> "DE"; "in" -> "IN"; else -> "US" }
+        val exch = when (base) { "de" -> "DE"; "in" -> "NSE"; else -> "NASDAQ" }
         val now = System.currentTimeMillis()
         val openMs = todayOpenMs(base, now)
         val mins = if (openMs > 0L) (now - openMs) / 60_000L else Long.MAX_VALUE
-        val ys = YahooFinanceClient.toYahooSymbol(symbol, space)
-        val live = try { PatientExecutor.currentRefOrNull(config, ticker, ys, space) } catch (_: Exception) { null }
+        // INDIA (6 Nov 2026): Zerodha's live price — there is no Trading 212 quote.
+        val live = if (india) ZerodhaLiveMirror.livePrice(config, symbol.trim().uppercase().removeSuffix(".NS"))
+            else try {
+                PatientExecutor.currentRefOrNull(config, ticker, YahooFinanceClient.toYahooSymbol(symbol, space), space)
+            } catch (_: Exception) { null }
         val atr = try { DailyVolatility.of(symbol, exch)?.atr ?: 0.0 } catch (_: Exception) { 0.0 }
         var high = 0.0; var low = 0.0; var velocity: Double? = null
         try {
@@ -202,7 +207,8 @@ object RvGate {
             // saw today's range or direction, held orders only through the first 20
             // minutes, and then let everything through "not held back blind". Found
             // by its own record on 19 Oct. Five days clears the rule on any morning.
-            val res = YahooFinanceClient.fetchCandles15mRange(symbol.trim(), exch, "5d")
+            val res = YahooFinanceClient.fetchCandles15mRange(
+                if (india) symbol.trim().uppercase().removeSuffix(".NS") else symbol.trim(), exch, "5d")
             val cs = (res as? YahooFinanceClient.CandleResult.Success)?.candles.orEmpty()
             barsOut?.addAll(cs)
             val lag = if (base == "de") FeedDelay.XETRA_SEC else 0L

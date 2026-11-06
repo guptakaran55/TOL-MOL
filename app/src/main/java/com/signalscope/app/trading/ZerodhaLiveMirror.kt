@@ -392,6 +392,15 @@ object ZerodhaLiveMirror {
      * close is NOT an acceptable fallback here — it can be hours old, and this is
      * the number a real order is built around. Stale in, wrong order out.
      */
+    /** India's live price for the RV gate (6 Nov 2026): a tick from the last minute,
+     *  else Zerodha's last traded price. Null when there is none. Network. */
+    fun livePrice(cfg: ConfigManager, sym: String): Double? = try {
+        if (!cfg.isZerodhaConnected) {
+            val mark = MarkToMarket.get(sym.uppercase())
+            mark?.price?.takeIf { it > 0.0 && System.currentTimeMillis() - mark.atMs < 60_000L }
+        } else referencePrice(ZerodhaClient(cfg), sym.uppercase()).takeIf { it > 0.0 }
+    } catch (_: Exception) { null }
+
     private fun referencePrice(client: ZerodhaClient, sym: String): Double {
         val mark = try { MarkToMarket.get(sym) } catch (_: Exception) { null }
         if (mark != null && mark.price > 0.0 &&

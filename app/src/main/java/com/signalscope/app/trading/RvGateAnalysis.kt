@@ -310,7 +310,7 @@ object RvGateAnalysis {
         val t = target(ctx, src, ns, id) ?: return mapOf("ok" to false, "error" to "That order is no longer waiting.")
         val config = ConfigManager(ctx)
         val base = Spaces.baseOf(t.ns)
-        val cur = if (base == "de") "€" else "$"
+        val cur = when (base) { "de" -> "€"; "in" -> "₹"; else -> "$" }
         val now = System.currentTimeMillis()
         val ticker = t.ticker.ifBlank {
             try { com.signalscope.app.network.Trading212Client(config)
@@ -616,7 +616,7 @@ object RvGateAnalysis {
         val now = System.currentTimeMillis()
         val sp = space.uppercase()
         val rows = finished(RvJournal.lines(ctx, now - days * 24L * 3_600_000L), sp, now, liveKeys(ctx, sp))
-        mapOf("ok" to true, "days" to days, "cur" to (if (sp == "DE") "€" else "$"),
+        mapOf("ok" to true, "days" to days, "cur" to (when (sp) { "DE" -> "€"; "IN" -> "₹"; else -> "$" }),
             "rows" to rows.map { mapOf("f" to it, "from" to fromOf(ctx, it)) })
     } catch (e: Exception) { mapOf("ok" to false, "error" to (e.message ?: "record unreadable")) }
 
@@ -632,7 +632,7 @@ object RvGateAnalysis {
             .firstOrNull { it.key == key && it.firstAt == firstAt }
             ?: return mapOf("ok" to false, "error" to "That order is no longer in the gate's record.")
         val base = if (sp == "DE") "de" else "us"
-        val cur = if (base == "de") "€" else "$"
+        val cur = when (base) { "de" -> "€"; "in" -> "₹"; else -> "$" }
         val side = if (f.side == "SELL") RvGate.Side.SELL else RvGate.Side.BUY
         val buy = side == RvGate.Side.BUY
         val openMs = RvGate.todayOpenMs(base, firstAt)
@@ -643,7 +643,7 @@ object RvGateAnalysis {
         } catch (_: Exception) { 0L }
         val bars = try {
             val res = com.signalscope.app.network.YahooFinanceClient.fetchCandles15mRange(
-                f.symbol.trim(), if (base == "de") "DE" else "NASDAQ", "5d")
+                f.symbol.trim().removeSuffix(".NS"), when (base) { "de" -> "DE"; "in" -> "NSE"; else -> "NASDAQ" }, "5d")
             (res as? com.signalscope.app.network.YahooFinanceClient.CandleResult.Success)?.candles.orEmpty()
         } catch (e: Exception) { Log.w(TAG, "${f.symbol}: day's prices failed: ${e.message}"); emptyList() }
         val day = bars.filter { it.close > 0.0 && it.timestamp * 1000L >= openMs && (closeMs <= 0L || it.timestamp * 1000L < closeMs) }

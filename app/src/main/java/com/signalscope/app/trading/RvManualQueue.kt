@@ -21,8 +21,10 @@ import java.io.File
  * that runs, or times out and runs anyway, sends a notification — you are not
  * watching when it happens.
  *
- * Trading 212 only. India's orders rest at Zerodha as triggers, and the crypto
- * space trades around the clock with no daily range in the same sense.
+ * Trading 212, and India's buy buttons since 6 Nov 2026 — released, the buy goes
+ * to Zerodha as the button sends it (an ordinary order; a trigger only if Zerodha
+ * refuses one). The crypto space trades around the clock with no daily range in
+ * the same sense.
  */
 object RvManualQueue {
     private const val TAG = "RvManualQueue"
@@ -41,7 +43,7 @@ object RvManualQueue {
     data class Order(
         val id: String,
         val kind: String,
-        /** "DE" or "US". */
+        /** "DE", "US" or "IN". */
         val space: String,
         val symbol: String,
         val ticker: String = "",
@@ -74,7 +76,7 @@ object RvManualQueue {
         val result: String = ""
     ) {
         val isSell get() = kind == Kind.T212_SELL || kind == Kind.ALGO_TP
-        val ns get() = if (space.equals("DE", true)) "de" else "us"
+        val ns get() = when (space.uppercase()) { "DE" -> "de"; "IN" -> "in"; else -> "us" }
     }
 
     private data class Book(val orders: List<Order> = emptyList())
@@ -372,12 +374,19 @@ object RvManualQueue {
             Spaces.exchangeOf(base), since)?.entryTs
     } catch (e: Exception) { Log.w(TAG, "${o.symbol} signal check failed: ${e.message}"); null }
 
+    /** Pure: an India buy Zerodha accepted that owns no share yet. */
+    internal fun indiaPlaced(immediate: Boolean, note: String): String =
+        (if (immediate) "order placed at Zerodha, filling" else "buy trigger resting at Zerodha — nothing bought yet") +
+            (if (note.isNotBlank()) ": $note" else "")
+
     /** Did the order do what it was for? Read off [run]'s sentence. */
     private fun wentThrough(result: String) =
         !listOf("nothing ", "not taken", "failed", "unknown").any { result.startsWith(it) }
 
     private fun resolve(config: ConfigManager, symbol: String, space: String): String = try {
-        Trading212Client(config).resolveT212Ticker(symbol.uppercase().removeSuffix(".DE"), space) ?: ""
+        // India trades on Zerodha by the symbol itself.
+        if (space.equals("IN", true)) symbol.uppercase().removeSuffix(".NS")
+        else Trading212Client(config).resolveT212Ticker(symbol.uppercase().removeSuffix(".DE"), space) ?: ""
     } catch (_: Exception) { "" }
 
     /**
@@ -529,6 +538,9 @@ object RvManualQueue {
                     "signal" to r.signalPrice.takeIf { it > 0.0 })
                 (if (r.ok && r.toppedUp) "added ${"%.4f".format(r.filledQty)} to your watchlist position"
                  else if (r.ok && r.filledQty > 0.0) "bought ${"%.4f".format(r.filledQty)} and handed to your watchlist"
+                 // INDIA: an order accepted at Zerodha that has not filled yet, or a
+                 // resting trigger — placed, not "nothing bought".
+                 else if (r.ok) indiaPlaced(r.immediate, r.note)
                  else "nothing bought: ${r.error.ifBlank { r.note.ifBlank { "the ladder filled nothing" } }}") to fill
             }
             Kind.ALGO_TP -> {

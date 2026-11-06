@@ -6076,8 +6076,8 @@ class MainActivity : AppCompatActivity() {
                         Log.w(TAG, "waiting orders: ${snap.error}")
                 }
 
-                // YOUR PATIENT ORDERS WAITING ON THE RV GATE.
-                if (base == "de" || base == "us") {
+                // YOUR PATIENT ORDERS WAITING ON THE RV GATE — India's buys too (6 Nov 2026).
+                if (base == "de" || base == "us" || base == "in") {
                     com.signalscope.app.trading.RvManualQueue.waitingFor(applicationContext, base).forEach { o ->
                         val what = when (o.kind) {
                             com.signalscope.app.trading.RvManualQueue.Kind.T212_SELL -> "sell ${o.qty}"
@@ -7228,9 +7228,10 @@ class MainActivity : AppCompatActivity() {
             val a = com.google.gson.JsonParser.parseString(argsJson).asJsonObject
             fun s(k: String) = a.get(k)?.takeIf { !it.isJsonNull }?.asString.orEmpty()
             fun d(k: String) = try { a.get(k)?.asDouble ?: 0.0 } catch (_: Exception) { 0.0 }
-            val space = s("space").uppercase().let { if (it == "DE") "DE" else "US" }
+            val space = s("space").uppercase().let { when (it) { "DE" -> "DE"; "IN" -> "IN"; else -> "US" } }
             return com.signalscope.app.trading.RvManualQueue.Order(
-                id = "", kind = kind, space = space, symbol = s("symbol").uppercase().removeSuffix(".DE"),
+                id = "", kind = kind, space = space,
+                symbol = s("symbol").uppercase().removeSuffix(".DE").removeSuffix(".NS"),
                 ticker = s("ticker"), yahooSymbol = s("yahooSymbol"), qty = d("qty"), cash = d("cash"),
                 refPrice = d("refPrice"), force = (a.get("force")?.asBoolean ?: false), algoNs = s("algoNs"))
         }
@@ -7330,10 +7331,10 @@ class MainActivity : AppCompatActivity() {
          */
         @JavascriptInterface
         fun rvManualSame(space: String, symbol: String, sell: Boolean): String = try {
-            val sym = symbol.trim().uppercase().removeSuffix(".DE")
+            val sym = symbol.trim().uppercase().removeSuffix(".DE").removeSuffix(".NS")
             val rows = com.signalscope.app.trading.RvManualQueue.all(applicationContext).filter {
                 (it.status == "WAITING" || it.status == "ASK") && it.space.equals(space, true) &&
-                    it.symbol.uppercase().removeSuffix(".DE") == sym && it.isSell == sell
+                    it.symbol.uppercase().removeSuffix(".DE").removeSuffix(".NS") == sym && it.isSell == sell
             }.map { mapOf("since" to it.createdAt, "cash" to it.cash, "qty" to it.qty,
                 "status" to it.status, "startsBy" to com.signalscope.app.trading.RvManualQueue.startsBy(it)) }
             gson.toJson(mapOf("ok" to true, "rows" to rows))
