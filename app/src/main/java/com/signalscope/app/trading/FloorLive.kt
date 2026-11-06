@@ -244,7 +244,9 @@ object FloorLive {
                         it.copy(status = FloorLiveStore.OPEN, qty = r.filled, buyIds = r.orderIds, note = r.note.take(160))
                     }
                     Log.w(TAG, "[${a.name}] ${t.symbol}: bought ${r.filled} for real (${"%.2f".format(amount)} €)")
-                    try { LabNotifier.floorLiveBought(app, a.name, a.ns, t.symbol, r.filled, amount, t.firstPrice) } catch (_: Exception) {}
+                    // THE ALGO'S BELL (6 Nov 2026): muted means no buy or sale notice, real
+                    // ones included. Problems that need you still notify.
+                    if (a.notify) try { LabNotifier.floorLiveBought(app, a.name, a.ns, t.symbol, r.filled, amount, t.firstPrice) } catch (_: Exception) {}
                 } else {
                     val why = (r.error ?: r.note).ifBlank { "the buy did not fill" }
                     FloorLiveStore.update(app, a.ns, t.id) {
@@ -291,7 +293,7 @@ object FloorLive {
                             sellIds = it.sellIds + res.orderIds, note = "")
                     }
                     Log.w(TAG, "[${a.name}] ${r.symbol}: sold $sold for real ($reason)")
-                    try { LabNotifier.floorLiveSold(app, a.name, a.ns, r.symbol, sold, reason, t?.let { pct(it) }) } catch (_: Exception) {}
+                    if (a.notify) try { LabNotifier.floorLiveSold(app, a.name, a.ns, r.symbol, sold, reason, t?.let { pct(it) }) } catch (_: Exception) {}
                 } else if (sold > 0.0) {
                     FloorLiveStore.update(app, r.ns, r.tradeId) {
                         it.copy(status = FloorLiveStore.OPEN, qty = left, soldQty = it.soldQty + sold,

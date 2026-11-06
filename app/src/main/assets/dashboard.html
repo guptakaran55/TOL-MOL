@@ -15571,7 +15571,7 @@ function floorCard(x,cur){
     (a.enabled?'':'<span style="font-size:8px;font-weight:800;background:rgba(245,158,11,.18);color:#b45309;padding:1px 5px;border-radius:3px">PAUSED</span>')+
     (s.liveOn?'<span title="Real money at Trading 212 — see the card" style="font-size:8px;font-weight:800;background:rgba(220,38,38,.14);color:var(--rd);padding:1px 5px;border-radius:3px;border:1px solid rgba(220,38,38,.4)">REAL €'+Number(s.liveBudget||0).toFixed(0)+'</span>'
       :(floorRealHeld(x)?'<span title="Real money switched off: buys nothing new for real, but still sells what it holds with its paper trades" style="font-size:8px;font-weight:800;background:rgba(245,158,11,.16);color:#b45309;padding:1px 5px;border-radius:3px;border:1px solid rgba(245,158,11,.45)">REAL OFF · '+floorRealHeld(x)+' held</span>':''))+
-    '<span onclick="event.stopPropagation();floorBell(\''+id+'\','+(a.notify!==false)+')" title="Notifications for this algo" style="cursor:pointer;padding:0 2px;font-size:11px;opacity:'+(a.notify!==false?'1':'.45')+'">'+(a.notify!==false?'🔔':'🔕')+'</span>'+
+    '<span onclick="event.stopPropagation();floorBell(\''+id+'\','+(a.notify!==false)+')" title="'+(a.notify!==false?'Buys and sales notify you, paper and real':'Muted: no buy or sale notices, paper or real. A real order that fails still notifies you')+'" style="cursor:pointer;padding:0 2px;font-size:11px;opacity:'+(a.notify!==false?'1':'.45')+'">'+(a.notify!==false?'🔔':'🔕')+'</span>'+
     '<span style="flex:1"></span>'+
     '<span style="font-size:7px;font-weight:800;color:var(--t3);letter-spacing:.5px">BOOK</span>'+
     '<span style="font-family:monospace;font-size:11px;font-weight:800;color:'+(tot>=0?'var(--gn)':'var(--rd)')+'">'+(tot>=0?'+':'')+tot.toFixed(1)+'%</span>'+
