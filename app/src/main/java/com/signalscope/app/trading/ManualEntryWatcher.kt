@@ -847,6 +847,9 @@ object ManualEntryWatcher {
         // BOTH stops, so nothing can ever sell it.
         try { backfillLiveRows(ctx, base) } catch (e: Exception) { Log.w(TAG, "[$base] live-row backfill failed", e) }
         repairS92Once(ctx, base)
+        // India's profit legs onto the year-high rule, once (6 Nov 2026).
+        if (base == "in") try { ZerodhaLiveMirror.raiseIndiaTargetsOnce(ctx) }
+            catch (e: Exception) { Log.w(TAG, "[in] profit-leg raise failed", e) }
         // ONE OWNER PER SHARE, re-established every pass. Must run BEFORE anything
         // that reads a quantity or decides an exit: a book still claiming shares an
         // algo owns would size its sell off a number the account cannot honour.

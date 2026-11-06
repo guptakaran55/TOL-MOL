@@ -167,7 +167,10 @@ object WeekTarget {
     // "optimistically reached whenever the price goes near it"). For your own buys:
     //   Germany  a tenth of the 3-month range under the 3-month high, at least 1% up;
     //   US       1% under the year high, at least 5% up — the currency charge, twice;
-    //   India    1% under the week high, at least 3% up, else 4% up.
+    //   India    1% under the year high, at least 5% up — the US rule (6 Nov 2026; it was
+    //            1% under the week high, at least 3% up, else 4%, which sold SAILIFE at +3.6%
+    //            before it ran +18.6%). Replayed on NSE 500 2020–26 (RESULTS_MATRIX_india_target.md):
+    //            week rule −0.01% a trade, year rule +0.13%, no target +0.18%.
     // Replayed 2 Nov 2026 on two years of buys near the monthly low (−4% stop, at most
     // 60 trading days, each market's charges): Germany +0.48% a trade, reached by 20%
     // (the month rule: +0.38%); US +0.66%, 12% (next resistance: +0.29%); India −0.46%
@@ -186,7 +189,7 @@ object WeekTarget {
     fun levelRuleFor(base: String): LevelRule = when (base.lowercase()) {
         "de" -> LevelRule("high3m", "3-month high", 63, tenthOfRange = true, underPct = 0.0, minGapPct = 1.0, fallbackPct = 0.0)
         "us" -> LevelRule("high1y", "year high", 252, tenthOfRange = false, underPct = 1.0, minGapPct = 5.0, fallbackPct = 0.0)
-        else -> LevelRule("high1w", "week high", 5, tenthOfRange = false, underPct = 1.0, minGapPct = 3.0, fallbackPct = 4.0)
+        else -> LevelRule("high1y", "year high", 252, tenthOfRange = false, underPct = 1.0, minGapPct = 5.0, fallbackPct = 0.0)
     }
 
     /** The market's rule as the exits panel has set it — null when the target is

@@ -1279,6 +1279,72 @@ object ZerodhaLiveMirror {
         }
     }
 
+    /** Farthest a watchlist position's profit leg rests above its buy: far enough
+     *  that only a real run reaches it, and clear of the 25% over the price that
+     *  Zerodha accepts for a trigger. */
+    const val INDIA_FAR_LEG = 1.20
+
+    /**
+     * Pure: the profit leg for one of YOUR India positions. [level] = the rule's
+     * target (null: none, or switched off). Never above [entry] × [INDIA_FAR_LEG]
+     * (nor 24% over [ltp] when known), never at or under the stop [sl]; with no
+     * level, the far leg itself — so the stops and the strategy do the selling.
+     */
+    fun indiaUpperLeg(level: Double?, entry: Double, tick: Double, sl: Double, ltp: Double = 0.0): Double {
+        val t = if (tick > 0.0) tick else 0.05
+        fun down(x: Double) = Math.floor(x / t + 1e-9) * t
+        var cap = down(entry * INDIA_FAR_LEG)
+        if (ltp > 0.0) cap = minOf(cap, down(ltp * 1.24))
+        return level?.takeIf { it > sl && it > 0.0 }?.let { minOf(it, cap) } ?: cap
+    }
+
+    /**
+     * ONE-OFF (6 Nov 2026): your India positions protected under the old week-high
+     * rule rest a profit leg at +3–4%. Each is raised to the new rule's leg — the
+     * year high less 1% if at least 5% up, else the far leg. Raised only, never
+     * lowered; the stop leg is not touched. Done when every one went through.
+     */
+    fun raiseIndiaTargetsOnce(ctx: Context) {
+        val marker = java.io.File(ctx.filesDir, "india_targets_year_v1.done")
+        if (marker.exists()) return
+        val cfg = ConfigManager(ctx)
+        if (!cfg.isZerodhaConnected) return
+        val client = ZerodhaClient(cfg)
+        val list = (client.fetchGttTriggers() as? ZerodhaClient.GttListResult.Success)?.triggers ?: return
+        val ns = com.signalscope.app.data.ManualWatchStore.nsFor("in")
+        val rule = WeekTarget.levelRuleFor("in", com.signalscope.app.data.ManualWatchStore.load(ctx, "in"))
+        val rows = ZerodhaLiveStore.load(ctx).trades.filter {
+            it.ns == ns && it.status == "OPEN" && it.qty > 0 && it.entryPrice > 0.0 }
+        var allDone = true
+        for (r in rows) {
+            val sym = r.symbol.uppercase()
+            try {
+                val g = list.firstOrNull { it.tradingsymbol.equals(sym, true) && it.status == "active" &&
+                    it.transactionType.equals("SELL", true) } ?: continue
+                val current = g.triggerPriceAux ?: continue          // stop only: no leg to raise
+                val tick = cfg.learnedTickSize(sym) ?: 0.05
+                val ltp = (client.fetchLtp(EXCHANGE, sym) as? ZerodhaClient.LtpResult.Success)?.lastPrice ?: 0.0
+                val buyDay = if (r.buyAt > 0L) java.time.Instant.ofEpochMilli(r.buyAt).atZone(IndianSession.ZONE).toLocalDate()
+                    else java.time.LocalDate.now(IndianSession.ZONE)
+                val bars = com.signalscope.app.screener.ScreenerRunner.fetchUniverseBars("IN", listOf(sym), minBars = 10)
+                    .first[sym]?.filter { it.date.isBefore(buyDay) }
+                val plan = rule?.let { WeekTarget.levelPlan(it, bars, r.entryPrice, ltp.takeIf { p -> p > 0.0 }, preExisting = true) }
+                val want = indiaUpperLeg(plan?.takeIf { it.ok }?.price, r.entryPrice, tick, g.triggerPrice, ltp)
+                if (want <= current + tick / 2 || (ltp > 0.0 && want <= ltp * 1.0025)) {
+                    Log.i(TAG, "[$ns] $sym profit leg ${"%.2f".format(current)} kept (new rule: ${"%.2f".format(want)})")
+                    continue
+                }
+                when (val res = client.modifyGttTriggerPrice(g.id, want, current)) {
+                    is ZerodhaClient.GttModifyResult.Success ->
+                        Log.w(TAG, "[$ns] $sym profit leg raised ${"%.2f".format(current)} → ${"%.2f".format(want)} " +
+                            "(${plan?.takeIf { it.ok }?.label ?: "far leg: ${plan?.why ?: "rule off"}"})")
+                    else -> { allDone = false; Log.w(TAG, "[$ns] $sym profit leg not raised: $res") }
+                }
+            } catch (e: Exception) { allDone = false; Log.w(TAG, "[$ns] $sym profit leg raise failed", e) }
+        }
+        if (allDone) try { marker.writeText(System.currentTimeMillis().toString()) } catch (_: Exception) {}
+    }
+
     /**
      * The protective trigger. Placed AFTER the buy, and its failure is not fatal
      * to the position — an unprotected holding is worse than a protected one but
@@ -1327,8 +1393,12 @@ object ZerodhaLiveMirror {
             } catch (_: Exception) { null }
             val tgt = range?.takeIf { it.ok }?.let { Math.floor(it.price / tick + 1e-9) * tick }
                 ?.takeIf { it > plan.sl }
-            val target = tgt?.let { Math.round(it * 10_000.0) / 10_000.0 } ?: plan.target
-            val targetLimit = if (tgt != null)
+            // YOUR BUYS: no level (or the target switched off) means the farthest leg,
+            // not the planner's +4% — and a year high far above is capped where
+            // Zerodha still takes it (6 Nov 2026). The algos keep the planner's.
+            val target = if (mine) Math.round(indiaUpperLeg(tgt, entry, tick, plan.sl) * 10_000.0) / 10_000.0
+                else tgt?.let { Math.round(it * 10_000.0) / 10_000.0 } ?: plan.target
+            val targetLimit = if (tgt != null || mine)
                 Math.round(Math.floor(target * 0.99 / tick + 1e-9) * tick * 10_000.0) / 10_000.0
                 else plan.targetLimit
             Log.i(TAG, "[$ns] $sym target leg ${"%.2f".format(target)} — " +

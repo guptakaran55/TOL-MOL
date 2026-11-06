@@ -275,12 +275,25 @@ class WeekTargetTest {
         assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("us"), bars.takeLast(100), 160.0, null, false).ok)
     }
 
-    @Test fun `India - 1 percent under the week high, at least 3 percent up, else 4 percent`() {
-        val bars = days(30, { if (it == 27) 110.0 else 100.0 })
-        assertEquals(108.9, WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 100.0, null, false).price, 1e-9)
-        val near = WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 107.0, null, false)
-        assertEquals(111.28, near.price, 1e-9)                       // +4% of 107
-        assertEquals("fixed", near.kind)
+    @Test fun `India - the US rule since 6 Nov 2026, 1 percent under the year high, at least 5 percent up`() {
+        val bars = days(260, { if (it == 30) 200.0 else 150.0 })
+        val p = WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 160.0, null, false)
+        assertEquals(198.0, p.price, 1e-9)
+        // Under 5% up: no fixed +4% any more — the far leg takes over.
+        assertFalse(WeekTarget.levelPlan(WeekTarget.levelRuleFor("in"), bars, 190.0, null, false).ok)
+    }
+
+    @Test fun `India - the profit leg never falls back to a near level and never past what Zerodha takes`() {
+        // No level: the far leg, +20% of the buy.
+        assertEquals(120.0, ZerodhaLiveMirror.indiaUpperLeg(null, 100.0, 0.05, 96.0), 1e-9)
+        // A year high 35% up is capped at +20%.
+        assertEquals(120.0, ZerodhaLiveMirror.indiaUpperLeg(135.0, 100.0, 0.05, 96.0), 1e-9)
+        // A level inside the cap is kept.
+        assertEquals(110.0, ZerodhaLiveMirror.indiaUpperLeg(110.0, 100.0, 0.05, 96.0), 1e-9)
+        // A level at or under the stop is no level.
+        assertEquals(120.0, ZerodhaLiveMirror.indiaUpperLeg(95.0, 100.0, 0.05, 96.0), 1e-9)
+        // Fallen price: 24% over the market at most.
+        assertEquals(111.6, ZerodhaLiveMirror.indiaUpperLeg(null, 100.0, 0.05, 85.0, ltp = 90.0), 1e-9)
     }
 
     @Test fun `a position already past its new target is left to you`() {
