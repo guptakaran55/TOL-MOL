@@ -397,6 +397,33 @@ var SECTOR_MAP_DATA={
 };
 // Build reverse map: symbol \u2192 sector (for O(1) lookup during filter)
 var SECTOR_MAP={};
+// US AND GERMAN TILES (6 Nov 2026): matched by the sector and industry Yahoo gives
+// every scanned stock, the way India's tiles use the hand-made list above.
+var SECTOR_RULES={
+  US:{'Tech':function(s,i){return s==='Technology'&&i.indexOf('Semiconductor')<0},
+      'Semis':function(s,i){return i.indexOf('Semiconductor')===0},
+      'Financials':function(s){return s==='Financial Services'},'Health':function(s){return s==='Healthcare'},
+      'Energy':function(s){return s==='Energy'},'Discretionary':function(s){return s==='Consumer Cyclical'},
+      'Staples':function(s){return s==='Consumer Defensive'},'Industrials':function(s){return s==='Industrials'},
+      'Materials':function(s){return s==='Basic Materials'},'Utilities':function(s){return s==='Utilities'},
+      'Real Estate':function(s){return s==='Real Estate'},'Comms':function(s){return s==='Communication Services'},
+      'Clean energy':function(s,i){return i==='Solar'||i.indexOf('Renewable')>=0}},
+  DE:{'Banks':function(s,i){return i.indexOf('Banks')===0},'Insurance':function(s,i){return i.indexOf('Insurance')===0},
+      'Tech':function(s){return s==='Technology'},'Health':function(s){return s==='Healthcare'},
+      'Autos':function(s,i){return i.indexOf('Auto ')===0},
+      'Chemicals':function(s,i){return i.indexOf('Chemicals')>=0||i==='Agricultural Inputs'},
+      'Industrials':function(s,i){return s==='Industrials'&&!/Construction|Building/.test(i)},
+      'Construction':function(s,i){return /Construction|Building/.test(i)},
+      'Basic Res.':function(s,i){return s==='Basic Materials'&&!(i.indexOf('Chemicals')>=0||i==='Agricultural Inputs')},
+      'Utilities':function(s){return s==='Utilities'},'Telecom':function(s,i){return i==='Telecom Services'},
+      'Real Estate':function(s){return s==='Real Estate'},
+      'Clean energy':function(s,i){return i==='Solar'||i.indexOf('Renewable')>=0}}
+};
+function sectorRule(name){var r=SECTOR_RULES[SPACE];return r&&r[name]}
+function inSector(row,name){
+  if(SPACE==='IN')return SECTOR_MAP[(row.symbol||'').replace('.NS','')]===name;
+  var r=sectorRule(name);return !!r&&r(String(row.sector||''),String(row.industry||''));
+}
 (function(){for(var sec in SECTOR_MAP_DATA){if(SECTOR_MAP_DATA.hasOwnProperty(sec)){SECTOR_MAP_DATA[sec].forEach(function(sym){SECTOR_MAP[sym]=sec});}}})();
 // ── SPACE state (IN ↔ US) ──────────────────────────────────────────────────
 // Persisted via Kotlin bridge so the user lands back where they left.
@@ -6518,10 +6545,7 @@ function render(){
   if(tab==='discovery'&&DISCOVERY_SQUEEZE_MODE){squeezeLoad();f=f.filter(squeezeFilter)}
   // Sector filter (applies to discovery + setups). Symbol may or may not carry .NS suffix.
   if(STATE.sectorFilter){
-    f=f.filter(function(s){
-      var sym=(s.symbol||'').replace('.NS','');
-      return SECTOR_MAP[sym]===STATE.sectorFilter;
-    });
+    f=f.filter(function(s){return inSector(s,STATE.sectorFilter)});
   }
   if(STATE.search){var q=STATE.search.toLowerCase();f=f.filter(function(s){return rowSearchText(s.symbol,s.name,s.sector,s.industry).indexOf(q)>=0})}
   var sk=STATE.sortK,sa=STATE.sortA;
@@ -19050,7 +19074,7 @@ function sectorCardHtml(sec){
 
   // Is this sector filterable (has mapped stocks)?
   // Only India's sectors have a stock list to filter Discovery by.
-  var hasMap=SPACE==='IN'&&sec.kind!=='commodity'&&SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length>0;
+  var hasMap=sec.kind!=='commodity'&&(SPACE==='IN'?!!(SECTOR_MAP_DATA[sec.name]&&SECTOR_MAP_DATA[sec.name].length):!!sectorRule(sec.name));
   var cardStyle='padding:10px 8px;background:var(--bg2);border-radius:10px;border:1px solid var(--bd);text-align:center;position:relative';
   if(hasMap)cardStyle+=';cursor:pointer';
   var onClickAttr=hasMap?' onclick="applySectorFilter(\''+sec.name+'\')"':'';
@@ -19704,6 +19728,7 @@ function priceEntryLines(sym,cur){
       :'priceEntryCancelPrompt(\''+escHtml(e.id)+'\',\''+escHtml(e.symbol)+'\')';
     h+='<div style="margin:2px 0 6px;font-size:10px;color:var(--pu);font-weight:700">🎯 Armed: buy '+cur+Number(e.cash||0).toFixed(0)+' when it '+
       (e.india?'reaches':(e.rising?'rises to':'falls to'))+' '+cur+Number(e.level||0).toFixed(2)+(e.india?' — a trigger at Zerodha':'')+
+      (e.tries?' · retry '+(e.tries+1)+'/3':'')+
       ' · <span onclick="'+off+'" style="cursor:pointer;color:var(--rd)">✕ call off</span></div>';
   });
   return h+'</div>';

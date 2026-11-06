@@ -7327,7 +7327,7 @@ class MainActivity : AppCompatActivity() {
             else com.signalscope.app.trading.PriceEntries.waitingFor(applicationContext, base).map {
                 mapOf("id" to it.id, "symbol" to it.symbol, "level" to it.level, "cash" to it.cash,
                     "rising" to it.rising, "lastPrice" to it.lastPrice, "since" to it.createdAt,
-                    "expiresAt" to it.expiresAt)
+                    "expiresAt" to it.expiresAt, "tries" to it.tries)
             }
             gson.toJson(mapOf("ok" to true, "rows" to rows))
         } catch (e: Exception) { gson.toJson(mapOf("ok" to false, "rows" to emptyList<Any>())) }
@@ -11511,6 +11511,7 @@ class MainActivity : AppCompatActivity() {
         SectorSpec("US", "US", "Utilities", "Utilities", listOf("XLU")),
         SectorSpec("US", "US", "Real Estate", "Real Estate", listOf("XLRE")),
         SectorSpec("US", "US", "Comms", "Communication Services", listOf("XLC")),
+        SectorSpec("US", "US", "Clean energy", "Global Clean Energy", listOf("ICLN")),
 
         SectorSpec("DE", "DE", "Banks", "STOXX 600 Banks", listOf("EXV1.DE")),
         SectorSpec("DE", "DE", "Insurance", "STOXX 600 Insurance", listOf("EXH5.DE")),
@@ -11524,6 +11525,7 @@ class MainActivity : AppCompatActivity() {
         SectorSpec("DE", "DE", "Utilities", "STOXX 600 Utilities", listOf("EXH9.DE")),
         SectorSpec("DE", "DE", "Telecom", "STOXX 600 Telecoms", listOf("EXV2.DE")),
         SectorSpec("DE", "DE", "Real Estate", "STOXX 600 Real Estate", listOf("EXI5.DE")),
+        SectorSpec("DE", "DE", "Clean energy", "Global Clean Energy · Xetra", listOf("IQQH.DE")),
 
         // Commodities strip: the world prices (USD futures) in every space, then
         // the gold/silver fund each market's investors can actually buy.

@@ -912,6 +912,14 @@ object LabNotifier {
             "pe-$space-$symbol-${System.currentTimeMillis() / 60000}",
             openSymbol = symbol, openSpace = space.lowercase())
 
+    /** A "buy at my price" whose buy went nowhere and is no longer armed. */
+    fun priceEntryFailed(ctx: Context, space: String, symbol: String, level: Double, what: String) =
+        notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
+            "⚠ $symbol — your buy at ${"%.2f".format(level)} did not go through",
+            "No longer armed. ${what.take(200)}",
+            "pef-$space-$symbol-${System.currentTimeMillis() / 60000}",
+            openSymbol = symbol, openSpace = space.lowercase())
+
     /** A "buy at my price" that was never reached lapsed after a year. */
     fun priceEntryLapsed(ctx: Context, space: String, symbol: String, level: Double) =
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_DEFAULT, "Stock LIVE trades",

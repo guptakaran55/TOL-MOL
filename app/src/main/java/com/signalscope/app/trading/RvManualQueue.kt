@@ -308,19 +308,40 @@ object RvManualQueue {
      * let go at once, it runs here and now — where the page would have run the
      * button's own order — and you are notified as for a released order, since
      * nobody is looking at the page. Blocking: a ladder takes minutes.
-     * @return what happened, in a sentence.
+     * @return what happened, in a sentence, and whether anything was bought.
      */
-    fun submitAndRun(ctx: Context, o: Order): String {
+    fun submitAndRun(ctx: Context, o: Order): RunOutcome {
         val (queued, why, by) = submit(ctx, o)
-        if (queued) return "held by the RV gate — $why" +
-            (if (by > 0L) "; it starts by ${hhmm(by)} at the latest" else "")
-        if (why == NO_SIGNAL) return "not started — $why"
-        val (result, _) = try { run(ctx, ConfigManager(ctx), o) }
+        if (queued) return RunOutcome("held by the RV gate — $why" +
+            (if (by > 0L) "; it starts by ${hhmm(by)} at the latest" else ""), held = true)
+        if (why == NO_SIGNAL) return RunOutcome("not started — $why", nothingPlaced = true)
+        val (result, fill) = try { run(ctx, ConfigManager(ctx), o) }
                           catch (e: Exception) { Log.e(TAG, "${o.symbol} ${o.kind} failed", e); "failed: ${e.message}" to emptyMap() }
         try { LabNotifier.rvManualDone(ctx, o.space, o.symbol, !o.isSell, false, why, result, wentThrough(result)) }
         catch (_: Exception) {}
-        return "started at once ($why) — $result"
+        // A share filled or an order id kept means something reached the broker,
+        // whatever the sentence says.
+        val filled = ((fill["qty"] as? Number)?.toDouble() ?: 0.0) > 0.0 ||
+            (fill["orderIds"] as? Collection<*>)?.isNotEmpty() == true
+        return RunOutcome("started at once ($why) — $result", bought = wentThrough(result) || filled,
+            nothingPlaced = !filled && nothingPlaced(result))
     }
+
+    /**
+     * What [submitAndRun] did. [held]: the gate is holding it — this queue owns it
+     * now. [bought]: something was bought. [nothingPlaced]: sure that NO order
+     * reached Trading 212 — the only case a retry cannot buy twice.
+     */
+    data class RunOutcome(val text: String, val held: Boolean = false,
+                          val bought: Boolean = false, val nothingPlaced: Boolean = false)
+
+    /** Pure: does [result] say no order reached the broker? "nothing bought" (the
+     *  ladder filled nothing and took its rungs back), or a failure that says
+     *  nothing was placed. Any other failure may have left an order behind. The
+     *  caller also checks the fill itself. */
+    internal fun nothingPlaced(result: String): Boolean =
+        result.startsWith("nothing bought") ||
+            (result.startsWith("failed") && result.contains("nothing placed"))
 
     private fun hhmm(ms: Long): String = try {
         java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).toLocalTime().toString().take(5)

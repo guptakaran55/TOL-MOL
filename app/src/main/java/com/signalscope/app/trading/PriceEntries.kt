@@ -39,6 +39,12 @@ object PriceEntries {
     /** Armed at most this long, as a Zerodha GTT is. */
     const val LIFE_MS = 365L * 24 * 3_600_000L
 
+    /** A buy that went nowhere is armed again, this many buys in all. */
+    const val MAX_TRIES = 3
+    /** ...and not looked at again for this long, so a price still past the level
+     *  does not start a failing buy every minute. */
+    const val RETRY_GAP_MS = 15 * 60_000L
+
     // ── THE RULE (pure) ──────────────────────────────────────────────────────
 
     /** Which way the price must move to reach [level] from [now]: true = up to it,
@@ -55,6 +61,23 @@ object PriceEntries {
         price > 0.0 && level > 0.0 && (if (rising) price >= level else price <= level)
 
     fun baseOf(space: String) = if (space.equals("DE", true)) "de" else "us"
+
+    /**
+     * Pure: the entry after its buy ran (6 Nov 2026). Bought, or held by the RV
+     * gate (its queue owns it now): done, as before. NOTHING PLACED at Trading 212
+     * — not enough cash, holding unreadable, the ladder filled nothing: armed
+     * again, looked at no sooner than [RETRY_GAP_MS], at most [MAX_TRIES] buys in
+     * all. A failure that may have left an order behind is never retried: FAILED,
+     * and you are told.
+     */
+    fun afterBuy(e: PriceEntryStore.Entry, o: RvManualQueue.RunOutcome, now: Long): PriceEntryStore.Entry {
+        if (o.held || o.bought) return e.copy(result = o.text)
+        val tries = e.tries + 1
+        return if (o.nothingPlaced && tries < MAX_TRIES)
+            e.copy(status = "WAITING", tries = tries, retryAt = now + RETRY_GAP_MS,
+                result = "${o.text} — armed again ($tries of $MAX_TRIES)")
+        else e.copy(status = "FAILED", tries = tries, result = o.text)
+    }
 
     // ── SETTING ONE ──────────────────────────────────────────────────────────
 
@@ -127,6 +150,7 @@ object PriceEntries {
                 continue
             }
             if (!MarketHours.isRegularSession(baseOf(e.space), now)) continue
+            if (now < e.retryAt) continue                     // re-armed after a buy that went nowhere
             val price = try { PatientExecutor.currentRefOrNull(config, e.ticker, e.yahooSymbol, e.space) }
                         catch (ex: Exception) { Log.w(TAG, "${e.symbol}: no price: ${ex.message}"); null }
                 ?: continue
@@ -151,9 +175,15 @@ object PriceEntries {
                 LabNotifier.priceEntryReached(ctx, e.space, e.symbol, e.level, price, e.rising,
                     "Starting through the RV gate" + (if (managed) ", then handed to your watchlist" else ""))
             } catch (_: Exception) {}
-            val result = try { RvManualQueue.submitAndRun(ctx, o) }
-                         catch (ex: Exception) { Log.e(TAG, "${e.symbol} buy failed", ex); "failed: ${ex.message}" }
-            PriceEntryStore.update(ctx, e.id) { it.copy(result = result) }
+            val outcome = try { RvManualQueue.submitAndRun(ctx, o) }
+                          catch (ex: Exception) { Log.e(TAG, "${e.symbol} buy failed", ex)
+                              RvManualQueue.RunOutcome("failed: ${ex.message}") }
+            val after = PriceEntryStore.update(ctx, e.id) {
+                if (it.status == "TRIGGERED") afterBuy(it, outcome, System.currentTimeMillis()) else it
+            }
+            if (after?.status == "WAITING") Log.w(TAG, "${e.symbol}: nothing bought — armed again (${after.tries} of $MAX_TRIES)")
+            if (after?.status == "FAILED")
+                try { LabNotifier.priceEntryFailed(ctx, e.space, e.symbol, e.level, outcome.text) } catch (_: Exception) {}
         }
     }
 }

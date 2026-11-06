@@ -41,7 +41,7 @@ object PriceEntryStore {
         val setAt: Double = 0.0,
         val createdAt: Long = 0L,
         val expiresAt: Long = 0L,
-        /** WAITING · TRIGGERED · CANCELLED · EXPIRED */
+        /** WAITING · TRIGGERED · CANCELLED · EXPIRED · FAILED */
         val status: String = "WAITING",
         /** The latest look at the price, and when. */
         val lastPrice: Double = 0.0,
@@ -49,7 +49,12 @@ object PriceEntryStore {
         val triggeredAt: Long = 0L,
         val triggerPrice: Double = 0.0,
         /** What happened when it triggered — held by the RV gate, started, refused. */
-        val result: String = ""
+        val result: String = "",
+        /** Buys that went nowhere so far — armed again after each, up to
+         *  PriceEntries.MAX_TRIES. */
+        val tries: Int = 0,
+        /** Re-armed after a buy that went nowhere: not looked at again before this. */
+        val retryAt: Long = 0L
     )
 
     data class State(val entries: List<Entry> = emptyList())

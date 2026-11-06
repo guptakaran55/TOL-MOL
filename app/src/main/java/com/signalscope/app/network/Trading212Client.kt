@@ -50,10 +50,15 @@ class Trading212Client(private val config: ConfigManager) {
          *  little more, so network jitter cannot land two inside one window. */
         private const val PORTFOLIO_SPACING_MS = 5_200L
 
+        /** The answer a no-wait portfolio read gets when it is not its turn. No
+         *  request was sent, so it says nothing about the broker — the holdings
+         *  cache does not keep it (see BrokerHoldings.t212). */
+        const val PORTFOLIO_BUSY = "Trading 212 allows one portfolio read every 5 s — another one is due first"
+
         /** EVERY PORTFOLIO READ IN THE APP, IN TURN — see [fetchPortfolio]. */
         private val PORTFOLIO_READS = SpacedReads<T212Result<List<Position>>>(
             PORTFOLIO_SPACING_MS,
-            busy = { T212Result.Failure("Trading 212 allows one portfolio read every 5 s — another one is due first", 429) },
+            busy = { T212Result.Failure(PORTFOLIO_BUSY, 429) },
             failed = { T212Result.Failure(it) })
         private const val OPEN_ORDERS_CACHE_MS = 2_500L
         @Volatile private var openOrdersCacheBaseUrl: String = ""

@@ -89,8 +89,11 @@ object T212HandSales {
         // What is left in the account now. Unreadable = do nothing here; a full
         // exit is still caught by [sweep] later, from the broker's own word.
         var remaining: Double? = null
+        // WAITS ITS TURN at the portfolio (6 Nov 2026): without waiting, both tries
+        // could land on a moment another read had booked, and the sale was never
+        // taken off the positions it came from. Runs on a background thread.
         for (attempt in 0..1) {
-            val r = client.fetchPortfolio()
+            val r = client.fetchPortfolio(waitForTurn = true)
             if (r is Trading212Client.T212Result.Success) {
                 remaining = r.data.firstOrNull { it.ticker.equals(ticker, true) }?.quantity ?: 0.0
                 break

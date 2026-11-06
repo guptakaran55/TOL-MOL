@@ -101,6 +101,9 @@ object BrokerHoldings {
     fun t212(ctx: Context): Result {
         cached("t212")?.let { return it }
         val cfg = ConfigManager(ctx)
+        // NOT ITS TURN (no request was sent): not kept, so the next caller asks
+        // again instead of every caller being told "unreadable" for 90 s.
+        var notItsTurn = false
         val r = try {
             if (!cfg.hasT212Credentials) Result.Unreadable("no Trading 212 credentials")
             else {
@@ -112,8 +115,10 @@ object BrokerHoldings {
                             Holding(ys.substringBefore(".").uppercase(),
                                 it.quantity, it.averagePrice, it.currentPrice, ys, it.ticker)
                         })
-                    is Trading212Client.T212Result.Failure ->
+                    is Trading212Client.T212Result.Failure -> {
+                        notItsTurn = p.message == Trading212Client.PORTFOLIO_BUSY
                         Result.Unreadable("Trading 212 said: ${p.message}")
+                    }
                     is Trading212Client.T212Result.NotConfigured ->
                         Result.Unreadable("Trading 212 not configured")
                 }
@@ -122,7 +127,7 @@ object BrokerHoldings {
             Result.Unreadable(e.message ?: "portfolio read threw")
         }
         if (r is Result.Unreadable) Log.w(TAG, "T212 holdings unreadable — ${r.why}")
-        put("t212", r)
+        if (!notItsTurn) put("t212", r)
         if (r is Result.Ok) {
             remember(ctx, "de", r.holdings.filter { it.yahoo.endsWith(".DE", true) })
             remember(ctx, "us", r.holdings.filter { !it.yahoo.endsWith(".DE", true) })
