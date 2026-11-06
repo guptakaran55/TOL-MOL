@@ -30,6 +30,15 @@ class ResultsBookTest {
         assertEquals(1794587400000L, q.earningsAtMs); assertEquals("Bechtle AG", q.name)
     }
 
+    @Test fun `the sector comes from the company profile and leads the prompt`() {
+        val (s, i) = YahooFinanceClient.parseProfile(
+            """{"quoteSummary":{"result":[{"assetProfile":{"sector":"Technology","industry":"Information Technology Services"}}]}}""")
+        assertEquals("Technology", s); assertEquals("Information Technology Services", i)
+        assertEquals(null to null, YahooFinanceClient.parseProfile("""{"quoteSummary":{"result":[{}]}}"""))
+        val p = ResultsBook.forPrompt(ResultsBook.Rec(sector = "Technology", industry = "Semiconductors"))
+        assertEquals("Sector: Technology · Semiconductors\n\n", p)
+    }
+
     @Test fun `wording of a surprise`() {
         assertEquals("beat 9.7%", ResultsBook.word(9.69))
         assertEquals("miss 2.0%", ResultsBook.word(-2.0))
@@ -40,8 +49,9 @@ class ResultsBookTest {
     @Test fun `read again every three days and right after a report`() {
         val now = 1_794_000_000_000L
         assertTrue(ResultsBook.stale(null, 0L, now))
-        val r = ResultsBook.Rec(readAt = now - day)
+        val r = ResultsBook.Rec(readAt = now - day, sector = "Technology")
         assertFalse(ResultsBook.stale(r, 0L, now))
+        assertTrue(ResultsBook.stale(ResultsBook.Rec(readAt = now - day), 0L, now))   // kept before sectors: read once more
         assertTrue(ResultsBook.stale(r, now - 3_600_000L, now))           // reported since it was read
         assertTrue(ResultsBook.stale(ResultsBook.Rec(readAt = now - 4 * day), 0L, now))
     }

@@ -411,7 +411,8 @@ Evaluate whether this pullback is:
 Prioritize recent news over older stories. A headline marked "(+N more outlets)" is ONE story that several outlets covered.
 Be concise (3-4 sentences max). If you rely on a headline, name its outlet and date in words — never bracketed reference numbers.
 If you're unsure, answer UNCERTAIN rather than guessing.
-A "Results record", when given, is factual: reported earnings against expectations and big price moves with their headlines. Weigh it as evidence alongside the news."""
+A "Results record", when given, is factual: reported earnings against expectations and big price moves with their headlines. Weigh it as evidence alongside the news.
+Name the company's sector and industry, and say whether this fall looks sector-wide or specific to the company."""
 
         val trendDesc = if (adx != null) {
             "ADX = ${String.format("%.1f", adx)} (${if (adx > 25) "trending" else if (adx > 15) "emerging trend" else "choppy"})"
@@ -453,6 +454,7 @@ A "Results record", when given, is factual: reported earnings against expectatio
             append("\nAnalyze critically:\n")
             append("• Based on the news, what is the PRIMARY driver of this pullback?\n")
             append("• Is this a temporary market overreaction or structural weakness?\n")
+            append("• Is the whole sector falling, or only this company? Name a risk specific to its sector.\n")
             append("• What would need to happen for this to be a BUY vs AVOID?\n")
             append("• If uncertain, say UNCERTAIN rather than guessing.\n")
             append("\nProvide your verdict: TEMPORARY, STRUCTURAL, or UNCERTAIN.")
@@ -526,8 +528,10 @@ Verdict — exactly one of: ${allowed.joinToString(" / ")}$guide
 Confidence — LOW, MEDIUM or HIGH: how firmly the news supports the verdict. Few, old or conflicting headlines mean LOW.
 News — NEW (real developments in the last week or so), REPEAT (mostly older stories or commentary), or NONE (nothing relevant).
 
+THE SECTOR. Say which sector and industry the company is in, and what is moving that sector now (rates, demand cycle, input costs, regulation, tariffs, AI spending — whichever apply). At least one of the risks must be specific to that sector, not generic. If a "Sector:" line is given, use it; otherwise use what you know and say so.
+
 Reply with ONLY a JSON object — no markdown, no code fences — in exactly this shape:
-{"short_term":"1-4 weeks: 2-3 sentences","long_term":"3-12 months: 1-2 sentences — headlines are thin evidence for this, so keep it tentative","risks":["one risk","another risk"],"news":"NEW|REPEAT|NONE","confidence":"LOW|MEDIUM|HIGH","verdict":"one of the verdicts above"}
+{"sector":"1-2 sentences: its sector and industry, and what is driving that sector now","short_term":"1-4 weeks: 2-3 sentences","long_term":"3-12 months: 1-2 sentences — headlines are thin evidence for this, so keep it tentative","risks":["one risk","another risk"],"news":"NEW|REPEAT|NONE","confidence":"LOW|MEDIUM|HIGH","verdict":"one of the verdicts above"}
 When a sentence rests on a headline, put that headline's number in square brackets right after it, e.g. [2]. Use only the numbers listed."""
 
         val user = buildString {

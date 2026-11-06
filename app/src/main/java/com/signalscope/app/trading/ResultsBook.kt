@@ -35,7 +35,9 @@ object ResultsBook {
                     val surprisePct: Double? = null)
     data class Rec(val quarters: List<Quarter>? = null, val moves: List<Move>? = null,
                    val readAt: Long = 0L, val lastReportMs: Long = 0L, val reactionPct: Double? = null,
-                   val reactionFor: Long = 0L)
+                   val reactionFor: Long = 0L,
+                   /** The company's sector and industry, as Yahoo files it. */
+                   val sector: String? = null, val industry: String? = null)
     private data class Saved(val m: Map<String, Rec>? = null)
 
     private fun file(ctx: Context) = File(ctx.filesDir, FILE)
@@ -61,7 +63,8 @@ object ResultsBook {
     /** Pure: read again? Every 3 days, and as soon as a report has come out since. */
     fun stale(r: Rec?, lastReportMs: Long, now: Long): Boolean =
         r == null || r.readAt <= 0L || now - r.readAt > 3L * 86_400_000L ||
-            (lastReportMs in (r.readAt + 1)..now)
+            (lastReportMs in (r.readAt + 1)..now) ||
+            (r.sector == null && now - r.readAt > 6L * 3_600_000L)       // read before the sector was kept
 
     /** Pure: the price over the two sessions from the report day, against the close
      *  before it. Daily bars, oldest first. Null when there are not enough. */
@@ -104,7 +107,8 @@ object ResultsBook {
         val cur = get(ctx, key)
         val rep = lastReport(ctx, key, cur, now)
         if (!force && !stale(cur, rep, now)) return cur
-        val qs = YahooFinanceClient.fetchEarningsHistory(yahooOf(key)) ?: return cur
+        val reply = YahooFinanceClient.fetchResultsAndProfile(yahooOf(key)) ?: return cur
+        val qs = reply.quarters
         var react: Double? = cur?.reactionPct.takeIf { cur?.reactionFor == rep }
         if (rep > 0L && (react == null || now - rep < 4L * 86_400_000L)) try {
             val y = yahooOf(key)
@@ -116,6 +120,7 @@ object ResultsBook {
             r.copy(quarters = qs.map { Quarter(it.quarterEndMs, it.eps, it.estimate, it.surprisePct) }
                     .ifEmpty { r.quarters.orEmpty() },
                 readAt = now, lastReportMs = maxOf(r.lastReportMs, rep),
+                sector = reply.sector ?: r.sector ?: "", industry = reply.industry ?: r.industry,
                 reactionPct = react, reactionFor = if (react != null) rep else r.reactionFor)
         }
     }
@@ -142,6 +147,7 @@ object ResultsBook {
     // ── for the page and the AI ──────────────────────────────────────────────
 
     fun forPage(r: Rec?): Map<String, Any?> = mapOf(
+        "sector" to r?.sector?.takeIf { it.isNotBlank() }, "industry" to r?.industry,
         "quarters" to r?.quarters.orEmpty().takeLast(4).reversed().map { mapOf("q" to it.qEnd, "s" to it.surprisePct) },
         "lastReport" to (r?.lastReportMs ?: 0L), "reaction" to r?.reactionPct,
         "moves" to r?.moves.orEmpty().takeLast(3).reversed().map {
@@ -152,9 +158,12 @@ object ResultsBook {
         if (r == null) return ""
         val qs = r.quarters.orEmpty().takeLast(4)
         val mv = r.moves.orEmpty().filter { System.currentTimeMillis() - it.dayMs < 120L * 86_400_000L }.takeLast(4)
-        if (qs.isEmpty() && mv.isEmpty()) return ""
+        val sec = listOfNotNull(r.sector?.takeIf { it.isNotBlank() }, r.industry?.takeIf { it.isNotBlank() })
+        if (qs.isEmpty() && mv.isEmpty() && sec.isEmpty()) return ""
         fun d(ms: Long) = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate().toString()
         return buildString {
+            if (sec.isNotEmpty()) append("Sector: ${sec.joinToString(" · ")}\n\n")
+            if (qs.isEmpty() && mv.isEmpty()) return@buildString
             append("─ Results record (facts from Yahoo Finance and this app, not opinions) ─\n")
             qs.reversed().forEach { q ->
                 append("• Quarter to ${d(q.qEnd)}: earnings a share ${q.eps?.let { "%.2f".format(it) } ?: "?"}" +

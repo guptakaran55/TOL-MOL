@@ -1325,25 +1325,37 @@ object YahooFinanceClient {
     /** One reported quarter: earnings a share against what analysts expected. */
     data class QuarterResult(val quarterEndMs: Long, val eps: Double?, val estimate: Double?, val surprisePct: Double?)
 
-    /** The last four quarters, oldest first. Null when Yahoo could not be asked. */
-    fun fetchEarningsHistory(yahooSymbol: String): List<QuarterResult>? = try {
+    /** The last four quarters, and the company's sector and industry. */
+    data class ResultsReply(val quarters: List<QuarterResult>, val sector: String?, val industry: String?)
+
+    /** The last four quarters (oldest first) with the company's sector. Null when
+     *  Yahoo could not be asked. */
+    fun fetchResultsAndProfile(yahooSymbol: String): ResultsReply? = try {
         val crumb = fetchCrumb() ?: return null
         val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
             .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
-            .addQueryParameter("modules", "earningsHistory")
+            .addQueryParameter("modules", "earningsHistory,assetProfile")
             .addQueryParameter("crumb", crumb).build()
         val req = Request.Builder().url(url)
             .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
             .addHeader("Accept", "application/json").build()
         client.newCall(req).execute().use { r ->
             when (r.code) {
-                200 -> parseEarningsHistory(r.body?.string().orEmpty())
-                404 -> emptyList()
+                200 -> r.body?.string().orEmpty().let { b -> parseProfile(b).let { (s, i) -> ResultsReply(parseEarningsHistory(b), s, i) } }
+                404 -> ResultsReply(emptyList(), null, null)
                 401, 403 -> { cachedCrumb = null; null }
                 else -> null
             }
         }
     } catch (e: Exception) { Log.w(TAG, "earnings history failed for $yahooSymbol: ${e.message}"); null }
+
+    /** Pure: sector and industry out of an assetProfile reply. */
+    fun parseProfile(body: String): Pair<String?, String?> = try {
+        val p = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
+            ?.optJSONObject("assetProfile")
+        (p?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() }) to
+            (p?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() })
+    } catch (e: Exception) { null to null }
 
     /** Pure: an earningsHistory reply, oldest quarter first. Surprise in %. */
     fun parseEarningsHistory(body: String): List<QuarterResult> = try {

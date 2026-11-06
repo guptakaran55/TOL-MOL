@@ -47,6 +47,7 @@ object OutlookReply {
             out.put("news", o.optString("news").trim().uppercase(Locale.US).takeIf { it in NEWS } ?: "")
             out.put("short_term", cites(o.optString("short_term"), n).take(700))
             out.put("long_term", cites(o.optString("long_term"), n).take(500))
+            out.put("sector", cites(o.optString("sector"), n).take(500))
             val risks = JSONArray()
             val arr = o.optJSONArray("risks")
             if (arr != null) {

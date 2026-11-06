@@ -631,8 +631,10 @@ function aiDisagreePaint(){
 // "📊 Jun beat 9.7% · Mar beat 3.1% · … · reported 13 Nov → +6.1%", and the
 // latest big move with its headline. Read from ResultsBook (Yahoo when stale).
 var RES={d:{}};
-function resLineSlot(sym,sp){
+var RES_SEC={};
+function resLineSlot(sym,sp,sector,industry){
   if(!sym)return '';var k=aicKey(sym,sp);if(k.indexOf('XX:')===0)return '';
+  if(sector||industry)RES_SEC[k]={sector:sector||'',industry:industry||''};
   if(!RES.d[k]){RES.d[k]={loading:1};
     androidAsync('resultsRecord',[k],function(raw){
       try{RES.d[k]=JSON.parse(raw||'{}')||{}}catch(e){RES.d[k]={}}
@@ -642,7 +644,11 @@ function resLineSlot(sym,sp){
   return '<div id="res-line" data-k="'+escHtml(k)+'" style="font-size:9px;color:var(--t2);margin-top:3px;line-height:1.45">'+resLineInner(k)+'</div>';
 }
 function resLineInner(k){
-  var r=RES.d[k];if(!r||r.loading)return '';
+  var r=RES.d[k]||{},sc=RES_SEC[k]||{};
+  // THE SECTOR FIRST (the user, 6 Nov 2026): the scan's when there is one, else Yahoo's profile.
+  var sec=[r.sector||sc.sector,r.industry||sc.industry].filter(function(x){return x}).join(' · ');
+  var head=sec?'<div style="font-weight:700;color:var(--t1)">🏷 '+escHtml(sec)+'</div>':'';
+  if(!RES.d[k]||r.loading)return head;
   var mo=function(ms){return new Date(Number(ms)).toLocaleDateString([], {month:'short'})};
   var dd=function(ms){return new Date(Number(ms)).toLocaleDateString([], {day:'numeric',month:'short'})};
   var w=function(s){if(s==null)return '?';s=Number(s);return s>=1?'<b style="color:var(--gn)">beat '+s.toFixed(1)+'%</b>':s<=-1?'<b style="color:var(--rd)">miss '+(-s).toFixed(1)+'%</b>':'in line'};
@@ -653,7 +659,7 @@ function resLineInner(k){
   var mv=(r.moves||[])[0];
   if(mv&&Date.now()-Number(mv.day)<30*86400000)parts.push('<span title="'+escHtml(String(mv.headline||''))+'">⚡ '+dd(mv.day)+' '+(Number(mv.pct)>=0?'+':'')+Number(mv.pct).toFixed(1)+'%'+
     (mv.headline?' · '+escHtml(String(mv.headline).slice(0,60))+(String(mv.headline).length>60?'…':''):'')+'</span>');
-  return parts.join('<br/>');
+  return head+parts.join('<br/>');
 }
 (function(){for(var sec in SECTOR_MAP_DATA){if(SECTOR_MAP_DATA.hasOwnProperty(sec)){SECTOR_MAP_DATA[sec].forEach(function(sym){SECTOR_MAP[sym]=sec});}}})();
 // ── SPACE state (IN ↔ US) ──────────────────────────────────────────────────
@@ -20497,7 +20503,7 @@ function showDetail(idx,focus){
   hh+=ernChip(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE),true);
   hh+='</div>';
   hh+='<div id="dt-px" data-cur="'+escHtml(cur)+'" style="margin-top:4px">'+detailPxHtml(s,cur)+'</div>';
-  hh+=resLineSlot(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE));
+  hh+=resLineSlot(s.yahooSymbol||s.symbol,s._t212?'':(s.space||SPACE),s.sector,s.industry);
   // A SCAN ROW IS ONLY AS CURRENT AS THE SCAN. Said under the price, because a
   // two-month-old price shown bare reads as today's.
   var fromScan=(typeof idx==='number')||(STATE.data&&STATE.data.indexOf(s)>=0);
@@ -21112,6 +21118,7 @@ function renderOutlook(o){
     h+='<div class="ol-note">The AI did not answer in the expected shape \u2014 its reply as sent:</div>';
     h+='<div style="white-space:pre-wrap">'+olCites(escHtml(o.raw))+'</div>';
   }
+  if(o.sector)h+='<div class="ol-h">SECTOR</div><div>'+olCites(escHtml(o.sector))+'</div>';
   if(o.short_term)h+='<div class="ol-h">SHORT TERM \u00b7 1\u20134 weeks</div><div>'+olCites(escHtml(o.short_term))+'</div>';
   if(o.long_term)h+='<div class="ol-h">LONG TERM \u00b7 3\u201312 months <span class="ol-thin">\u2014 headlines only, thin evidence</span></div><div>'+olCites(escHtml(o.long_term))+'</div>';
   if(o.risks&&o.risks.length){
@@ -21151,6 +21158,7 @@ function outlookPlain(o){
   var strip=function(t){return String(t||'').replace(/\s*\[\d+(?:,\d+)*\]/g,'')};
   var p=[];
   if(o.verdict)p.push('Verdict: '+o.verdict+(o.confidence?' ('+o.confidence.toLowerCase()+' confidence)':''));
+  if(o.sector)p.push('Sector: '+strip(o.sector));
   if(o.short_term)p.push('Short term: '+strip(o.short_term));
   if(o.long_term)p.push('Long term: '+strip(o.long_term));
   if(o.risks&&o.risks.length)p.push('Key risks: '+o.risks.map(strip).join('; '));
