@@ -126,7 +126,7 @@ object ManualEntryWatcher {
     // ── the watcher's OWN daily screen ─────────────────────────────────────
     /** The space's full universe. The watcher screens ALL of it, not any algo's
      *  symbol group — it is a separate lens on the same market, not a follower. */
-    private fun universeFor(ctx: Context, space: String): List<String> {
+    internal fun universeFor(ctx: Context, space: String): List<String> {
         val base = Spaces.baseOf(space)
         val index = when (base) {
             "de" -> com.signalscope.app.service.deScreenedUniverse(ctx).map { it.removeSuffix(".DE") }

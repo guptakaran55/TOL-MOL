@@ -2358,7 +2358,7 @@ function openNotificationList(){
   var r={entries:[]};
   try{r=JSON.parse(Android.notificationLog()||'{}')}catch(e){}
   NOTIF_LIST={entries:r.entries||[],seenAt:Number(r.seenAt||0)};
-  NOTIF_MARKET=null;
+  NOTIF_MARKET=null;NOTIF_VIEW='alerts';NEWS_MARKET=null;
   try{Android.notificationSeen()}catch(e){}
   renderNotificationList();
   // The bell's count is now zero; redraw the bar under the sheet.
@@ -2452,7 +2452,95 @@ function notifOpenShort(l){
   if(l.ns)return 'algo';if(l.symbol||l.watchSymbol)return 'details';if(l.holding)return 'holding';if(l.tab)return 'open';
   return '';
 }
+// ── NEWS MOVES IN NOTIFICATIONS (the user, 6 Nov 2026) ────────────────────────
+// A second view beside the alerts: every big move on news the app saw across
+// each market's whole list (NewsMoves.kt), by market, with a "Holdings +
+// watchlist" tick to keep only your own. A row's headline opens the article;
+// › opens the stock.
+var NOTIF_VIEW='alerts',NEWS_LOG=[],NEWS_MARKET=null,NEWS_MINE=false;
+try{NEWS_MINE=localStorage.getItem('newsMine')==='1'}catch(e){}
+function notifView(v){
+  NOTIF_VIEW=v;
+  if(v==='news'){try{NEWS_LOG=(JSON.parse(Android.newsMovesLog()||'{}').items)||[]}catch(e){NEWS_LOG=[]}}
+  renderNotificationList();
+}
+function newsMinePick(on){NEWS_MINE=!!on;try{localStorage.setItem('newsMine',on?'1':'0')}catch(e){}renderNotificationList()}
+function newsPick(m){NEWS_MARKET=m;renderNotificationList()}
+function notifViewToggle(){
+  var b=function(v,t){var on=NOTIF_VIEW===v;return '<span onclick="notifView(\''+v+'\')" style="flex:1;text-align:center;cursor:pointer;padding:5px 0;font-size:11px;font-weight:800;border-radius:7px;'+
+    (on?'background:var(--pu);color:#fff':'color:var(--t2)')+'">'+t+'</span>'};
+  return '<div style="display:flex;gap:4px;padding:3px;border:1px solid var(--bd);border-radius:9px;margin-bottom:8px;background:var(--cd)">'+b('alerts','🔔 Alerts')+b('news','📰 News moves')+'</div>';
+}
+function newsOpenStock(i){
+  var it=NEWS_LOG[i];if(!it)return;
+  closeNotificationList();
+  try{window.openWatcherChartFromNotification(it.space,String(it.symbol||'').replace(/\.(DE|NS)$/i,''))}catch(e){console.error(e)}
+}
+function newsOpenArticle(i){
+  var it=NEWS_LOG[i],u=it&&it.link;if(!u||!/^https:\/\/news\.google\.com\//.test(u))return;
+  if(typeof Android!=='undefined'&&Android.openNewsLink)Android.openNewsLink(u);else window.open(u,'_blank','noopener');
+}
+function newsSheetHtml(){
+  var mine=function(it){return it.role==='held'||it.role==='watch'};
+  var src=(NEWS_LOG||[]).filter(function(it){return !NEWS_MINE||mine(it)});
+  var counts={all:src.length};src.forEach(function(it){counts[it.space]=(counts[it.space]||0)+1});
+  if(NEWS_MARKET==null){var here=String(SPACE||'').toLowerCase();NEWS_MARKET=counts[here]?here:'all'}
+  var h='<div style="position:sticky;top:-14px;margin:-14px -14px 0;padding:14px 14px 6px;background:var(--bg);z-index:1;border-bottom:1px solid var(--bd)">';
+  h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><div style="font-size:14px;font-weight:800;flex:1">\uD83D\uDD14 Notifications</div>'+
+    '<span onclick="closeNotificationList()" style="cursor:pointer;font-size:18px;color:var(--t2);padding:0 4px">\u2715</span></div>';
+  h+=notifViewToggle();
+  h+='<div style="display:flex;gap:6px;align-items:center;overflow-x:auto;scrollbar-width:none;padding-bottom:2px">';
+  [['all','All',''],['de','Germany','\uD83C\uDDE9\uD83C\uDDEA'],['us','US','\uD83C\uDDFA\uD83C\uDDF8'],['in','India','\uD83C\uDDEE\uD83C\uDDF3']].forEach(function(mk){
+    var on=NEWS_MARKET===mk[0],n=counts[mk[0]]||0;
+    h+='<span onclick="newsPick(\''+mk[0]+'\')" style="flex:0 0 auto;cursor:pointer;padding:4px 10px;border-radius:14px;font-size:10px;font-weight:800;white-space:nowrap;'+
+      (on?'background:var(--pu);color:#fff;border:1px solid var(--pu)':'background:var(--cd);color:var(--t2);border:1px solid var(--bd)')+'">'+
+      (mk[2]?mk[2]+' ':'')+mk[1]+' <span style="opacity:.75;font-family:monospace">'+n+'</span></span>';
+  });
+  h+='</div>';
+  h+='<label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:10px;color:var(--t2);cursor:pointer">'+
+    '<input type="checkbox" '+(NEWS_MINE?'checked ':'')+'onchange="newsMinePick(this.checked)" style="margin:0"/> Holdings + watchlist only</label>';
+  h+='</div>';
+  var rows=src.filter(function(it){return NEWS_MARKET==='all'||it.space===NEWS_MARKET});
+  if(!rows.length)h+='<div style="font-size:11px;color:var(--t3);padding:24px 4px;text-align:center">No big moves on news yet. During market hours, a stock moving 5% on twice its usual volume (3% around results) lands here.</div>';
+  var lastDay='';
+  rows.forEach(function(it){
+    var i=NEWS_LOG.indexOf(it),day=new Date(it.at).toDateString();
+    if(day!==lastDay){lastDay=day;h+='<div style="font-size:9px;font-weight:800;color:var(--t3);margin:9px 2px 4px;text-transform:uppercase;letter-spacing:.04em">'+escHtml(notifWhen(it.at).replace(/ \d\d:\d\d$/,''))+'</div>'}
+    var up=Number(it.pct)>=0,flag=NEWS_MARKET==='all'?(notifFlag(it.space)+' '):'';
+    var tag=it.role==='held'?'<span style="font-size:8px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.45);border-radius:3px;padding:0 3px">you hold it</span>'
+      :it.role==='watch'?'<span style="font-size:8px;font-weight:800;color:var(--pu);border:1px solid var(--pu);border-radius:3px;padding:0 3px">watchlist</span>':'';
+    var res='';
+    if(it.results){var s=it.surprise;res='<span style="font-size:8px;font-weight:800;border-radius:3px;padding:0 3px;'+
+      (s==null?'color:var(--t2);border:1px solid var(--bd)">results':(s>=1?'color:var(--gn);border:1px solid var(--gn)">beat '+Number(s).toFixed(1)+'%':s<=-1?'color:var(--rd);border:1px solid var(--rd)">miss '+(-Number(s)).toFixed(1)+'%':'color:var(--t2);border:1px solid var(--bd)">in line'))+'</span>'}
+    h+='<div style="display:flex;align-items:stretch;margin-bottom:5px;border:1px solid var(--bd);border-radius:8px;background:var(--cd);overflow:hidden">'+
+      '<div style="flex:1;min-width:0;padding:6px 8px 6px 9px">'+
+        '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">'+
+          '<span style="font-size:11px;font-weight:800;color:var(--t1)">'+flag+escHtml(String(it.symbol||''))+'</span>'+
+          '<span style="font-size:11px;font-weight:800;color:'+(up?'var(--gn)':'var(--rd)')+'">'+(up?'+':'')+Number(it.pct).toFixed(1)+'%</span>'+
+          '<span style="font-size:9px;color:var(--t3)">'+Number(it.volX||0).toFixed(1)+'× vol</span>'+res+tag+
+          '<span style="flex:1"></span><span style="font-size:9px;color:var(--t3);white-space:nowrap">'+escHtml(notifWhen(it.at).replace(/^(Today|Yesterday) /,''))+'</span></div>'+
+        (it.name?'<div style="font-size:9px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(String(it.name))+'</div>':'')+
+        '<div onclick="newsOpenArticle('+i+')" style="font-size:10px;line-height:1.4;margin-top:2px;'+(it.link?'color:var(--bl);cursor:pointer':'color:var(--t3)')+'">'+
+          (it.headline?escHtml(String(it.headline))+(it.outlet?' <span style="color:var(--t3)">— '+escHtml(String(it.outlet))+'</span>':''):'No headline found.')+'</div>'+
+      '</div>'+
+      '<div onclick="newsOpenStock('+i+')" title="Open the stock" style="flex:0 0 44px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border-left:1px solid var(--bd);color:var(--pu)">'+
+        '<span style="font-size:18px;font-weight:800;line-height:1">\u203A</span><span style="font-size:8px;font-weight:800;margin-top:1px">details</span></div>'+
+    '</div>';
+  });
+  return h;
+}
+function notifMount(h){
+  var w=document.getElementById('notif-list');
+  if(!w){
+    w=document.createElement('div');w.id='notif-list';
+    w.style.cssText='position:fixed;inset:0;z-index:10002;background:rgba(0,0,0,.5);display:flex;justify-content:center;align-items:flex-start;padding:12px';
+    w.addEventListener('click',function(ev){if(ev.target===w)closeNotificationList()});
+    document.body.appendChild(w);
+  }
+  w.innerHTML='<div style="width:100%;max-width:520px;max-height:calc(100vh - 24px);overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px 14px 8px;box-shadow:0 12px 40px rgba(0,0,0,.4)">'+h+'</div>';
+}
 function renderNotificationList(){
+  if(NOTIF_VIEW==='news')return notifMount(newsSheetHtml());
   var es=NOTIF_LIST.entries||[];
   var counts={all:es.length},fresh={all:0};
   es.forEach(function(e){var m=notifMarket(e);counts[m]=(counts[m]||0)+1;if(e.at>NOTIF_LIST.seenAt){fresh[m]=(fresh[m]||0)+1;fresh.all++}});
@@ -2463,6 +2551,7 @@ function renderNotificationList(){
     '<div style="font-size:14px;font-weight:800;flex:1">\uD83D\uDD14 Notifications</div>'+
     (es.length?'<span onclick="notifClearAll()" style="cursor:pointer;font-size:10px;color:var(--t3);border:1px solid var(--bd);border-radius:6px;padding:4px 9px">Clear</span>':'')+
     '<span onclick="closeNotificationList()" style="cursor:pointer;font-size:18px;color:var(--t2);padding:0 4px">\u2715</span></div>';
+  h+=notifViewToggle();
   if(es.length){
     h+='<div style="display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:2px">';
     NOTIF_MARKETS.forEach(function(mk){
@@ -2504,14 +2593,7 @@ function renderNotificationList(){
         '<span style="font-size:18px;font-weight:800;line-height:1">\u203A</span><span style="font-size:8px;font-weight:800;margin-top:1px">'+lab+'</span></div>':'')+
       '</div>';
   });
-  var w=document.getElementById('notif-list');
-  if(!w){
-    w=document.createElement('div');w.id='notif-list';
-    w.style.cssText='position:fixed;inset:0;z-index:10002;background:rgba(0,0,0,.5);display:flex;justify-content:center;align-items:flex-start;padding:12px';
-    w.addEventListener('click',function(ev){if(ev.target===w)closeNotificationList()});
-    document.body.appendChild(w);
-  }
-  w.innerHTML='<div style="width:100%;max-width:520px;max-height:calc(100vh - 24px);overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px 14px 8px;box-shadow:0 12px 40px rgba(0,0,0,.4)">'+h+'</div>';
+  notifMount(h);
 }
 var fmt=function(n,d){d=d||2;return n!=null?Number(n).toFixed(d):'\u2014'};
 var ACTIVE_RANGE_INPUT=null;

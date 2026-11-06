@@ -2,32 +2,62 @@ package com.signalscope.app.trading
 
 import android.content.Context
 import android.util.Log
+import com.google.gson.Gson
 import com.signalscope.app.data.ManualWatchStore
+import com.signalscope.app.data.StoreCache
 import com.signalscope.app.network.StockAiClient
 import com.signalscope.app.network.YahooFinanceClient
+import java.io.File
 import java.time.ZonedDateTime
 
 /**
- * NEWS MOVES (the user, 6 Nov 2026): "tell me the stocks with sudden positive
- * news so I can buy in early; keep the negative for later decisions."
+ * NEWS MOVES (the user, 6 Nov 2026): big moves on news across each market's
+ * WHOLE list — the same stocks the watchlist screens (DAX-and-more, Nasdaq-100,
+ * NSE 500) plus your holdings and pins.
  *
  * Reading the news of every stock all day would cost a lot and find little. The
- * price says first: a stock moving 5% or more on twice its usual volume (or 3%
- * around its results) almost always has news behind it. Only then are its
- * headlines — and its results, when it just reported — read, and:
- *   • your HOLDINGS: an alert either way (good news, or bad news you hold);
- *   • the WATCHLIST (top of the ranking, pins, open entries): an alert when up;
- *   • every move, up or down, goes into [ResultsBook] for good.
- *
- * It only tells. It buys and sells nothing — the alert opens the stock, and the
- * buy, if you make one, goes through the RV gate like any other.
+ * price says first: 5% or more on twice the usual volume (or 3% around results)
+ * almost always has news behind it. Only then are its headlines — and its
+ * results, when it just reported — read.
+ *   • Every move goes to the News list in Notifications (per market, with a
+ *     "holdings + watchlist" filter) and into that stock's [ResultsBook].
+ *   • A phone alert only for YOUR stocks — holdings and the watchlist, up or
+ *     down — so the rest of the market never buzzes the phone.
+ * It buys and sells nothing.
  */
 object NewsMoves {
     private const val TAG = "NewsMoves"
-    /** Ranked watchlist names looked at, from the top. */
+    private const val FILE = "news_moves.json"
+    /** Ranked watchlist names counted as "watchlist", from the top. */
     private const val TOP = 60
-    /** Most stocks whose news is read in one pass. */
-    private const val MAX_READS = 6
+    /** Most stocks whose news is read in one pass — yours first, then the biggest moves. */
+    private const val MAX_READS = 10
+    private const val KEEP_DAYS = 14
+    private const val MAX_ITEMS = 800
+    private val gson = Gson()
+
+    data class Item(val at: Long = 0L, val space: String = "", val key: String = "", val symbol: String = "",
+                    val name: String = "", val pct: Double = 0.0, val volX: Double = 0.0,
+                    val results: Boolean = false, val surprise: Double? = null,
+                    val headline: String = "", val outlet: String = "", val link: String = "",
+                    /** "held", "watch" or "market" — when the move was seen. */
+                    val role: String = "market")
+    private data class Saved(val items: List<Item>? = null)
+
+    private fun file(ctx: Context) = File(ctx.filesDir, FILE)
+
+    @Synchronized
+    fun log(ctx: Context): List<Item> = try {
+        StoreCache.read(file(ctx)) { gson.fromJson(it, Saved::class.java) }?.items.orEmpty()
+    } catch (e: Exception) { Log.w(TAG, "unreadable", e); emptyList() }
+
+    @Synchronized
+    private fun append(ctx: Context, add: List<Item>) {
+        if (add.isEmpty()) return
+        val cut = System.currentTimeMillis() - KEEP_DAYS * 86_400_000L
+        val all = (log(ctx) + add).filter { it.at > cut }.sortedByDescending { it.at }.take(MAX_ITEMS)
+        try { StoreCache.write(file(ctx), gson.toJson(Saved(all))) } catch (e: Exception) { Log.w(TAG, "save failed", e) }
+    }
 
     /** Pure: is this a move worth reading the news for? [volX] is volume against
      *  the usual for this time of day. */
@@ -41,29 +71,38 @@ object NewsMoves {
         return ((nowMin - openMin).toDouble() / len).coerceIn(0.2, 1.0)
     }
 
+    /** Pure: the order news is read in — holdings, then watchlist, then the market;
+     *  biggest move first within each. */
+    fun readOrder(roles: Map<String, String>, pct: Map<String, Double>): List<String> {
+        fun rank(r: String?) = when (r) { "held" -> 0; "watch" -> 1; else -> 2 }
+        return pct.keys.sortedWith(compareBy<String>({ rank(roles[it]) }, { -kotlin.math.abs(pct[it] ?: 0.0) }))
+    }
+
     fun runOnce(ctx: Context, base0: String): String {
         val base = Spaces.baseOf(base0.lowercase())
         val now = System.currentTimeMillis()
         if (!MarketHours.isRegularSession(base, now)) return ""
         val sp = base.uppercase()
 
-        // Who is looked at, and in what role.
-        val role = LinkedHashMap<String, String>()                 // key → "held" | "watch"
+        val role = LinkedHashMap<String, String>()                 // key → held | watch | market
         val label = HashMap<String, String>()                      // key → the symbol as shown
         when (val r = BrokerHoldings.forSpace(ctx, base)) {
             is BrokerHoldings.Result.Ok -> r.holdings.forEach { h ->
-                val s = h.yahoo.ifBlank { h.symbol }
-                val k = AiChips.keyOf(s, sp); role[k] = "held"; label[k] = h.symbol }
+                val k = AiChips.keyOf(h.yahoo.ifBlank { h.symbol }, sp); role[k] = "held"; label[k] = h.symbol }
             is BrokerHoldings.Result.Unreadable -> {}
         }
         try {
             val st = ManualWatchStore.load(ctx, base)
             (st.ranking.take(TOP).map { it.symbol } + st.pinned +
                 st.entries.filter { it.status != "CLOSED" }.map { it.symbol }).forEach { s ->
-                val k = AiChips.keyOf(s, sp)
-                if (k !in role) { role[k] = "watch"; label[k] = s }
+                val k = AiChips.keyOf(s, sp); if (k !in role) { role[k] = "watch"; label[k] = s }
             }
         } catch (e: Exception) { Log.w(TAG, "[$base] watchlist unreadable", e) }
+        try {
+            ManualEntryWatcher.universeFor(ctx, base).forEach { s ->
+                val k = AiChips.keyOf(s, sp); if (k !in role) { role[k] = "market"; label[k] = s }
+            }
+        } catch (e: Exception) { Log.w(TAG, "[$base] universe unreadable", e) }
         role.keys.removeAll { it.startsWith("XX:") }
         if (role.isEmpty()) return ""
 
@@ -76,42 +115,47 @@ object NewsMoves {
             sessionShare(open.hour * 60 + open.minute, close.hour * 60 + close.minute, t.hour * 60 + t.minute)
         } else 1.0
 
-        val said = ArrayList<String>()
-        var reads = 0
-        for ((k, rl) in role) {
+        // Every move today not yet read, then read yours first.
+        data class Hit(val q: YahooFinanceClient.DayQuote, val volX: Double, val rep: Long, val near: Boolean)
+        val hits = HashMap<String, Hit>()
+        for (k in role.keys) {
             val q = quotes[ySym[k]!!.uppercase()] ?: continue
             if (q.avgVolume10d <= 0L || q.price <= 0.0) continue
             val volX = q.volume / (q.avgVolume10d * share)
             val rep = q.earningsAtMs.takeIf { it > 0L } ?: EarningsDates.known(ctx, k)?.atMs ?: 0L
-            val resultsNear = rep in (now - 2 * 86_400_000L)..(now + 12 * 3_600_000L)
-            if (!isMove(q.changePct, volX, resultsNear)) continue
-            if (ResultsBook.movedToday(ctx, k, now)) continue
-            if (reads >= MAX_READS) break
-            reads++
+            val near = rep in (now - 2 * 86_400_000L)..(now + 12 * 3_600_000L)
+            if (!isMove(q.changePct, volX, near) || ResultsBook.movedToday(ctx, k, now)) continue
+            hits[k] = Hit(q, volX, rep, near)
+        }
+        val order = readOrder(role, hits.mapValues { it.value.q.changePct }).take(MAX_READS)
 
-            val ctxM = StockAiClient.MarketContext.fromSpace(sp)
+        val said = ArrayList<String>(); val items = ArrayList<Item>()
+        for (k in order) {
+            val h = hits[k]!!; val q = h.q; val rl = role[k] ?: "market"
+            val sym = label[k] ?: k.substringAfter(':')
             val story = try {
-                StockAiClient.fetchStories(label[k] ?: k.substringAfter(':'), 4, ctxM, q.name.ifBlank { null })
+                StockAiClient.fetchStories(sym, 4, StockAiClient.MarketContext.fromSpace(sp), q.name.ifBlank { null })
                     .firstOrNull { (it.timeMs ?: 0L) > now - 3 * 86_400_000L }
             } catch (e: Exception) { null }
-            val surprise = if (resultsNear) try {
+            val surprise = if (h.near) try {
                 ResultsBook.freshSurprise(ResultsBook.read(ctx, k, force = true), now)
             } catch (e: Exception) { null } else null
 
-            ResultsBook.addMove(ctx, k, ResultsBook.Move(now, q.changePct, volX,
-                story?.title.orEmpty(), story?.source.orEmpty(), resultsNear, surprise),
-                if (rep <= now) rep else 0L)
-            val sym = label[k] ?: k.substringAfter(':')
-            Log.i(TAG, "[$base] $sym ${"%+.1f".format(q.changePct)}% on ${"%.1f".format(volX)}× volume" +
-                (if (resultsNear) " · results ${ResultsBook.word(surprise)}" else "") +
-                (story?.let { " · ${it.title}" } ?: ""))
-            val held = rl == "held"
-            if (held || q.changePct > 0) {
-                try { LabNotifier.newsMove(ctx, base, sym, q.changePct, volX, resultsNear, surprise, story?.title, story?.source, held) }
+            ResultsBook.addMove(ctx, k, ResultsBook.Move(now, q.changePct, h.volX,
+                story?.title.orEmpty(), story?.source.orEmpty(), h.near, surprise), if (h.rep <= now) h.rep else 0L)
+            items.add(Item(now, base, k, sym, q.name, q.changePct, h.volX, h.near, surprise,
+                story?.title.orEmpty(), story?.source.orEmpty(), story?.link.orEmpty(), rl))
+            Log.i(TAG, "[$base] $sym ($rl) ${"%+.1f".format(q.changePct)}% on ${"%.1f".format(h.volX)}× volume" +
+                (if (h.near) " · results ${ResultsBook.word(surprise)}" else "") + (story?.let { " · ${it.title}" } ?: ""))
+            if (rl != "market") {
+                try { LabNotifier.newsMove(ctx, base, sym, q.changePct, h.volX, h.near, surprise, story?.title, story?.source, rl == "held") }
                 catch (e: Exception) { Log.w(TAG, "alert failed", e) }
                 said.add("$sym ${"%+.0f".format(q.changePct)}%")
             }
         }
-        return if (said.isEmpty()) "" else "moves ${said.joinToString(", ")}"
+        append(ctx, items)
+        val more = items.count { it.role == "market" }
+        return listOfNotNull(said.takeIf { it.isNotEmpty() }?.let { "moves ${it.joinToString(", ")}" },
+            more.takeIf { it > 0 }?.let { "$it market moves listed" }).joinToString(" · ")
     }
 }

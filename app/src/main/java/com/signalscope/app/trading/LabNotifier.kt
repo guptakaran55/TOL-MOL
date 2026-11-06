@@ -1072,6 +1072,15 @@ object LabNotifier {
             ?.let { !(it.live && it.liveBudget > 0.0 && it.liveAllowlist.isNotEmpty()) } ?: true
     } catch (_: Exception) { true }
 
+    /** True the first time [key] is asked on [day]; false after, across restarts. */
+    @Synchronized
+    private fun firstToday(ctx: Context, key: String, day: String): Boolean {
+        val p = ctx.getSharedPreferences("lab_notifier_once", Context.MODE_PRIVATE)
+        if (p.getString(key, null) == day) return false
+        p.edit().putString(key, day).apply()
+        return true
+    }
+
     /**
      * A holding the trailing stop cannot protect, because nothing is guarding it.
      *
@@ -1082,6 +1091,10 @@ object LabNotifier {
      */
     fun unprotectedHolding(ctx: Context, ns: String, symbol: String) {
         val day = java.time.LocalDate.now(java.time.ZoneOffset.UTC)
+        // ONCE A DAY FOR REAL (6 Nov 2026): the same id only replaced the card in the
+        // tray — every pass still rang and logged it again (GMMPFAUDLR, REDINGTON,
+        // every 15 minutes). Remembered here, it is said once and stays said.
+        if (!firstToday(ctx, "np-$ns-$symbol", day.toString())) return
         notify(ctx, CH_T212, NotificationManager.IMPORTANCE_HIGH, "Stock LIVE trades",
             "⚠️ $symbol has no stop at the broker",
             "${spaceLabel(ns)} · your trailing stop had nothing to raise — there is no " +

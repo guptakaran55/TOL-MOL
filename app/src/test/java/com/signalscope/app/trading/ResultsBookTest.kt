@@ -72,4 +72,9 @@ class ResultsBookTest {
         assertTrue(p.indexOf("beat 9.7%") < p.indexOf("miss 9.1%"))
         assertEquals("", ResultsBook.forPrompt(ResultsBook.Rec()))
     }
+    @Test fun `news is read for your stocks first, then the biggest market moves`() {
+        val roles = mapOf("US:A" to "market", "US:B" to "held", "US:C" to "watch", "US:D" to "market")
+        val pct = mapOf("US:A" to 9.0, "US:B" to -5.5, "US:C" to 6.0, "US:D" to -12.0)
+        assertEquals(listOf("US:B", "US:C", "US:D", "US:A"), NewsMoves.readOrder(roles, pct))
+    }
 }

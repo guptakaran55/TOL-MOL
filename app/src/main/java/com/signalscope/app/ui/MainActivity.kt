@@ -7343,6 +7343,12 @@ class MainActivity : AppCompatActivity() {
          * second tap can say one is already there (PYPL, 19 Oct: €50 at 16:19 was
          * still waiting when a second €50 went in at 17:47, and both bought). No network.
          */
+        /** NEWS MOVES: the last two weeks of big moves on news, every market, newest first. */
+        @JavascriptInterface
+        fun newsMovesLog(): String = try {
+            gson.toJson(mapOf("items" to com.signalscope.app.trading.NewsMoves.log(applicationContext)))
+        } catch (e: Exception) { "{\"items\":[]}" }
+
         /** AI & CHIPS: the list, your marks and the limit — read once when the page loads. */
         @JavascriptInterface
         fun aiChipsConfig(): String = try {
