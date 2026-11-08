@@ -33,6 +33,27 @@ class ZerodhaClient(private val config: ConfigManager) {
          * ACMESOLAR (29 Oct) on 30 Oct — and the last two lost their stops to the
          * stale-trigger cleanup that evening, with every share still in the account.
          */
+        /** Pure: a positions reply → holdings rows for delivery buys (CNC, net > 0)
+         *  in stocks not in [held]. Intraday (MIS) and sales are left out. */
+        fun parseDeliveryBuys(body: String, held: Set<String>): List<PortfolioHolding> {
+            val json = JsonParser.parseString(body).asJsonObject
+            if (json.get("status")?.asString != "success") return emptyList()
+            val arr = json.getAsJsonObject("data")?.getAsJsonArray("net") ?: return emptyList()
+            return arr.mapNotNull { el ->
+                val o = el.asJsonObject
+                fun s(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asString.orEmpty()
+                fun d(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asDouble ?: 0.0
+                val sym = s("tradingsymbol").uppercase()
+                val q = o.get("quantity")?.takeIf { !it.isJsonNull }?.asInt ?: 0
+                if (sym.isBlank() || q <= 0 || !s("product").equals("CNC", true) || sym in held) return@mapNotNull null
+                val avg = d("average_price").takeIf { it > 0.0 } ?: d("buy_price")
+                val ltp = d("last_price")
+                PortfolioHolding(symbol = sym, token = "", quantity = q, avgPrice = avg, ltp = ltp,
+                    pnl = if (avg > 0.0 && ltp > 0.0) (ltp - avg) * q else d("pnl"),
+                    exchange = s("exchange").ifBlank { "NSE" }, source = "zerodha")
+            }
+        }
+
         fun heldQty(o: com.google.gson.JsonObject): Int {
             fun n(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asInt ?: 0
             return n("quantity") + n("t1_quantity")
@@ -258,6 +279,18 @@ class ZerodhaClient(private val config: ConfigManager) {
         }
     }
 
+    /** Today's delivery buys (positions, product CNC, net quantity above zero) in
+     *  stocks the holdings list does not show yet. */
+    private fun deliveryBuysNotInHoldings(held: Set<String>): List<PortfolioHolding> {
+        val request = Request.Builder()
+            .url("$BASE_URL/portfolio/positions")
+            .addHeader("Authorization", "token ${config.zerodhaApiKey}:${config.zerodhaAccessToken}")
+            .build()
+        return client.newCall(request).execute().use { r ->
+            parseDeliveryBuys(r.body?.string() ?: return@use emptyList(), held)
+        }
+    }
+
     fun fetchHoldings(): HoldingsResult {
         if (!isConnected) return HoldingsResult.Failure("Not connected to Zerodha")
 
@@ -309,8 +342,17 @@ class ZerodhaClient(private val config: ConfigManager) {
                     )
                 }
 
-                Log.i(TAG, "Zerodha holdings fetched: ${holdings.size} stocks")
-                HoldingsResult.Success(holdings)
+                // BOUGHT BUT NOT YET IN HOLDINGS (the user, 8 Nov 2026). A delivery buy
+                // shows only under positions until the next session: LTFOODS and
+                // SUNDRMFAST, bought on a Friday, were missing all weekend — and their
+                // stop triggers were offered for deletion as "not in your portfolio".
+                val held = holdings.map { it.symbol.uppercase() }.toSet()
+                val fresh = try { deliveryBuysNotInHoldings(held) } catch (e: Exception) {
+                    Log.w(TAG, "today's positions unreadable — holdings only", e); emptyList()
+                }
+                Log.i(TAG, "Zerodha holdings fetched: ${holdings.size} stocks" +
+                    (if (fresh.isNotEmpty()) " + ${fresh.size} bought, not settled yet (${fresh.joinToString { it.symbol }})" else ""))
+                HoldingsResult.Success(holdings + fresh)
             }
 
         } catch (e: Exception) {
