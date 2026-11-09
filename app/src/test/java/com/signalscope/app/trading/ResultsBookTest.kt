@@ -87,4 +87,21 @@ class ResultsBookTest {
         val pct = mapOf("US:A" to 9.0, "US:B" to -5.5, "US:C" to 6.0, "US:D" to -12.0)
         assertEquals(listOf("US:B", "US:C", "US:D", "US:A"), NewsMoves.readOrder(roles, pct))
     }
+    @Test fun `a headline counts only when it names the company`() {
+        assertTrue(NewsMoves.namesCompany("Auto supplier Stabilus cuts medium-term targets, shares under pressure", "Stabilus SE", "STM"))
+        assertTrue(NewsMoves.namesCompany("ABO Energy GmbH & Co. KGaA suspends the interest payment", "ABO Energy GmbH & Co. KGaA", "AB9"))
+        assertFalse(NewsMoves.namesCompany("One shared system will help a phone group bundle subscriptions", "Net-Digital AG", "VRL"))
+        assertFalse(NewsMoves.namesCompany("Nitro Boys Bike - Prep boys basketball Class AAA final", "Circus SE", "CA1"))
+        assertFalse(NewsMoves.namesCompany("Symbiotec Pharmalab IPO Details", "SynBiotic SE", "SBX"))
+        assertFalse(NewsMoves.namesCompany("Deutsche Bank beats estimates", "Deutsche Telekom AG", "DTE"))
+        assertTrue(NewsMoves.namesCompany("Deutsche Telekom raises outlook", "Deutsche Telekom AG", "DTE"))
+        assertTrue(NewsMoves.namesCompany("NVDA jumps after results", null, "NVDA"))
+    }
+
+    @Test fun `the market list keeps to the Discovery floor`() {
+        assertTrue(NewsMoves.tooThin(2.0, 50_000, 500_000.0))        // 100k a day under a 500k floor
+        assertFalse(NewsMoves.tooThin(50.0, 200_000, 500_000.0))     // 10M a day
+        assertFalse(NewsMoves.tooThin(2.0, 50_000, 0.0))             // floor switched off
+        assertFalse(NewsMoves.tooThin(0.0, 0, 500_000.0))            // unknown passes
+    }
 }

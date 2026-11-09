@@ -71,6 +71,52 @@ object NewsMoves {
         return ((nowMin - openMin).toDouble() / len).coerceIn(0.2, 1.0)
     }
 
+    /** Words too common in company names to identify one ("Deutsche", "Tata"):
+     *  with these, the first TWO words of the name must both appear. */
+    private val SHARED_FIRST = setOf("deutsche", "american", "united", "general", "first", "international",
+        "national", "global", "new", "china", "india", "indian", "tata", "adani", "bajaj", "birla", "mahindra")
+
+    /**
+     * Pure: does this headline name the company? (the user, 9 Nov 2026: Net-Digital
+     * was shown a phone-bundle story, Circus a basketball one — the search had matched
+     * the ticker letters.) The first distinctive word of the cleaned name, as a whole
+     * word; with no name, the ticker.
+     */
+    fun namesCompany(headline: String, companyName: String?, symbol: String): Boolean {
+        val h = headline.lowercase()
+        fun has(w: String) = Regex("(^|[^\\p{L}0-9])" + Regex.escape(w) + "($|[^\\p{L}0-9])").containsMatchIn(h)
+        val words = com.signalscope.app.network.NewsDigest.searchName(companyName)
+            ?.lowercase()?.split(Regex("[\\s/&,]+"))?.filter { it.length >= 2 }.orEmpty()
+        if (words.isNotEmpty()) {
+            val first = words.first()
+            return if (first in SHARED_FIRST && words.size >= 2) has(first) && has(words[1])
+                   else first.length >= 3 && has(first) || (first.length < 3 && words.size >= 2 && has("$first ${words[1]}"))
+        }
+        val sym = symbol.substringBefore('.').lowercase()
+        return sym.length >= 3 && has(sym)
+    }
+
+    /** Pure: thinner than the Discovery floor? Price × 10-day average volume against
+     *  the market's minimum daily turnover. Unknown (0) passes, as in Discovery. */
+    fun tooThin(price: Double, avgVolume: Long, floor: Double): Boolean {
+        if (floor <= 0.0) return false
+        val t = price * avgVolume
+        return t > 0.0 && t < floor
+    }
+
+    /** Takes thin market stocks off the list, and clears a headline that is about
+     *  some other company (kept before the check existed). */
+    @Synchronized
+    private fun drop(ctx: Context, keys: Set<String>) {
+        val cur = log(ctx)
+        val keep = cur.filterNot { it.role == "market" && it.key in keys }.map {
+            if (it.headline.isNotBlank() && !namesCompany(it.headline, it.name.ifBlank { null }, it.symbol))
+                it.copy(headline = "", outlet = "", link = "") else it
+        }
+        if (keep != cur)
+            try { StoreCache.write(file(ctx), gson.toJson(Saved(keep))) } catch (e: Exception) { Log.w(TAG, "save failed", e) }
+    }
+
     /** Pure: the order news is read in — holdings, then watchlist, then the market;
      *  biggest move first within each. */
     fun readOrder(roles: Map<String, String>, pct: Map<String, Double>): List<String> {
@@ -115,18 +161,23 @@ object NewsMoves {
             sessionShare(open.hour * 60 + open.minute, close.hour * 60 + close.minute, t.hour * 60 + t.minute)
         } else 1.0
 
-        // Every move today not yet read, then read yours first.
+        // Every move today not yet read, then read yours first. The rest of the market
+        // only when it trades enough to pass the Discovery floor (yours always count).
+        val floor = try { com.signalscope.app.data.ConfigManager(ctx).minTurnoverFor(base) } catch (_: Exception) { 0.0 }
         data class Hit(val q: YahooFinanceClient.DayQuote, val volX: Double, val rep: Long, val near: Boolean)
         val hits = HashMap<String, Hit>()
+        val thin = HashSet<String>()
         for (k in role.keys) {
             val q = quotes[ySym[k]!!.uppercase()] ?: continue
             if (q.avgVolume10d <= 0L || q.price <= 0.0) continue
+            if (role[k] == "market" && tooThin(q.price, q.avgVolume10d, floor)) { thin.add(k); continue }
             val volX = q.volume / (q.avgVolume10d * share)
             val rep = q.earningsAtMs.takeIf { it > 0L } ?: EarningsDates.known(ctx, k)?.atMs ?: 0L
             val near = rep in (now - 2 * 86_400_000L)..(now + 12 * 3_600_000L)
             if (!isMove(q.changePct, volX, near) || ResultsBook.movedToday(ctx, k, now)) continue
             hits[k] = Hit(q, volX, rep, near)
         }
+        drop(ctx, thin)                                  // and off the list if already on it
         val order = readOrder(role, hits.mapValues { it.value.q.changePct }).take(MAX_READS)
 
         val said = ArrayList<String>(); val items = ArrayList<Item>()
@@ -134,8 +185,8 @@ object NewsMoves {
             val h = hits[k]!!; val q = h.q; val rl = role[k] ?: "market"
             val sym = label[k] ?: k.substringAfter(':')
             val story = try {
-                StockAiClient.fetchStories(sym, 4, StockAiClient.MarketContext.fromSpace(sp), q.name.ifBlank { null })
-                    .firstOrNull { (it.timeMs ?: 0L) > now - 3 * 86_400_000L }
+                StockAiClient.fetchStories(sym, 6, StockAiClient.MarketContext.fromSpace(sp), q.name.ifBlank { null })
+                    .firstOrNull { (it.timeMs ?: 0L) > now - 3 * 86_400_000L && namesCompany(it.title, q.name.ifBlank { null }, sym) }
             } catch (e: Exception) { null }
             val surprise = if (h.near) try {
                 ResultsBook.freshSurprise(ResultsBook.read(ctx, k, force = true), now)
