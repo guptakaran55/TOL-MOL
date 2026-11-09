@@ -180,9 +180,12 @@ object TradeReasons {
             }
         } catch (e: Exception) { Log.w(TAG, "ledger unreadable", e) }
         try {
+            // Read once for all rows, not once per row (9 Nov 2026: 10 s per panel read).
+            val algoSettings = try { com.signalscope.app.data.FloorAlgoStore.load(ctx).algos.associate { it.id to it.settings } }
+                               catch (_: Exception) { emptyMap() }
             FloorLiveStore.load(ctx).rows.filter { Spaces.baseOf(it.ns) == base }.forEach { r ->
                 r.buyIds.forEach { buyBy["$it"] = name(r.ns) }
-                val st = try { com.signalscope.app.data.FloorAlgoStore.get(ctx, r.ns.substringAfter("__"))?.settings } catch (_: Exception) { null }
+                val st = algoSettings[r.ns.substringAfter("__")]
                 r.sellIds.forEach { sellBy["$it"] = "${floorExit(r.exitReason, st?.stopPct, st?.stopUnit, st?.targetPct)} · ${name(r.ns)}" }
             }
         } catch (e: Exception) { Log.w(TAG, "built-in algos unreadable", e) }

@@ -3819,6 +3819,12 @@ function scheduleLiveRender(){
 window.updateLiveStreamState=function(j){
   try{
     var d=typeof j==='string'?JSON.parse(j):j;
+    // Only what the page shows (on/off, connected, count) earns a repaint: the
+    // status text alone changed 62 times in 10 minutes, each a full rebuild that
+    // queued ahead of your taps (9 Nov 2026).
+    var same=LIVE_STREAM.enabled===!!d.enabled&&LIVE_STREAM.connected===!!d.connected&&LIVE_STREAM.symbols===(d.symbols||0);
+    LIVE_STREAM.status=d.status||'';
+    if(same)return;
     LIVE_STREAM.enabled=!!d.enabled;
     LIVE_STREAM.connected=!!d.connected;
     LIVE_STREAM.status=d.status||'';
@@ -9565,13 +9571,21 @@ function t212Bare(t){ return String(t||'').split('_')[0].replace(/[dl]$/,'') || 
 function closedAnalysisBridge(){
   return (SPACE==='IN')?'zerodhaClosedTrades':(SPACE==='BN')?'binanceClosedTrades':'t212ClosedTrades';
 }
+// KEPT A MINUTE PER TAB (9 Nov 2026): the portfolio repaints many times a minute
+// and the strip reads this even folded; the report itself only changes when a
+// history read finishes, which drops the kept copy.
+var CLOSED_READ={};
 function closedAnalysisRead(){
   try{
     var fn=closedAnalysisBridge();
     if(typeof Android==='undefined'||!Android[fn])return null;
+    var k=SPACE, c=CLOSED_READ[k], now=Date.now();
+    if(c&&now-c.at<60000)return c.r;
     // Trading 212 is one account shown as two tabs, so it is asked for this
     // tab's market only; Zerodha's history is India's alone.
-    return JSON.parse(((SPACE==='IN'||SPACE==='BN')?Android[fn](false):Android[fn](false,SPACE))||'{}');
+    var r=JSON.parse(((SPACE==='IN'||SPACE==='BN')?Android[fn](false):Android[fn](false,SPACE))||'{}');
+    CLOSED_READ[k]={at:now,r:r};
+    return r;
   }catch(e){ return null }
 }
 function closedAnalysisScan(){
@@ -9584,7 +9598,7 @@ function closedAnalysisScan(){
   // broker's pace — minutes, not seconds — and the rest of the app stays usable
   // meanwhile. Busy is per tab, so another space is never shown as reading.
   androidAsync(fn,(sp==='IN'||sp==='BN')?[true]:[true,sp],function(){
-    CLOSED_ANALYSIS_BUSY[sp]=false; renderKeepScroll();
+    CLOSED_ANALYSIS_BUSY[sp]=false; CLOSED_READ={}; renderKeepScroll();
   });
 }
 function closedAnalysisPanel(){

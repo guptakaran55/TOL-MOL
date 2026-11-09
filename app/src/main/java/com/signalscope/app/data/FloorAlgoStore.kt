@@ -530,12 +530,15 @@ object FloorAlgoStore {
     private val gson = Gson()
     private fun file(ctx: Context) = File(ctx.filesDir, FILE)
 
-    @Synchronized
+    /** Parsed once and kept until the file changes (the user, 9 Nov 2026: the
+     *  portfolio's closed-trades panel took 10 s — this 2.5 MB file was parsed
+     *  afresh for every built-in algo trade on it). Not locked: a save replaces
+     *  the file in one step, so a read never waits for an algo's pass to finish. */
     fun load(ctx: Context): State {
         val f = file(ctx)
         if (!f.exists()) return State()
         return try {
-            gson.fromJson(f.readText(), State::class.java) ?: State()
+            StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()
         } catch (e: Exception) {
             Log.e(TAG, "floor algos unreadable — set aside, starting afresh", e)
             try { f.renameTo(File(f.parentFile, "$FILE.bad-${System.currentTimeMillis()}")) } catch (_: Exception) {}
@@ -546,10 +549,7 @@ object FloorAlgoStore {
     @Synchronized
     private fun save(ctx: Context, s: State) {
         try {
-            val f = file(ctx)
-            val tmp = File(f.parentFile, "$FILE.tmp")
-            tmp.writeText(gson.toJson(s))
-            if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
+            StoreCache.write(file(ctx), gson.toJson(s))   // in one step; drops the kept copy
         } catch (e: Exception) { Log.e(TAG, "floor algos save failed", e) }
     }
 
