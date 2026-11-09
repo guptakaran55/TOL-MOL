@@ -2751,8 +2751,19 @@ object ManualEntryWatcher {
 
             val why = if (hitTarget)
                 "take profit +${"%.2f".format(tpPct)}% from a fill of ${"%.2f".format(e.filledPrice)}"
-            else
-                "trailing stop -${"%.2f".format(pct)}% from a high of ${"%.2f".format(peak)}"
+            else {
+                // THE REAL DISTANCE, AND WHAT SET IT (9 Nov 2026). With the trail in
+                // Bollinger or ATR widths, "-1.50%" was the multiple, not the drop —
+                // the sale was right, the words (and the fill-cost mark read off them)
+                // were not. The % is now the drop from the high to the floor.
+                val drop = if (peak > 0.0 && level > 0.0) (1.0 - level / peak) * 100.0 else pct
+                val how = when (unit) {
+                    ManualWatchStore.TrailUnit.BB -> " (${"%.2f".format(pct)}× half Bollinger width)"
+                    ManualWatchStore.TrailUnit.ATR -> " (${"%.2f".format(pct)}× ATR)"
+                    else -> ""
+                }
+                "trailing stop -${"%.2f".format(drop)}% from a high of ${"%.2f".format(peak)}$how"
+            }
             Log.w(TAG, "[$base] $sym ${if (hitTarget) "TAKE PROFIT" else "TRAILING STOP"} hit: " +
                 "${"%.2f".format(trigger)} ${if (hitTarget) "reached" else "through"} " +
                 "${"%.2f".format(if (hitTarget) ceiling else level)} ($why)")

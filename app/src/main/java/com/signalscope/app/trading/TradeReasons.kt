@@ -68,6 +68,63 @@ object TradeReasons {
         }
     }
 
+    private val TRAIL = Regex("""trailing stop -([0-9.]+)% from a high of ([0-9.]+)(?: \(([0-9.]+)× (half Bollinger width|ATR)\))?""")
+    private val FIXED = Regex("""stop loss -([0-9.]+)%""")
+    private val FROM_FILL = Regex("""real stop -([0-9.]+)% from fill""")
+    private val TP = Regex("""take profit \+([0-9.]+)% from a fill""")
+    private val NEAR_HIGH = Regex("""near its ([0-9]+)-(week|month|year) high""")
+    private val WEEK_TGT = Regex("""reached its ([0-9]+)-(week|month) high target""")
+    /** Stands for "the real drop from this high", filled in from the trade's sale price. */
+    const val HIGH_MARK = "⟨H"
+
+    private fun g(x: String): String = x.toDoubleOrNull()?.let { v ->
+        if (v == Math.floor(v)) "%.0f".format(v) else "%.1f".format(v) } ?: x
+    private fun basisWord(b: String?): String? {
+        val (u, k) = (b ?: "").split(':').let { (it.getOrNull(0) ?: "") to (it.getOrNull(1) ?: "") }
+        return when (u.uppercase()) { "BB" -> "${g(k)}×BB/2"; "ATR" -> "${g(k)}×ATR"; else -> null }
+    }
+
+    /**
+     * WHAT SOLD IT, AND BY WHAT MECHANISM (the user, 9 Nov 2026): "SL −4% fixed",
+     * "SL −9% from buy", "trail −3.4% from high (1.5×BB/2)", "TP +6%",
+     * "target · 3-month high". [basis] is the watchlist entry's trail setting
+     * ("BB:1.5"), [hardStopPct] the watchlist's hard floor. Pure.
+     *
+     * Sales recorded before 9 Nov wrote the trail's MULTIPLE as if it were the
+     * drop ("-1.50%" for 1.5× the band); those get [HIGH_MARK] so the real drop
+     * is worked out from the sale price ([fillHighMarks]).
+     */
+    fun exitLabel(note: String?, basis: String? = null, hardStopPct: Double? = null): String {
+        val n = (note ?: "").trim()
+        TRAIL.find(n)?.let { m ->
+            val pct = m.groupValues[1]; val high = m.groupValues[2]
+            if (m.groupValues[3].isNotEmpty())
+                return "trail −${g(pct)}% from high (${g(m.groupValues[3])}×${if (m.groupValues[4] == "ATR") "ATR" else "BB/2"})"
+            val bw = basisWord(basis)
+            return if (bw != null) "trail $HIGH_MARK$high⟩ ($bw)" else "trail −${g(pct)}% from high"
+        }
+        FIXED.find(n)?.let { return "SL −${g(it.groupValues[1])}% fixed" }
+        FROM_FILL.find(n)?.let { return "SL −${g(it.groupValues[1])}% from fill" }
+        TP.find(n)?.let { return "TP +${g(it.groupValues[1])}% from fill" }
+        NEAR_HIGH.find(n)?.let { return "target · ${it.groupValues[1]}-${it.groupValues[2]} high" }
+        WEEK_TGT.find(n)?.let { return "target · ${it.groupValues[1]}-${it.groupValues[2]} high" }
+        val l = n.lowercase()
+        return when {
+            l == "stop" -> hardStopPct?.takeIf { it > 0.0 }?.let { "SL −${g(it.toString())}% from buy" } ?: "SL from buy"
+            l.contains("your own price") || l == "your own target" -> "your target"
+            l == "range target" -> "target · range top"
+            l.contains("manual take profit") || l.contains("take-profit tap") -> "take profit (you)"
+            else -> shortExit(n)
+        }
+    }
+
+    /** Pure: replaces each [HIGH_MARK] with the real drop from that high to [sellPrice]. */
+    fun fillHighMarks(label: String, sellPrice: Double): String =
+        Regex("""⟨H([0-9.]+)⟩""").replace(label) { m ->
+            val h = m.groupValues[1].toDoubleOrNull() ?: 0.0
+            if (h > 0.0 && sellPrice > 0.0) "−${"%.1f".format((1.0 - sellPrice / h) * 100.0)}% from high" else "from high"
+        }
+
     /** A strategy's exit note, shortened for a table cell. Pure. */
     fun shortExit(note: String?): String {
         val n = (note ?: "").trim()
@@ -107,33 +164,58 @@ object TradeReasons {
         fun name(ns: String) = names.getOrPut(ns) { ShareOwners.nameOf(ctx, ns).trim() }
         val buyBy = HashMap<String, String>()
         val sellBy = HashMap<String, String>()
+        // The watchlist's own settings, for what its stops were made of.
+        val watch = try { ManualWatchStore.load(ctx, base) } catch (_: Exception) { null }
+        val trailOf = watch?.entries.orEmpty().filter { !it.exitReason.isNullOrBlank() }
+            .associate { "${it.symbol.uppercase()}|${it.exitReason}" to it.trailBasis }
+        val hardStop = watch?.hardStopPct
         try {
             T212LiveStore.load(ctx).trades.filter { Spaces.baseOf(it.ns) == base }.forEach { t ->
                 t.allBuyIds().forEach { buyBy["$it"] = name(t.ns) }
-                val why = "${shortExit(t.exitReasonNote ?: t.exitOrigin)} · ${name(t.ns)}"
+                val note = t.exitReasonNote ?: t.exitOrigin
+                val isWatch = Spaces.bucketIdOf(t.ns) == ManualWatchStore.ID
+                val why = "${exitLabel(note, if (isWatch) trailOf["${t.symbol.uppercase()}|$note"] else null,
+                    if (isWatch) hardStop else null)} · ${name(t.ns)}"
                 t.allSellIds().forEach { sellBy["$it"] = why }
             }
         } catch (e: Exception) { Log.w(TAG, "ledger unreadable", e) }
         try {
             FloorLiveStore.load(ctx).rows.filter { Spaces.baseOf(it.ns) == base }.forEach { r ->
                 r.buyIds.forEach { buyBy["$it"] = name(r.ns) }
-                r.sellIds.forEach { sellBy["$it"] = "${shortExit(r.exitReason)} · ${name(r.ns)}" }
+                val st = try { com.signalscope.app.data.FloorAlgoStore.get(ctx, r.ns.substringAfter("__"))?.settings } catch (_: Exception) { null }
+                r.sellIds.forEach { sellBy["$it"] = "${floorExit(r.exitReason, st?.stopPct, st?.stopUnit, st?.targetPct)} · ${name(r.ns)}" }
             }
         } catch (e: Exception) { Log.w(TAG, "built-in algos unreadable", e) }
         // Targets and stops last: they say more than the ledger's own exit note.
         try {
             T212TargetStore.load(ctx).targets.filter { Spaces.baseOf(it.ns) == base }.forEach { t ->
                 val lv = levelWord(t.kind)
-                val why = (if (lv.isNotBlank()) "$lv target" else "target reached") + " · set by ${name(t.ns)}"
+                val up = if (t.price > 0.0 && t.paid > 0.0) " +${"%.1f".format((t.price / t.paid - 1.0) * 100.0)}%" else ""
+                val why = (if (lv.isNotBlank()) "$lv target$up" else "target reached$up") + " · set by ${name(t.ns)}"
                 (listOf(t.orderId) + t.prevIds.orEmpty()).filter { it > 0L }.forEach { sellBy["$it"] = why }
             }
         } catch (e: Exception) { Log.w(TAG, "targets unreadable", e) }
         try {
             T212ExitGuardStore.load(ctx).guards.filter { Spaces.baseOf(it.ns) == base }.forEach { g ->
-                (listOf(g.orderId) + g.prevIds.orEmpty()).filter { it > 0L }.forEach { sellBy["$it"] = "SL hit · set by ${name(g.ns)}" }
+                // The safety stop under a sale still waiting: half a day's range under
+                // the price the strategy sold at, 1–3% (ExitGuard).
+                val pct = if (g.level > 0.0 && g.decisionPx > 0.0) " −${"%.1f".format((1.0 - g.level / g.decisionPx) * 100.0)}%" else ""
+                (listOf(g.orderId) + g.prevIds.orEmpty()).filter { it > 0L }
+                    .forEach { sellBy["$it"] = "safety SL$pct (½ day range) · set by ${name(g.ns)}" }
             }
         } catch (e: Exception) { Log.w(TAG, "stops unreadable", e) }
-        return resolve(ctx, "t212", trips, buyBy, sellBy)
+        val out = resolve(ctx, "t212", trips, buyBy, sellBy)
+        return out.mapIndexed { i, w -> if (w.sell.contains(HIGH_MARK)) w.copy(sell = fillHighMarks(w.sell, trips[i].sellPrice)) else w }
+    }
+
+    /** Pure: a German built-in algo's exit with its own settings — "SL −4%",
+     *  "SL 2×ATR", "TP +7%". */
+    fun floorExit(reason: String?, stopPct: Double?, stopUnit: String?, targetPct: Double?): String = when (reason) {
+        "stop" -> stopPct?.takeIf { it > 0.0 }?.let { p ->
+            when ((stopUnit ?: "PCT").uppercase()) { "ATR" -> "SL ${g(p.toString())}×ATR"; "BB" -> "SL ${g(p.toString())}×BB/2"; else -> "SL −${g(p.toString())}%" }
+        } ?: "SL hit"
+        "target" -> targetPct?.takeIf { it > 0.0 }?.let { "TP +${g(it.toString())}%" } ?: "target reached"
+        else -> shortExit(reason)
     }
 
     // ── India ───────────────────────────────────────────────────────────────
