@@ -1007,7 +1007,7 @@ function openSpaceDropdown(){
   // A count rather than a bare label: the useful fact is whether anything is
   // waiting at all, and that has to be visible without opening it.
   var nPend=0;
-  try{var pj=JSON.parse(Android.pendingOrders(SPACE)||'{}');nPend=(pj.rows||[]).length}catch(e){}
+  try{nPend=pendingAllRows().rows.length}catch(e){}
   d.innerHTML=
     row('IN','🇮🇳','India','Zerodha · NIFTY 500')+
     row('US','🇺🇸','USA','Trading 212 · NASDAQ / NYSE'+(t212Connected?'':' · not connected'))+
@@ -1016,7 +1016,7 @@ function openSpaceDropdown(){
     '<div onclick="openPendingOrders()" style="cursor:pointer;padding:10px 12px;display:flex;align-items:center;gap:9px;background:var(--cd)">'+
       '<div style="font-size:18px">⏳</div>'+
       '<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:var(--t1)">Waiting orders</div>'+
-      '<div style="font-size:9px;color:var(--t3)">'+(nPend?'in this market right now':'nothing outstanding here')+'</div></div>'+
+      '<div style="font-size:9px;color:var(--t3)">'+(nPend?'all markets':'nothing outstanding')+'</div></div>'+
       (nPend?'<div style="font-size:11px;font-weight:900;color:var(--am)">'+nPend+'</div>':'')+
     '</div>';
   document.body.appendChild(d);
@@ -1042,21 +1042,23 @@ function pendingSideOf(p){
   return /sell|sale/i.test(String(p.kind||''))?'SELL':'BUY';
 }
 // The price now, from what the page already has — never a fetch.
-function pendingPriceNow(sym){
+function pendingPriceNow(sym,sp){
+  sp=sp||SPACE;
   var s=String(sym||'').toUpperCase();
-  try{var lq=liveQuoteFor((SPACE==='DE'?s+'.DE':s),null,SPACE);if(lq&&Number(lq.price)>0)return Number(lq.price)}catch(e){}
-  try{var pos=(T212_PORTFOLIO.positions||[]).filter(function(p){
+  try{var lq=liveQuoteFor((sp==='DE'?s+'.DE':s),null,sp);if(lq&&Number(lq.price)>0)return Number(lq.price)}catch(e){}
+  if(sp==='DE'||sp==='US')try{var pos=(T212_PORTFOLIO.positions||[]).filter(function(p){
       return t212Bare(p.ticker).toUpperCase()===s||String(p.yahooSymbol||'').toUpperCase().replace(/\.DE$/,'')===s})[0];
     if(pos&&Number(pos.currentPrice)>0)return Number(pos.currentPrice)}catch(e){}
-  try{var d=(STATE.dataBySpace[SPACE]||[]).filter(function(x){
+  try{var d=(STATE.dataBySpace[sp]||[]).filter(function(x){
       return String(x.symbol||'').toUpperCase().replace(/\.(DE|NS)$/,'')===s})[0];
     if(d&&Number(d.price)>0)return Number(d.price)}catch(e){}
   return 0;
 }
 function pendingCondsFor(p){
   var cs=(p.conds||[]).slice();
-  var now=pendingPriceNow(p.symbol);
-  var c=p.cur||(SPACE==='DE'?'€':SPACE==='IN'?'₹':'$');
+  var sp=p._sp||SPACE;
+  var now=pendingPriceNow(p.symbol,sp);
+  var c=p.cur||(sp==='DE'?'€':sp==='IN'?'₹':'$');
   var nowTxt=now>0?(' · now '+c+now.toFixed(2)):'';
   if(p.status==='BROKER'){
     var buy=pendingSideOf(p)==='BUY', lim=Number(p.limit||0), st=Number(p.stop||0);
@@ -1092,12 +1094,31 @@ function pendingCondsHtml(cs){
   }
   return h+'</div>';
 }
+// EVERY MARKET IN ONE LIST (the user, 9 Nov 2026), narrowed by the flags on top.
+// "All" is the default and is remembered on this phone.
+var PENDING_SPACES=[['DE','🇩🇪'],['US','🇺🇸'],['IN','🇮🇳'],['BN','🪙']];
+var PENDING_SP=(function(){try{return localStorage.getItem('pendingSp')||'ALL'}catch(e){return 'ALL'}})();
+function pendingFlag(sp){for(var i=0;i<PENDING_SPACES.length;i++)if(PENDING_SPACES[i][0]===sp)return PENDING_SPACES[i][1];return ''}
+function pendingSpPick(sp){PENDING_SP=sp;try{localStorage.setItem('pendingSp',sp)}catch(e){}closePendingOrders();openPendingOrders(true)}
+/** Every market's waiting orders, each row tagged with its market (_sp). */
+function pendingAllRows(){
+  var out=[],errs=[];
+  PENDING_SPACES.forEach(function(x){
+    try{var r=JSON.parse(Android.pendingOrders(x[0])||'{}');
+      if(!r.ok){errs.push(pendingFlag(x[0])+' '+(r.error||'unreadable'));return}
+      (r.rows||[]).forEach(function(p){p._sp=x[0];out.push(p)});
+    }catch(e){errs.push(pendingFlag(x[0])+' '+e.message)}
+  });
+  return {rows:out,errs:errs};
+}
 function openPendingOrders(keepTab){
   closeSpaceDropdown();
   if(typeof Android==='undefined'||!Android.pendingOrders){uiAlert('Unavailable','Rebuild the APK for this.');return}
-  var r;try{r=JSON.parse(Android.pendingOrders(SPACE)||'{}')}catch(e){uiAlert('Error',e.message);return}
-  if(!r.ok){uiAlert('Could not read',escHtml(r.error||'unknown error'));return}
-  var all=r.rows||[];
+  var got=pendingAllRows();
+  var every=got.rows;
+  var nBy={};every.forEach(function(p){nBy[p._sp]=(nBy[p._sp]||0)+1});
+  var one=(PENDING_SP!=='ALL');
+  var all=one?every.filter(function(p){return p._sp===PENDING_SP}):every;
   var buys=all.filter(function(p){return pendingSideOf(p)==='BUY'});
   var sells=all.filter(function(p){return pendingSideOf(p)==='SELL'});
   if(!keepTab)PENDING_TAB=(!buys.length&&sells.length)?'SELL':'BUY';
@@ -1111,19 +1132,29 @@ function openPendingOrders(keepTab){
     '<div style="font-size:15px;font-weight:800;color:var(--t1)">Waiting orders</div>'+
     '<span style="flex:1"></span>'+
     '<div onclick="closePendingOrders()" style="cursor:pointer;font-size:13px;font-weight:800;color:var(--t3);padding:4px 10px;border:1px solid var(--bd);border-radius:7px">Close</div></div>';
+  // THE FLAGS: All, then each market with its count; an empty market is greyed.
+  var chip=function(sp,label,n){var on=(PENDING_SP===sp);
+    return '<span onclick="pendingSpPick(\''+sp+'\')" style="cursor:pointer;padding:5px 10px;border-radius:14px;font-size:12px;font-weight:800;white-space:nowrap;'+
+      (on?'background:var(--pu);color:#fff;border:1px solid var(--pu)':'background:var(--cd);color:'+(n?'var(--t1)':'var(--t3)')+';border:1px solid var(--bd)')+'">'+
+      label+' <span style="font-size:10px;opacity:.85">'+n+'</span></span>'};
+  h+='<div style="display:flex;gap:6px;padding:0 12px 8px;overflow-x:auto">'+chip('ALL','All',every.length)+
+    PENDING_SPACES.map(function(x){return chip(x[0],x[1],nBy[x[0]]||0)}).join('')+'</div>';
+  if(got.errs.length)h+='<div style="font-size:9px;color:var(--am);padding:0 14px 6px">Not read: '+escHtml(got.errs.join(' · '))+'</div>';
   h+='<div style="display:flex;gap:8px;padding:0 12px 8px">'+tab('BUY','Buys',buys.length)+tab('SELL','Sales',sells.length)+'</div>';
-  // RV GATE ANALYSIS: every order the gate holds here, on today's chart, and its record.
-  if(SPACE==='DE'||SPACE==='US'){
-    var nRv=all.filter(function(p){return !!p.rvSrc}).length;
-    h+='<div onclick="openRvAnalysis()" style="margin:0 12px 8px;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 11px;border:1px solid rgba(124,58,237,.45);border-radius:8px;background:rgba(124,58,237,.06)">'+
-      '<div style="font-size:18px">📈</div><div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:var(--pu)">RV gate analysis</div>'+
+  // RV GATE ANALYSIS: every order the gate holds in that market, on today's chart, and its record.
+  // With All, the market on screen if it is a Trading 212 one, else the one with most held.
+  var rvSp=one?PENDING_SP:((SPACE==='DE'||SPACE==='US')?SPACE:((nBy.US||0)>(nBy.DE||0)?'US':'DE'));
+  if(rvSp==='DE'||rvSp==='US'){
+    var nRv=every.filter(function(p){return !!p.rvSrc&&p._sp===rvSp}).length;
+    h+='<div onclick="openRvAnalysis(null,null,null,\''+rvSp+'\')" style="margin:0 12px 8px;cursor:pointer;display:flex;align-items:center;gap:9px;padding:8px 11px;border:1px solid rgba(124,58,237,.45);border-radius:8px;background:rgba(124,58,237,.06)">'+
+      '<div style="font-size:18px">📈</div><div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:var(--pu)">RV gate analysis'+(one?'':' '+pendingFlag(rvSp))+'</div>'+
       '<div style="font-size:9px;color:var(--t3)">'+(nRv?(nRv+' order'+(nRv===1?'':'s')+' held by the gate — where each stands on today’s chart, and what it waits for'):'nothing held right now — see whether its waiting has paid')+'</div></div>'+
       '<div style="font-size:14px;color:var(--pu)">›</div></div>';
   }
   h+='<div style="font-size:9px;color:var(--t3);padding:0 14px 6px">'+pendingDot(true)+' met &nbsp; '+pendingDot(false)+' not yet &nbsp; '+pendingDot(null)+' unknown</div>';
-  h+=waitingBuysReadLine(all);
+  if(!one||PENDING_SP==='DE'||PENDING_SP==='US')h+=waitingBuysReadLine(all,true);
   if(!rows.length){
-    h+='<div style="padding:24px 16px;text-align:center;color:var(--t3);font-size:12px">Nothing waiting to '+(PENDING_TAB==='SELL'?'sell':'buy')+' in this market.</div>';
+    h+='<div style="padding:24px 16px;text-align:center;color:var(--t3);font-size:12px">Nothing waiting to '+(PENDING_TAB==='SELL'?'sell':'buy')+(one?' in this market':'')+'.</div>';
   }else{
     // TWO COLUMNS PER CARD (23 Oct 2026): what it is and what it waits for on the
     // left; its size, its timing and the buttons down the right, which used to sit
@@ -1150,29 +1181,29 @@ function openPendingOrders(keepTab){
       if(p.tries)meta.push(p.tries+'/24 tried');
       if(p.status==='PRICEENTRY'&&p.expiresAt>0)meta.push('armed until '+new Date(p.expiresAt).toLocaleDateString());
       var acts=[];
-      if(p.rvSrc)acts.push(btn('openRvAnalysis(\''+escHtml(p.rvSrc)+'\',\''+escHtml(p.rvSrc==='you'?'':(p.ns||''))+'\',\''+escHtml(String(p.rvSrc==='you'?p.rvManualId:p.id))+'\')','📈 Analyse','var(--pu)','rgba(124,58,237,.45)'));
+      if(p.rvSrc)acts.push(btn('openRvAnalysis(\''+escHtml(p.rvSrc)+'\',\''+escHtml(p.rvSrc==='you'?'':(p.ns||''))+'\',\''+escHtml(String(p.rvSrc==='you'?p.rvManualId:p.id))+'\',\''+p._sp+'\')','📈 Analyse','var(--pu)','rgba(124,58,237,.45)'));
       if(p.cancellable){
-        var call=(r.space==='in')
-          ? 'cancelTriggerPrompt(\''+escHtml(p.symbol)+'\',\''+escHtml(String(p.signalBarTs||0))+'\')'
+        var call=(p._sp==='IN')
+          ? 'cancelTriggerPrompt(\''+escHtml(p.symbol)+'\',\''+escHtml(String(p.signalBarTs||0))+'\',\'IN\')'
           : 'cancelQueuedPrompt(\''+escHtml(p.ns||'')+'\',\''+escHtml(p.id||'')+'\',\''+escHtml(p.symbol||'')+'\')';
         acts.push(btn(call,'✕ Call it off','var(--rd)',RED));
         // WAIT FOR THE OPEN and TRY IT NOW — overrides for a moment the 15-minute
         // sweep cannot know about. Not for India, whose queued entries are triggers
         // resting at the broker with no app-side attempts to pause or force.
-        if(r.space!=='in' && !p.parked)
+        if(p._sp!=='IN' && !p.parked)
           acts.push(btn('parkQueuedPrompt(\''+escHtml(p.ns||'')+'\',\''+escHtml(p.id||'')+'\',\''+escHtml(p.symbol||'')+'\')','\u23f8 Wait for the open','var(--am)','rgba(245,158,11,.5)'));
-        if(r.space!=='in')
+        if(p._sp!=='IN')
           acts.push(btn('retryQueuedPrompt(\''+escHtml(p.ns||'')+'\',\''+escHtml(p.id||'')+'\',\''+escHtml(p.symbol||'')+'\')','\u21bb Try it now','var(--pu)','rgba(124,58,237,.45)'));
       }else if(stale){
         // CUT OFF BEFORE ITS RESULT WAS RECORDED: nothing to cancel at the broker,
         // only a record to clear (REGN, 19–23 Oct).
-        acts.push(btn('watchClearInterruptedPrompt(\''+escHtml(p.symbol||'')+'\','+Number(p.signalBarTs||0)+')','✕ Clear this record','var(--rd)',RED));
+        acts.push(btn('watchClearInterruptedPrompt(\''+escHtml(p.symbol||'')+'\','+Number(p.signalBarTs||0)+',\''+p._sp+'\')','✕ Clear this record','var(--rd)',RED));
       }else if(p.status==='PENDING'&&p.stopTicker&&pendingSideOf(p)==='BUY'){
         // A BUY LADDER RUNNING NOW: stopped, and it pulls its own order.
         acts.push(btn('stopBuyLadderPrompt(\''+escHtml(p.stopTicker)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Stop this buy','var(--rd)',RED));
       }else if(p.status==='PRICEENTRY'&&p.priceEntryId){
         // Nothing at the broker: calling it off only stops the watching.
-        acts.push(btn('priceEntryCancelPrompt(\''+escHtml(p.priceEntryId)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Call it off','var(--rd)',RED));
+        acts.push(btn('priceEntryCancelPrompt(\''+escHtml(p.priceEntryId)+'\',\''+escHtml(p.symbol||'')+'\',\''+p._sp+'\')','✕ Call it off','var(--rd)',RED));
       }else if(p.status==='RVMANUAL'&&p.rvManualId){
         acts.push(btn('rvManualCancelPrompt(\''+escHtml(p.rvManualId)+'\',\''+escHtml(p.symbol||'')+'\')','✕ Call it off','var(--rd)',RED));
       }else if(p.status==='RVASK'&&p.rvManualId){
@@ -1189,7 +1220,7 @@ function openPendingOrders(keepTab){
       // left: what it is, who started it, what it waits for
       h+='<div style="flex:1 1 auto;min-width:0">'+
         '<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
-          '<span style="font-weight:800;font-size:13px;color:var(--t1)">'+escHtml(p.symbol||'')+'</span>'+
+          '<span style="font-weight:800;font-size:13px;color:var(--t1)">'+(one?'':pendingFlag(p._sp)+' ')+escHtml(p.symbol||'')+'</span>'+
           '<span style="font-size:8px;font-weight:900;color:'+col+';border:1px solid '+col+';border-radius:3px;padding:1px 5px">'+escHtml(p.kind||'')+'</span></div>'+
         (from?'<div style="margin-top:3px;font-size:10px;font-weight:700;color:'+(mine?'var(--t2)':'var(--pu)')+'">'+(mine?'👤 ':'⚙ ')+'From: '+escHtml(from)+'</div>':'')+
         pendingCondsHtml(pendingCondsFor(p))+
@@ -1205,19 +1236,21 @@ function openPendingOrders(keepTab){
       h+='</div>';
     });
   }
-  h+=rvGateLogHtml(PENDING_TAB==='SELL'?'SELL':'BUY');
+  ['DE','US'].forEach(function(sp){if(!one||PENDING_SP===sp)h+=rvGateLogHtml(PENDING_TAB==='SELL'?'SELL':'BUY',sp,one?'':pendingFlag(sp))});
   // ── WHAT IT DECLINED ──────────────────────────────────────────────────────
   // A refusal is a decision made about your money without asking, and until now
   // it lived only in a log line. It belongs beside what is still waiting: the
   // two together answer "what is the app doing, and what did it decide not to".
-  var dec=[];if(PENDING_TAB==='BUY'){try{var dj=JSON.parse(Android.declinedEntries(SPACE)||'{}');dec=dj.rows||[]}catch(e){}}
+  var dec=[];if(PENDING_TAB==='BUY')PENDING_SPACES.forEach(function(x){
+    if(one&&PENDING_SP!==x[0])return;
+    try{(JSON.parse(Android.declinedEntries(x[0])||'{}').rows||[]).forEach(function(p){p._sp=x[0];dec.push(p)})}catch(e){}});
   if(dec.length){
     h+='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:12px 14px 4px;letter-spacing:.03em">DECLINED IN THE LAST 48 HOURS</div>';
     h+='<div style="font-size:10px;color:var(--t3);padding:0 14px 8px;line-height:1.5">Refused for the reason shown. Re-queuing faces the same checks at the next open.</div>';
     dec.forEach(function(p){
       h+='<div style="margin:0 12px 8px;border:1px solid var(--bd);border-left:3px solid var(--t3);border-radius:8px;background:var(--cd);padding:9px 11px;opacity:.92">';
       h+='<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">'+
-        '<span style="font-weight:800;font-size:13px;color:var(--t2)">'+escHtml(p.symbol||'')+'</span>'+
+        '<span style="font-weight:800;font-size:13px;color:var(--t2)">'+(one?'':pendingFlag(p._sp)+' ')+escHtml(p.symbol||'')+'</span>'+
         '<span style="flex:1"></span>'+
         '<span style="font-size:9px;color:var(--t3);font-family:monospace">'+agoText(p.at)+' ago</span></div>';
       h+='<div style="font-size:10px;color:var(--t3);margin-top:4px;line-height:1.5">'+escHtml(p.why||'')+'</div>';
@@ -1300,13 +1333,13 @@ window.onRequeueEntry=function(json){
 };
 // A WATCHLIST BUY CUT OFF BEFORE ITS RESULT WAS RECORDED: clear the record. No
 // order is placed or cancelled — there is nothing at Trading 212 behind it.
-function watchClearInterruptedPrompt(sym,barTs){
+function watchClearInterruptedPrompt(sym,barTs,sp){
   if(typeof Android==='undefined'||!Android.watchClearInterrupted){uiAlert('Unavailable','Rebuild the APK for this.');return}
   uiConfirm('Clear the '+escHtml(sym)+' buy record?',
     '<div style="font-size:11px;line-height:1.6;color:var(--t2)">This buy was cut off before its result was recorded — usually the app being stopped while it ran. <b>Nothing is waiting at Trading 212</b>, so nothing is cancelled there.<br/><br/>Any shares it did buy stay in your account and show in your Portfolio, not managed by the watchlist.</div>',
     function(ok){
       if(!ok)return;
-      var r={};try{r=JSON.parse(Android.watchClearInterrupted(SPACE,String(sym),Number(barTs))||'{}')}catch(e){r={ok:false,error:e.message}}
+      var r={};try{r=JSON.parse(Android.watchClearInterrupted(sp||SPACE,String(sym),Number(barTs))||'{}')}catch(e){r={ok:false,error:e.message}}
       if(!r.ok){uiAlert('Not cleared',escHtml(r.error||'unknown error'));return}
       try{closePendingOrders();openPendingOrders(true)}catch(e){}
       renderKeepScroll();
@@ -1323,14 +1356,18 @@ function closePendingOrders(){var o=document.getElementById('pending-sheet');if(
 // Nothing here decides anything: the verdict is the gate's own, on its own reading.
 var RVA={src:'',ns:'',id:'',side:'BUY'}, RVA_REC_SIDE='', RVA_REC_DAYS=30;
 function rvaRows(){
-  var rows=[];try{rows=(JSON.parse(Android.pendingOrders(SPACE)||'{}').rows)||[]}catch(e){}
+  var rows=[];try{rows=(JSON.parse(Android.pendingOrders(RVA_SP)||'{}').rows)||[]}catch(e){}
   return rows.filter(function(p){return !!p.rvSrc}).map(function(p){
     return {src:p.rvSrc, ns:(p.rvSrc==='you'?'':String(p.ns||'')), id:String(p.rvSrc==='you'?p.rvManualId:p.id),
       symbol:p.symbol, side:pendingSideOf(p), from:p.from||'', ask:p.status==='RVASK'};
   });
 }
-function openRvAnalysis(src,ns,id){
-  if(!(SPACE==='DE'||SPACE==='US')){uiAlert('RV gate analysis','The RV gate works on Trading 212 orders only — Germany and the US.');return}
+// The market the analysis is about — the order's own, which the all-markets
+// Waiting orders list may hold for a market other than the one on screen.
+var RVA_SP='DE';
+function openRvAnalysis(src,ns,id,sp){
+  RVA_SP=sp||(document.getElementById('rva-sheet')?RVA_SP:SPACE);
+  if(!(RVA_SP==='DE'||RVA_SP==='US')){uiAlert('RV gate analysis','The RV gate works on Trading 212 orders only — Germany and the US.');return}
   if(typeof Android==='undefined'||!Android.callAsync){uiAlert('Unavailable','Rebuild the APK for this.');return}
   var rows=rvaRows();
   if(src){RVA={src:src,ns:ns||'',id:String(id||''),side:'BUY'};
@@ -1345,7 +1382,7 @@ function openRvAnalysis(src,ns,id){
   var h='<div style="padding:14px 14px 6px;display:flex;align-items:center;gap:8px">'+
     '<div style="font-size:15px;font-weight:800;color:var(--t1)">📈 RV gate analysis</div><span style="flex:1"></span>'+
     '<div onclick="closeRvAnalysis()" style="cursor:pointer;font-size:13px;font-weight:800;color:var(--t3);padding:4px 10px;border:1px solid var(--bd);border-radius:7px">‹ Back</div></div>';
-  h+='<div style="font-size:10px;color:var(--t3);padding:0 14px 8px;line-height:1.5">What the gate sees for each order it is holding in '+(SPACE==='DE'?'Germany':'the US')+
+  h+='<div style="font-size:10px;color:var(--t3);padding:0 14px 8px;line-height:1.5">What the gate sees for each order it is holding in '+(RVA_SP==='DE'?'Germany':'the US')+
     ', what would start it, and whether waiting has paid so far. '+
     '<span onclick="rvaRulesToggle()" style="color:var(--bl);font-weight:700;cursor:pointer">How it decides ›</span></div>';
   h+='<div id="rva-rules" style="display:none">'+rvaRulesHtml()+'</div>';
@@ -1609,7 +1646,7 @@ var RVA_DONE=[], RVA_DONE_CUR='', RVA_DONE_OPEN=-1;
 function rvaLoadDone(){
   var el=document.getElementById('rva-done');if(!el)return;
   el.innerHTML='<div style="font-size:10px;color:var(--t3);padding:8px 2px">Reading the orders it finished with…</div>';
-  androidAsync('rvGateFinished',[SPACE,3],function(raw){
+  androidAsync('rvGateFinished',[RVA_SP,3],function(raw){
     var el2=document.getElementById('rva-done');if(!el2)return;
     var j=null;try{j=JSON.parse(raw||'{}')}catch(e){}
     if(!j||!j.ok){el2.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((j&&j.error)||'The journal could not be read.')+'</div>';return}
@@ -1626,7 +1663,7 @@ function rvaDayLabel(ms){
 function rvaDoneHtml(){
   var c=RVA_DONE_CUR, rows=RVA_DONE, f2=function(x){return Number(x).toFixed(2)};
   var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:10px 2px 6px;letter-spacing:.03em">FINISHED — THE LAST 3 DAYS</div>';
-  if(!rows.length)return h+'<div style="font-size:10px;color:var(--t3);padding:2px 2px 8px">Nothing went through the gate in '+(SPACE==='DE'?'Germany':'the US')+' in the last three days.</div>';
+  if(!rows.length)return h+'<div style="font-size:10px;color:var(--t3);padding:2px 2px 8px">Nothing went through the gate in '+(RVA_SP==='DE'?'Germany':'the US')+' in the last three days.</div>';
   var once=rows.filter(function(f){return f.atOnce}).length;
   var held=rows.filter(function(f){return f.relAt>0&&!f.atOnce});
   var hp=held.filter(function(f){return f.gatePct!=null});
@@ -1674,7 +1711,7 @@ function rvaDoneToggle(i){
   el.innerHTML=rvaDoneHtml();
   if(RVA_DONE_OPEN<0)return;
   var f=RVA_DONE[i];
-  androidAsync('rvGateEpisode',[SPACE,f.key,f.firstAt],function(raw){
+  androidAsync('rvGateEpisode',[RVA_SP,f.key,f.firstAt],function(raw){
     var box=document.getElementById('rva-ep-'+i);if(!box||RVA_DONE_OPEN!==i)return;
     var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
     if(!r||!r.ok){box.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((r&&r.error)||'No answer.')+'</div>';return}
@@ -1748,7 +1785,7 @@ function rvaRecDays(d){RVA_REC_DAYS=d;rvaLoadRecord()}
 function rvaLoadRecord(){
   var el=document.getElementById('rva-record');if(!el)return;
   el.innerHTML='<div style="font-size:10px;color:var(--t3);padding:8px 2px">Reading the gate’s journal…</div>';
-  androidAsync('rvGateRecord',[SPACE,RVA_REC_SIDE||'BUY',RVA_REC_DAYS],function(raw){
+  androidAsync('rvGateRecord',[RVA_SP,RVA_REC_SIDE||'BUY',RVA_REC_DAYS],function(raw){
     var el2=document.getElementById('rva-record');if(!el2)return;
     var j=null;try{j=JSON.parse(raw||'{}')}catch(e){}
     if(!j||!j.ok){el2.innerHTML='<div style="font-size:10px;color:var(--rd);padding:8px 2px">'+escHtml((j&&j.error)||'The journal could not be read.')+'</div>';return}
@@ -1764,7 +1801,7 @@ function rvaRecordHtml(rec){
   h+='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'+tab(buy,'Buys','rvaRecSide(\'BUY\')')+tab(!buy,'Sales','rvaRecSide(\'SELL\')')+
     '<span style="flex:1"></span>'+tab(RVA_REC_DAYS===7,'7 d','rvaRecDays(7)')+tab(RVA_REC_DAYS===30,'30 d','rvaRecDays(30)')+tab(RVA_REC_DAYS===90,'90 d','rvaRecDays(90)')+'</div>';
   var looked=Number(rec.looked||0);
-  if(!looked)return h+'<div style="font-size:10px;color:var(--t3);padding:6px 2px">No '+mk+' through the gate in '+(SPACE==='DE'?'Germany':'the US')+' in the last '+RVA_REC_DAYS+' days.</div>';
+  if(!looked)return h+'<div style="font-size:10px;color:var(--t3);padding:6px 2px">No '+mk+' through the gate in '+(RVA_SP==='DE'?'Germany':'the US')+' in the last '+RVA_REC_DAYS+' days.</div>';
   var a=rec.all;
   h+='<div style="border:1px solid var(--bd);border-radius:8px;background:var(--cd);padding:9px 10px;font-size:10px;color:var(--t2);line-height:1.6">';
   h+='The gate looked at <b>'+looked+'</b> '+mk+'. <b>'+Number(rec.atOnce||0)+'</b> went at its first look — there it changed nothing. '+
@@ -1818,13 +1855,14 @@ function rvaReasonRead(g,buy){
 // Every one: started at once, held, released, called off — and orders placed
 // with the box unticked, with what the gate would have said. Where the price
 // sat in today's range and which way it was moving, as the gate saw it.
-function rvGateLogHtml(side){
-  if(!(SPACE==='DE'||SPACE==='US')||typeof Android==='undefined'||!Android.rvGateLog)return '';
-  var rows=[];try{rows=(JSON.parse(Android.rvGateLog(SPACE)||'{}').rows)||[]}catch(e){}
+function rvGateLogHtml(side,sp,flag){
+  sp=sp||SPACE;
+  if(!(sp==='DE'||sp==='US')||typeof Android==='undefined'||!Android.rvGateLog)return '';
+  var rows=[];try{rows=(JSON.parse(Android.rvGateLog(sp)||'{}').rows)||[]}catch(e){}
   rows=rows.filter(function(r){return side==='SELL'?!r.buy:!!r.buy});
   if(!rows.length)return '';
   var today=new Date().toDateString();
-  var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:12px 14px 4px;letter-spacing:.03em">RV GATE — YOUR ORDERS, LAST 3 DAYS</div>';
+  var h='<div style="font-size:10px;font-weight:900;color:var(--t3);padding:12px 14px 4px;letter-spacing:.03em">'+(flag?flag+' ':'')+'RV GATE — YOUR ORDERS, LAST 3 DAYS</div>';
   rows.slice(0,30).forEach(function(r){
     var d=new Date(r.at), when=(d.toDateString()===today?'':d.toLocaleDateString([], {weekday:'short'})+' ')+
       d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
@@ -1854,8 +1892,8 @@ function agoText(ms){
 }
 // BUY ORDERS WAITING AT TRADING 212 — read by every pass, so the sheet says how
 // old its picture is and offers a fresh look.
-function waitingBuysReadLine(rows){
-  if(!isT212Space())return '';
+function waitingBuysReadLine(rows,any){
+  if(!any&&!isT212Space())return '';
   var at=0;(rows||[]).forEach(function(p){if(p.status==='BROKER'&&p.readAt>at)at=p.readAt});
   if(!at){try{at=Number(JSON.parse(Android.t212WaitingBuys()||'{}').at)||0}catch(e){}}
   return '<div style="font-size:9px;color:var(--t3);padding:0 14px 8px">Trading 212 orders as of '+
@@ -1897,8 +1935,8 @@ function waitingBuysSummary(){
 }
 function openWaitingBuysIn(sp){
   PENDING_TAB='BUY';
-  if(sp&&sp!==SPACE){setSpace(sp);setTimeout(function(){openPendingOrders(true)},350)}
-  else openPendingOrders(true);
+  if(sp){PENDING_SP=sp;try{localStorage.setItem('pendingSp',sp)}catch(e){}}
+  openPendingOrders(true);
 }
 // ── THE RV GATE CHECKBOX, beside every patient buy and sale (Germany, US) ────
 // Ticked: the order waits until the price is near the right end of today's range
@@ -12609,7 +12647,7 @@ function watchUnpinPrompt(sym,ev){
       try{Android.watchUnpin(SPACE,sym);render()}catch(e){uiAlert('Error',e.message)}
     });
 }
-function cancelTriggerPrompt(sym,ts){
+function cancelTriggerPrompt(sym,ts,sp){
   if(typeof Android==='undefined'||!Android.manualCancelTrigger){uiAlert('Unavailable','Rebuild the APK for this.');return}
   uiConfirm('Cancel the waiting order?',
     '<div style="line-height:1.55;font-size:11px">This calls off the waiting buy for <b>'+escHtml(sym)+'</b> at Zerodha — '+
@@ -12617,7 +12655,7 @@ function cancelTriggerPrompt(sym,ts){
     'Nothing has been bought, so nothing is sold. If part of an order did fill in the meantime, that much is '+
     'yours and stays yours — only the rest is called off, and the app will open and protect what filled.<br/><br/>'+
     '<span style="color:var(--t3)">If Zerodha refuses, the row is left exactly as it is rather than claiming a cancellation that did not happen.</span></div>',
-    function(ok){ if(!ok)return; try{Android.manualCancelTrigger(SPACE,sym,String(ts))}catch(e){uiAlert('Error',e.message)} });
+    function(ok){ if(!ok)return; try{Android.manualCancelTrigger(sp||SPACE,sym,String(ts))}catch(e){uiAlert('Error',e.message)} });
 }
 window.onCancelTrigger=function(json){
   var r;try{r=JSON.parse(json||'{}')}catch(e){uiAlert('Error',e.message);return}
@@ -20142,7 +20180,7 @@ function priceEntryLines(sym,cur){
   });
   return h+'</div>';
 }
-function priceEntryCancelPrompt(id,sym){
+function priceEntryCancelPrompt(id,sym,sp){
   if(typeof Android==='undefined'||!Android.priceEntryCancel){uiAlert('Unavailable','Rebuild the APK for this.');return}
   uiConfirm('Call off your buy at price for '+escHtml(sym)+'?',
     '<div style="font-size:11px;line-height:1.55">Nothing is at Trading 212 to cancel and no money was held — the app simply stops watching the price.</div>',
@@ -20150,7 +20188,7 @@ function priceEntryCancelPrompt(id,sym){
       if(!ok)return;
       var r={};try{r=JSON.parse(Android.priceEntryCancel(String(id))||'{}')}catch(e){r={ok:false}}
       if(!r.ok)uiAlert('Not called off','It was no longer waiting — it may have just been reached. Check Waiting orders.');
-      var line=document.getElementById('pe-lines-'+sym);if(line)line.outerHTML=priceEntryLines(sym,SPACE==='DE'?'€':'$');
+      var line=document.getElementById('pe-lines-'+sym);if(line)line.outerHTML=priceEntryLines(sym,(sp||SPACE)==='DE'?'€':'$');
       if(document.getElementById('pending-sheet')){closePendingOrders();openPendingOrders(true)}
     });
 }
