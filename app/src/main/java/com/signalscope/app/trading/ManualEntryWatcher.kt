@@ -1125,7 +1125,8 @@ object ManualEntryWatcher {
                     Log.i(TAG, "[$base] ${c.symbol} entry signal held — market shut " +
                         "(newest bar ${barAgeMin}m old, limit ${staleLimit}m)")
                 } else {
-                    LabNotifier.manualEntrySignal(ctx, base, c.symbol, c.rank, fresh.entryPrice, fresh.entryReason)
+                    LabNotifier.manualEntrySignal(ctx, base, c.symbol, c.rank, fresh.entryPrice, fresh.entryReason,
+                        pinned = ManualWatchStore.load(ctx, base).pinned.any { it.equals(c.symbol, true) })
                     ManualWatchStore.markAlerted(ctx, base, c.symbol, day)
                     alerted.add(c.symbol)
                     Log.i(TAG, "[$base] ENTRY SIGNAL ${c.symbol} #${c.rank} @ ${fresh.entryPrice}")

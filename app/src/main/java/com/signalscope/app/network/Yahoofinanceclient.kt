@@ -1349,7 +1349,9 @@ object YahooFinanceClient {
     data class QuarterResult(val quarterEndMs: Long, val eps: Double?, val estimate: Double?, val surprisePct: Double?)
 
     /** The last four quarters, and the company's sector and industry. */
-    data class ResultsReply(val quarters: List<QuarterResult>, val sector: String?, val industry: String?)
+    data class ResultsReply(val quarters: List<QuarterResult>, val sector: String?, val industry: String?,
+                            /** Market value of the company, in [capCur]; null when Yahoo gives none. */
+                            val marketCap: Double? = null, val capCur: String? = null)
 
     /** The last four quarters (oldest first) with the company's sector. Null when
      *  Yahoo could not be asked. */
@@ -1357,14 +1359,16 @@ object YahooFinanceClient {
         val crumb = fetchCrumb() ?: return null
         val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
             .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
-            .addQueryParameter("modules", "earningsHistory,assetProfile")
+            .addQueryParameter("modules", "earningsHistory,assetProfile,price")
             .addQueryParameter("crumb", crumb).build()
         val req = Request.Builder().url(url)
             .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
             .addHeader("Accept", "application/json").build()
         client.newCall(req).execute().use { r ->
             when (r.code) {
-                200 -> r.body?.string().orEmpty().let { b -> parseProfile(b).let { (s, i) -> ResultsReply(parseEarningsHistory(b), s, i) } }
+                200 -> r.body?.string().orEmpty().let { b -> parseProfile(b).let { (s, i) ->
+                    val (cap, cur) = parseMarketCap(b)
+                    ResultsReply(parseEarningsHistory(b), s, i, cap, cur) } }
                 404 -> ResultsReply(emptyList(), null, null)
                 401, 403 -> { cachedCrumb = null; null }
                 else -> null
@@ -1378,6 +1382,14 @@ object YahooFinanceClient {
             ?.optJSONObject("assetProfile")
         (p?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() }) to
             (p?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() })
+    } catch (e: Exception) { null to null }
+
+    /** Pure: the company's market value and its currency, from the price module. */
+    fun parseMarketCap(body: String): Pair<Double?, String?> = try {
+        val p = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
+            ?.optJSONObject("price")
+        val cap = p?.optJSONObject("marketCap")?.optDouble("raw", 0.0)?.takeIf { it.isFinite() && it > 0.0 }
+        cap to p?.optString("currency", "")?.takeIf { it.isNotBlank() }
     } catch (e: Exception) { null to null }
 
     /** Pure: an earningsHistory reply, oldest quarter first. Surprise in %. */

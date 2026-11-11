@@ -49,8 +49,10 @@ class ResultsBookTest {
     @Test fun `read again every three days and right after a report`() {
         val now = 1_794_000_000_000L
         assertTrue(ResultsBook.stale(null, 0L, now))
-        val r = ResultsBook.Rec(readAt = now - day, sector = "Technology")
+        val r = ResultsBook.Rec(readAt = now - day, sector = "Technology", marketCap = 2.5e11)
         assertFalse(ResultsBook.stale(r, 0L, now))
+        assertTrue(ResultsBook.stale(r.copy(marketCap = null), 0L, now))     // kept before market cap: read once more
+        assertFalse(ResultsBook.stale(r.copy(marketCap = 0.0), 0L, now))     // Yahoo had none: not asked again
         assertTrue(ResultsBook.stale(ResultsBook.Rec(readAt = now - day), 0L, now))   // kept before sectors: read once more
         assertTrue(ResultsBook.stale(r, now - 3_600_000L, now))           // reported since it was read
         assertTrue(ResultsBook.stale(ResultsBook.Rec(readAt = now - 4 * day), 0L, now))

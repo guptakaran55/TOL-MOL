@@ -643,11 +643,30 @@ function resLineSlot(sym,sp,sector,industry){
   }
   return '<div id="res-line" data-k="'+escHtml(k)+'" style="font-size:9px;color:var(--t2);margin-top:3px;line-height:1.45">'+resLineInner(k)+'</div>';
 }
+// COMPANY SIZE (the user, 11 Nov 2026): the market cap and a size word. India in
+// crore against the fund-industry cut-offs (large ≥ ₹1 lakh Cr, mid ≥ ₹30,000 Cr,
+// small ≥ ₹5,000 Cr); elsewhere the usual dollar bands (a euro taken as $1.1).
+function capText(cap,cur){
+  cap=Number(cap||0);if(!(cap>0))return '';
+  cur=String(cur||'').toUpperCase();
+  var word,amt;
+  if(cur==='INR'){
+    word=cap>=1e12?'large':cap>=3e11?'mid':cap>=5e10?'small':'micro';
+    amt='₹'+Math.round(cap/1e7).toLocaleString('en-IN')+' Cr';
+  }else{
+    var usd=cap*(cur==='EUR'?1.1:cur==='GBP'?1.3:1);
+    word=usd>=2e11?'mega':usd>=1e10?'large':usd>=2e9?'mid':usd>=3e8?'small':'micro';
+    var sym=cur==='EUR'?'€':cur==='USD'?'$':cur==='GBP'?'£':(cur+' ');
+    amt=cap>=1e9?sym+(cap/1e9).toFixed(cap>=1e11?0:1)+' bn':sym+Math.round(cap/1e6)+' m';
+  }
+  return '<span style="font-weight:600;color:var(--t2)">🏢 '+amt+' <span style="color:var(--t3)">'+word+'</span></span>';
+}
 function resLineInner(k){
   var r=RES.d[k]||{},sc=RES_SEC[k]||{};
   // THE SECTOR FIRST (the user, 6 Nov 2026): the scan's when there is one, else Yahoo's profile.
   var sec=[r.sector||sc.sector,r.industry||sc.industry].filter(function(x){return x}).join(' · ');
-  var head=sec?'<div style="font-weight:700;color:var(--t1)">🏷 '+escHtml(sec)+'</div>':'';
+  var cap=capText(r.cap,r.capCur);
+  var head=(sec||cap)?'<div style="font-weight:700;color:var(--t1)">'+(sec?'🏷 '+escHtml(sec):'')+(sec&&cap?' · ':'')+cap+'</div>':'';
   if(!RES.d[k]||r.loading)return head;
   var mo=function(ms){return new Date(Number(ms)).toLocaleDateString([], {month:'short'})};
   var dd=function(ms){return new Date(Number(ms)).toLocaleDateString([], {day:'numeric',month:'short'})};
@@ -764,7 +783,15 @@ window.openAlgoFromNotification=function(ns){
     setTimeout(function(){
       try{
         var el=document.querySelector('[data-dk="alg-cost-'+ns+'"]');
-        if(el&&el.scrollIntoView)el.scrollIntoView({block:'center'});
+        // A BUY REQUEST WAITING: straight to its Buy and Skip (the user, 11 Nov
+        // 2026). The card runs three screens tall; centring it left them above
+        // the top edge, so the app looked as if the buttons had gone.
+        var ask=el&&el.querySelector('[data-ask-waiting]');
+        if(ask&&ask.scrollIntoView){
+          ask.scrollIntoView({block:'center'});
+          ask.style.transition='box-shadow .4s';ask.style.boxShadow='0 0 0 2px var(--bl)';
+          setTimeout(function(){try{ask.style.boxShadow=''}catch(e){}},2600);
+        }else if(el&&el.scrollIntoView)el.scrollIntoView({block:'start'});
       }catch(e){}
     },160);
   }catch(e){console.error(e)}
@@ -16499,7 +16526,7 @@ function floorAskBox(a,cur){
   if(!floorAsksOn(a))return '';
   var now=Date.now(),W=(a.asks||[]).filter(function(k){return k.status==='WAITING'});
   var recent=(a.asks||[]).filter(function(k){return k.status!=='WAITING'&&now-Number(k.answeredMs||0)<86400e3}).slice(-6).reverse();
-  var h='<div style="margin:0 0 9px;padding:8px 9px;border:1px solid '+(W.length?'rgba(37,99,235,.5)':'var(--bd)')+';border-radius:6px;background:'+(W.length?'rgba(37,99,235,.06)':'var(--bg)')+'">';
+  var h='<div'+(W.length?' data-ask-waiting="1"':'')+' style="margin:0 0 9px;padding:8px 9px;border:1px solid '+(W.length?'rgba(37,99,235,.5)':'var(--bd)')+';border-radius:6px;background:'+(W.length?'rgba(37,99,235,.06)':'var(--bg)')+'">';
   h+='<div style="font-size:9px;font-weight:800;letter-spacing:.4px;color:'+(W.length?'var(--bl)':'var(--t3)')+';margin-bottom:4px">WAITING FOR YOU'+(W.length?' ('+W.length+')':'')+'</div>';
   if(!W.length)h+='<div style="font-size:10px;color:var(--t3);line-height:1.5">Nothing to answer. Every buy asks first — a notification with Buy and Skip. Buy fills at the first fifteen-minute price after your tap; no answer in 30 minutes means not bought, followed on the side. Sales never ask.</div>';
   W.forEach(function(k){

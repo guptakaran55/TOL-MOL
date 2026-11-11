@@ -37,7 +37,9 @@ object ResultsBook {
                    val readAt: Long = 0L, val lastReportMs: Long = 0L, val reactionPct: Double? = null,
                    val reactionFor: Long = 0L,
                    /** The company's sector and industry, as Yahoo files it. */
-                   val sector: String? = null, val industry: String? = null)
+                   val sector: String? = null, val industry: String? = null,
+                   /** Market cap in [capCur]; 0 = Yahoo had none, null = not read yet (11 Nov 2026). */
+                   val marketCap: Double? = null, val capCur: String? = null)
     private data class Saved(val m: Map<String, Rec>? = null)
 
     private fun file(ctx: Context) = File(ctx.filesDir, FILE)
@@ -64,7 +66,7 @@ object ResultsBook {
     fun stale(r: Rec?, lastReportMs: Long, now: Long): Boolean =
         r == null || r.readAt <= 0L || now - r.readAt > 3L * 86_400_000L ||
             (lastReportMs in (r.readAt + 1)..now) ||
-            (r.sector == null && now - r.readAt > 6L * 3_600_000L)       // read before the sector was kept
+            ((r.sector == null || r.marketCap == null) && now - r.readAt > 6L * 3_600_000L)   // read before these were kept
 
     /** Pure: the price over the two sessions from the report day, against the close
      *  before it. Daily bars, oldest first. Null when there are not enough. */
@@ -121,6 +123,7 @@ object ResultsBook {
                     .ifEmpty { r.quarters.orEmpty() },
                 readAt = now, lastReportMs = maxOf(r.lastReportMs, rep),
                 sector = reply.sector ?: r.sector ?: "", industry = reply.industry ?: r.industry,
+                marketCap = reply.marketCap ?: r.marketCap?.takeIf { it > 0.0 } ?: 0.0, capCur = reply.capCur ?: r.capCur,
                 reactionPct = react, reactionFor = if (react != null) rep else r.reactionFor)
         }
     }
@@ -148,6 +151,7 @@ object ResultsBook {
 
     fun forPage(r: Rec?): Map<String, Any?> = mapOf(
         "sector" to r?.sector?.takeIf { it.isNotBlank() }, "industry" to r?.industry,
+        "cap" to r?.marketCap?.takeIf { it > 0.0 }, "capCur" to r?.capCur,
         "quarters" to r?.quarters.orEmpty().takeLast(4).reversed().map { mapOf("q" to it.qEnd, "s" to it.surprisePct) },
         "lastReport" to (r?.lastReportMs ?: 0L), "reaction" to r?.reactionPct,
         "moves" to r?.moves.orEmpty().takeLast(3).reversed().map {

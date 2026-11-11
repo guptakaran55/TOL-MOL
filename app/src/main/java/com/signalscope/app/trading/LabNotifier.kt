@@ -420,7 +420,11 @@ object LabNotifier {
      * the one dangerous misreading is thinking an algo has already acted.
      */
     fun manualEntrySignal(ctx: Context, space: String, symbol: String, rank: Int,
-                          price: Double, reason: String) {
+                          price: Double, reason: String, pinned: Boolean = false) {
+        // YOUR PINS STAND OUT (the user, 11 Nov 2026: "never got a notification" —
+        // they came, as one 🟣 among a dozen a day).
+        val mark = if (pinned) "📌" else "🟣"
+        val pinTag = if (pinned) " · your pin" else ""
         // THE SAME COMPACT PICTURE AS THE NEAR-LOW ALERT — see [lowsArt]: a
         // one-line title, then the slope strip and the 2×2 grid of price and MACD.
         // The rule wording goes to the folded line only; expanded, the picture
@@ -429,8 +433,8 @@ object LabNotifier {
         if (art != null) {
             withVerdict(ctx, space, symbol, price) { ai, update ->
                 notify(ctx, CH_MANUAL, NotificationManager.IMPORTANCE_HIGH, "Manual entry signals",
-                    "🟣 $symbol" + (if (rank > 0) " #$rank" else "") +
-                        " ${curOf(space)}${"%.2f".format(price)} · entry signal",
+                    "$mark $symbol" + (if (rank > 0) " #$rank" else "") +
+                        " ${curOf(space)}${"%.2f".format(price)} · entry signal$pinTag",
                     reason.ifBlank { "The watcher config would enter here" },
                     "me-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
                     openSymbol = symbol, openSpace = space, chart = art, textInBig = false, ai = ai, update = update)
@@ -440,7 +444,7 @@ object LabNotifier {
         val art2 = macdArt(ctx, space, symbol)
         withVerdict(ctx, space, symbol, price) { ai, update ->
             notify(ctx, CH_MANUAL, NotificationManager.IMPORTANCE_HIGH, "Manual entry signals",
-                "🟣 $symbol — entry signal (#$rank)",
+                "$mark $symbol — entry signal (#$rank)$pinTag",
                 "${spaceLabel(space)} · the watcher config would enter at ${"%.4f".format(price)}" +
                     (if (reason.isNotBlank()) " · $reason" else "") +
                     ". No algo holds this and nothing has been bought — open the Watchlist tab to review the chart and decide.",
