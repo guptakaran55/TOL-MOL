@@ -123,3 +123,4 @@ a new day gets its own heading. "Installed" is when the change reached the phone
 - **Your pins stand out** (11 Nov) — next entry signal on a pinned stock (e.g. JEN, AIXA, HAG): the alert reads "📌 JEN #34 €… · entry signal · your pin" instead of 🟣.
 - **Company size** (11 Nov) — open any stock page: the 🏷 sector line ends with e.g. "🏢 €12.3 bn large" (India: "₹31,715 Cr mid").
 - **Results for every stock** (11 Nov) — open Hochtief (HOT) or Fielmann (FIE): where there was no 📊 line, it now reads "📊 sales Q4 ’25 … · Q3 ’26 €649 m +2.3% q/q · profit … (no estimates on Yahoo)". SAP still shows beat/miss.
+- **Choose your columns** (11 Nov) — Portfolio: ▦ 8/8 beside ⇅ Sort → untick Zone, move 1Y up → table changes at once; reopen the app → still so; ↺ Default columns restores. Same in Discovery (▦ 15/15). Portfolio rows show a 1Y column with the 252-day price line.

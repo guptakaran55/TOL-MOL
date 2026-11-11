@@ -6734,6 +6734,188 @@ var SORT_GROUPS={
     ['Position',[['zonePct','S/R Zone']]]
   ]
 };
+// ── COLUMNS YOU CHOOSE (the user, 11 Nov 2026) ─────────────────────────────
+// Every column of the Discovery and Portfolio tables is one entry here: its
+// heading, what it sorts by, and how its cell is drawn. Which ones show, and in
+// what order, is yours — ▦ Columns beside ⇅ Sort — kept on this phone. The stock
+// column stays first. A column added in a later version appears at its default
+// place and switched on (unless it says off), without disturbing your order.
+var COL_DEFS={
+  discovery:[
+    {id:'symbol',label:'Stock',sort:'symbol',fixed:true,td:function(s){
+      var primaryName=stockSymbolFor(s)||displayNameFor(s);
+      var subLine=s.avgVol20?fmtV(s.avgVol20)+'/d':'';
+      var h='<td'+aicTd(s.symbol,s.industry)+'><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>'+aicChip(s.symbol,s.industry);
+      if(subLine)h+='<br/><span class="snn">'+escHtml(subLine)+'</span>';
+      // The squeeze and the divergences sit with the name, stacked rather than
+      // strung along, so the column is as wide as one chip, not the sum of them.
+      var sqc=squeezeChip(s.symbol);
+      var divc=divergenceChips(s)+volumePatternChip(s);
+      if(divc||sqc)h+='<div class="snnotes snnotes-w">'+sqc+divc+'</div>';
+      return h+'</div></td>';
+    }},
+    {id:'price',label:'Price',sort:'price',hint:'price and its 252-session trend',td:function(s,i,x){
+      return '<td><div style="min-width:58px"><span style="font-weight:700;font-size:11px;color:var(--t1)">'+x.cur+fmt(s.price)+'</span>'+priceTrendSvg(s,58,18,false)+'</div></td>';
+    }},
+    {id:'trend',label:'Trend',sort:'trendStackScore',title:'Trend Stack Score: 200S + 200E + 50E + 21E slopes',td:function(s){return '<td>'+trendStackCell(s)+'</td>'}},
+    {id:'pullbackScore',label:'Pull',sort:'pullbackScore',hint:'pullback score',td:function(s){return '<td>'+pointPill('Pb',pullbackScoreValue(s),75,60,'var(--bl)')+'</td>'}},
+    {id:'areaRank',label:'Area',sort:'areaRank',title:'Area score rank, 0–100 against the stock’s own earlier scores. Small figure: how far the last 12 months sat above (+) or below (−) today on average.',td:function(s){return '<td>'+areaCell(s)+'</td>'}},
+    {id:'momentumScore',label:'Momo',sort:'momentumScore',hint:'momentum score',td:function(s){return '<td>'+pointPill('Mo',momentumScoreValue(s),75,60,'var(--gn)')+'</td>'}},
+    {id:'valueScore',label:'Value',sort:'valueScore',td:function(s,i){return '<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueScoreMini(s)+'</td>'}},
+    {id:'valueFloor',label:'Floor',sort:'valueFloor',title:'Value floor: how far the price sits above what the company is worth at the least — the higher of its book value and its value if profits never grow. Nearest first.',
+      td:function(s,i){return '<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueFloorCell(s)+'</td>'}},
+    {id:'macdSlope',label:'MACD',sort:'macdSlope',td:function(s){
+      var pc=PH[s.macdPhase]||'var(--t3)';
+      var h='<td><div style="display:flex;align-items:center;gap:2px">';
+      h+='<div>'+macdSparkSvg((SETUPS_LENS==='hook'||SETUPS_LENS==='turn'||SETUPS_LENS==='both')&&s.smoothMacdCurve?s.smoothMacdCurve:s.macdCurve,s.macdPhase,44,16)+'</div>';
+      h+='<div style="display:flex;flex-direction:column;gap:1px"><span class="phase" style="color:'+pc+';font-size:7px;font-weight:700">'+s.macdPhase+'</span>';
+      var ma=macdSlopeAngleFor(s);
+      h+='<span style="font-size:7px;color:'+pc+'">'+(isFinite(ma)?((ma>0?'+':'')+fmt(ma,0)+'\u00B0'):'—')+'</span>';
+      if(SETUPS_LENS==='turn')h+=smoothTurnQualityBadge(s);
+      return h+'</div></div></td>';
+    }},
+    {id:'zone',label:'S/R',sort:'zone',hint:'support → price → resistance',td:function(s){return '<td>'+renderZone(s.support,s.resistance,s.price,true)+'</td>'}},
+    {id:'rocPct',label:'ROC',sort:'rocPct',title:'ROC: room to the nearest resistance, (resistance \u2212 price) \u00F7 price.',td:function(s){
+      return '<td><span style="color:'+(s.rocPct>=10?'var(--gn)':s.rocPct>=5?'var(--am)':'var(--t2)')+';font-weight:700;font-size:10px">'+(s.rocPct>0?fmt(s.rocPct,1)+'%':'\u2014')+'</span></td>';
+    }},
+    {id:'rrRatio',label:'R:R',sort:'rrRatio',hint:'reward to risk',td:function(s){
+      var c=s.rrRatio>=2?'var(--gn)':s.rrRatio>=1?'var(--am)':'var(--rd)';
+      return '<td><span style="color:'+c+';font-weight:700;font-size:10px">'+(s.rrRatio>0?fmt(s.rrRatio,1)+':1':'\u2014')+'</span></td>';
+    }},
+    {id:'priceVel',label:'Chg%',sort:'priceVel',hint:'price change, and days up in a row',td:function(s){
+      var c=s.priceVel>0?'var(--gn)':s.priceVel<0?'var(--rd)':'var(--t3)';
+      return '<td><span style="color:'+c+';font-weight:700;font-size:10px">'+(s.priceVel>0?'+':'')+fmt(s.priceVel,2)+'%</span>'+
+        (s.upDays>=3?'<br/><span style="font-size:8px;color:var(--gn)">\u2191'+s.upDays+'</span>':'')+'</td>';
+    }},
+    {id:'swingScore',label:'Style',sort:'swingScore',hint:'swing or long-term fit',td:function(s){return '<td>'+styleMini(s)+'</td>'}},
+    {id:'riskInAtrs',label:'Risk',sort:'riskInAtrs',hint:'room to the stop, in ATRs',td:function(s){
+      var c=s.riskInAtrs>=1.5?'var(--gn)':s.riskInAtrs>=1?'var(--am)':'var(--rd)';
+      return '<td><span style="color:'+c+';font-weight:700;font-size:10px">'+(s.riskInAtrs>0?fmt(s.riskInAtrs,1):'\u2014')+'</span></td>';
+    }}
+  ],
+  portfolio:[
+    {id:'symbol',label:'Stock',sort:'symbol',fixed:true,td:function(r){
+      var primaryName=displayNameFor(r), subLine=stockSubLine(r);
+      // A long company name gets a smaller size rather than being cut off; always bold.
+      var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
+      var h='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+algoHeldDot(r)+untrackedDot(r);
+      var notes='';
+      notes+=portfolioWarningBadges(r);
+      if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
+      else if(r.softSniperFiredToday)notes+='<span class="snb snb-soft" title="Soft sniper fired today — auto-GTT placed on BOOK_PROFIT alert">SS</span>';
+      if(r.obvDivergence)notes+='<span class="snb snb-exit" title="OBV bearish divergence: price near 5-day high but volume not confirming.">BIG EXIT</span>';
+      else if(r.obvWeakness)notes+='<span class="snb snb-vol" title="OBV under 20-day average — volume support is weakening.">vol weak</span>';
+      notes+=divergenceChips(r);
+      notes+=volumePatternChip(r);
+      if(notes)h+='<div class="snnotes">'+notes+'</div>';
+      h+=ownerSplitLine(r);
+      if(!r.hasAnalysis&&r.analysisPending)h+='<div title="New holding — its scores are being worked out" style="font-size:6px;color:var(--t3);margin-top:1px">scoring…</div>';
+      else if(!r.hasAnalysis)h+='<div title="'+escHtml(r.analysisError||'Yahoo candle scan did not return usable data')+'" style="font-size:6px;color:var(--am);margin-top:1px">no scan</div>';
+      else h+='<div class="snn">'+escHtml(subLine)+(r.dayChangePct?' <span style="color:'+(r.dayChangePct>=0?'var(--gn)':'var(--rd)')+'">'+(r.dayChangePct>=0?'+':'')+fmt(r.dayChangePct,1)+'%</span>':'')+'</div>';
+      h+=liveIntradayPriceSvg(r,96,30);
+      return h+'</div></td>';
+    }},
+    {id:'macdPhase',label:'MACD',sort:'macdPhase',td:function(r){return '<td>'+portfolioMacdCell(r)+'</td>'}},
+    {id:'totalReturnPct',label:'P&L',sort:'totalReturnPct',title:'Return% / P&L / Day%',hint:'return, profit or loss',td:function(r){
+      var retCol=r.totalReturnPct>=0?'var(--gn)':'var(--rd)', pnlCol=r.pnl>=0?'var(--gn)':'var(--rd)';
+      return '<td><span style="color:'+retCol+';font-weight:800;font-size:11px">'+(r.totalReturnPct>=0?'+':'')+fmt(r.totalReturnPct,1)+'%</span><br/><span style="color:'+pnlCol+';font-size:9px">'+(r.pnl>=0?'+':'-')+r.currency+fmtV(Math.abs(r.pnl))+'</span></td>';
+    }},
+    {id:'zonePct',label:'Zone',sort:'zonePct',title:'Price position: support=0% resistance=100%',hint:'support → price → resistance, stop and target',td:function(r){
+      return '<td>'+(r.broker==='t212'?renderT212ZoneCell(r)
+                :renderZone(r.support,r.resistance,r.ltp,r.hasAnalysis,{atr:r.atr,sl:r.sl,tgt:r.tgt,ccy:r.currency,buy:r.avgPrice}))+'</td>';
+    }},
+    {id:'scores',label:'Pb/Mo',title:'Entry and exit scores',hint:'pullback and momentum scores',
+      th:function(){
+        var a=function(k){return PORTFOLIO.sortK===k?(PORTFOLIO.sortA?' \u25B2':' \u25BC'):''};
+        return '<th title="Entry and exit scores"><span onclick="event.stopPropagation();doPSort(\'pullbackScore\')" style="cursor:pointer">Pb'+a('pullbackScore')+'</span>/<span onclick="event.stopPropagation();doPSort(\'momentumScore\')" style="cursor:pointer">Mo'+a('momentumScore')+'</span></th>';
+      },
+      td:function(r){return '<td>'+portfolioScoresCell(r)+'</td>'}},
+    {id:'ltp',label:'LTP',sort:'ltp',hint:'last price',td:function(r){
+      var live=r.live?'<span title="Yahoo live stream" style="margin-left:3px;color:var(--gn);font-size:8px;font-weight:900">LIVE</span>':'';
+      return '<td style="font-weight:700;font-size:11px">'+r.currency+fmt(r.ltp)+live+'</td>';
+    }},
+    // THE YEAR'S PRICE (the user, 11 Nov 2026): the same 252-session line the
+    // Discovery price column draws — grey the price, coloured its trend.
+    {id:'trend1y',label:'1Y',sort:'kalmanTrendPct',title:'252-session price and its Kalman trend; sorts by the trend over the year',hint:'252-day price graph',td:function(r){
+      var svg=r.hasAnalysis?priceTrendSvg(r,64,20,false):'';
+      return '<td>'+(svg||'<span style="color:var(--t3)">—</span>')+'</td>';
+    }},
+    {id:'invested',label:'Inv/Qty',sort:'invested',hint:'money in, shares and average price',td:function(r){
+      return '<td><span style="font-size:10px">'+r.currency+fmtV(r.invested)+'</span><br/><span style="font-size:9px;color:var(--t3)">'+(r.qty%1?r.qty.toFixed(2):r.qty)+' @'+r.currency+fmt(r.avgPrice)+'</span></td>';
+    }},
+    // Germany and the US show their target or stop inside the Zone cell — the GTT
+    // column is India's alone.
+    {id:'gtt',label:'GTT',hint:'India: the order at Zerodha',when:function(){return !isT212Space()},td:function(r){
+      return r.broker!=='t212'?'<td onclick="event.stopPropagation()">'+r.orderHtml()+'</td>':'<td></td>';
+    }}
+  ]
+};
+function colsSaved(view){try{return JSON.parse(localStorage.getItem('cols_'+view)||'null')||{}}catch(e){return {}}}
+function colsSave(view,v){try{localStorage.setItem('cols_'+view,JSON.stringify(v))}catch(e){}}
+/** Every column of [view] in your order, each with whether it is on. */
+function colsAll(view){
+  var defs=COL_DEFS[view]||[], sv=colsSaved(view), byId={}, out=[];
+  defs.forEach(function(d){byId[d.id]=d});
+  (sv.order||[]).forEach(function(id){if(byId[id]&&out.indexOf(id)<0)out.push(id)});
+  // A column you have never placed goes in after the one before it by default.
+  defs.forEach(function(d,k){
+    if(out.indexOf(d.id)>=0)return;
+    var at=0;for(var b=k-1;b>=0;b--){var p=out.indexOf(defs[b].id);if(p>=0){at=p+1;break}}
+    out.splice(at,0,d.id);
+  });
+  // The fixed column first, whatever was saved.
+  defs.forEach(function(d){if(d.fixed){out.splice(out.indexOf(d.id),1);out.unshift(d.id)}});
+  var on=sv.on||{};
+  return out.map(function(id){var d=byId[id];return {d:d,on:d.fixed||(on.hasOwnProperty(id)?!!on[id]:!d.off)}});
+}
+/** The columns to draw: on, and meant for this market. */
+function colsOn(view){
+  return colsAll(view).filter(function(x){return x.on&&(!x.d.when||x.d.when())}).map(function(x){return x.d});
+}
+function colTh(c,sortK,sortA,fn){
+  if(c.th)return c.th();
+  var arrow=(c.sort&&sortK===c.sort)?(sortA?' \u25B2':' \u25BC'):'';
+  return '<th'+(c.sort?' onclick="'+fn+'(\''+c.sort+'\')"':'')+(c.title?' title="'+escHtml(c.title)+'"':'')+'>'+escHtml(c.label)+arrow+'</th>';
+}
+function colsPill(view){
+  var all=colsAll(view).filter(function(x){return !x.d.when||x.d.when()});
+  var n=all.filter(function(x){return x.on}).length;
+  return '<span onclick="openColsSheet(\''+view+'\')" title="Choose the columns and their order" style="display:inline-flex;align-items:center;gap:4px;padding:7px 11px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;color:var(--t1);font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">▦ '+n+'/'+all.length+'</span>';
+}
+function openColsSheet(view){
+  var all=colsAll(view).filter(function(x){return !x.d.when||x.d.when()});
+  var h='<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Tick to show · ▲▼ to move. Left to right = top to bottom.</div>';
+  all.forEach(function(x,k){
+    var d=x.d, mv=function(dir,lab,ok){return '<span onclick="'+(ok?'colsMove(\''+view+'\',\''+d.id+'\','+dir+')':'')+'" style="cursor:'+(ok?'pointer':'default')+';padding:4px 9px;border:1px solid var(--bd);border-radius:6px;font-size:11px;color:'+(ok?'var(--t1)':'var(--bd)')+'">'+lab+'</span>'};
+    h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 2px;border-top:1px solid var(--bd)">'+
+      (d.fixed?'<span style="width:18px;text-align:center;color:var(--t3)">📌</span>'
+        :'<input type="checkbox" '+(x.on?'checked ':'')+'onchange="colsToggle(\''+view+'\',\''+d.id+'\',this.checked)" style="width:18px;height:18px"/>')+
+      '<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:'+(x.on?'var(--t1)':'var(--t3)')+'">'+escHtml(d.label)+'</div>'+
+        (d.hint?'<div style="font-size:9px;color:var(--t3)">'+escHtml(d.hint)+'</div>':'')+'</div>'+
+      (d.fixed?'<span style="font-size:9px;color:var(--t3)">always first</span>':mv(-1,'▲',k>1)+mv(1,'▼',k<all.length-1))+
+    '</div>';
+  });
+  h+='<div style="margin-top:10px;text-align:right"><span onclick="colsReset(\''+view+'\')" style="cursor:pointer;font-size:11px;font-weight:700;color:var(--bl)">↺ Default columns</span></div>';
+  uiAlert('▦ '+(view==='portfolio'?'Portfolio':'Discovery')+' columns',h);
+}
+function colsStore(view,all){
+  var on={};all.forEach(function(x){on[x.d.id]=x.on});
+  colsSave(view,{order:all.map(function(x){return x.d.id}),on:on});
+  renderKeepScroll();openColsSheet(view);
+}
+function colsToggle(view,id,v){
+  var all=colsAll(view);all.forEach(function(x){if(x.d.id===id&&!x.d.fixed)x.on=!!v});colsStore(view,all);
+}
+function colsMove(view,id,dir){
+  var all=colsAll(view);
+  // Moved past the columns this market does not show, so a tap always moves it on screen.
+  var vis=function(x){return !x.d.when||x.d.when()};
+  var i=-1;all.forEach(function(x,k){if(x.d.id===id)i=k});if(i<0)return;
+  var j=i+dir;while(j>0&&j<all.length&&!vis(all[j]))j+=dir;
+  if(j<1||j>=all.length)return;
+  var t=all[i];all[i]=all[j];all[j]=t;colsStore(view,all);
+}
+function colsReset(view){try{localStorage.removeItem('cols_'+view)}catch(e){}renderKeepScroll();openColsSheet(view)}
 function sortPill(scope){
   var st=scope==='portfolio'?PORTFOLIO:STATE;
   // Show the active metric label so the pill doubles as a status indicator.
@@ -7198,6 +7380,7 @@ function render(){
   // rest of the time.
   if(tab==='discovery')h+=clearFiltersPill();
   h+=sortPill('discovery');
+  h+=colsPill('discovery');
   h+='</div>';
 
 
@@ -7217,82 +7400,14 @@ function render(){
            '<div onclick="clearDiscoveryFilters()" style="display:inline-block;margin-top:9px;cursor:pointer;font-size:11px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.4);border-radius:7px;padding:5px 12px">&#10005; Clear all filters</div>':'')+
          '</div>');
   }else{
+    // COLUMNS YOU CHOOSE — see COL_DEFS: which indicators show, and in what order.
+    var dcols=colsOn('discovery'), dctx={cur:cur};
     h+='<div class="tw"><table><thead><tr>';
-    // Columns: Stock, Price, Trend, Pullback, Momentum, Value, MACD, S/R, ROC, R/R, Chg%, Style, Risk.
-    // Signal remains in the detail modal; Value opens the same breakdown previously reached from the Value tab.
-    // ROC is the app's own: room left to the nearest resistance, a price figure \u2014
-    // the same one the watchlist and the floor algo use.
-    var cols=[['symbol','Stock'],['price','Price'],['trend','Trend'],['pullbackScore','Pull'],['areaRank','Area'],['momentumScore','Momo'],['valueScore','Value'],['valueFloor','Floor'],['macdSlope','MACD'],['zone','S/R'],['rocPct','ROC'],['rrRatio','R:R'],['priceVel','Chg%'],['swingScore','Style'],['riskInAtrs','Risk']];
-    cols.forEach(function(c){
-      if(c[0]==='rocPct'){
-        h+='<th onclick="doSort(\'rocPct\')" title="ROC: room to the nearest resistance, (resistance \u2212 price) \u00F7 price.">ROC'+(STATE.sortK==='rocPct'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
-      }else if(c[0]==='areaRank'){
-        h+='<th onclick="doSort(\'areaRank\')" title="Area score rank, 0–100 against the stock’s own earlier scores. Small figure: how far the last 12 months sat above (+) or below (−) today on average.">Area'+(STATE.sortK==='areaRank'?(STATE.sortA?' ▲':' ▼'):'')+'</th>';
-      }else if(c[0]==='valueFloor'){
-        h+='<th onclick="doSort(\'valueFloor\')" title="Value floor: how far the price sits above what the company is worth at the least — the higher of its book value and its value if profits never grow. Nearest first.">Floor'+(STATE.sortK==='valueFloor'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
-      }else if(c[0]==='trend'){
-        h+='<th onclick="doSort(\'trendStackScore\')" title="Trend Stack Score: 200S + 200E + 50E + 21E slopes">Trend'+(STATE.sortK==='trendStackScore'?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
-      }else{
-        h+='<th onclick="doSort(\''+c[0]+'\')">'+c[1]+(STATE.sortK===c[0]?(STATE.sortA?' \u25B2':' \u25BC'):'')+'</th>';
-      }
-    });
+    dcols.forEach(function(c){h+=colTh(c,STATE.sortK,STATE.sortA,'doSort')});
     h+='</tr></thead><tbody>';
     f.forEach(function(s,i){
-      var pc=PH[s.macdPhase]||'var(--t3)';
-      var primaryName=stockSymbolFor(s)||displayNameFor(s);
-      var subLine=s.avgVol20?fmtV(s.avgVol20)+'/d':'';
       h+='<tr data-search="'+escHtml(rowSearchText(s.symbol,s.name,s.sector,s.industry))+'" onclick="showDetail('+i+')">';
-      // Stock (symbol + volume)
-      h+='<td'+aicTd(s.symbol,s.industry)+'><div class="sn"><span class="sns">'+escHtml(primaryName)+'</span>'+aicChip(s.symbol,s.industry);
-      if(subLine)h+='<br/><span class="snn">'+escHtml(subLine)+'</span>';
-      // The squeeze sits with the name, not out in the indicator columns. It is a
-      // statement about the stock's character right now — quiet, or just done
-      // being quiet — and that belongs where the eye lands first.
-      var sqc=squeezeChip(s.symbol);
-      var divc=divergenceChips(s)+volumePatternChip(s);
-      // STACKED, NOT STRUNG ALONG. Four chips side by side pushed this column past
-      // 200px and shoved the whole table sideways, which costs a horizontal scroll
-      // on every row — including the rows carrying no chips at all. One under the
-      // other, the column is set by its widest single chip instead of the sum of
-      // them, and the price of that is vertical space, which scrolls cheaply.
-      if(divc||sqc)h+='<div class="snnotes snnotes-w">'+sqc+divc+'</div>';
-      h+='</div></td>';
-      // Price (LTP + 252-session Kalman trend strip)
-      h+='<td><div style="min-width:58px"><span style="font-weight:700;font-size:11px;color:var(--t1)">'+cur+fmt(s.price)+'</span>'+priceTrendSvg(s,58,18,false)+'</div></td>';
-      // Trend stack: 200S + 200E + 50E + 21E
-      h+='<td>'+trendStackCell(s)+'</td>';
-      // Pullback + momentum points
-      h+='<td>'+pointPill('Pb',pullbackScoreValue(s),75,60,'var(--bl)')+'</td>';
-      h+='<td>'+areaCell(s)+'</td>';
-      h+='<td>'+pointPill('Mo',momentumScoreValue(s),75,60,'var(--gn)')+'</td>';
-      // Value score
-      h+='<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueScoreMini(s)+'</td>';
-      h+='<td onclick="event.stopPropagation();showDetail('+i+',\'value\')">'+valueFloorCell(s)+'</td>';
-      // MACD (chart + phase + slope)
-      h+='<td><div style="display:flex;align-items:center;gap:2px">';
-      h+='<div>'+macdSparkSvg((SETUPS_LENS==='hook'||SETUPS_LENS==='turn'||SETUPS_LENS==='both')&&s.smoothMacdCurve?s.smoothMacdCurve:s.macdCurve,s.macdPhase,44,16)+'</div>';
-      h+='<div style="display:flex;flex-direction:column;gap:1px"><span class="phase" style="color:'+pc+';font-size:7px;font-weight:700">'+s.macdPhase+'</span>';
-      var ma=macdSlopeAngleFor(s);
-      h+='<span style="font-size:7px;color:'+pc+'">'+(isFinite(ma)?((ma>0?'+':'')+fmt(ma,0)+'\u00B0'):'—')+'</span>';
-      if(SETUPS_LENS==='turn')h+=smoothTurnQualityBadge(s);
-      h+='</div></div></td>';
-      // S/R Zone thermometer (Support → Current → Resistance) — placed right after MACD
-      h+='<td>'+renderZone(s.support,s.resistance,s.price,true)+'</td>';
-      // ROC = upside percent from current price to resistance, independent of quantity.
-      h+='<td><span style="color:'+(s.rocPct>=10?'var(--gn)':s.rocPct>=5?'var(--am)':'var(--t2)')+';font-weight:700;font-size:10px">'+(s.rocPct>0?fmt(s.rocPct,1)+'%':'\u2014')+'</span></td>';
-      // R:R ratio
-      var rrCol=s.rrRatio>=2?'var(--gn)':s.rrRatio>=1?'var(--am)':'var(--rd)';
-      h+='<td><span style="color:'+rrCol+';font-weight:700;font-size:10px">'+(s.rrRatio>0?fmt(s.rrRatio,1)+':1':'\u2014')+'</span></td>';
-      // Change %
-      var vCol=s.priceVel>0?'var(--gn)':s.priceVel<0?'var(--rd)':'var(--t3)';
-      h+='<td><span style="color:'+vCol+';font-weight:700;font-size:10px">'+(s.priceVel>0?'+':'')+fmt(s.priceVel,2)+'%</span>';
-      if(s.upDays>=3)h+='<br/><span style="font-size:8px;color:var(--gn)">\u2191'+s.upDays+'</span>';
-      h+='</td>';
-      // Swing / long-term style fit
-      h+='<td>'+styleMini(s)+'</td>';
-      // Risk (in ATRs)
-      var aCol=s.riskInAtrs>=1.5?'var(--gn)':s.riskInAtrs>=1?'var(--am)':'var(--rd)';
-      h+='<td><span style="color:'+aCol+';font-weight:700;font-size:10px">'+(s.riskInAtrs>0?fmt(s.riskInAtrs,1):'\u2014')+'</span></td>';
+      dcols.forEach(function(c){h+=c.td(s,i,dctx)});
       h+='</tr>';
     });
     h+='</tbody></table></div>';
@@ -10505,7 +10620,7 @@ function renderUnifiedPortfolioTable(rows,opts){
   LAST_PORTFOLIO_ROWS=rows;
   var h=renderPortfolioNewsPanel();
   h+=renderDummyGttPanel();
-  h+='<div style="display:flex;justify-content:flex-end;margin:0 0 6px">'+sortPill('portfolio')+'</div>';
+  h+='<div style="display:flex;justify-content:flex-end;gap:6px;margin:0 0 6px">'+colsPill('portfolio')+sortPill('portfolio')+'</div>';
   // ON AUTOPILOT, FOLDED (the user, 5 Nov 2026): holdings only a German built-in
   // algo owns sell on its own stop, target and trend several times a week — no
   // decision of yours in them. They go into their own fold under the table. The
@@ -10515,72 +10630,16 @@ function renderUnifiedPortfolioTable(rows,opts){
   rows.forEach(function(r){var who=autopilotOnly(r);if(who){auto.push(r);who.split(', ').forEach(function(n){autoBy[n]=1})}else main.push(r)});
   if(!main.length&&auto.length&&!q){main=auto;auto=[]}   // nothing else to show: no fold
   function tableOf(list){
+    var pcols=colsOn('portfolio');
     var h='<div class="tw"><table><thead><tr>';
-    h+='<th onclick="doPSort(\'symbol\')">Stock'+pSA('symbol')+'</th>';
-    h+='<th onclick="doPSort(\'macdPhase\')">MACD'+pSA('macdPhase')+'</th>';
-    h+='<th onclick="doPSort(\'totalReturnPct\')" title="Return% / P&L / Day%">P&L'+pSA('totalReturnPct')+'</th>';
-    h+='<th onclick="doPSort(\'zonePct\')" title="Price position: support=0% resistance=100%">Zone'+pSA('zonePct')+'</th>';
-    h+='<th title="Entry and exit scores"><span onclick="event.stopPropagation();doPSort(\'pullbackScore\')" style="cursor:pointer">Pb'+pSA('pullbackScore')+'</span>/<span onclick="event.stopPropagation();doPSort(\'momentumScore\')" style="cursor:pointer">Mo'+pSA('momentumScore')+'</span><br/><span style="font-size:7px;color:var(--t3)">Pr/Pt</span></th>';
-    h+='<th onclick="doPSort(\'ltp\')">LTP'+pSA('ltp')+'</th>';
-    h+='<th onclick="doPSort(\'invested\')">Inv/Qty'+pSA('invested')+'</th>';
-    // Germany and the US show their target or stop inside the Zone cell (one
-    // picture, one tap) — the GTT column is India's alone now.
-    h+=(isT212Space()?'':'<th>GTT</th>')+'</tr></thead><tbody>';
+    pcols.forEach(function(c){h+=colTh(c,PORTFOLIO.sortK,PORTFOLIO.sortA,'doPSort')});
+    h+='</tr></thead><tbody>';
     if(!list.length){
-      h+='<tr><td colspan="8" style="text-align:center;color:var(--t3);padding:22px 8px;font-family:-apple-system,sans-serif;font-size:11px">No portfolio stocks match the current filter.</td></tr>';
+      h+='<tr><td colspan="'+pcols.length+'" style="text-align:center;color:var(--t3);padding:22px 8px;font-family:-apple-system,sans-serif;font-size:11px">No portfolio stocks match the current filter.</td></tr>';
     }
     list.forEach(function(r){
-      var retCol=r.totalReturnPct>=0?'var(--gn)':'var(--rd)';
-      var pnlCol=r.pnl>=0?'var(--gn)':'var(--rd)';
-      var intent=r.verdict||'HOLD';
-      var liveBadge=r.live?'<span title="Yahoo live stream" style="margin-left:3px;color:var(--gn);font-size:8px;font-weight:900">LIVE</span>':'';
-      var primaryName=displayNameFor(r);
-      var subLine=stockSubLine(r);
       h+='<tr data-search="'+escHtml(rowSearchText(r.symbol,r.sub,r.name))+'" onclick="'+r.detailCall+'" style="cursor:pointer">';
-      // A long company name gets a smaller size rather than being cut off; always bold.
-      var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
-      h+='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+algoHeldDot(r)+untrackedDot(r);
-      var notes='';
-      notes+=portfolioWarningBadges(r);
-      if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
-      else if(r.softSniperFiredToday)notes+='<span class="snb snb-soft" title="Soft sniper fired today — auto-GTT placed on BOOK_PROFIT alert">SS</span>';
-      if(r.obvDivergence)notes+='<span class="snb snb-exit" title="OBV bearish divergence: price near 5-day high but volume not confirming.">BIG EXIT</span>';
-      else if(r.obvWeakness)notes+='<span class="snb snb-vol" title="OBV under 20-day average — volume support is weakening.">vol weak</span>';
-      notes+=divergenceChips(r);
-      notes+=volumePatternChip(r);
-      if(notes)h+='<div class="snnotes">'+notes+'</div>';
-      h+=ownerSplitLine(r);
-      if(!r.hasAnalysis&&r.analysisPending)h+='<div title="New holding — its scores are being worked out" style="font-size:6px;color:var(--t3);margin-top:1px">scoring…</div>';
-      else if(!r.hasAnalysis)h+='<div title="'+escHtml(r.analysisError||'Yahoo candle scan did not return usable data')+'" style="font-size:6px;color:var(--am);margin-top:1px">no scan</div>';
-      else h+='<div class="snn">'+escHtml(subLine)+(r.dayChangePct?' <span style="color:'+(r.dayChangePct>=0?'var(--gn)':'var(--rd)')+'">'+(r.dayChangePct>=0?'+':'')+fmt(r.dayChangePct,1)+'%</span>':'')+'</div>';
-      h+=liveIntradayPriceSvg(r,96,30);
-      h+='</div></td>';
-      h+='<td>'+portfolioMacdCell(r)+'</td>';
-      /* Legacy narrow MACD cell kept inert while the roomier portfolioMacdCell owns this column.
-      if(false&&r.hasAnalysis){
-        var spd=speedLabel(r.minBarsFilter);
-        h+='<td style="max-width:80px"><div style="display:flex;align-items:center;gap:2px"><div>'+macdSparkSvg(r.macdCurve,r.macdPhase,30,12)+'</div><span style="color:'+pc2+';font-size:7px;white-space:normal;max-width:50px;line-height:1.2">'+(r.macdPhase||'—')+'</span></div>';
-        if(spd.tag)h+='<div title="Adaptive MACD filter" style="margin-top:2px;display:inline-flex;align-items:center;gap:2px;background:rgba(0,0,0,0.04);border:1px solid rgba(0,0,0,0.08);border-radius:3px;padding:1px 4px"><span style="font-size:7px;color:'+spd.col+';font-weight:800;font-family:monospace">⚡'+spd.d+'</span><span style="font-size:6px;color:var(--t3);font-weight:600">'+spd.tag+'</span></div>';
-        h+='</td>';
-      }else h+='<td style="color:var(--t3)">—</td>';
-      */
-      h+='<td><span style="color:'+retCol+';font-weight:800;font-size:11px">'+(r.totalReturnPct>=0?'+':'')+fmt(r.totalReturnPct,1)+'%</span><br/><span style="color:'+pnlCol+';font-size:9px">'+(r.pnl>=0?'+':'-')+r.currency+fmtV(Math.abs(r.pnl))+'</span></td>';
-      h+='<td>'+(r.broker==='t212'?renderT212ZoneCell(r)
-                :renderZone(r.support,r.resistance,r.ltp,r.hasAnalysis,{atr:r.atr,sl:r.sl,tgt:r.tgt,ccy:r.currency,buy:r.avgPrice}))+'</td>';
-      h+='<td>'+portfolioScoresCell(r)+'</td>';
-      /* Legacy vertical score stack kept inert; portfolioScoresCell lays scores horizontally.
-      h+='<td>';
-      if(r.hasAnalysis)h+='<div style="display:flex;flex-direction:column;gap:1px;align-items:flex-start"><span class="sc scb">B:'+r.buyScore+'</span><span class="scp scp-profit'+(r.profitScore>=35?' s':'')+'">Pr:'+r.profitScore+'</span><span class="scp scp-protect'+(r.protectScore>=35?' s':'')+'">Pt:'+r.protectScore+'</span>'+styleMini(r)+'</div>';
-      else h+='—';
-      h+='</td>';
-      */
-      h+='<td style="font-weight:700;font-size:11px">'+r.currency+fmt(r.ltp)+liveBadge+'</td>';
-      h+='<td><span style="font-size:10px">'+r.currency+fmtV(r.invested)+'</span><br/><span style="font-size:9px;color:var(--t3)">'+(r.qty%1?r.qty.toFixed(2):r.qty)+' @'+r.currency+fmt(r.avgPrice)+'</span></td>';
-      /* Intent now lives inside portfolioScoresCell, so it no longer needs its own column.
-      var vrdShort=intent==='STRONG EXIT'?'EXIT':intent==='BOOK PROFIT'?'PROFIT':intent==='PROTECT CAPITAL'?'PROTECT':intent;
-      h+='<td style="max-width:56px;padding-left:2px;padding-right:2px"><span class="vrd '+vrdCls+'" title="'+intent+'">'+vrdShort+'</span></td>';
-      */
-      if(r.broker!=='t212')h+='<td onclick="event.stopPropagation()">'+r.orderHtml()+'</td>';
+      pcols.forEach(function(c){h+=c.td(r)});
       h+='</tr>';
     });
     h+='</tbody></table></div>';
