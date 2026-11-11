@@ -30,6 +30,9 @@ object ResultsBook {
     private val gson = Gson()
 
     data class Quarter(val qEnd: Long = 0L, val eps: Double? = null, val est: Double? = null, val surprisePct: Double? = null)
+    /** A quarter's reported sales and profit (11 Nov 2026): for companies Yahoo keeps
+     *  no analyst estimates on, so there is no beat or miss to show. */
+    data class Sales(val label: String = "", val revenue: Double = 0.0, val earnings: Double? = null)
     data class Move(val dayMs: Long = 0L, val pct: Double = 0.0, val volX: Double = 0.0,
                     val headline: String = "", val outlet: String = "", val results: Boolean = false,
                     val surprisePct: Double? = null)
@@ -39,7 +42,9 @@ object ResultsBook {
                    /** The company's sector and industry, as Yahoo files it. */
                    val sector: String? = null, val industry: String? = null,
                    /** Market cap in [capCur]; 0 = Yahoo had none, null = not read yet (11 Nov 2026). */
-                   val marketCap: Double? = null, val capCur: String? = null)
+                   val marketCap: Double? = null, val capCur: String? = null,
+                   /** Reported sales by quarter, oldest first; null = not read yet. */
+                   val sales: List<Sales>? = null, val salesCur: String? = null)
     private data class Saved(val m: Map<String, Rec>? = null)
 
     private fun file(ctx: Context) = File(ctx.filesDir, FILE)
@@ -66,7 +71,7 @@ object ResultsBook {
     fun stale(r: Rec?, lastReportMs: Long, now: Long): Boolean =
         r == null || r.readAt <= 0L || now - r.readAt > 3L * 86_400_000L ||
             (lastReportMs in (r.readAt + 1)..now) ||
-            ((r.sector == null || r.marketCap == null) && now - r.readAt > 6L * 3_600_000L)   // read before these were kept
+            ((r.sector == null || r.marketCap == null || r.sales == null) && now - r.readAt > 6L * 3_600_000L)   // read before these were kept
 
     /** Pure: the price over the two sessions from the report day, against the close
      *  before it. Daily bars, oldest first. Null when there are not enough. */
@@ -124,6 +129,8 @@ object ResultsBook {
                 readAt = now, lastReportMs = maxOf(r.lastReportMs, rep),
                 sector = reply.sector ?: r.sector ?: "", industry = reply.industry ?: r.industry,
                 marketCap = reply.marketCap ?: r.marketCap?.takeIf { it > 0.0 } ?: 0.0, capCur = reply.capCur ?: r.capCur,
+                sales = reply.sales.map { Sales(it.label, it.revenue, it.earnings) }.ifEmpty { r.sales.orEmpty() },
+                salesCur = reply.salesCur ?: r.salesCur,
                 reactionPct = react, reactionFor = if (react != null) rep else r.reactionFor)
         }
     }
@@ -152,6 +159,8 @@ object ResultsBook {
     fun forPage(r: Rec?): Map<String, Any?> = mapOf(
         "sector" to r?.sector?.takeIf { it.isNotBlank() }, "industry" to r?.industry,
         "cap" to r?.marketCap?.takeIf { it > 0.0 }, "capCur" to r?.capCur,
+        "sales" to r?.sales.orEmpty().takeLast(4).map { mapOf("q" to it.label, "rev" to it.revenue, "earn" to it.earnings) },
+        "salesCur" to r?.salesCur,
         "quarters" to r?.quarters.orEmpty().takeLast(4).reversed().map { mapOf("q" to it.qEnd, "s" to it.surprisePct) },
         "lastReport" to (r?.lastReportMs ?: 0L), "reaction" to r?.reactionPct,
         "moves" to r?.moves.orEmpty().takeLast(3).reversed().map {
@@ -163,12 +172,20 @@ object ResultsBook {
         val qs = r.quarters.orEmpty().takeLast(4)
         val mv = r.moves.orEmpty().filter { System.currentTimeMillis() - it.dayMs < 120L * 86_400_000L }.takeLast(4)
         val sec = listOfNotNull(r.sector?.takeIf { it.isNotBlank() }, r.industry?.takeIf { it.isNotBlank() })
-        if (qs.isEmpty() && mv.isEmpty() && sec.isEmpty()) return ""
+        // Sales by quarter only where there is no beat-or-miss record to say more.
+        val sl = if (qs.isEmpty()) r.sales.orEmpty().takeLast(4) else emptyList()
+        if (qs.isEmpty() && mv.isEmpty() && sec.isEmpty() && sl.isEmpty()) return ""
         fun d(ms: Long) = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate().toString()
         return buildString {
             if (sec.isNotEmpty()) append("Sector: ${sec.joinToString(" · ")}\n\n")
-            if (qs.isEmpty() && mv.isEmpty()) return@buildString
+            if (qs.isEmpty() && mv.isEmpty() && sl.isEmpty()) return@buildString
             append("─ Results record (facts from Yahoo Finance and this app, not opinions) ─\n")
+            fun big(v: Double) = if (kotlin.math.abs(v) >= 1e9) "%.2f bn".format(v / 1e9) else "%.0f m".format(v / 1e6)
+            val sc = r.salesCur?.let { " $it" } ?: ""
+            sl.reversed().forEach { s ->
+                append("• Quarter ${s.label}: sales ${big(s.revenue)}$sc" +
+                    (s.earnings?.let { ", profit ${big(it)}$sc" } ?: "") + " (no analyst estimate to compare)\n")
+            }
             qs.reversed().forEach { q ->
                 append("• Quarter to ${d(q.qEnd)}: earnings a share ${q.eps?.let { "%.2f".format(it) } ?: "?"}" +
                     (q.est?.let { " vs ${"%.2f".format(it)} expected" } ?: "") + " — ${word(q.surprisePct)}\n")

@@ -1351,7 +1351,13 @@ object YahooFinanceClient {
     /** The last four quarters, and the company's sector and industry. */
     data class ResultsReply(val quarters: List<QuarterResult>, val sector: String?, val industry: String?,
                             /** Market value of the company, in [capCur]; null when Yahoo gives none. */
-                            val marketCap: Double? = null, val capCur: String? = null)
+                            val marketCap: Double? = null, val capCur: String? = null,
+                            /** Reported sales (and profit, when given) by quarter, oldest first —
+                             *  there even when no analyst estimate is, so no beat or miss. */
+                            val sales: List<QuarterSales> = emptyList(), val salesCur: String? = null)
+
+    /** One quarter's reported sales and profit; [label] as Yahoo names it, e.g. "3Q2026". */
+    data class QuarterSales(val label: String, val revenue: Double, val earnings: Double?)
 
     /** The last four quarters (oldest first) with the company's sector. Null when
      *  Yahoo could not be asked. */
@@ -1359,7 +1365,7 @@ object YahooFinanceClient {
         val crumb = fetchCrumb() ?: return null
         val url = HttpUrl.Builder().scheme("https").host("query2.finance.yahoo.com")
             .addPathSegments("v10/finance/quoteSummary/$yahooSymbol")
-            .addQueryParameter("modules", "earningsHistory,assetProfile,price")
+            .addQueryParameter("modules", "earningsHistory,assetProfile,price,earnings")
             .addQueryParameter("crumb", crumb).build()
         val req = Request.Builder().url(url)
             .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
@@ -1368,7 +1374,8 @@ object YahooFinanceClient {
             when (r.code) {
                 200 -> r.body?.string().orEmpty().let { b -> parseProfile(b).let { (s, i) ->
                     val (cap, cur) = parseMarketCap(b)
-                    ResultsReply(parseEarningsHistory(b), s, i, cap, cur) } }
+                    val (sales, sCur) = parseQuarterSales(b)
+                    ResultsReply(parseEarningsHistory(b), s, i, cap, cur, sales, sCur) } }
                 404 -> ResultsReply(emptyList(), null, null)
                 401, 403 -> { cachedCrumb = null; null }
                 else -> null
@@ -1383,6 +1390,21 @@ object YahooFinanceClient {
         (p?.optString("sector", "")?.trim()?.takeIf { it.isNotBlank() }) to
             (p?.optString("industry", "")?.trim()?.takeIf { it.isNotBlank() })
     } catch (e: Exception) { null to null }
+
+    /** Pure: reported sales and profit by quarter, oldest first, from the earnings module. */
+    fun parseQuarterSales(body: String): Pair<List<QuarterSales>, String?> = try {
+        val e = JSONObject(body).optJSONObject("quoteSummary")?.optJSONArray("result")?.optJSONObject(0)
+            ?.optJSONObject("earnings")
+        val arr = e?.optJSONObject("financialsChart")?.optJSONArray("quarterly")
+        fun raw(o: JSONObject, k: String): Double? = o.optJSONObject(k)?.let { if (it.has("raw")) it.optDouble("raw") else null }
+            ?.takeIf { it.isFinite() }
+        val list = (0 until (arr?.length() ?: 0)).mapNotNull { i ->
+            val o = arr!!.optJSONObject(i) ?: return@mapNotNull null
+            val rev = raw(o, "revenue")?.takeIf { it > 0.0 } ?: return@mapNotNull null
+            QuarterSales(o.optString("date", ""), rev, raw(o, "earnings"))
+        }
+        list to e?.optString("financialCurrency", "")?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) { emptyList<QuarterSales>() to null }
 
     /** Pure: the company's market value and its currency, from the price module. */
     fun parseMarketCap(body: String): Pair<Double?, String?> = try {

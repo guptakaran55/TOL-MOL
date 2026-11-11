@@ -674,6 +674,18 @@ function resLineInner(k){
   var parts=[];
   var qs=r.quarters||[];
   if(qs.length)parts.push('📊 '+qs.map(function(q){return mo(q.q)+' '+w(q.s)}).join(' · '));
+  // NO ANALYST ESTIMATES ON YAHOO (Hochtief, Fielmann, Henkel…: 11 Nov 2026) — no
+  // beat or miss to show, so the reported sales by quarter and the last change.
+  else if((r.sales||[]).length){
+    var sl=r.sales,sc=String(r.salesCur||'').toUpperCase(),sy=sc==='EUR'?'€':sc==='USD'?'$':sc==='INR'?'₹':sc==='GBP'?'£':'';
+    var amt=function(v){v=Number(v);return sc==='INR'?sy+Math.round(v/1e7).toLocaleString('en-IN')+' Cr':(Math.abs(v)>=1e9?sy+(v/1e9).toFixed(2)+' bn':sy+Math.round(v/1e6)+' m')};
+    var ql=function(s){var m=/^(\d)Q(\d{4})$/.exec(String(s||''));return m?'Q'+m[1]+' ’'+m[2].slice(2):escHtml(String(s||''))};
+    var last=sl[sl.length-1],prev=sl.length>1?sl[sl.length-2]:null;
+    var chg=prev&&Number(prev.rev)>0?(Number(last.rev)/Number(prev.rev)-1)*100:null;
+    parts.push('📊 sales '+sl.map(function(s){return ql(s.q)+' '+amt(s.rev)}).join(' · ')+
+      (chg!=null?' <b style="color:'+(chg>=0?'var(--gn)':'var(--rd)')+'">'+(chg>=0?'+':'')+chg.toFixed(1)+'% q/q</b>':'')+
+      (last.earn!=null?' · profit '+amt(last.earn):'')+' <span style="color:var(--t3)">(no estimates on Yahoo)</span>');
+  }
   if(Number(r.lastReport)>0&&r.reaction!=null)parts.push('reported '+dd(r.lastReport)+' → '+(Number(r.reaction)>=0?'+':'')+Number(r.reaction).toFixed(1)+'%');
   var mv=(r.moves||[])[0];
   if(mv&&Date.now()-Number(mv.day)<30*86400000)parts.push('<span title="'+escHtml(String(mv.headline||''))+'">⚡ '+dd(mv.day)+' '+(Number(mv.pct)>=0?'+':'')+Number(mv.pct).toFixed(1)+'%'+
