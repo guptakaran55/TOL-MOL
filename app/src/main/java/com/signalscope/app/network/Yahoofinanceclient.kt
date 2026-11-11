@@ -1280,7 +1280,9 @@ object YahooFinanceClient {
 
     /** One stock's day so far, from the batch quote. */
     data class DayQuote(val symbol: String, val price: Double, val changePct: Double,
-                        val volume: Long, val avgVolume10d: Long, val earningsAtMs: Long, val name: String = "")
+                        val volume: Long, val avgVolume10d: Long, val earningsAtMs: Long, val name: String = "",
+                        /** When it last traded. On a holiday this is the previous session (10 Nov 2026). */
+                        val tradedAtMs: Long = 0L)
 
     /**
      * NEWS MOVES (6 Nov 2026): today's move and volume for many stocks in one
@@ -1306,6 +1308,26 @@ object YahooFinanceClient {
         out
     } catch (e: Exception) { Log.w(TAG, "batch quote failed: ${e.message}"); null }
 
+    /**
+     * When [yahooSymbol] last traded (Yahoo's own time of the last price), or null
+     * when it could not be asked. One small request — for "has this exchange
+     * traded today?" on the market's index.
+     */
+    fun fetchLastTradeMs(yahooSymbol: String): Long? = try {
+        val url = HttpUrl.Builder().scheme("https").host("query1.finance.yahoo.com")
+            .addPathSegments("v8/finance/chart/${onFeed(yahooSymbol)}")
+            .addQueryParameter("range", "1d").addQueryParameter("interval", "5m").build()
+        val req = Request.Builder().url(url)
+            .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+            .addHeader("Accept", "application/json").build()
+        client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) null else r.body?.string()?.let { body ->
+                JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+                    .getJSONObject("meta").optLong("regularMarketTime", 0L).takeIf { it > 0L }?.let { it * 1000L }
+            }
+        }
+    } catch (e: Exception) { Log.w(TAG, "last trade of $yahooSymbol failed: ${e.message}"); null }
+
     /** Pure: a v7 quote reply. */
     fun parseQuotes(body: String): Map<String, DayQuote> {
         val out = HashMap<String, DayQuote>()
@@ -1317,7 +1339,8 @@ object YahooFinanceClient {
             out[sym.uppercase()] = DayQuote(sym, q.optDouble("regularMarketPrice", 0.0),
                 q.optDouble("regularMarketChangePercent", 0.0), q.optLong("regularMarketVolume", 0L),
                 q.optLong("averageDailyVolume10Day", 0L), q.optLong("earningsTimestamp", 0L) * 1000L,
-                q.optString("longName", "").ifBlank { q.optString("shortName", "") })
+                q.optString("longName", "").ifBlank { q.optString("shortName", "") },
+                q.optLong("regularMarketTime", 0L) * 1000L)
         }
         return out
     }

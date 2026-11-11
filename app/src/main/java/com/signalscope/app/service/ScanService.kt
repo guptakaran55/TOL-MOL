@@ -979,6 +979,19 @@ class ScanService : Service() {
             // still queued for the lock, before the inner one could run.
             try { yahooScanLock.withLock {
                 try {
+                    // A HOLIDAY (NSE, 10 Nov 2026): the automatic scan re-read the last
+                    // session and alerted on it as if it were today's. Skipped instead;
+                    // the scheduler asks again in half an hour (three tries a day), so a
+                    // first trade that is merely late costs a delay, not the scan.
+                    if (robust) {
+                        val base = when (market) { "nifty500" -> "in"; "dax" -> "de"; else -> "us" }
+                        if (com.signalscope.app.trading.TradingDay.tradedToday(base) == false) {
+                            val msg = "No automatic scan: the exchange has not traded today (holiday?)"
+                            Log.i(TAG, "[$market] $msg")
+                            ScanServiceResultHolder.discoveryStatusText = msg
+                            return@withLock
+                        }
+                    }
                     // ── RESUME-FROM-CHECKPOINT ──
                     // If the previous run of this market was killed mid-scan by MIUI/Samsung
                     // battery-killers, we have a partial result saved on disk. Resume from

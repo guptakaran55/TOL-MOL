@@ -154,6 +154,12 @@ object NewsMoves {
 
         val ySym = role.keys.associateWith { EarningsDates.yahooOf(it) }
         val quotes = YahooFinanceClient.fetchQuotes(ySym.values.toList()) ?: return "quotes unreadable"
+        // A HOLIDAY: the clock says open, but every price is the last session's
+        // (NSE, 10 Nov 2026 — alerts on Monday's moves). Nothing to read today.
+        if (TradingDay.tradedFromQuotes(quotes.values.map { it.tradedAtMs }, base, now) == false) {
+            Log.i(TAG, "[$base] no trades today — the exchange is shut")
+            return "market shut today"
+        }
 
         val zone = MarketHours.zoneOf(base); val open = MarketHours.openOf(base); val close = MarketHours.closeOf(base)
         val share = if (zone != null && open != null && close != null) {
@@ -170,6 +176,8 @@ object NewsMoves {
         for (k in role.keys) {
             val q = quotes[ySym[k]!!.uppercase()] ?: continue
             if (q.avgVolume10d <= 0L || q.price <= 0.0) continue
+            // Not traded yet today: its move and volume are the last session's.
+            if (q.tradedAtMs > 0L && !TradingDay.isToday(q.tradedAtMs, base, now)) continue
             if (role[k] == "market" && tooThin(q.price, q.avgVolume10d, floor)) { thin.add(k); continue }
             val volX = q.volume / (q.avgVolume10d * share)
             val rep = q.earningsAtMs.takeIf { it > 0L } ?: EarningsDates.known(ctx, k)?.atMs ?: 0L
