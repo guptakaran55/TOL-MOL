@@ -4533,6 +4533,7 @@ class MainActivity : AppCompatActivity() {
             if (base == "de") com.signalscope.app.data.FloorAlgoStore.ensureMonthTrendSeeded(applicationContext)
             if (base == "de") com.signalscope.app.data.FloorAlgoStore.ensurePortfolioSeeded(applicationContext)
             if (base == "in") com.signalscope.app.data.FloorAlgoStore.ensureIndiaCapitalRaised(applicationContext)
+            if (base == "in") com.signalscope.app.data.FloorAlgoStore.ensureIndiaNiftyGateCopy(applicationContext)
             gson.toJson(mapOf("ok" to true,
                 "cur" to com.signalscope.app.trading.FloorAlgoEngine.currencyMark(base),
                 "algos" to com.signalscope.app.data.FloorAlgoStore.list(applicationContext, base)
@@ -4568,6 +4569,19 @@ class MainActivity : AppCompatActivity() {
                     log = a.log + "$stamp · paused — nothing new is bought; anything held still sells on its stop, target, time or trend")
             } ?: throw IllegalStateException("algo not found")
             com.signalscope.app.service.StrategyLabScheduler.ensureScheduled(applicationContext)
+            "{\"ok\":true}"
+        } catch (e: Exception) { floorErr(e) }
+
+        /** The market gate on a MACD-turns algo — see [com.signalscope.app.trading.MarketGate]. */
+        @JavascriptInterface
+        fun floorMarketGate(id: String, on: Boolean): String = try {
+            val stamp = com.signalscope.app.data.FloorAlgoStore.stamp()
+            com.signalscope.app.data.FloorAlgoStore.update(applicationContext, id) { a ->
+                if (a.kind != com.signalscope.app.data.FloorAlgoStore.KIND_MACD) throw IllegalStateException("MACD-turns algos only")
+                val idx = com.signalscope.app.trading.MarketGate.indexName(a.space)
+                a.copy(settings = a.settings.copy(marketGate = if (on) com.signalscope.app.trading.MarketGate.INDEX_DMACD else null),
+                    log = a.log + "$stamp · market gate ${if (on) "on: new buys only on days $idx's daily MACD rose" else "off"}")
+            } ?: throw IllegalStateException("algo not found")
             "{\"ok\":true}"
         } catch (e: Exception) { floorErr(e) }
 

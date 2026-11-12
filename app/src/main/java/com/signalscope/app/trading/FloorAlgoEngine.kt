@@ -302,7 +302,10 @@ object FloorAlgoEngine {
         /** May this stock be bought today, as far as the trend goes? Always, with the filter off.
          *  On a monthly-low list, only this morning's picks are watched — the outlook's
          *  yeses, and its noes on the side. */
-        fun passes(m: Member) = (!filterOn || FloorOrders.inUptrend(m.week, m.day)) &&
+        /** The market gate: on a day the index's daily MACD fell, nothing new is bought. */
+        val gated = macd && start.settings.marketGate == MarketGate.INDEX_DMACD
+        val marketOpen: Boolean by lazy { !gated || MarketGate.indexRising(space, today) == true }
+        fun passes(m: Member) = marketOpen && (!filterOn || FloorOrders.inUptrend(m.week, m.day)) &&
             (!lowPick || m.pick == FloorAlgoStore.PICK_YES || m.pick == FloorAlgoStore.PICK_SIDE)
 
         fun summary(): String {
@@ -690,6 +693,12 @@ object FloorAlgoEngine {
                     (if (held.isNotEmpty()) " (${held.size} already held)" else ""))
                 return
             }
+            if (gated) note("${today.format(dayFmt)}: ${MarketGate.indexName(space)}'s daily MACD " +
+                when (MarketGate.indexRising(space, today)) {
+                    true -> "rising — buys allowed today"
+                    false -> "falling — no new buys today; what is held still sells as usual"
+                    null -> "could not be read — no new buys until it can"
+                })
             note("${today.format(dayFmt)}: " +
                 (if (filterOn) "$rising of ${members.size} rising on $longShort and day"
                  else "trend filter off — $open of ${members.size} in play ($rising rising on $longShort and day)") +

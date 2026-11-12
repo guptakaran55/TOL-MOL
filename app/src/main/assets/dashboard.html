@@ -16224,6 +16224,19 @@ function floorExitWords(s,a){
   return 'Sold on whichever comes first: '+parts.join(', ')+'.<br/>';
 }
 // The trend filter in words: what it gates, or that it is off.
+// THE MARKET GATE (12 Nov 2026): MACD turns bought only on days the market's index
+// had its daily MACD rising. One line on the card, with its switch.
+function floorGateWords(a,mc){
+  if(!mc||(a.settings||{}).universeMode==='portfolio')return '';
+  var on=(a.settings||{}).marketGate==='index_dmacd',idx=a.space==='in'?'Nifty 50':a.space==='de'?'DAX':'S&P 500';
+  return (on?'<b>Market gate on</b> — new buys only on days the <b>'+idx+'’s daily MACD rose</b> (closes before the day). '
+            :'Market gate off — buys whatever the '+idx+' is doing. ')+
+    '<span onclick="event.stopPropagation();floorGate(\''+a.id+'\','+(!on)+')" style="cursor:pointer;color:var(--bl);font-weight:700">'+(on?'Switch off':'Switch on')+'</span><br/>';
+}
+function floorGate(id,on){
+  try{var r=JSON.parse(Android.floorMarketGate(id,on)||'{}');if(!r.ok){uiAlert('Not changed',escHtml(r.error||''));return}}catch(e){uiAlert('Unavailable','Rebuild the APK for this.');return}
+  renderKeepScroll();
+}
 function floorFilterWords(s,mc){
   if(!s.trendFilter)return '<b>Trend filter off</b> — every stock in the universe is '+(mc?'watched':'given orders')+', whatever its '+(mc?'weekly':'monthly')+' and daily MACD.<br/>';
   return mc?'Watched only while their <b>weekly and daily MACD slopes are both rising</b>.<br/>'
@@ -16521,7 +16534,7 @@ function floorDetail(a,cur,st){
     (s.universeMode==='portfolio'
       ?'Universe: <b>the stocks you hold</b> at '+(a.space==='in'?'Zerodha':'Trading 212')+', not live algos’ shares — '+(a.universe||[]).length+' now, read every check. A stock you buy joins; one you sell leaves, and its paper position is sold at the market. No seat limit: '+cur+(Number(s.capital||0)/Math.max(1,Number(s.seats||1))).toFixed(0)+' of paper money a stock.<br/>'
       :'Universe: the top <b>'+(s.universeSize||30)+'</b> stocks by ROC (room to resistance) in Discovery.<br/>')+
-    floorFilterWords(s,mc)+
+    floorFilterWords(s,mc)+floorGateWords(a,mc)+
     (mc
       ? 'Bought, a whole seat ('+cur+seat.toFixed(0)+'), when the <b>4-hour MACD is rising</b> and the <b>15-minute and hourly MACD turn up together</b> — at the next fifteen-minute price after the app sees it. One buy per stock per day.<br/>'
       : (s.orderMode==='week'

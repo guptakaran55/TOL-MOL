@@ -1328,6 +1328,31 @@ object YahooFinanceClient {
         }
     } catch (e: Exception) { Log.w(TAG, "last trade of $yahooSymbol failed: ${e.message}"); null }
 
+    /** About a year of daily closes for [yahooSymbol] (an index too, e.g. "^NSEI"), as
+     *  (epoch seconds, close), oldest first. Null when it could not be read. */
+    fun fetchDailyCloses(yahooSymbol: String): List<Pair<Long, Double>>? = try {
+        val url = HttpUrl.Builder().scheme("https").host("query1.finance.yahoo.com")
+            .addPathSegments("v8/finance/chart/${onFeed(yahooSymbol)}")
+            .addQueryParameter("range", "1y").addQueryParameter("interval", "1d").build()
+        val req = Request.Builder().url(url)
+            .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0")
+            .addHeader("Accept", "application/json").build()
+        client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) null else r.body?.string()?.let { parseDailyCloses(it) }
+        }
+    } catch (e: Exception) { Log.w(TAG, "daily closes of $yahooSymbol failed: ${e.message}"); null }
+
+    /** Pure: (time, close) pairs of a chart reply, gaps left out. */
+    fun parseDailyCloses(body: String): List<Pair<Long, Double>> {
+        val res = JSONObject(body).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+        val ts = res.optJSONArray("timestamp") ?: return emptyList()
+        val cl = res.getJSONObject("indicators").getJSONArray("quote").getJSONObject(0).optJSONArray("close")
+            ?: return emptyList()
+        return (0 until minOf(ts.length(), cl.length())).mapNotNull { i ->
+            if (cl.isNull(i)) null else cl.optDouble(i).takeIf { it.isFinite() && it > 0.0 }?.let { ts.getLong(i) to it }
+        }
+    }
+
     /** Pure: a v7 quote reply. */
     fun parseQuotes(body: String): Map<String, DayQuote> {
         val out = HashMap<String, DayQuote>()

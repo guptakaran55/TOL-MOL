@@ -139,6 +139,9 @@ object FloorAlgoStore {
          * first (the user's design, 14 Oct 2026).
          */
         val orderMode: String = MODE_DAY,
+        /** MACD turns only: [com.signalscope.app.trading.MarketGate.INDEX_DMACD] = no new buys on a
+         *  day the market's index had its daily MACD falling (12 Nov 2026). Null = no gate. */
+        val marketGate: String? = null,
         /** Weekly zones: the bottom and the top this many percent of the last
          *  week's price range (low to high) — support and resistance. */
         val zonePct: Double = 10.0,
@@ -695,6 +698,26 @@ object FloorAlgoStore {
             }
             marker.writeText(System.currentTimeMillis().toString())
         } catch (e: Exception) { Log.w(TAG, "India capital raise failed", e) }
+    }
+
+    /**
+     * INDIA'S MACD SWING WITH THE NIFTY GATE, added once as a paper copy (the user,
+     * 12 Nov 2026): the same settings as the India "Macd swing", buying only on days
+     * the Nifty 50's daily MACD rose — run beside the plain one to see which holds up.
+     */
+    fun ensureIndiaNiftyGateCopy(ctx: Context) {
+        val marker = File(ctx.filesDir, "seeded_india_nifty_gate.done")
+        if (marker.exists()) return
+        try {
+            val src = list(ctx, "in").firstOrNull { it.kind == KIND_MACD && it.name.trim().equals("Macd swing", true) }
+            val a = create(ctx, "in", "Macd swing · Nifty gate", KIND_MACD)
+            update(ctx, a.id) { it.copy(
+                settings = (src?.settings ?: it.settings.copy(capital = INDIA_RAISED_CAPITAL)).copy(
+                    marketGate = com.signalscope.app.trading.MarketGate.INDEX_DMACD, liveOn = false),
+                log = it.log + (stamp() + " · a copy of Macd swing that buys only on days the Nifty 50's daily MACD " +
+                    "rose (closes before the day) — paper only; ten-year backtest: +11%/yr 2015–20, +5%/yr 2021–26, unproven")) }
+            marker.writeText(System.currentTimeMillis().toString())
+        } catch (e: Exception) { Log.w(TAG, "India Nifty-gate copy failed", e) }
     }
 
     fun update(ctx: Context, id: String, block: (Algo) -> Algo): Algo? {
