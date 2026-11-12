@@ -975,16 +975,50 @@ object LabNotifier {
      * NEWS MOVES: a big move on news — a holding either way, a watchlist stock up.
      * Opens the stock; it buys and sells nothing. One per stock per day ([NewsMoves]).
      */
+    /**
+     * THE FOUR PICTURES OF AN ENTRY ALERT for any stock — a year, a month and five
+     * days of price, and the MACD (the user, 12 Nov 2026: news alerts and the in-app
+     * News list show them too). Network: the stock's bars. Null when nothing could
+     * be drawn. Kept as a PNG for [CHART_KEEP_MS] so the alert and the list share one
+     * download.
+     */
+    fun chartArtFor(ctx: Context, space: String, symbol: String, price: Double = 0.0): ChartArt? = try {
+        val base = Spaces.baseOf(space.lowercase())
+        val sym = QualityCheap.bare(symbol)
+        val bars = StrategyLabRunner.recentClosedCandles(ctx,
+            com.signalscope.app.data.ManualWatchStore.nsFor(base), sym)
+        val px = price.takeIf { it > 0.0 } ?: MarkToMarket.get(sym)?.price?.takeIf { it > 0.0 }
+            ?: bars.lastOrNull()?.close ?: 0.0
+        (lowsArt(ctx, base, sym, px, bars, ScanLookup.row(ctx, base, sym)) ?: macdArt(ctx, base, sym))
+            ?.also { art -> try {
+                val f = chartFile(ctx, base, sym); f.parentFile?.mkdirs()
+                f.outputStream().use { art.wide.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            } catch (e: Exception) { Log.w(TAG, "chart not kept", e) } }
+    } catch (e: Exception) { Log.w(TAG, "chart for $symbol failed", e); null }
+
+    private const val CHART_KEEP_MS = 20 * 60_000L
+    private fun chartFile(ctx: Context, base: String, sym: String) =
+        java.io.File(ctx.cacheDir, "stock_charts/${base}_${sym.replace(Regex("[^A-Za-z0-9._-]"), "_")}.png")
+
+    /** The picture as PNG bytes: the kept one while fresh, else drawn now. */
+    fun chartPng(ctx: Context, space: String, symbol: String): ByteArray? {
+        val base = Spaces.baseOf(space.lowercase()); val sym = QualityCheap.bare(symbol)
+        val f = chartFile(ctx, base, sym)
+        if (f.exists() && System.currentTimeMillis() - f.lastModified() < CHART_KEEP_MS) return f.readBytes()
+        return chartArtFor(ctx, base, sym)?.let { f.takeIf { it.exists() }?.readBytes() }
+    }
+
     fun newsMove(ctx: Context, space: String, symbol: String, pct: Double, volX: Double, results: Boolean,
-                 surprise: Double?, headline: String?, outlet: String?, held: Boolean) {
+                 surprise: Double?, headline: String?, outlet: String?, held: Boolean, price: Double = 0.0) {
         val up = pct > 0
+        val art = chartArtFor(ctx, space, symbol, price)
         val why = if (results) "results " + ResultsBook.word(surprise).let { if (it == "?") "out" else it } else "news"
         notify(ctx, CH_NEWS, NotificationManager.IMPORTANCE_HIGH, "News moves",
             "${if (up) "🟢" else "🔴"} ${flagOf(space)} $symbol ${"%+.1f".format(pct)}% · $why" + (if (held) " · you hold it" else ""),
             (headline?.takeIf { it.isNotBlank() }?.let { "$it${outlet?.takeIf { o -> o.isNotBlank() }?.let { o -> " — $o" } ?: ""}" }
                 ?: "No headline found yet.") + " · ${"%.1f".format(volX)}× usual volume",
             "nm-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
-            openSymbol = symbol, openSpace = space)
+            openSymbol = symbol, openSpace = space, chart = art)
     }
 
     fun heldPositionBreak(ctx: Context, space: String, symbol: String,

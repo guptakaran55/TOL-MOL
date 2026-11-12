@@ -207,7 +207,7 @@ object NewsMoves {
             Log.i(TAG, "[$base] $sym ($rl) ${"%+.1f".format(q.changePct)}% on ${"%.1f".format(h.volX)}× volume" +
                 (if (h.near) " · results ${ResultsBook.word(surprise)}" else "") + (story?.let { " · ${it.title}" } ?: ""))
             if (rl != "market") {
-                try { LabNotifier.newsMove(ctx, base, sym, q.changePct, h.volX, h.near, surprise, story?.title, story?.source, rl == "held") }
+                try { LabNotifier.newsMove(ctx, base, sym, q.changePct, h.volX, h.near, surprise, story?.title, story?.source, rl == "held", q.price) }
                 catch (e: Exception) { Log.w(TAG, "alert failed", e) }
                 said.add("$sym ${"%+.0f".format(q.changePct)}%")
             }

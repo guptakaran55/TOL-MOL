@@ -124,3 +124,5 @@ a new day gets its own heading. "Installed" is when the change reached the phone
 - **Company size** (11 Nov) — open any stock page: the 🏷 sector line ends with e.g. "🏢 €12.3 bn large" (India: "₹31,715 Cr mid").
 - **Results for every stock** (11 Nov) — open Hochtief (HOT) or Fielmann (FIE): where there was no 📊 line, it now reads "📊 sales Q4 ’25 … · Q3 ’26 €649 m +2.3% q/q · profit … (no estimates on Yahoo)". SAP still shows beat/miss.
 - **Choose your columns** (11 Nov) — Portfolio: ▦ 8/8 beside ⇅ Sort → untick Zone, move 1Y up → table changes at once; reopen the app → still so; ↺ Default columns restores. Same in Discovery (▦ 15/15). Portfolio rows show a 1Y column with the 252-day price line.
+- **Slide to order columns** (12 Nov) — Portfolio › ▦: hold ☰ beside MACD and slide it to the top in one move; let go → table changes, order kept after reopening.
+- **News with pictures** (12 Nov) — next "· news" alert on a held or watchlist stock: expanded, it shows the 1Y/1M/5D price and MACD pictures under the headline. 🔔 › News moves: each row fills in the same picture as you scroll; tap it to open the stock.

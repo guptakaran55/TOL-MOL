@@ -2019,6 +2019,11 @@ class MainActivity : AppCompatActivity() {
                         // THE RESULTS RECORD for the stock page (network when stale).
                         "resultsRecord" -> gson.toJson(com.signalscope.app.trading.ResultsBook.forPage(
                             com.signalscope.app.trading.ResultsBook.read(applicationContext, a[0].asString)))
+                        // THE FOUR PICTURES for a News row (the same as its alert).
+                        "newsChart" -> com.signalscope.app.trading.LabNotifier.chartPng(applicationContext, a[0].asString, a[1].asString)
+                            ?.let { gson.toJson(mapOf("ok" to true, "src" to "data:image/png;base64," +
+                                android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP))) }
+                            ?: "{\"ok\":false}"
                         "aiChipsLearn" -> { com.signalscope.app.trading.AiChips.learn(applicationContext, a.map { it.asString }); "{}" }
                         "t212SoleOwner" -> gson.toJson(com.signalscope.app.trading.T212WeekTargets
                             .soleOwner(applicationContext, a[0].asString, a[1].asDouble) ?: mapOf("ns" to ""))

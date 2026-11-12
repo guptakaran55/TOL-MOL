@@ -2563,6 +2563,44 @@ function newsOpenArticle(i){
   var it=NEWS_LOG[i],u=it&&it.link;if(!u||!/^https:\/\/news\.google\.com\//.test(u))return;
   if(typeof Android!=='undefined'&&Android.openNewsLink)Android.openNewsLink(u);else window.open(u,'_blank','noopener');
 }
+// THE FOUR PICTURES ON EACH NEWS ROW (the user, 12 Nov 2026) — the same as the
+// alert's: a year, a month and five days of price, and the MACD. Drawn by the app
+// as each row scrolls into view, one at a time, and kept for the session.
+var NEWS_CHART={}, NEWS_CHART_Q=[], NEWS_CHART_BUSY=false, NEWS_CHART_OBS=null;
+function newsChartKey(it){return String(it.space||'').toLowerCase()+':'+String(it.symbol||'').toUpperCase()}
+function newsChartSlot(it,i){
+  var k=newsChartKey(it),c=NEWS_CHART[k];
+  return '<div class="nchart" data-k="'+escHtml(k)+'" onclick="newsOpenStock('+i+')" style="margin-top:4px;cursor:pointer">'+
+    (c&&c.src?'<img src="'+c.src+'" style="width:100%;display:block;border-radius:6px"/>':
+     c&&c.none?'':'<div style="font-size:9px;color:var(--t3);padding:3px 0">📈 …</div>')+'</div>';
+}
+function newsChartFill(k){
+  var c=NEWS_CHART[k];
+  document.querySelectorAll('#notif-list .nchart[data-k="'+k+'"]').forEach(function(el){
+    el.innerHTML=c&&c.src?'<img src="'+c.src+'" style="width:100%;display:block;border-radius:6px"/>':'';
+  });
+}
+function newsChartNext(){
+  if(NEWS_CHART_BUSY)return;
+  var k=NEWS_CHART_Q.shift();if(!k)return;
+  if(NEWS_CHART[k]){newsChartFill(k);newsChartNext();return}
+  NEWS_CHART_BUSY=true;
+  var p=k.split(':');
+  androidAsync('newsChart',[p[0],p.slice(1).join(':')],function(raw){
+    var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
+    NEWS_CHART[k]=(r&&r.ok&&r.src)?{src:r.src}:{none:true};
+    NEWS_CHART_BUSY=false;newsChartFill(k);newsChartNext();
+  });
+}
+function newsChartsWatch(){
+  if(typeof Android==='undefined'||!Android.callAsync)return;
+  var slots=document.querySelectorAll('#notif-list .nchart');
+  var want=function(el){var k=el.getAttribute('data-k');if(!NEWS_CHART[k]&&NEWS_CHART_Q.indexOf(k)<0){NEWS_CHART_Q.push(k);newsChartNext()}};
+  if(NEWS_CHART_OBS)try{NEWS_CHART_OBS.disconnect()}catch(e){}
+  if(typeof IntersectionObserver==='undefined'){[].slice.call(slots,0,8).forEach(want);return}
+  NEWS_CHART_OBS=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){want(e.target);NEWS_CHART_OBS.unobserve(e.target)}})},{rootMargin:'200px'});
+  slots.forEach(function(el){if(!NEWS_CHART[el.getAttribute('data-k')])NEWS_CHART_OBS.observe(el)});
+}
 function newsSheetHtml(){
   var mine=function(it){return it.role==='held'||it.role==='watch'};
   var src=(NEWS_LOG||[]).filter(function(it){return !NEWS_MINE||mine(it)});
@@ -2605,6 +2643,7 @@ function newsSheetHtml(){
         (it.name?'<div style="font-size:9px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+escHtml(String(it.name))+'</div>':'')+
         '<div onclick="newsOpenArticle('+i+')" style="font-size:10px;line-height:1.4;margin-top:2px;'+(it.link?'color:var(--bl);cursor:pointer':'color:var(--t3)')+'">'+
           (it.headline?escHtml(String(it.headline))+(it.outlet?' <span style="color:var(--t3)">— '+escHtml(String(it.outlet))+'</span>':''):'No headline found.')+'</div>'+
+        newsChartSlot(it,i)+
       '</div>'+
       '<div onclick="newsOpenStock('+i+')" title="Open the stock" style="flex:0 0 44px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border-left:1px solid var(--bd);color:var(--pu)">'+
         '<span style="font-size:18px;font-weight:800;line-height:1">\u203A</span><span style="font-size:8px;font-weight:800;margin-top:1px">details</span></div>'+
@@ -2623,7 +2662,7 @@ function notifMount(h){
   w.innerHTML='<div style="width:100%;max-width:520px;max-height:calc(100vh - 24px);overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:14px 14px 8px;box-shadow:0 12px 40px rgba(0,0,0,.4)">'+h+'</div>';
 }
 function renderNotificationList(){
-  if(NOTIF_VIEW==='news')return notifMount(newsSheetHtml());
+  if(NOTIF_VIEW==='news'){notifMount(newsSheetHtml());newsChartsWatch();return}
   var es=NOTIF_LIST.entries||[];
   var counts={all:es.length},fresh={all:0};
   es.forEach(function(e){var m=notifMarket(e);counts[m]=(counts[m]||0)+1;if(e.at>NOTIF_LIST.seenAt){fresh[m]=(fresh[m]||0)+1;fresh.all++}});
@@ -6882,21 +6921,71 @@ function colsPill(view){
   var n=all.filter(function(x){return x.on}).length;
   return '<span onclick="openColsSheet(\''+view+'\')" title="Choose the columns and their order" style="display:inline-flex;align-items:center;gap:4px;padding:7px 11px;background:var(--cd);border:1px solid var(--bd);border-radius:8px;color:var(--t1);font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap">▦ '+n+'/'+all.length+'</span>';
 }
+// DRAG TO ORDER (the user, 12 Nov 2026): hold ☰ and slide the row where you want
+// it — one move, not a tap per row as with the arrows before. Saved on release.
 function openColsSheet(view){
   var all=colsAll(view).filter(function(x){return !x.d.when||x.d.when()});
-  var h='<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Tick to show · ▲▼ to move. Left to right = top to bottom.</div>';
-  all.forEach(function(x,k){
-    var d=x.d, mv=function(dir,lab,ok){return '<span onclick="'+(ok?'colsMove(\''+view+'\',\''+d.id+'\','+dir+')':'')+'" style="cursor:'+(ok?'pointer':'default')+';padding:4px 9px;border:1px solid var(--bd);border-radius:6px;font-size:11px;color:'+(ok?'var(--t1)':'var(--bd)')+'">'+lab+'</span>'};
-    h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 2px;border-top:1px solid var(--bd)">'+
+  var h='<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Tick to show · hold ☰ and slide to move. Top to bottom = left to right.</div><div id="colrows">';
+  all.forEach(function(x){
+    var d=x.d;
+    h+='<div class="colrow" data-id="'+d.id+'"'+(d.fixed?'':' data-movable="1"')+' style="display:flex;align-items:center;gap:8px;padding:6px 2px;border-top:1px solid var(--bd);background:var(--cd)">'+
       (d.fixed?'<span style="width:18px;text-align:center;color:var(--t3)">📌</span>'
         :'<input type="checkbox" '+(x.on?'checked ':'')+'onchange="colsToggle(\''+view+'\',\''+d.id+'\',this.checked)" style="width:18px;height:18px"/>')+
       '<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:800;color:'+(x.on?'var(--t1)':'var(--t3)')+'">'+escHtml(d.label)+'</div>'+
         (d.hint?'<div style="font-size:9px;color:var(--t3)">'+escHtml(d.hint)+'</div>':'')+'</div>'+
-      (d.fixed?'<span style="font-size:9px;color:var(--t3)">always first</span>':mv(-1,'▲',k>1)+mv(1,'▼',k<all.length-1))+
+      (d.fixed?'<span style="font-size:9px;color:var(--t3)">always first</span>'
+        :'<span onpointerdown="colsDragStart(event,\''+view+'\')" style="touch-action:none;cursor:grab;padding:6px 12px;font-size:18px;color:var(--t2);user-select:none">☰</span>')+
     '</div>';
   });
-  h+='<div style="margin-top:10px;text-align:right"><span onclick="colsReset(\''+view+'\')" style="cursor:pointer;font-size:11px;font-weight:700;color:var(--bl)">↺ Default columns</span></div>';
+  h+='</div><div style="margin-top:10px;text-align:right"><span onclick="colsReset(\''+view+'\')" style="cursor:pointer;font-size:11px;font-weight:700;color:var(--bl)">↺ Default columns</span></div>';
   uiAlert('▦ '+(view==='portfolio'?'Portfolio':'Discovery')+' columns',h);
+}
+var COL_DRAG=null;
+function colsScroller(el){
+  for(var p=el&&el.parentNode;p&&p!==document.body;p=p.parentNode){
+    var cs=getComputedStyle(p);if(/(auto|scroll)/.test(cs.overflowY)&&p.scrollHeight>p.clientHeight)return p;
+  }
+  return null;
+}
+function colsDragStart(ev,view){
+  var handle=ev.currentTarget||ev.target,row=handle.closest('.colrow');if(!row)return;
+  ev.preventDefault();
+  COL_DRAG={view:view,row:row,list:row.parentNode,handle:handle,box:colsScroller(row)};
+  row.style.position='relative';row.style.zIndex='2';
+  row.style.background='rgba(124,58,237,.14)';row.style.boxShadow='0 3px 10px rgba(0,0,0,.25)';
+  // On the whole page, not the grip: moving the row in the list makes the browser
+  // let go of a grip's captured finger, and the rest of the slide went unheard.
+  document.addEventListener('pointermove',colsDragMove,{passive:false});
+  document.addEventListener('pointerup',colsDragEnd);
+  document.addEventListener('pointercancel',colsDragEnd);
+}
+function colsDragMove(ev){
+  var d=COL_DRAG;if(!d)return;
+  ev.preventDefault();
+  var y=ev.clientY;
+  // Near the top or bottom edge of a list taller than the sheet, it scrolls along.
+  if(d.box){var b=d.box.getBoundingClientRect();if(y<b.top+40)d.box.scrollTop-=12;else if(y>b.bottom-40)d.box.scrollTop+=12;}
+  var rows=[].slice.call(d.list.querySelectorAll('.colrow[data-movable]'));
+  for(var k=0;k<rows.length;k++){
+    var r=rows[k];if(r===d.row)continue;
+    var rb=r.getBoundingClientRect();
+    if(y<rb.top+rb.height/2){if(r.previousElementSibling!==d.row)d.list.insertBefore(d.row,r);return}
+  }
+  var last=rows[rows.length-1];
+  if(last&&last!==d.row)d.list.insertBefore(d.row,last.nextSibling);
+}
+function colsDragEnd(ev){
+  var d=COL_DRAG;COL_DRAG=null;if(!d)return;
+  document.removeEventListener('pointermove',colsDragMove,{passive:false});
+  document.removeEventListener('pointerup',colsDragEnd);
+  document.removeEventListener('pointercancel',colsDragEnd);
+  var shown=[].map.call(d.list.querySelectorAll('.colrow'),function(r){return r.getAttribute('data-id')});
+  // The new screen order into the full list; a column this market does not show keeps its place.
+  var all=colsAll(d.view),byId={},k=0;
+  all.forEach(function(x){byId[x.d.id]=x});
+  var vis=function(x){return !x.d.when||x.d.when()};
+  all=all.map(function(x){return vis(x)?byId[shown[k++]]||x:x});
+  colsStore(d.view,all);
 }
 function colsStore(view,all){
   var on={};all.forEach(function(x){on[x.d.id]=x.on});
@@ -6905,15 +6994,6 @@ function colsStore(view,all){
 }
 function colsToggle(view,id,v){
   var all=colsAll(view);all.forEach(function(x){if(x.d.id===id&&!x.d.fixed)x.on=!!v});colsStore(view,all);
-}
-function colsMove(view,id,dir){
-  var all=colsAll(view);
-  // Moved past the columns this market does not show, so a tap always moves it on screen.
-  var vis=function(x){return !x.d.when||x.d.when()};
-  var i=-1;all.forEach(function(x,k){if(x.d.id===id)i=k});if(i<0)return;
-  var j=i+dir;while(j>0&&j<all.length&&!vis(all[j]))j+=dir;
-  if(j<1||j>=all.length)return;
-  var t=all[i];all[i]=all[j];all[j]=t;colsStore(view,all);
 }
 function colsReset(view){try{localStorage.removeItem('cols_'+view)}catch(e){}renderKeepScroll();openColsSheet(view)}
 function sortPill(scope){
