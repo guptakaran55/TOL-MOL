@@ -130,3 +130,4 @@ a new day gets its own heading. "Installed" is when the change reached the phone
 - **Frozen stock column** (12 Nov) — Portfolio or Discovery: swipe the table sideways → the Stock column stays on the left. ▦ › untick "Freeze the stock column" → it scrolls away with the rest.
 - **Held = underline in News** (12 Nov) — 🔔 › News moves: a stock you hold now has its symbol underlined green (any market tab), no "you hold it" tag; one held when it moved but sold since says "held then".
 - **Narrower stock column** (12 Nov) — Portfolio › Germany: the Stock column is ~90px (was ~130): long names wrap, 📅today and the AI chip sit on a line under the name, the small price graph is narrower.
+- **Snipers leave managed holdings alone** (12 Nov) — India, after 15:20 IST: a holding the watchlist or an algo owns keeps its own GTT (Zerodha › GTT unchanged); the MACD-exit alert can still come. A stock you bought by hand and never handed over is still trailed / sniped as before.

@@ -2425,6 +2425,12 @@ class ScanService : Service() {
         // Gate 4: data sanity
         if (holding.ltp <= 0 || holding.quantity <= 0) return
 
+        // Gate 5: yours alone — the watchlist and the algos keep their own orders (12 Nov 2026).
+        com.signalscope.app.trading.ShareOwners.ownersBySymbol(applicationContext, "in")[holding.symbol.uppercase()]?.let {
+            Log.i(TAG, "Soft sniper skipped for ${holding.symbol}: managed by $it")
+            return
+        }
+
         val liveSignal =
             if (config.livePriceStreamingEnabled) {
                 val yahooSymbol = YahooFinanceClient.toYahooSymbol(holding.symbol, holding.exchange)

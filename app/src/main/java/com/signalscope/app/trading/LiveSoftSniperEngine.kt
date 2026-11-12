@@ -75,6 +75,11 @@ object LiveSoftSniperEngine {
             auditSkip(context, signal, "symbol not found in portfolio")
             return
         }
+        // Yours alone only — the watchlist and the algos keep their own orders (12 Nov 2026).
+        ShareOwners.ownersBySymbol(context, "in")[holding.symbol.uppercase()]?.let {
+            auditSkip(context, signal, "managed by $it")
+            return
+        }
 
         val analysis = holding.analysis ?: run {
             auditSkip(context, signal, "portfolio holding has no analysis", holding.symbol)

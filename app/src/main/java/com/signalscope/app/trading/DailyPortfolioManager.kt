@@ -180,7 +180,14 @@ class DailyPortfolioManager(
         }
 
         // 3. Process each holding
+        // WHO MANAGES EACH HOLDING (12 Nov 2026). The watchlist and the algos keep their
+        // own stop and target orders at Zerodha; this pass used to cancel and re-place
+        // them like any other holding's. Theirs are left alone now: only the exit alert
+        // goes out for them — no sniper, no exit sale, no trailing, no new OCO.
+        val owners = com.signalscope.app.trading.ShareOwners.ownersBySymbol(context, "in")
+
         for (h in holdings) {
+            val ownedBy = owners[h.symbol.uppercase()]
             val analysis = h.analysis ?: run {
                 logLines.add("${h.symbol}: SKIP — no analysis (scan may not have completed)")
                 continue
@@ -236,7 +243,9 @@ class DailyPortfolioManager(
                 // at LTP × SNIPER_TRIGGER_FRAC. If price drops further it executes;
                 // if it recovers the GTT sits inert and you can decide later.
                 // MUCH safer than a market order — still conditional, still cancellable.
-                if (!dryRun && config.autoCreateGtt) {
+                if (ownedBy != null) {
+                    logLines.add("${h.symbol}: managed by $ownedBy — no sniper GTT or exit sale; its own stop and target stay")
+                } else if (!dryRun && config.autoCreateGtt) {
                     val sniperResult = replaceSniperGtt(h, gtts)
                     logLines.add("${h.symbol}: sniper GTT → ${sniperResult}")
                     delay(API_CALL_GAP_MS)
@@ -248,7 +257,7 @@ class DailyPortfolioManager(
                 // ── Tier 3 (autoExitEnabled): live market-order ladder ────────────
                 // Irreversible — places real SELL orders immediately. Only runs if
                 // the user has explicitly enabled the hot switch.
-                if (!dryRun && config.autoExitEnabled) {
+                if (ownedBy == null && !dryRun && config.autoExitEnabled) {
                     exitsAttempted++
                     val ladderResult = runExitLadder(h, gtts)
                     if (ladderResult.filled) {
@@ -262,6 +271,12 @@ class DailyPortfolioManager(
 
                 // Whether or not live orders were placed, skip SL trailing for this
                 // holding — the sniper GTT is now the active protection.
+                continue
+            }
+
+            if (ownedBy != null) {
+                slSkipped++
+                logLines.add("${h.symbol}: managed by $ownedBy — its own orders, not trailed here")
                 continue
             }
 

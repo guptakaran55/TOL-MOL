@@ -49,6 +49,17 @@ object ShareOwners {
         }
     } catch (e: Exception) { "a deleted algo" }
 
+    /**
+     * Stock (upper case) → who in the app holds shares of it in [base]: "watchlist",
+     * an algo's name, or several. A stock missing from the map is yours alone —
+     * the only kind India's old snipers and daily trailing still touch (the user,
+     * 12 Nov 2026): the watchlist and the algos keep their own stops and targets.
+     */
+    fun ownersBySymbol(ctx: Context, base: String): Map<String, String> = try {
+        lots(ctx, base).groupBy { it.symbol.uppercase() }
+            .mapValues { (_, l) -> l.map { it.name }.distinct().joinToString(", ") }
+    } catch (e: Exception) { Log.w(TAG, "[$base] owners unreadable", e); emptyMap() }
+
     /** The German built-in algos' rows that hold shares in this market. */
     fun floorRows(ctx: Context, base: String): List<FloorLiveStore.Row> =
         FloorLiveStore.load(ctx).rows.filter { it.holds && Spaces.baseOf(it.ns) == base }
