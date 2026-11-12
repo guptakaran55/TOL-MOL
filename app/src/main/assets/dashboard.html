@@ -2634,7 +2634,11 @@ function newsSheetHtml(){
     var i=NEWS_LOG.indexOf(it),day=new Date(it.at).toDateString();
     if(day!==lastDay){lastDay=day;h+='<div style="font-size:9px;font-weight:800;color:var(--t3);margin:9px 2px 4px;text-transform:uppercase;letter-spacing:.04em">'+escHtml(notifWhen(it.at).replace(/ \d\d:\d\d$/,''))+'</div>'}
     var up=Number(it.pct)>=0,flag=NEWS_MARKET==='all'?(notifFlag(it.space)+' '):'';
-    var tag=it.role==='held'?'<span style="font-size:8px;font-weight:800;color:var(--bl);border:1px solid rgba(37,99,235,.45);border-radius:3px;padding:0 3px">you hold it</span>'
+    // HELD IS THE GREEN UNDERLINE, as everywhere else (the user, 12 Nov 2026) — what you
+    // hold NOW, in this row's own market. The role kept with the move only says what it was then.
+    var heldNow=!!heldSetFor(String(it.space||'').toUpperCase())[String(it.symbol||'').toUpperCase().replace(/\.(DE|NS|BO)$/,'')];
+    var tag=heldNow?''
+      :it.role==='held'?'<span title="You held it when it moved; not now" style="font-size:8px;font-weight:700;color:var(--t3);border:1px solid var(--bd);border-radius:3px;padding:0 3px">held then</span>'
       :it.role==='watch'?'<span style="font-size:8px;font-weight:800;color:var(--pu);border:1px solid var(--pu);border-radius:3px;padding:0 3px">watchlist</span>':'';
     var res='';
     if(it.results){var s=it.surprise;res='<span style="font-size:8px;font-weight:800;border-radius:3px;padding:0 3px;'+
@@ -2642,7 +2646,7 @@ function newsSheetHtml(){
     h+='<div style="display:flex;align-items:stretch;margin-bottom:5px;border:1px solid var(--bd);border-radius:8px;background:var(--cd);overflow:hidden">'+
       '<div style="flex:1;min-width:0;padding:6px 8px 6px 9px">'+
         '<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">'+
-          '<span style="font-size:11px;font-weight:800;color:var(--t1)">'+flag+escHtml(String(it.symbol||''))+'</span>'+
+          '<span style="font-size:11px;font-weight:800;color:var(--t1)">'+flag+'<span'+(heldNow?' class="held-u" title="You hold this"':'')+'>'+escHtml(String(it.symbol||''))+'</span></span>'+
           '<span style="font-size:11px;font-weight:800;color:'+(up?'var(--gn)':'var(--rd)')+'">'+(up?'+':'')+Number(it.pct).toFixed(1)+'%</span>'+
           '<span style="font-size:9px;color:var(--t3)">'+Number(it.volX||0).toFixed(1)+'× vol</span>'+res+tag+
           '<span style="flex:1"></span><span style="font-size:9px;color:var(--t3);white-space:nowrap">'+escHtml(notifWhen(it.at).replace(/^(Today|Yesterday) /,''))+'</span></div>'+
