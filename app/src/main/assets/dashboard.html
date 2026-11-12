@@ -25,6 +25,12 @@ input[type=range]{min-height:32px;touch-action:none;-webkit-user-select:none;use
 .srch input:focus{border-color:var(--bl)}
 .srch::before{content:'\2315';position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--t3);font-size:13px}
 .tw{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 4px}
+/* THE STOCK COLUMN STAYS PUT while the table scrolls sideways (the user, 12 Nov 2026) —
+   switched in ▦ Columns. Its cells take the page colour so the scrolled ones pass under. */
+.tw.frz th:first-child,.tw.frz td:first-child{position:sticky;left:0;box-shadow:inset -1px 0 0 var(--bd)}
+.tw.frz td:first-child{background:var(--bg);z-index:1}
+.tw.frz th:first-child{z-index:3}
+.tw.frz td.aicrow:first-child{box-shadow:inset 3px 0 0 #d97706,inset -1px 0 0 var(--bd)}
 table{width:100%;border-collapse:collapse;font-size:11px}
 th{padding:4px 2px;text-align:left;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.2px;color:var(--t3);background:var(--bg2);border-bottom:1px solid var(--bd);white-space:nowrap;position:sticky;top:0;z-index:2;cursor:pointer}
 td{padding:3px 2px;border-bottom:1px solid var(--bd);white-space:nowrap;font-family:monospace;font-size:11px}
@@ -6889,6 +6895,8 @@ var COL_DEFS={
     }}
   ]
 };
+function colsFrozen(){try{return localStorage.getItem('colsFreeze')!=='0'}catch(e){return true}}
+function colsFreeze(on){try{localStorage.setItem('colsFreeze',on?'1':'0')}catch(e){}renderKeepScroll()}
 function colsSaved(view){try{return JSON.parse(localStorage.getItem('cols_'+view)||'null')||{}}catch(e){return {}}}
 function colsSave(view,v){try{localStorage.setItem('cols_'+view,JSON.stringify(v))}catch(e){}}
 /** Every column of [view] in your order, each with whether it is on. */
@@ -6925,7 +6933,9 @@ function colsPill(view){
 // it — one move, not a tap per row as with the arrows before. Saved on release.
 function openColsSheet(view){
   var all=colsAll(view).filter(function(x){return !x.d.when||x.d.when()});
-  var h='<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Tick to show · hold ☰ and slide to move. Top to bottom = left to right.</div><div id="colrows">';
+  var h='<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px;font-weight:800;color:var(--t1);cursor:pointer">'+
+    '<input type="checkbox" '+(colsFrozen()?'checked ':'')+'onchange="colsFreeze(this.checked)" style="width:18px;height:18px"/> Freeze the stock column</label>'+
+    '<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Tick to show · hold ☰ and slide to move. Top to bottom = left to right.</div><div id="colrows">';
   all.forEach(function(x){
     var d=x.d;
     h+='<div class="colrow" data-id="'+d.id+'"'+(d.fixed?'':' data-movable="1"')+' style="display:flex;align-items:center;gap:8px;padding:6px 2px;border-top:1px solid var(--bd);background:var(--cd)">'+
@@ -7482,7 +7492,7 @@ function render(){
   }else{
     // COLUMNS YOU CHOOSE — see COL_DEFS: which indicators show, and in what order.
     var dcols=colsOn('discovery'), dctx={cur:cur};
-    h+='<div class="tw"><table><thead><tr>';
+    h+='<div class="tw'+(colsFrozen()?' frz':'')+'"><table><thead><tr>';
     dcols.forEach(function(c){h+=colTh(c,STATE.sortK,STATE.sortA,'doSort')});
     h+='</tr></thead><tbody>';
     f.forEach(function(s,i){
@@ -10711,7 +10721,7 @@ function renderUnifiedPortfolioTable(rows,opts){
   if(!main.length&&auto.length&&!q){main=auto;auto=[]}   // nothing else to show: no fold
   function tableOf(list){
     var pcols=colsOn('portfolio');
-    var h='<div class="tw"><table><thead><tr>';
+    var h='<div class="tw'+(colsFrozen()?' frz':'')+'"><table><thead><tr>';
     pcols.forEach(function(c){h+=colTh(c,PORTFOLIO.sortK,PORTFOLIO.sortA,'doPSort')});
     h+='</tr></thead><tbody>';
     if(!list.length){
