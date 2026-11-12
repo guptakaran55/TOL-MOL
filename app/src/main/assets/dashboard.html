@@ -44,6 +44,13 @@ tr:active{background:var(--cdh)}
    readable text to buy space that stacking already bought would be a bad trade.
    The India table keeps the tighter 6px stack it already had. */
 .snnotes-w{max-width:92px}
+/* The portfolio's stock cell, kept narrow: names and the code line wrap, the chips sit
+   under the name (an empty chip line takes no room). */
+.sn-narrow{max-width:90px;white-space:normal}
+.sn-narrow .snn{white-space:normal;word-break:break-word}
+.snchips{line-height:11px}
+.snchips:empty{display:none}
+.snchips .aic,.snchips [data-ern] span{margin-left:0;margin-right:3px}
 .snnotes-w .snb{font-size:7px;max-width:none}
 .snb{display:inline-block;font-size:6px;line-height:1;padding:1px 2px;border-radius:2px;font-weight:800;letter-spacing:0;max-width:58px;white-space:normal}
 .snb-flip{background:#b91c1c;color:#fff}.snb-soft{background:#c2410c;color:#fff}.snb-exit{background:#7c2d12;color:#fbbf24}.snb-vol{background:rgba(251,191,36,0.18);color:#f59e0b;font-weight:700}
@@ -3857,7 +3864,7 @@ function liveIntradayPriceSvg(r,w,ht){
   var lastPt=coords[coords.length-1].split(',');
   svg+='<circle cx="'+lastPt[0]+'" cy="'+lastPt[1]+'" r="1.8" fill="'+col+'"/>';
   svg+='</svg>';
-  svg+='<div style="display:flex;justify-content:space-between;gap:4px;font-size:7px;line-height:1;color:'+col+';font-weight:800;font-family:monospace;margin-top:1px"><span>'+label+'</span><span style="color:var(--t3)">H '+fmt(hi,d)+' L '+fmt(lo,d)+'</span></div>';
+  svg+='<div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:1px 4px;font-size:7px;line-height:1;color:'+col+';font-weight:800;font-family:monospace;margin-top:1px"><span>'+label+'</span><span style="color:var(--t3)">H '+fmt(hi,d)+' L '+fmt(lo,d)+'</span></div>';
   svg+='</div>';
   return svg;
 }
@@ -6847,7 +6854,11 @@ var COL_DEFS={
       var primaryName=displayNameFor(r), subLine=stockSubLine(r);
       // A long company name gets a smaller size rather than being cut off; always bold.
       var nmStyle=(r.broker==='t212')?(' style="font-weight:800;font-size:'+(primaryName.length>18?'10':primaryName.length>12?'11':'12')+'px"'):'';
-      var h='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+algoHeldDot(r)+untrackedDot(r);
+      // NARROW (the user, 12 Nov 2026): the name may wrap, the AI and results chips sit
+      // on their own line under it, and the price graph is narrower — the column was
+      // ~130px of a 392px screen, set by "name + 📅today" on one line.
+      var h='<td'+aicTd(r.symbol,r.industry,r.space)+'><div class="sn sn-narrow"><span class="sns"'+nmStyle+'>'+escHtml(primaryName)+'</span>'+algoHeldDot(r)+untrackedDot(r)+
+        '<div class="snchips">'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+'</div>';
       var notes='';
       notes+=portfolioWarningBadges(r);
       if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
@@ -6861,7 +6872,7 @@ var COL_DEFS={
       if(!r.hasAnalysis&&r.analysisPending)h+='<div title="New holding — its scores are being worked out" style="font-size:6px;color:var(--t3);margin-top:1px">scoring…</div>';
       else if(!r.hasAnalysis)h+='<div title="'+escHtml(r.analysisError||'Yahoo candle scan did not return usable data')+'" style="font-size:6px;color:var(--am);margin-top:1px">no scan</div>';
       else h+='<div class="snn">'+escHtml(subLine)+(r.dayChangePct?' <span style="color:'+(r.dayChangePct>=0?'var(--gn)':'var(--rd)')+'">'+(r.dayChangePct>=0?'+':'')+fmt(r.dayChangePct,1)+'%</span>':'')+'</div>';
-      h+=liveIntradayPriceSvg(r,96,30);
+      h+=liveIntradayPriceSvg(r,84,28);
       return h+'</div></td>';
     }},
     {id:'macdPhase',label:'MACD',sort:'macdPhase',td:function(r){return '<td>'+portfolioMacdCell(r)+'</td>'}},
