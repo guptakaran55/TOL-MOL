@@ -572,6 +572,14 @@ object ManualWatchStore {
         File(ctx.filesDir, "manual_watch_${Spaces.baseOf(space.lowercase())}.json")
 
     @Synchronized
+    /** Can the book be read? True with no file yet. [load] hands back an empty book
+     *  for an unreadable one, which a caller deciding on real orders must not take
+     *  for "nothing held" (15 Nov 2026). */
+    fun readable(ctx: Context, space: String): Boolean = try {
+        val f = file(ctx, space)
+        !f.exists() || StoreCache.read(f) { gson.fromJson(it, State::class.java) } != null
+    } catch (e: Exception) { Log.e(TAG, "book($space) unreadable", e); false }
+
     fun load(ctx: Context, space: String): State = try {
         val f = file(ctx, space)
         val raw = StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes

@@ -55,6 +55,18 @@ object ShareOwners {
      * the only kind India's old snipers and daily trailing still touch (the user,
      * 12 Nov 2026): the watchlist and the algos keep their own stops and targets.
      */
+    /**
+     * [ownersBySymbol], or NULL when the records it is built from cannot be read —
+     * an unreadable book is not "nobody owns it" (15 Nov 2026). Whoever is about to
+     * cancel or place a real order on the answer does nothing on null.
+     */
+    fun ownersOrNull(ctx: Context, base: String): Map<String, String>? {
+        val ok = ManualWatchStore.readable(ctx, base) &&
+            (base != "in" || ZerodhaLiveStore.readable(ctx))
+        if (!ok) { Log.e(TAG, "[$base] ownership records unreadable — nothing may be assumed unowned"); return null }
+        return ownersBySymbol(ctx, base)
+    }
+
     fun ownersBySymbol(ctx: Context, base: String): Map<String, String> = try {
         lots(ctx, base).groupBy { it.symbol.uppercase() }
             .mapValues { (_, l) -> l.map { it.name }.distinct().joinToString(", ") }

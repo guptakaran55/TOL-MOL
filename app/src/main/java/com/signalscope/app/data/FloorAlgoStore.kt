@@ -705,6 +705,7 @@ object FloorAlgoStore {
      * 12 Nov 2026): the same settings as the India "Macd swing", buying only on days
      * the Nifty 50's daily MACD rose — run beside the plain one to see which holds up.
      */
+    @Synchronized   // the engine's pass and the Algos tab may both ask at once: one copy, not two
     fun ensureIndiaNiftyGateCopy(ctx: Context) {
         val marker = File(ctx.filesDir, "seeded_india_nifty_gate.done")
         if (marker.exists()) return

@@ -996,7 +996,9 @@ object LabNotifier {
             } catch (e: Exception) { Log.w(TAG, "chart not kept", e) } }
     } catch (e: Exception) { Log.w(TAG, "chart for $symbol failed", e); null }
 
-    private const val CHART_KEEP_MS = 20 * 60_000L
+    /** An hour: a year, a month and five days of price barely move in that time, and
+     *  the News list asks again as rows scroll back into view. */
+    private const val CHART_KEEP_MS = 60 * 60_000L
     private fun chartFile(ctx: Context, base: String, sym: String) =
         java.io.File(ctx.cacheDir, "stock_charts/${base}_${sym.replace(Regex("[^A-Za-z0-9._-]"), "_")}.png")
 
@@ -1011,14 +1013,26 @@ object LabNotifier {
     fun newsMove(ctx: Context, space: String, symbol: String, pct: Double, volX: Double, results: Boolean,
                  surprise: Double?, headline: String?, outlet: String?, held: Boolean, price: Double = 0.0) {
         val up = pct > 0
-        val art = chartArtFor(ctx, space, symbol, price)
         val why = if (results) "results " + ResultsBook.word(surprise).let { if (it == "?") "out" else it } else "news"
-        notify(ctx, CH_NEWS, NotificationManager.IMPORTANCE_HIGH, "News moves",
-            "${if (up) "🟢" else "🔴"} ${flagOf(space)} $symbol ${"%+.1f".format(pct)}% · $why" + (if (held) " · you hold it" else ""),
-            (headline?.takeIf { it.isNotBlank() }?.let { "$it${outlet?.takeIf { o -> o.isNotBlank() }?.let { o -> " — $o" } ?: ""}" }
-                ?: "No headline found yet.") + " · ${"%.1f".format(volX)}× usual volume",
-            "nm-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}",
-            openSymbol = symbol, openSpace = space, chart = art)
+        val title = "${if (up) "🟢" else "🔴"} ${flagOf(space)} $symbol ${"%+.1f".format(pct)}% · $why" + (if (held) " · you hold it" else "")
+        val text = (headline?.takeIf { it.isNotBlank() }?.let { "$it${outlet?.takeIf { o -> o.isNotBlank() }?.let { o -> " — $o" } ?: ""}" }
+            ?: "No headline found yet.") + " · ${"%.1f".format(volX)}× usual volume"
+        val seed = "nm-$space-$symbol-${java.time.LocalDate.now(java.time.ZoneOffset.UTC)}"
+        // THE ALERT FIRST, ITS PICTURE AFTER (15 Nov 2026): the picture needs the stock's
+        // bars downloaded, and several moves in one pass held the pass up by that long.
+        // Drawn on the chart thread and put on the alert already showing, quietly; one
+        // swiped away meanwhile is not brought back.
+        notify(ctx, CH_NEWS, NotificationManager.IMPORTANCE_HIGH, "News moves", title, text, seed,
+            openSymbol = symbol, openSpace = space)
+        val app = ctx.applicationContext
+        chartWorker.execute {
+            try {
+                chartArtFor(app, space, symbol, price)?.let { art ->
+                    notify(app, CH_NEWS, NotificationManager.IMPORTANCE_HIGH, "News moves", title, text, seed,
+                        openSymbol = symbol, openSpace = space, chart = art, update = true)
+                }
+            } catch (e: Exception) { Log.w(TAG, "news picture failed for $symbol", e) }
+        }
     }
 
     fun heldPositionBreak(ctx: Context, space: String, symbol: String,

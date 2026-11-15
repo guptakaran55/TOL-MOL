@@ -2426,7 +2426,8 @@ class ScanService : Service() {
         if (holding.ltp <= 0 || holding.quantity <= 0) return
 
         // Gate 5: yours alone — the watchlist and the algos keep their own orders (12 Nov 2026).
-        com.signalscope.app.trading.ShareOwners.ownersBySymbol(applicationContext, "in")[holding.symbol.uppercase()]?.let {
+        val softOwners = com.signalscope.app.trading.ShareOwners.ownersOrNull(applicationContext, "in")
+        (if (softOwners == null) "an unreadable record" else softOwners[holding.symbol.uppercase()])?.let {
             Log.i(TAG, "Soft sniper skipped for ${holding.symbol}: managed by $it")
             return
         }

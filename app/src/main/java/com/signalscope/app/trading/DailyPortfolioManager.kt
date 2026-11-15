@@ -184,10 +184,12 @@ class DailyPortfolioManager(
         // own stop and target orders at Zerodha; this pass used to cancel and re-place
         // them like any other holding's. Theirs are left alone now: only the exit alert
         // goes out for them — no sniper, no exit sale, no trailing, no new OCO.
-        val owners = com.signalscope.app.trading.ShareOwners.ownersBySymbol(context, "in")
+        // Unreadable records: every holding is treated as managed this pass (15 Nov 2026).
+        val owners = com.signalscope.app.trading.ShareOwners.ownersOrNull(context, "in")
+        if (owners == null) logLines.add("Ownership records unreadable — no order is touched this pass")
 
         for (h in holdings) {
-            val ownedBy = owners[h.symbol.uppercase()]
+            val ownedBy = if (owners == null) "an unreadable record" else owners[h.symbol.uppercase()]
             val analysis = h.analysis ?: run {
                 logLines.add("${h.symbol}: SKIP — no analysis (scan may not have completed)")
                 continue
@@ -228,7 +230,7 @@ class DailyPortfolioManager(
                 // Even if the user mutes Tier 1, the watchdog still records into
                 // cross-talk so suppression and alert history work correctly.
                 if (config.macdFlipNotificationsEnabled) {
-                    sendMacdFlipNotification(h, analysis, gainPct, watchdogOut.reason)
+                    sendMacdFlipNotification(h, analysis, gainPct, watchdogOut.reason, ownedBy)
                     logLines.add("${h.symbol}: ⚠ MACD FLIP — notification sent. gain=${gainPct.format(1)}%")
                 } else {
                     logLines.add("${h.symbol}: ⚠ MACD FLIP — notification muted (Tier 1 disabled). gain=${gainPct.format(1)}%")
@@ -236,7 +238,7 @@ class DailyPortfolioManager(
                 // Cross-talk into ScanService: register the firing so (a) BOOK_PROFIT
                 // is suppressed for this symbol the rest of today, and (b) the alert
                 // appears in the in-app history panel alongside ScanService alerts.
-                registerMacdFlipForCrossTalk(h, analysis, gainPct, watchdogOut.reason, startMs)
+                registerMacdFlipForCrossTalk(h, analysis, gainPct, watchdogOut.reason, startMs, ownedBy)
 
                 // ── Tier 2 (autoCreateGtt): sniper GTT ───────────────────────────
                 // Cancel existing OCO and replace with a tight single-leg SELL GTT
@@ -490,22 +492,30 @@ class DailyPortfolioManager(
         h: PortfolioHolding,
         analysis: StockAnalysis,
         gainPct: Double,
-        reason: String
+        reason: String,
+        /** Who manages it in the app; null = yours alone, and only then is a sniper set. */
+        ownedBy: String? = null
     ) {
         try {
             ensureMacdExitChannel(context)
+            val sniperLine = when {
+                ownedBy != null -> "Managed by $ownedBy: its own stop and target stay. No sniper order is set."
+                config.autoCreateGtt -> "Sniper GTT being set ~1.5% below LTP. Check Kite to review or cancel."
+                else -> "No order is placed — decide in Kite."
+            }
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val title = "⚠ MACD FLIP — ${h.symbol}  sell soon"
             val body = buildString {
                 append("LTP ₹${h.ltp.format(2)}  ·  gain ${gainPct.format(1)}%  ·  qty ${h.quantity}\n")
                 append("MACD hist negative ≥ ${analysis.minBarsFilter}d filter (adaptive).\n")
-                append("Sniper GTT being set ~1.5% below LTP. Check Kite to review or cancel.\n")
+                append(sniperLine + "\n")
                 append("Reason: $reason")
             }
             val notif = NotificationCompat.Builder(context, CHANNEL_MACD_EXIT)
                 .setSmallIcon(android.R.drawable.ic_dialog_alert)
                 .setContentTitle(title)
-                .setContentText("LTP ₹${h.ltp.format(2)} · gain ${gainPct.format(1)}% · sniper GTT being set")
+                .setContentText("LTP ₹${h.ltp.format(2)} · gain ${gainPct.format(1)}% · " +
+                    (if (ownedBy != null) "managed by $ownedBy, no sniper" else if (config.autoCreateGtt) "sniper GTT being set" else "no order placed"))
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
                 .setPriority(NotificationCompat.PRIORITY_MAX)
                 .setCategory(NotificationCompat.CATEGORY_ALARM)
@@ -532,7 +542,9 @@ class DailyPortfolioManager(
         analysis: StockAnalysis,
         gainPct: Double,
         reason: String,
-        nowMs: Long
+        nowMs: Long,
+        /** Who manages it in the app; null = yours alone. */
+        ownedBy: String? = null
     ) {
         try {
             // IST trading date key — same format ScanService uses for date-stamped sets
@@ -554,7 +566,8 @@ class DailyPortfolioManager(
                 symbol = h.symbol,
                 name = h.symbol,
                 alertType = com.signalscope.app.data.AlertType.MACD_FLIP,
-                message = "Histogram watchdog confirmed (≥${analysis.minBarsFilter}d sustained, gain ${gainPct.format(1)}%). Sniper GTT set. $reason",
+                message = "Histogram watchdog confirmed (≥${analysis.minBarsFilter}d sustained, gain ${gainPct.format(1)}%). " +
+                    (if (ownedBy != null) "Managed by $ownedBy — no sniper set. " else if (config.autoCreateGtt) "Sniper GTT set. " else "") + reason,
                 sellScore = analysis.sellScore,
                 cherryPoints = analysis.cherryPoints,
                 price = h.ltp,

@@ -131,3 +131,6 @@ a new day gets its own heading. "Installed" is when the change reached the phone
 - **Held = underline in News** (12 Nov) — 🔔 › News moves: a stock you hold now has its symbol underlined green (any market tab), no "you hold it" tag; one held when it moved but sold since says "held then".
 - **Narrower stock column** (12 Nov) — Portfolio › Germany: the Stock column is ~90px (was ~130): long names wrap, 📅today and the AI chip sit on a line under the name, the small price graph is narrower.
 - **Snipers leave managed holdings alone** (12 Nov) — India, after 15:20 IST: a holding the watchlist or an algo owns keeps its own GTT (Zerodha › GTT unchanged); the MACD-exit alert can still come. A stock you bought by hand and never handed over is still trailed / sniped as before.
+- **Honest exit alert** (15 Nov) — India, after 15:20 IST: a "⚠ MACD FLIP" alert on a watchlist-managed holding reads "Managed by watchlist: its own stop and target stay. No sniper order is set."
+- **News pictures, capped** (15 Nov) — 🔔 › News moves › India: scroll to the bottom and back up — pictures refill as rows return; the app stays responsive. A "· news" phone alert arrives at once, its picture a few seconds later.
+- **Nifty-gate copy without opening the tab** (15 Nov) — Algos › India shows "Macd swing · Nifty gate" after Monday's first pass even if the tab was never opened.

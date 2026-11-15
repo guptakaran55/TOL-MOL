@@ -2580,12 +2580,26 @@ function newsOpenArticle(i){
 // alert's: a year, a month and five days of price, and the MACD. Drawn by the app
 // as each row scrolls into view, one at a time, and kept for the session.
 var NEWS_CHART={}, NEWS_CHART_Q=[], NEWS_CHART_BUSY=false, NEWS_CHART_OBS=null;
+// AT MOST THIS MANY PICTURES KEPT (15 Nov 2026): a long list scrolled to the end held
+// one for every row, on a phone that already rebuilds the screen when memory is short.
+// The oldest goes back to its placeholder and is asked for again if scrolled back to
+// (the app keeps its own copy for an hour, so that costs no download).
+var NEWS_CHART_MAX=24, NEWS_CHART_ORDER=[];
+var NEWS_CHART_WAIT='<div style="font-size:9px;color:var(--t3);padding:3px 0">📈 …</div>';
+function newsChartKeep(k){
+  NEWS_CHART_ORDER=NEWS_CHART_ORDER.filter(function(x){return x!==k});NEWS_CHART_ORDER.push(k);
+  while(NEWS_CHART_ORDER.length>NEWS_CHART_MAX){
+    var old=NEWS_CHART_ORDER.shift();delete NEWS_CHART[old];
+    document.querySelectorAll('#notif-list .nchart[data-k="'+old+'"]').forEach(function(el){
+      el.innerHTML=NEWS_CHART_WAIT;if(NEWS_CHART_OBS)try{NEWS_CHART_OBS.observe(el)}catch(e){}});
+  }
+}
 function newsChartKey(it){return String(it.space||'').toLowerCase()+':'+String(it.symbol||'').toUpperCase()}
 function newsChartSlot(it,i){
   var k=newsChartKey(it),c=NEWS_CHART[k];
   return '<div class="nchart" data-k="'+escHtml(k)+'" onclick="newsOpenStock('+i+')" style="margin-top:4px;cursor:pointer">'+
     (c&&c.src?'<img src="'+c.src+'" style="width:100%;display:block;border-radius:6px"/>':
-     c&&c.none?'':'<div style="font-size:9px;color:var(--t3);padding:3px 0">📈 …</div>')+'</div>';
+     c&&c.none?'':NEWS_CHART_WAIT)+'</div>';
 }
 function newsChartFill(k){
   var c=NEWS_CHART[k];
@@ -2602,7 +2616,7 @@ function newsChartNext(){
   androidAsync('newsChart',[p[0],p.slice(1).join(':')],function(raw){
     var r=null;try{r=JSON.parse(raw||'{}')}catch(e){}
     NEWS_CHART[k]=(r&&r.ok&&r.src)?{src:r.src}:{none:true};
-    NEWS_CHART_BUSY=false;newsChartFill(k);newsChartNext();
+    NEWS_CHART_BUSY=false;newsChartFill(k);if(NEWS_CHART[k].src)newsChartKeep(k);newsChartNext();
   });
 }
 function newsChartsWatch(){
@@ -6861,7 +6875,7 @@ var COL_DEFS={
         '<div class="snchips">'+aicChip(r.symbol,r.industry,r.space)+ernChip(r.symbol,r.space)+'</div>';
       var notes='';
       notes+=portfolioWarningBadges(r);
-      if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD watchdog fired today — hard sniper GTT set">FLIP</span>';
+      if(r.macdFlipFiredToday)notes+='<span class="snb snb-flip" title="MACD exit signal fired today — a sniper order only on stocks nothing in the app manages">FLIP</span>';
       else if(r.softSniperFiredToday)notes+='<span class="snb snb-soft" title="Soft sniper fired today — auto-GTT placed on BOOK_PROFIT alert">SS</span>';
       if(r.obvDivergence)notes+='<span class="snb snb-exit" title="OBV bearish divergence: price near 5-day high but volume not confirming.">BIG EXIT</span>';
       else if(r.obvWeakness)notes+='<span class="snb snb-vol" title="OBV under 20-day average — volume support is weakening.">vol weak</span>';

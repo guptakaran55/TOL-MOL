@@ -85,6 +85,12 @@ object ZerodhaLiveStore {
 
     private fun file(ctx: Context) = File(ctx.filesDir, FILE)
 
+    /** Can the ledger be read? True with no file yet — see ManualWatchStore.readable. */
+    fun readable(ctx: Context): Boolean = try {
+        val f = file(ctx)
+        !f.exists() || StoreCache.read(f) { gson.fromJson(it, State::class.java) } != null
+    } catch (e: Exception) { Log.e(TAG, "ledger unreadable", e); false }
+
     fun load(ctx: Context): State = try {
         val f = file(ctx)
         StoreCache.read(f) { gson.fromJson(it, State::class.java) } ?: State()   // parsed once, kept until the file changes

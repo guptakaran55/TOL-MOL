@@ -74,6 +74,9 @@ object FloorAlgoEngine {
 
     /** Every algo with work to do, one after another. For the fifteen-minute pass. */
     fun runAll(ctx: Context): String {
+        // One-time copies are made here too: left to the Algos tab alone, the Nifty-gate
+        // copy did not exist until India's tab was next opened (found 15 Nov 2026).
+        try { FloorAlgoStore.ensureIndiaNiftyGateCopy(ctx) } catch (e: Exception) { Log.w(TAG, "seed failed", e) }
         // A paused algo with real shares still held gets its pass, so they still sell.
         val realHeld = try { com.signalscope.app.data.FloorLiveStore.load(ctx).rows.filter { it.holds }.map { it.ns }.toHashSet() }
             catch (_: Exception) { emptySet<String>() }
